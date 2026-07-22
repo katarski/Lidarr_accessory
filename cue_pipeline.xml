@@ -1,0 +1,66 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>cue_pipeline</Name>
+  <Repository>cue_pipeline:latest</Repository>
+  <Registry/>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>bash</Shell>
+  <Privileged>false</Privileged>
+  <Support/>
+  <Project/>
+  <Overview>Watches your downloads for CUE + audio, splits/tags disc images, hands pre-split albums to Lidarr via ManualImport, force-imports clear matches, de-duplicates against the library, and cleans up sources. Runs alongside Lidarr in the same /downloads + /music namespace. LLM (Ollama) is optional.</Overview>
+  <Category>MediaApp:Music MediaServer:Music</Category>
+  <WebUI/>
+  <TemplateURL/>
+  <Icon>https://raw.githubusercontent.com/lidarr/Lidarr/develop/Logo/256.png</Icon>
+  <ExtraParams>--user 99:100</ExtraParams>
+  <PostArgs/>
+  <CPUset/>
+  <DateInstalled/>
+  <DonateText/>
+  <DonateLink/>
+  <Description>cue_pipeline -- automatic CUE splitting + Lidarr import helper. Behavioral settings are editable below; anything not shown lives in /config/config.yaml.</Description>
+  <Networking>
+    <Mode>bridge</Mode>
+    <Publish/>
+  </Networking>
+  <Data>
+    <Volume><HostDir>/mnt/cache/appdata/cue_pipeline</HostDir><ContainerDir>/config</ContainerDir><Mode>rw</Mode></Volume>
+    <Volume><HostDir>/mnt/user/Network_Documents/Dan/Internet Downloads</HostDir><ContainerDir>/downloads</ContainerDir><Mode>rw</Mode></Volume>
+    <Volume><HostDir>/mnt/user/Audio</HostDir><ContainerDir>/music</ContainerDir><Mode>rw</Mode></Volume>
+  </Data>
+  <Environment/>
+
+  <Config Name="Config / appdata" Target="/config" Default="/mnt/cache/appdata/cue_pipeline" Mode="rw" Description="Holds config.yaml, logs, ledger and audit files. Must be writable by 99:100." Type="Path" Display="always" Required="true" Mask="false">/mnt/cache/appdata/cue_pipeline</Config>
+  <Config Name="Downloads" Target="/downloads" Default="" Mode="rw" Description="Same host path Lidarr's /downloads points at -- where finished music downloads land (the watch root)." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/Network_Documents/Dan/Internet Downloads</Config>
+  <Config Name="Music library" Target="/music" Default="" Mode="rw" Description="Same host path Lidarr's /music points at. The library sits at /music/Music." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/Audio</Config>
+
+  <Config Name="Timezone" Target="TZ" Default="Europe/Copenhagen" Mode="" Description="Timezone for log timestamps." Type="Variable" Display="always" Required="false" Mask="false">Europe/Copenhagen</Config>
+
+  <Config Name="Lidarr URL" Target="LIDARR_URL" Default="http://192.168.1.200:8686" Mode="" Description="Base URL of your Lidarr instance." Type="Variable" Display="always" Required="false" Mask="false">http://192.168.1.200:8686</Config>
+  <Config Name="Lidarr API key" Target="LIDARR_API_KEY" Default="" Mode="" Description="Lidarr -> Settings -> General -> API Key." Type="Variable" Display="always" Required="false" Mask="true"></Config>
+
+  <Config Name="LLM enabled (master switch)" Target="OLLAMA_ENABLED" Default="true" Mode="" Description="MASTER SWITCH. false = no LLM at all and EVERY LLM_* field below is ignored (GPU stays free). true = use the provider+URL+model below. The LLM only auto-repairs malformed .cue files -- optional." Type="Variable" Display="always" Required="false" Mask="false">true</Config>
+  <Config Name="LLM provider" Target="LLM_PROVIDER" Default="openai" Mode="" Description="Only matters if enabled=true. Pick ONE and set base URL + model + key to MATCH it. 'ollama' = local GPU, no key. 'openai' = cloud (Gemini/OpenAI/Groq/OpenRouter), needs API key, no GPU." Type="Variable" Display="always" Required="false" Mask="false">openai</Config>
+  <Config Name="LLM base URL (must match provider)" Target="LLM_BASE_URL" Default="https://generativelanguage.googleapis.com/v1beta/openai" Mode="" Description="Only if enabled=true. MUST match provider: Gemini -> https://generativelanguage.googleapis.com/v1beta/openai ; OpenAI -> https://api.openai.com/v1 ; ollama -> http://HOST:11434 ." Type="Variable" Display="always" Required="false" Mask="false">https://generativelanguage.googleapis.com/v1beta/openai</Config>
+  <Config Name="LLM model (must match provider)" Target="LLM_MODEL" Default="gemini-2.0-flash" Mode="" Description="Only if enabled=true. MUST match provider: Gemini -> gemini-2.0-flash ; OpenAI -> gpt-4o-mini ; ollama -> qwen2.5:14b ." Type="Variable" Display="always" Required="false" Mask="false">gemini-2.0-flash</Config>
+  <Config Name="LLM API key (cloud only)" Target="LLM_API_KEY" Default="" Mode="" Description="Required for provider=openai (Gemini/OpenAI/...). Get a free Gemini key at aistudio.google.com. IGNORED for ollama and when enabled=false." Type="Variable" Display="always" Required="false" Mask="true"></Config>
+
+  <Config Name="Delete source folder on success" Target="DELETE_SOURCE_FOLDER" Default="true" Mode="" Description="DESTRUCTIVE. After a verified import, delete the whole source download folder. true/false." Type="Variable" Display="always" Required="false" Mask="false">true</Config>
+  <Config Name="Delete originals on success" Target="DELETE_ORIGINALS" Default="true" Mode="" Description="After import, delete the source disc image + .cue (used when the folder isn't deleted wholesale). true/false." Type="Variable" Display="advanced" Required="false" Mask="false">true</Config>
+
+  <Config Name="Force-import on exact/near count match" Target="FORCE_IMPORT" Default="true" Mode="" Description="Force-import when file count matches (or nearly matches) a Lidarr release, even if titles don't. true/false." Type="Variable" Display="advanced" Required="false" Mask="false">true</Config>
+  <Config Name="Force-import: max % missing" Target="FORCE_IMPORT_MAX_MISSING" Default="10" Mode="" Description="Allow up to this %% of an album's tracks to be missing and still force-import." Type="Variable" Display="advanced" Required="false" Mask="false">10</Config>
+  <Config Name="Force-import: max % extra" Target="FORCE_IMPORT_MAX_EXTRA" Default="25" Mode="" Description="Above this %% of extra tracks it's treated as a compilation and left alone (prevents cramming)." Type="Variable" Display="advanced" Required="false" Mask="false">25</Config>
+  <Config Name="Match floor %" Target="MIN_MATCH_PERCENT" Default="60" Mode="" Description="Override Lidarr's 80%% match rule down to this floor for soft mismatches." Type="Variable" Display="advanced" Required="false" Mask="false">60</Config>
+
+  <Config Name="Library audit (scheduled, change-gated)" Target="LIBRARY_AUDIT_ENABLED" Default="false" Mode="" Description="Periodically reconcile the on-disk library with Lidarr, only when it changed. true/false." Type="Variable" Display="advanced" Required="false" Mask="false">false</Config>
+
+  <Config Name="qBittorrent URL" Target="QBIT_URL" Default="http://192.168.1.200:8080" Mode="" Description="qBittorrent Web UI URL (for selective-download)." Type="Variable" Display="always" Required="false" Mask="false">http://192.168.1.200:8080</Config>
+  <Config Name="qBittorrent user" Target="QBIT_USER" Default="admin" Mode="" Description="qBittorrent Web UI username." Type="Variable" Display="always" Required="false" Mask="false">admin</Config>
+  <Config Name="qBittorrent password" Target="QBIT_PASS" Default="" Mode="" Description="qBittorrent Web UI password." Type="Variable" Display="always" Required="false" Mask="true"></Config>
+  <Config Name="qBit auto-deselect" Target="QBIT_AUTO_DESELECT" Default="false" Mode="" Description="Auto-deselect (skip) albums already in the library on incomplete music torrents, so a discography grab only downloads what's missing. true/false." Type="Variable" Display="always" Required="false" Mask="false">false</Config>
+  <Config Name="qBit auto-deselect interval (s)" Target="QBIT_INTERVAL" Default="300" Mode="" Description="How often to poll qBittorrent when auto-deselect is on (min 60)." Type="Variable" Display="advanced" Required="false" Mask="false">300</Config>
+  <Config Name="qBit category filter" Target="QBIT_CATEGORY" Default="" Mode="" Description="Only act on torrents in this qBittorrent category (blank = all)." Type="Variable" Display="advanced" Required="false" Mask="false"></Config>
+</Container>

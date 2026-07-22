@@ -1,0 +1,15 @@
+# Keep the image small and never bake host-specific config in.
+.venv/
+__pycache__/
+*.pyc
+.git/
+.gitignore
+_processed/
+*.log
+config.yaml
+config.docker.yaml
+ledger.csv
+library_audit.csv
+library_audit.sig
+dedup_report*.txt
+*.md

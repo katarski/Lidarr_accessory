@@ -1,0 +1,23 @@
+# Python
+.venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Secrets / runtime config -- these hold API keys. Use config.example.yaml.
+config.yaml
+config.docker.yaml
+
+# Runtime artifacts
+*.log
+ledger.csv
+library_audit.csv
+library_audit.sig
+_processed/
+dedup_report*.txt
+
+# OS cruft
+.DS_Store
+Thumbs.db

@@ -1,0 +1,31 @@
+# cue_pipeline on Unraid.
+#
+# Adjust the left-hand side of each volume to YOUR host paths. They must
+# point at the SAME data Lidarr uses, so the container sees identical
+# paths (/downloads, /music) -- that's what makes path-mapping an identity
+# and kills the SMB problems you had on Windows.
+#
+#   build:   docker compose build
+#   run:     docker compose up -d
+#   logs:    docker compose logs -f
+services:
+  cue_pipeline:
+    build: .
+    image: cue_pipeline:latest
+    container_name: cue_pipeline
+    restart: unless-stopped
+    # Run as Unraid's nobody:users so files it moves/creates match what
+    # Lidarr (also 99:100 by default) expects -- avoids root-owned files
+    # Lidarr can't manage. Make sure /config appdata is owned by 99:100.
+    user: "99:100"
+    environment:
+      - TZ=Europe/Copenhagen
+    volumes:
+      # appdata: config.yaml + pipeline.log + ledger.csv + library_audit.csv/.sig
+      - /mnt/cache/appdata/cue_pipeline:/config
+      # downloads share -> /downloads  (Lidarr's path_mapping "to")
+      # Left side = the HOST path that Lidarr's /downloads points at.
+      - /mnt/user/Network_Documents/Dan/Internet Downloads:/downloads
+      # Audio share -> /music  (Lidarr mounts it the same; library = /music/Music)
+      # Left side = the HOST path that Lidarr's /music points at.
+      - /mnt/user/Audio:/music
