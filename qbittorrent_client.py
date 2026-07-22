@@ -104,16 +104,40 @@ class QbtClient:
             logger.warning("qBittorrent filePrio failed: %s", exc)
             return False
 
+    def _post_first_ok(self, endpoints, data) -> bool:
+        """POST to each endpoint until one doesn't 404 (handles the qBittorrent
+        5.x rename of pause->stop / resume->start across versions)."""
+        for ep in endpoints:
+            try:
+                r = self.s.post(f"{self.base}/api/v2/torrents/{ep}",
+                                data=data, timeout=15)
+                if r.status_code != 404:
+                    return r.status_code < 400
+            except Exception:  # noqa: BLE001
+                return False
+        return False
+
     def pause(self, torrent_hash: str) -> None:
-        try:
-            self.s.post(f"{self.base}/api/v2/torrents/pause",
-                        data={"hashes": torrent_hash}, timeout=15)
-        except Exception:  # noqa: BLE001
-            pass
+        # qBittorrent 5.x renamed 'pause' -> 'stop'; older builds use 'pause'.
+        self._post_first_ok(("stop", "pause"), {"hashes": torrent_hash})
 
     def resume(self, torrent_hash: str) -> None:
+        # qBittorrent 5.x renamed 'resume' -> 'start'; older builds use 'resume'.
+        self._post_first_ok(("start", "resume"), {"hashes": torrent_hash})
+
+    def remove(self, torrent_hash: str, delete_files: bool = True) -> bool:
+        """Delete a torrent. delete_files=True also removes its data on disk."""
         try:
-            self.s.post(f"{self.base}/api/v2/torrents/resume",
-                        data={"hashes": torrent_hash}, timeout=15)
-        except Exception:  # noqa: BLE001
-            pass
+            r = self.s.post(
+                f"{self.base}/api/v2/torrents/delete",
+                data={
+                    "hashes": torrent_hash,
+                    "deleteFiles": "true" if delete_files else "false",
+                },
+                timeout=30,
+            )
+            r.raise_for_status()
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("qBittorrent delete(%s) failed: %s", torrent_hash, exc)
+            return False

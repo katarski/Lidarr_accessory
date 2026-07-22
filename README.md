@@ -1,16 +1,5 @@
 # cue_pipeline
 
-## Quick start / configuration
-This repo ships a template config, **not** real secrets. To use it:
-```sh
-cp config.example.yaml config.yaml     # then edit: Lidarr API key, paths, etc.
-```
-`config.yaml` (and `config.docker.yaml`) are gitignored so your API keys never get committed.
-For running on **Unraid via Docker**, see [UNRAID_SETUP.md](UNRAID_SETUP.md) — it uses the same
-`config.example.yaml` copied to the container's `/config/config.yaml`.
-
----
-
 Windows-side service that watches a download folder for FLAC/APE/WV disc
 images with `.cue` sheets, splits them with **ffmpeg** (no shntool — avoids
 the artifacts), tags the resulting tracks, and hands them to Lidarr.

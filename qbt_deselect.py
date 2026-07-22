@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import re
 import sys
 from pathlib import Path
@@ -36,13 +37,40 @@ from dedup_downloads import AUDIO_EXTS, album_complete_in_library, human
 logger = logging.getLogger("qbt_deselect")
 
 _YEAR = re.compile(r"\b(19|20)\d{2}\b")
+# Leading "1960 " / "1960,1961 " / "1960 - " / "1960. " year prefix(es).
+_LEAD_YEARS = re.compile(r"^\s*(?:19|20)\d{2}(?:\s*,\s*(?:19|20)\d{2})*[\s.\-]+")
+# Leading "01. " / "01 - " track/disc number (needs a . or - separator so a
+# real leading number like "20 Greatest Hits" is left alone).
+_LEAD_NUM = re.compile(r"^\s*\d+\s*[.\-]\s*")
+# A disc subfolder: "CD1", "CD 1", "Disc 2", "disc-3", "DVD1", "Side A", or a
+# bare "1"/"2" one- or two-digit folder.
+_DISC_DIR = re.compile(r"(?i)^(?:cd|disc|disk|dvd|side)\s*[.\-_]?\s*\w{1,3}$|^\d{1,2}$")
+# A non-audio sidecar subfolder (art/scans/etc.) -- audio never lives here, but
+# guard anyway so it never becomes an "album".
+_ART_DIR = re.compile(
+    r"(?i)^-?(?:scans?|artwork|art|covers?|cover|sleeves?|booklet|"
+    r"images?|thumbs?|logs?|info)$"
+)
 
 
-def _clean_album(name: str) -> str:
-    """'01. Album (1985) [FLAC] {CAT-123}' -> 'Album'."""
-    s = re.sub(r"^\s*\d+[\.\-]\s*", "", name)
-    s = re.sub(r"^\s*(19|20)\d{2}\s*[\.\-]\s*", "", s)
-    s = re.sub(r"[\(\[\{][^)\]\}]*[\)\]\}]", " ", s)
+def _clean_album(name: str, artist: str = "") -> str:
+    """
+    Turn a messy album-folder name into a bare album title:
+      '1988 Etta James - Seven Year Itch (1988 Canada Island CID-1210)'
+        -> 'Seven Year Itch'
+      '1960,1961 Etta James - At Last, The Second Time Around (2012 ...)'
+        -> 'At Last, The Second Time Around'
+    `artist` (when known) lets us strip an embedded 'Artist - ' prefix
+    (including '& guest' credits) without eating album titles that merely
+    contain ' - '.
+    """
+    s = _LEAD_NUM.sub("", name)          # '01. ' / '01 - '
+    s = _LEAD_YEARS.sub("", s)           # '1960 ' / '1960,1961 ' / '1960 - '
+    if artist:
+        na = re.escape(artist.strip())
+        # 'Etta James - ...' or 'Etta James & Eddie ... - ...' at the start.
+        s = re.sub(rf"(?i)^\s*{na}\b[^-]*?-\s*", "", s, count=1)
+    s = re.sub(r"[(\[\{][^)\]\}]*[)\]\}]", " ", s)   # drop (edition)[tag]{cat}
     return re.sub(r"\s{2,}", " ", s).strip(" -_.")
 
 
@@ -59,6 +87,28 @@ def _rel_parts(name: str) -> list:
     return [p for p in name.replace("\\", "/").split("/") if p]
 
 
+def _album_dir_parts(folder_parts: list) -> list:
+    """
+    Given the folder path of a file (no filename), walk up past any trailing
+    disc ('Disc 1', 'CD2') or sidecar ('Artwork', 'Scans', 'Covers')
+    subfolders to the real album folder, so multi-disc albums group as ONE
+    album, sidecar files map to their album, and a disc/art folder never
+    becomes the album title.
+    """
+    p = list(folder_parts)
+    while len(p) > 1 and (_DISC_DIR.match(p[-1]) or _ART_DIR.match(p[-1])):
+        p.pop()
+    return p
+
+
+def _file_album_key(f: Dict[str, Any], torrent_name: str) -> str:
+    """The album-folder key a file belongs to (audio OR sidecar)."""
+    parts = _rel_parts(f.get("name", ""))
+    folder_parts = parts[:-1] if len(parts) >= 2 else []
+    adir = _album_dir_parts(folder_parts)
+    return "/".join(adir) if adir else torrent_name
+
+
 def plan_torrent(
     lidarr: LidarrClient, torrent_name: str, files: List[Dict[str, Any]],
     forced_artist: str = "",
@@ -71,25 +121,40 @@ def plan_torrent(
     audio = [f for f in files if Path(f.get("name", "")).suffix.lower() in AUDIO_EXTS]
     if not audio:
         return []
+    # Group AUDIO by album folder (this drives the have-decision), and ALL
+    # files by the same folder key (this drives what we deselect). When an
+    # album is already in the library we deselect the WHOLE folder -- .cue,
+    # .log, covers, art, everything -- not just the audio. A leftover .cue
+    # would otherwise download and trip the pipeline's watcher.
     groups: Dict[str, list] = {}
+    all_by_key: Dict[str, list] = {}
     for f in audio:
-        parts = _rel_parts(f.get("name", ""))
-        key = "/".join(parts[:-1]) if len(parts) >= 2 else torrent_name
-        groups.setdefault(key, []).append(f)
+        groups.setdefault(_file_album_key(f, torrent_name), []).append(f)
+    for f in files:
+        all_by_key.setdefault(_file_album_key(f, torrent_name), []).append(f)
 
+    # Cache Lidarr artist/album lookups across this torrent's many folders
+    # (a discography can be 100+ folders -- don't re-query per folder).
+    lib_cache: Dict[str, Any] = {}
     plan: List[Dict[str, Any]] = []
     for key, afiles in sorted(groups.items()):
         parts = _rel_parts(key)
-        album = _clean_album(parts[-1]) if parts else _clean_album(torrent_name)
-        artist = (forced_artist or
-                  (_clean_artist(parts[0]) if len(parts) >= 2 else _clean_artist(torrent_name)))
-        complete, have, total = album_complete_in_library(lidarr, artist, album)
+        raw_artist = parts[0] if len(parts) >= 2 else torrent_name
+        artist = forced_artist or _clean_artist(raw_artist)
+        album_raw = parts[-1] if parts else torrent_name
+        album = _clean_album(album_raw, artist=(forced_artist or raw_artist))
+        complete, have, total = album_complete_in_library(
+            lidarr, artist, album, _cache=lib_cache
+        )
         # Deselect only when the library fully has it AND has >= as many
         # tracks as the torrent folder (don't drop a bigger edition).
         deselect = bool(complete and total >= len(afiles))
+        allf = all_by_key.get(key, afiles)
         plan.append({
-            "artist": artist, "album": album, "files": afiles,
-            "size": sum(int(x.get("size") or 0) for x in afiles),
+            "artist": artist, "album": album,
+            "files": afiles,       # audio only (drives the have-decision)
+            "all_files": allf,     # every file in the folder (what we deselect)
+            "size": sum(int(x.get("size") or 0) for x in allf),
             "have": deselect, "have_count": have, "total": total,
         })
     return plan
@@ -99,11 +164,14 @@ def process_torrent(
     qbt: QbtClient, lidarr: LidarrClient, torrent: Dict[str, Any],
     forced_artist: str = "", apply: bool = False,
     emit: Callable[[str], None] = logger.info,
+    files: Optional[List[Dict[str, Any]]] = None,
 ) -> tuple:
     """Plan + (optionally) deselect one torrent. Returns (deselected, kept)."""
     thash = torrent.get("hash")
     tname = torrent.get("name") or "?"
-    plan = plan_torrent(lidarr, tname, qbt.files(thash), forced_artist)
+    if files is None:
+        files = qbt.files(thash)
+    plan = plan_torrent(lidarr, tname, files, forced_artist)
     if not plan:
         return 0, 0
     emit(f"Torrent: {tname}")
@@ -112,9 +180,13 @@ def process_torrent(
     for a in sorted(plan, key=lambda x: -x["size"]):
         if a["have"]:
             deselected += 1
-            to_deselect.extend(int(x["index"]) for x in a["files"] if "index" in x)
+            folder_files = a.get("all_files", a["files"])
+            to_deselect.extend(int(x["index"]) for x in folder_files if "index" in x)
+            n_audio = len(a["files"])
+            n_all = len(folder_files)
+            extra = f" (+{n_all - n_audio} sidecar)" if n_all > n_audio else ""
             emit(f"  HAVE  [{human(a['size']):>9}]  {a['artist']} / {a['album']} "
-                 f"(library {a['have_count']}/{a['total']}) -> deselect {len(a['files'])}")
+                 f"(library {a['have_count']}/{a['total']}) -> deselect {n_all} file(s){extra} [whole folder]")
         else:
             kept += 1
             why = "not in library" if a["total"] == 0 else f"library {a['have_count']}/{a['total']}"
@@ -128,11 +200,21 @@ def process_torrent(
 def auto_deselect_pass(
     qbt: QbtClient, lidarr: LidarrClient, seen: set,
     category: str = "", emit: Callable[[str], None] = logger.info,
+    pause_during_scan: bool = True,
 ) -> int:
     """
     One scheduled pass for the pipeline: for each INCOMPLETE music torrent we
     haven't handled yet, deselect already-have albums. Marks torrents seen so
     we don't reprocess. Returns number of torrents acted on.
+
+    To keep bandwidth from leaking on already-owned albums before we act, a
+    freshly-seen torrent is PAUSED the instant we notice it, its file list is
+    read, the owned albums are deselected, and only then is it resumed -- so
+    for a .torrent add (file list known immediately) the unwanted albums never
+    download at all. A torrent whose metadata hasn't resolved yet (magnet,
+    empty file list) is left running and retried next pass -- no content
+    downloads before metadata anyway. Pause/resume is wrapped so an error
+    never leaves a torrent stuck paused.
     """
     acted = 0
     for t in qbt.torrents(category=category):
@@ -144,11 +226,118 @@ def auto_deselect_pass(
         if float(t.get("progress") or 0) >= 1.0:
             seen.add(h)
             continue
-        d, _k = process_torrent(qbt, lidarr, t, apply=True, emit=emit)
-        seen.add(h)
-        if d:
-            acted += 1
+        paused = False
+        try:
+            if pause_during_scan:
+                qbt.pause(h)
+                paused = True
+            files = qbt.files(h)
+            if not files:
+                # Metadata not ready yet (e.g. magnet still resolving). Can't
+                # plan without the file list -- retry next pass. Don't mark
+                # seen. (The finally-block resumes it so metadata keeps
+                # fetching.)
+                continue
+            d, _k = process_torrent(
+                qbt, lidarr, t, apply=True, emit=emit, files=files
+            )
+            seen.add(h)
+            if d:
+                acted += 1
+        finally:
+            if paused:
+                qbt.resume(h)
     return acted
+
+
+def _map_to_download_root(content_path: str, save_path: str, download_root: str) -> str:
+    """
+    qBittorrent reports a torrent's content_path under ITS OWN save path
+    (e.g. /data/Foo). Map that to the path the pipeline sees the same files at
+    (download_root, e.g. /downloads/Foo) by swapping the save-path prefix.
+    """
+    cp = (content_path or "").replace("\\", "/")
+    sp = (save_path or "").replace("\\", "/").rstrip("/")
+    if sp and (cp == sp or cp.startswith(sp + "/")):
+        rel = cp[len(sp):].lstrip("/")
+    else:
+        rel = os.path.basename(cp)
+    return os.path.join(download_root, rel) if rel else download_root
+
+
+def _count_audio_on_disk(path: str) -> int:
+    n = 0
+    for _dp, _dn, fn in os.walk(path):
+        for x in fn:
+            if os.path.splitext(x)[1].lower() in AUDIO_EXTS:
+                n += 1
+    return n
+
+
+def torrent_lifecycle_pass(
+    qbt: QbtClient, download_root: str, category: str = "",
+    emit: Callable[[str], None] = logger.info,
+) -> tuple:
+    """
+    Manage COMPLETED music torrents by how much of their content the pipeline
+    has already moved into the library (i.e. deleted from the download folder):
+
+      * fully moved      (no audio left on disk)  -> REMOVE torrent + data
+      * partially moved  (some audio gone)        -> PAUSE (stop seeding while
+                                                      the rest finishes importing)
+      * nothing moved yet (all audio still there) -> leave running
+
+    Non-music torrents (no selected audio -- TV, movies) are ignored.
+    Reads the real download folder, so it never deletes a torrent whose files
+    haven't actually been imported. Returns (removed, paused).
+    """
+    # Guard: if the download root isn't visible, do NOTHING -- otherwise an
+    # unmounted path would look like "everything moved" and nuke torrents.
+    if not download_root or not os.path.isdir(download_root):
+        emit(f"lifecycle: download root {download_root!r} not visible -- skipping")
+        return 0, 0
+
+    removed = paused = 0
+    for t in qbt.torrents(category=category):
+        if float(t.get("progress") or 0) < 1.0:
+            continue  # still downloading -> the deselect pass owns it
+        h = t.get("hash")
+        if not h:
+            continue
+        files = qbt.files(h)
+        sel_audio = sum(
+            1 for f in files
+            if f.get("priority", 1) != 0
+            and os.path.splitext(f.get("name", ""))[1].lower() in AUDIO_EXTS
+        )
+        if sel_audio == 0:
+            continue  # not a music torrent (or all audio deselected) -> ignore
+
+        folder = _map_to_download_root(
+            t.get("content_path"), t.get("save_path"), download_root
+        )
+        on_disk = _count_audio_on_disk(folder) if os.path.exists(folder) else 0
+        state = (t.get("state") or "").lower()
+        name = t.get("name") or "?"
+
+        if on_disk == 0:
+            # Everything moved to the library -> remove torrent + leftover data.
+            if qbt.remove(h, delete_files=True):
+                removed += 1
+                emit(f"lifecycle: REMOVED (fully imported) {name!r}")
+        elif on_disk < sel_audio:
+            # Partially moved -> pause so it stops seeding while the pipeline
+            # finishes importing the rest (paused torrents keep their files,
+            # so the pipeline can still read them).
+            if "paused" not in state and "stopped" not in state:
+                qbt.pause(h)
+                paused += 1
+                emit(
+                    f"lifecycle: PAUSED (imported {sel_audio - on_disk}/{sel_audio} "
+                    f"so far) {name!r}"
+                )
+        # else on_disk == sel_audio: nothing imported yet -> leave running.
+    return removed, paused
 
 
 def main() -> int:

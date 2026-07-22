@@ -87,6 +87,13 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     put("lidarr", "force_import_max_extra_percent", "FORCE_IMPORT_MAX_EXTRA", int)
     # Library audit
     put("lidarr", "library_audit_enabled", "LIBRARY_AUDIT_ENABLED", _as_bool)
+    # Queue reaper -- clears fully-downloaded-but-stuck torrents from Lidarr's
+    # queue (and, by default, from qBit) so mass imports don't pile up.
+    put("lidarr", "queue_reaper_enabled", "QUEUE_REAPER_ENABLED", _as_bool)
+    put("lidarr", "queue_reaper_interval_seconds", "QUEUE_REAPER_INTERVAL", int)
+    put("lidarr", "queue_reaper_grace_minutes", "QUEUE_REAPER_GRACE", int)
+    put("lidarr", "queue_reaper_remove_from_client", "QUEUE_REAPER_REMOVE_FROM_CLIENT", _as_bool)
+    put("lidarr", "queue_reaper_blocklist", "QUEUE_REAPER_BLOCKLIST", _as_bool)
     # qBittorrent selective-download
     put("qbittorrent", "base_url", "QBIT_URL")
     put("qbittorrent", "username", "QBIT_USER")
@@ -94,6 +101,8 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     put("qbittorrent", "category", "QBIT_CATEGORY")
     put("qbittorrent", "auto_deselect", "QBIT_AUTO_DESELECT", _as_bool)
     put("qbittorrent", "interval_seconds", "QBIT_INTERVAL", int)
+    put("qbittorrent", "pause_during_scan", "QBIT_PAUSE_SCAN", _as_bool)
+    put("qbittorrent", "manage_completed", "QBIT_MANAGE_COMPLETED", _as_bool)
     return cfg
 
 
@@ -320,37 +329,83 @@ def library_audit_loop(
         delay = cadence
 
 
-def qbt_auto_deselect_loop(
-    qcfg: Dict[str, Any], lidarr, stop: threading.Event, interval: int,
+def queue_reaper_loop(
+    orch: Orchestrator,
+    stop: threading.Event,
+    interval: int,
 ) -> None:
     """
-    Poll qBittorrent on a schedule and deselect (priority 0) the albums an
-    incomplete music torrent contains that Lidarr already has -- so a
-    discography grab only downloads what's missing. Opt-in via
-    qbittorrent.auto_deselect. Login is re-checked each pass (session may
-    expire). In-memory `seen` set avoids reprocessing a torrent.
+    Periodically clear fully-downloaded-but-stuck torrents from Lidarr's
+    queue (see Orchestrator.reap_lidarr_queue). The scale valve for mass
+    discography imports: without it, compilations / unmatched grabs / title
+    mismatches accumulate in the queue forever because Lidarr's native
+    cleanup only reaps successful imports. Minimum cadence 60s; first pass
+    is staggered one cadence out so startup stays light.
+    """
+    cadence = max(60, interval)
+    delay = cadence
+    while not stop.wait(delay):
+        try:
+            orch.reap_lidarr_queue()
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("queue reaper thread: %s", exc)
+        delay = cadence
+
+
+def qbt_auto_deselect_loop(
+    qcfg: Dict[str, Any], lidarr, stop: threading.Event, interval: int,
+    download_root: str = "",
+) -> None:
+    """
+    Poll qBittorrent on a schedule. Two jobs per pass:
+
+      1. Deselect (priority 0) the albums an INCOMPLETE music torrent contains
+         that Lidarr already has, so a discography grab only downloads what's
+         missing (opt-in: qbittorrent.auto_deselect). New torrents are
+         pause-scanned-resumed so owned albums never start downloading.
+
+      2. Manage COMPLETED music torrents by move-state (opt-in:
+         qbittorrent.manage_completed): pause a torrent while the pipeline is
+         mid-import, and remove it (with data) once every album has been moved
+         into the library. See qbt_deselect.torrent_lifecycle_pass.
+
+    Cadence is kept short (min 10s). Login is re-checked each pass.
     """
     from qbittorrent_client import QbtClient
-    from qbt_deselect import auto_deselect_pass
+    from qbt_deselect import auto_deselect_pass, torrent_lifecycle_pass
 
-    cadence = max(60, interval)
+    cadence = max(10, interval)
     category = qcfg.get("category", "") or ""
+    pause_scan = _as_bool(qcfg.get("pause_during_scan", True))
+    do_deselect = _as_bool(qcfg.get("auto_deselect", False))
+    manage_completed = _as_bool(qcfg.get("manage_completed", True))
     seen: set = set()
-    delay = min(cadence, 60)  # first pass soon after startup
+    delay = min(cadence, 10)  # first pass right after startup
     while not stop.wait(delay):
         delay = cadence
         try:
             qbt = QbtClient(qcfg["base_url"], qcfg.get("username", ""),
                             qcfg.get("password", ""))
             if not qbt.login():
-                logger.warning("qbt auto-deselect: login failed; will retry next pass")
+                logger.warning("qbt loop: login failed; will retry next pass")
                 continue
-            acted = auto_deselect_pass(qbt, lidarr, seen, category=category,
-                                       emit=logger.info)
-            if acted:
-                logger.info("qbt auto-deselect: acted on %d torrent(s)", acted)
+            if do_deselect:
+                acted = auto_deselect_pass(qbt, lidarr, seen, category=category,
+                                           emit=logger.info,
+                                           pause_during_scan=pause_scan)
+                if acted:
+                    logger.info("qbt auto-deselect: acted on %d torrent(s)", acted)
+            if manage_completed:
+                removed, paused = torrent_lifecycle_pass(
+                    qbt, download_root, category=category, emit=logger.info
+                )
+                if removed or paused:
+                    logger.info(
+                        "qbt lifecycle: removed %d fully-imported, paused %d "
+                        "mid-import torrent(s)", removed, paused,
+                    )
         except Exception as exc:  # noqa: BLE001
-            logger.exception("qbt auto-deselect thread: %s", exc)
+            logger.exception("qbt loop thread: %s", exc)
 
 
 # --- Startup scan -------------------------------------------------------
@@ -472,6 +527,20 @@ def main() -> int:
 
     ledger_file_cfg = staging_cfg.get("ledger_file")
     ledger_path = Path(ledger_file_cfg) if ledger_file_cfg else None
+
+    # Queue-reaper grace clock lives next to the other /config state files.
+    _reaper_state_cfg = lidarr_cfg.get("queue_reaper_state_file")
+    if _reaper_state_cfg:
+        reaper_state_path = Path(_reaper_state_cfg)
+    elif ledger_path is not None:
+        reaper_state_path = ledger_path.parent / "queue_reaper.json"
+    elif lidarr_cfg.get("library_audit_report_file"):
+        reaper_state_path = (
+            Path(lidarr_cfg["library_audit_report_file"]).parent
+            / "queue_reaper.json"
+        )
+    else:
+        reaper_state_path = None
     heartbeat_seconds = int(staging_cfg.get("heartbeat_seconds", 600) or 0)
 
     orch_cfg = OrchestratorConfig(
@@ -557,6 +626,22 @@ def main() -> int:
             Path(lidarr_cfg["library_audit_report_file"])
             if lidarr_cfg.get("library_audit_report_file") else None
         ),
+        queue_reaper_enabled=bool(
+            lidarr_cfg.get("queue_reaper_enabled", False)
+        ),
+        queue_reaper_interval_seconds=int(
+            lidarr_cfg.get("queue_reaper_interval_seconds", 600)
+        ),
+        queue_reaper_grace_minutes=int(
+            lidarr_cfg.get("queue_reaper_grace_minutes", 30)
+        ),
+        queue_reaper_remove_from_client=bool(
+            lidarr_cfg.get("queue_reaper_remove_from_client", True)
+        ),
+        queue_reaper_blocklist=bool(
+            lidarr_cfg.get("queue_reaper_blocklist", False)
+        ),
+        queue_reaper_state_file=reaper_state_path,
     )
 
     orch = Orchestrator(orch_cfg, lidarr, ollama_client)
@@ -628,14 +713,27 @@ def main() -> int:
     sweep_thread = None
     if orch_cfg.sweep_cueless_pre_split:
         logger.info(
-            "Cueless sweep: running startup pass (min_stable=%ds, interval=%ds)",
+            "Cueless sweep: starting startup pass in BACKGROUND (min_stable=%ds, "
+            "interval=%ds) -- so it never blocks the audit/deselect/reaper threads",
             orch_cfg.sweep_min_stable_seconds,
             orch_cfg.sweep_interval_seconds,
         )
-        try:
-            orch.sweep_cueless_pre_split_folders(watch_root, excluded_dirs)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("cueless sweep (startup): %s", exc)
+
+        def _startup_cueless_sweep() -> None:
+            try:
+                orch.sweep_cueless_pre_split_folders(watch_root, excluded_dirs)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("cueless sweep (startup): %s", exc)
+
+        # Run as a daemon thread: with a large download backlog this pass can
+        # take a very long time (each ManualImport may wait for Lidarr), and it
+        # used to run synchronously here -- which delayed the queue reaper and
+        # qBit auto-deselect threads (started further down) from ever starting.
+        threading.Thread(
+            target=_startup_cueless_sweep,
+            daemon=True,
+            name="cue-cueless-startup",
+        ).start()
 
         if orch_cfg.sweep_interval_seconds > 0:
             sweep_thread = threading.Thread(
@@ -690,29 +788,62 @@ def main() -> int:
                 orch_cfg.library_audit_report_file,
             )
 
-    # --- qBittorrent auto-deselect (opt-in) ----------------------------
+    # --- qBittorrent loop: auto-deselect + completed-torrent lifecycle -
     qbt_thread = None
     qbt_cfg = cfg.get("qbittorrent") or {}
-    if _as_bool(qbt_cfg.get("auto_deselect", False)):
+    qbt_deselect_on = _as_bool(qbt_cfg.get("auto_deselect", False))
+    qbt_manage_on = _as_bool(qbt_cfg.get("manage_completed", True))
+    if qbt_deselect_on or qbt_manage_on:
         if not qbt_cfg.get("base_url"):
             logger.warning(
-                "qbittorrent.auto_deselect is on but base_url is not set -- "
-                "skipping. Configure base_url/username/password."
+                "qBittorrent features on but base_url is not set -- skipping. "
+                "Configure base_url/username/password."
             )
         else:
-            interval = int(qbt_cfg.get("interval_seconds", 300) or 300)
+            interval = int(qbt_cfg.get("interval_seconds", 30) or 30)
             qbt_thread = threading.Thread(
                 target=qbt_auto_deselect_loop,
-                args=(qbt_cfg, lidarr, stop, interval),
+                args=(qbt_cfg, lidarr, stop, interval, str(watch_root)),
                 daemon=True,
-                name="cue-qbt-deselect",
+                name="cue-qbt",
             )
             qbt_thread.start()
             logger.info(
-                "qBittorrent auto-deselect: enabled (every %ds, %s, category=%r)",
-                max(60, interval), qbt_cfg["base_url"],
-                qbt_cfg.get("category", ""),
+                "qBittorrent loop: enabled (every %ds, deselect=%s, "
+                "manage_completed=%s, pause-scan=%s, %s, category=%r)",
+                max(10, interval), qbt_deselect_on, qbt_manage_on,
+                _as_bool(qbt_cfg.get("pause_during_scan", True)),
+                qbt_cfg["base_url"], qbt_cfg.get("category", ""),
             )
+
+    # --- Queue reaper (opt-in, legacy) ---------------------------------
+    # Time-based clearing of stuck Lidarr queue rows. SUPERSEDED by the qBit
+    # completed-torrent lifecycle above, which is disk-aware and won't delete a
+    # torrent whose files haven't actually been imported yet. We only run the
+    # old reaper when the lifecycle is OFF, so the two can't fight (the reaper
+    # would otherwise delete a partially-imported torrent's remaining data).
+    reaper_thread = None
+    if orch_cfg.queue_reaper_enabled and not qbt_manage_on:
+        reaper_thread = threading.Thread(
+            target=queue_reaper_loop,
+            args=(orch, stop, orch_cfg.queue_reaper_interval_seconds),
+            daemon=True,
+            name="cue-queue-reaper",
+        )
+        reaper_thread.start()
+        logger.info(
+            "Queue reaper: enabled (every %ds, grace=%dm, "
+            "remove_from_client=%s, blocklist=%s)",
+            max(60, orch_cfg.queue_reaper_interval_seconds),
+            orch_cfg.queue_reaper_grace_minutes,
+            orch_cfg.queue_reaper_remove_from_client,
+            orch_cfg.queue_reaper_blocklist,
+        )
+    elif orch_cfg.queue_reaper_enabled and qbt_manage_on:
+        logger.info(
+            "Queue reaper: superseded by qBittorrent completed-torrent "
+            "lifecycle (disk-aware) -- legacy reaper not started."
+        )
 
     def handle_signal(signum, _frame):
         logger.info("Signal %s received, shutting down.", signum)

@@ -113,28 +113,44 @@ def read_tags(path: Path) -> tuple[str, str]:
     return artist, album
 
 
-def album_complete_in_library(lidarr: LidarrClient, artist: str, album: str):
+def album_complete_in_library(
+    lidarr: LidarrClient, artist: str, album: str, _cache: dict = None
+):
     """
     Return (complete: bool, have: int, total: int). `complete` is True only
     when Lidarr knows the artist+album and every monitored track has a file.
     Mirrors the pipeline's _album_already_in_library check.
+
+    Matching is EXACT on a normalized title against the artist's full album
+    list -- not Lidarr's fuzzy find_album substring search, which both
+    over-matched ("Rare Pearls" -> "Pearl") and, more damagingly here,
+    under-matched when the download folder carried a year/label prefix.
+    `_cache` (dict) memoizes the per-artist (record, albums) lookup so a
+    100-folder discography doesn't hammer the API.
     """
     artist = (artist or "").strip()
     album = (album or "").strip()
     if not artist or not album:
         return False, 0, 0
     try:
-        arec = lidarr.find_artist(artist)
+        if _cache is None:
+            _cache = {}
+        akey = artist.lower()
+        if akey in _cache:
+            arec, albums = _cache[akey]
+        else:
+            arec = lidarr.find_artist(artist)
+            albums = lidarr.list_albums_for_artist(arec["id"]) if arec else []
+            _cache[akey] = (arec, albums)
         if not arec:
             return False, 0, 0
-        alb = lidarr.find_album(arec["id"], album)
+        target = norm_title(album)
+        alb = None
+        for a in albums:
+            if norm_title(a.get("title")) == target:
+                alb = a
+                break
         if not alb:
-            return False, 0, 0
-        # STRICT guard against fuzzy over-matching (Lidarr's find_album does
-        # loose substring matching): the matched album's title must
-        # normalize-equal the download's album. Otherwise "Rare Pearls" gets
-        # matched to "Pearl" and wrongly deleted.
-        if norm_title(alb.get("title")) != norm_title(album):
             return False, 0, 0
         album_id = alb.get("id")
         full = lidarr.get_album(album_id) or {}

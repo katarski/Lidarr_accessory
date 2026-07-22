@@ -1,0 +1,104 @@
+# EXAMPLE config. Copy to config.yaml (local) or the container's
+# /config/config.yaml and fill in secrets. Never commit real keys.
+
+watch:
+  root: /downloads
+  stable_seconds: 1
+  audio_extensions:
+  - .flac
+  - .ape
+  - .wv
+  - .wav
+  exclude_dirs:
+  - torrents
+  observer: polling
+  poll_interval_seconds: 15
+  sweep_cueless_pre_split: true
+  sweep_interval_seconds: 60
+  sweep_min_stable_seconds: 10
+staging:
+  mode: in_place
+  root: /downloads
+  lidarr_grace_seconds: 90
+  album_folder_template: '{album} ({year})'
+  filename_template: '{artist} - {album} - {number:02d} - {title}.{ext}'
+  delete_originals_on_success: true
+  delete_source_folder_on_success: true
+  delete_cue_if_pre_split: true
+  ledger_file: /config/ledger.csv
+  heartbeat_seconds: 640
+ffmpeg:
+  binary: ffmpeg
+  flac_compression_level: 8
+  extra_args: []
+lidarr:
+  base_url: http://192.168.1.200:8686
+  api_key: YOUR_LIDARR_API_KEY
+  library_root_lidarr: /music/Music
+  library_root_windows: /music/Music
+  path_mapping:
+    from: /downloads
+    to: /downloads
+  min_match_percent: 40
+  cleanup_lidarr_queue: true
+  manual_import_timeout_seconds: 300
+  pre_check_library: true
+  force_import_on_count_match: true
+  force_import_max_missing_percent: 10
+  force_import_max_extra_percent: 25
+  strict_import_only: true
+  wait_for_lidarr: true
+  availability_wait_seconds: -1
+  verify_library_after_import: true
+  verify_timeout_seconds: 60
+  library_audit_enabled: false
+  library_audit_on_startup: false
+  library_audit_interval_seconds: 1300
+  library_audit_skip_unchanged: true
+  library_audit_report_file: /config/library_audit.csv
+  # Queue reaper: clear fully-downloaded-but-stuck torrents (compilations,
+  # unmatched grabs, title mismatches Lidarr won't import) from the queue.
+  # Lidarr's native cleanup only reaps SUCCESSFUL imports, so at mass-import
+  # scale these pile up. Only acts once a torrent is finished AND has been
+  # stuck for grace minutes; never touches a still-downloading torrent.
+  queue_reaper_enabled: false
+  queue_reaper_interval_seconds: 600
+  queue_reaper_grace_minutes: 30
+  # Also delete the torrent + data from qBittorrent (needed for the reap to
+  # stick). WARNING: stops seeding -- hit-and-run risk on private trackers.
+  queue_reaper_remove_from_client: true
+  queue_reaper_blocklist: false
+  # queue_reaper_state_file: /config/queue_reaper.json   # default: next to ledger
+ollama:
+  base_url: https://generativelanguage.googleapis.com/v1beta/openai
+  model: gemini-2.0-flash
+  timeout_seconds: 300
+  keep_alive: 30m
+  num_ctx: 8192
+  warmup_on_start: true
+  enabled: true
+  provider: openai
+  api_key: ''
+logging:
+  level: INFO
+  file: /config/pipeline.log
+  max_bytes: 5242880
+  backup_count: 3
+qbittorrent:
+  base_url: http://192.168.1.200:8080
+  username: ''
+  password: ''
+  category: ''
+  auto_deselect: false
+  # Poll cadence (min 10s). Low = a newly-added torrent is caught almost
+  # immediately, before bandwidth leaks on albums you already own.
+  interval_seconds: 30
+  # Pause a freshly-seen torrent the instant it's noticed, deselect owned
+  # albums, then resume -- so a .torrent add never downloads the unwanted
+  # albums at all. false = deselect without pausing (a little may leak).
+  pause_during_scan: true
+  # Completed-torrent lifecycle: for each finished music torrent, pause it while
+  # the pipeline is mid-import and remove it (with data) once every album has
+  # been moved into the library. Disk-aware, so it never deletes un-imported
+  # files. Supersedes the time-based lidarr.queue_reaper_* when on.
+  manage_completed: true

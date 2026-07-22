@@ -332,6 +332,37 @@ class OrchestratorConfig:
     # subsequent runs to determine "first run" vs "act" mode.
     library_audit_report_file: Optional[Path] = None
 
+    # ---- Queue reaper --------------------------------------------------
+    # Periodically remove "stuck" rows from Lidarr's download queue:
+    # torrents that are FULLY downloaded but that Lidarr will never import
+    # (unmatched artist=None grabs, best-hits compilations, title
+    # mismatches the pipeline didn't force). Lidarr's own "remove
+    # completed" only fires on a SUCCESSFUL import, so these leftovers
+    # accumulate -- brutal at discography/mass-import scale.
+    #
+    # Safety model: a torrent is grouped by downloadId; the reaper only
+    # acts once EVERY row for that torrent is finished-and-stuck (nothing
+    # still downloading or actively importing) AND it has stayed that way
+    # for at least queue_reaper_grace_minutes (persisted across restarts,
+    # so a transient "waiting to import" blip never gets reaped).
+    queue_reaper_enabled: bool = False
+    # How often to sweep the queue (seconds). Minimum 60.
+    queue_reaper_interval_seconds: int = 600
+    # A torrent must sit finished-and-stuck this long before it's reaped,
+    # giving Lidarr and the pipeline time to import it first.
+    queue_reaper_grace_minutes: int = 30
+    # Also delete the torrent + its data from the download client (qBit).
+    # Required for the reap to actually stick -- otherwise Lidarr re-adds
+    # the row on its next sync. WARNING: stops seeding (hit-and-run risk
+    # on private trackers). True = delete from client + data.
+    queue_reaper_remove_from_client: bool = True
+    # Blocklist the release when reaping so Lidarr won't re-grab the exact
+    # same release. Off by default (we reap junk, not "bad" releases).
+    queue_reaper_blocklist: bool = False
+    # JSON state file remembering when each torrent was first seen stuck,
+    # so the grace clock survives restarts. Lives in /config.
+    queue_reaper_state_file: Optional[Path] = None
+
 
 class Orchestrator:
     def __init__(
@@ -3707,6 +3738,160 @@ class Orchestrator:
                     logger.info("Cleared queue item %s: %s", qid, e.get("title"))
         if removed:
             logger.info("Removed %d entries from Lidarr queue", removed)
+
+    # ---- Queue reaper -------------------------------------------------
+
+    @staticmethod
+    def _classify_queue_row(row: Dict[str, Any]) -> str:
+        """
+        Classify one Lidarr queue row for reaping purposes:
+
+          "active"   -- still downloading, or Lidarr is actively (and
+                        healthily) importing it. NEVER reap; blocks the
+                        whole torrent from being reaped.
+          "stuck"    -- fully downloaded but Lidarr will not import it
+                        (warning/error, import blocked/failed, or the
+                        grab never mapped to an artist/album). Reapable.
+          "imported" -- Lidarr imported it (native cleanup handles it).
+        """
+        status = (row.get("status") or "").lower()
+        state = (row.get("trackedDownloadState") or "").lower()
+        tstat = (row.get("trackedDownloadStatus") or "").lower()
+        sizeleft = row.get("sizeleft") or 0
+
+        # Not finished downloading yet -> always active (never touch an
+        # in-progress download; this is what protected the 9%-downloaded
+        # Thalia grab).
+        finished = sizeleft == 0 or status in ("completed", "warning", "failed")
+        if not finished:
+            return "active"
+
+        if state == "imported":
+            return "imported"
+        # Lidarr flags a problem it will not resolve on its own.
+        if tstat in ("warning", "error"):
+            return "stuck"
+        if state in ("importblocked", "importfailed", "failedpending", "failed"):
+            return "stuck"
+        # Grab that never mapped to a library artist/album -- Lidarr can't
+        # import what it can't identify.
+        if row.get("artist") is None and row.get("album") is None:
+            return "stuck"
+        # Finished + healthy + Lidarr still working on it (pending/importing).
+        if state in ("importpending", "importing", "downloading"):
+            return "active"
+        # Finished, healthy, identified, but idle: be conservative and let
+        # Lidarr's own completed-download handling take it.
+        return "active"
+
+    def _load_reaper_state(self) -> Dict[str, float]:
+        path = self.cfg.queue_reaper_state_file
+        if not path:
+            return {}
+        try:
+            import json
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            return {str(k): float(v) for k, v in (data or {}).items()}
+        except FileNotFoundError:
+            return {}
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("reaper state load failed: %s", exc)
+            return {}
+
+    def _save_reaper_state(self, state: Dict[str, float]) -> None:
+        path = self.cfg.queue_reaper_state_file
+        if not path:
+            return
+        try:
+            import json
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(state, fh)
+            tmp.replace(path)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("reaper state save failed: %s", exc)
+
+    def reap_lidarr_queue(self) -> int:
+        """
+        Remove fully-downloaded-but-stuck torrents from Lidarr's queue (and,
+        per config, from the download client). This is the scale valve for
+        mass discography imports: Lidarr's native cleanup only reaps a
+        SUCCESSFUL import, leaving compilations / unmatched grabs / title
+        mismatches to pile up forever. Returns the number of queue rows
+        removed.
+
+        Grouped by downloadId (one torrent -> many queue rows). A torrent is
+        reaped only when:
+          * no row is still active (downloading or healthily importing), and
+          * at least one row is stuck, and
+          * it has been continuously stuck for >= grace minutes.
+        """
+        from collections import defaultdict
+
+        try:
+            entries = self.lidarr.queue_list()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("reaper: queue_list failed: %s", exc)
+            return 0
+        if not entries:
+            # Nothing queued -- clear any stale grace clocks.
+            self._save_reaper_state({})
+            return 0
+
+        groups: Dict[str, list] = defaultdict(list)
+        for r in entries:
+            dlid = r.get("downloadId") or f"__row_{r.get('id')}"
+            groups[str(dlid)].append(r)
+
+        now = time.time()
+        grace = max(0, int(self.cfg.queue_reaper_grace_minutes)) * 60
+        state = self._load_reaper_state()
+        new_state: Dict[str, float] = {}
+        to_reap: list = []
+
+        for dlid, rows in groups.items():
+            classes = [self._classify_queue_row(r) for r in rows]
+            if "active" in classes or "stuck" not in classes:
+                # In progress, or nothing stuck -- reset this torrent's clock.
+                continue
+            first_seen = state.get(dlid, now)
+            new_state[dlid] = first_seen  # carry the clock forward
+            waited = now - first_seen
+            if waited >= grace:
+                to_reap.append((dlid, rows))
+            else:
+                logger.debug(
+                    "reaper: %s stuck %ds/%ds -- waiting out grace",
+                    dlid[:16], int(waited), grace,
+                )
+
+        removed = 0
+        for dlid, rows in to_reap:
+            label = (rows[0].get("title") or "?")
+            logger.info(
+                "reaper: reaping stuck torrent %s (%d queue row(s)): %r "
+                "[remove_from_client=%s]",
+                dlid[:16], len(rows), label,
+                self.cfg.queue_reaper_remove_from_client,
+            )
+            for r in rows:
+                qid = r.get("id")
+                if qid is None:
+                    continue
+                if self.lidarr.queue_remove(
+                    qid,
+                    remove_from_client=self.cfg.queue_reaper_remove_from_client,
+                    blocklist=self.cfg.queue_reaper_blocklist,
+                ):
+                    removed += 1
+            new_state.pop(dlid, None)  # gone -- drop its clock
+
+        self._save_reaper_state(new_state)
+        if removed:
+            logger.info("reaper: removed %d stuck queue row(s)", removed)
+        return removed
 
     # ---- Originals / ledger -------------------------------------------
 
