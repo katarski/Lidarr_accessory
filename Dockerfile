@@ -3,9 +3,10 @@
 # translation and no SMB in the hot path.
 FROM python:3.11-slim
 
-# ffmpeg = split/probe;  tzdata = correct local timestamps in logs
+# ffmpeg = split/probe;  tzdata = correct local timestamps in logs;
+# libchromaprint-tools = fpcalc (acoustic fingerprinting for AcoustID identify)
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg tzdata \
+    && apt-get install -y --no-install-recommends ffmpeg tzdata libchromaprint-tools \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
