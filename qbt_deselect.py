@@ -42,9 +42,16 @@ _LEAD_YEARS = re.compile(r"^\s*(?:19|20)\d{2}(?:\s*,\s*(?:19|20)\d{2})*[\s.\-]+"
 # Leading "01. " / "01 - " track/disc number (needs a . or - separator so a
 # real leading number like "20 Greatest Hits" is left alone).
 _LEAD_NUM = re.compile(r"^\s*\d+\s*[.\-]\s*")
-# A disc subfolder: "CD1", "CD 1", "Disc 2", "disc-3", "DVD1", "Side A", or a
-# bare "1"/"2" one- or two-digit folder.
-_DISC_DIR = re.compile(r"(?i)^(?:cd|disc|disk|dvd|side)\s*[.\-_]?\s*\w{1,3}$|^\d{1,2}$")
+# "Artist - YYYY - Album" (or "Artist - YYYY. Album") -> keep only "Album".
+# The year must sit AFTER a " - " (so a real trailing year like "Live In 1960"
+# with no prefix is left alone) and be FOLLOWED by a - or . separator (so it's
+# clearly a prefix, not part of the title). Lazy prefix + leftmost match means
+# the FIRST such " - YYYY - " wins, and the album keeps any internal " - ".
+_ARTIST_YEAR_ALBUM = re.compile(r"(?i)^.*?\s-\s*(?:19|20)\d{2}\s*[-.]\s*(.+)$")
+# A disc subfolder: "CD1", "CD 1", "Disc 2", "disc-3", "DVD1", a bare "1"/"2",
+# or a titled disc like "Disc 1 - Shout Sister Shout" / "CD2 Rock Me". Requires
+# a digit right after the keyword so real albums ("Discovery") aren't matched.
+_DISC_DIR = re.compile(r"(?i)^(?:cd|disc|disk|dvd|side)\s*[.\-_]?\s*\d{1,3}\b|^\d{1,2}$")
 # A non-audio sidecar subfolder (art/scans/etc.) -- audio never lives here, but
 # guard anyway so it never becomes an "album".
 _ART_DIR = re.compile(
@@ -66,6 +73,9 @@ def _clean_album(name: str, artist: str = "") -> str:
     """
     s = _LEAD_NUM.sub("", name)          # '01. ' / '01 - '
     s = _LEAD_YEARS.sub("", s)           # '1960 ' / '1960,1961 ' / '1960 - '
+    m = _ARTIST_YEAR_ALBUM.match(s)      # 'Artist - 2005 - Gospel Train' -> 'Gospel Train'
+    if m:
+        s = m.group(1)
     if artist:
         na = re.escape(artist.strip())
         # 'Etta James - ...' or 'Etta James & Eddie ... - ...' at the start.
