@@ -31,6 +31,7 @@ from typing import Callable, List, Dict, Any, Optional
 import yaml
 
 from lidarr import LidarrClient, LidarrConfig
+from ollama_client import OllamaClient
 from qbittorrent_client import QbtClient
 from dedup_downloads import AUDIO_EXTS, album_complete_in_library, human
 
@@ -121,7 +122,7 @@ def _file_album_key(f: Dict[str, Any], torrent_name: str) -> str:
 
 def plan_torrent(
     lidarr: LidarrClient, torrent_name: str, files: List[Dict[str, Any]],
-    forced_artist: str = "",
+    forced_artist: str = "", llm=None,
 ) -> List[Dict[str, Any]]:
     """
     Return a per-album plan for a torrent's audio files:
@@ -154,7 +155,7 @@ def plan_torrent(
         album_raw = parts[-1] if parts else torrent_name
         album = _clean_album(album_raw, artist=(forced_artist or raw_artist))
         complete, have, total = album_complete_in_library(
-            lidarr, artist, album, _cache=lib_cache
+            lidarr, artist, album, _cache=lib_cache, llm=llm
         )
         # Deselect only when the library fully has it AND has >= as many
         # tracks as the torrent folder (don't drop a bigger edition).
@@ -175,13 +176,14 @@ def process_torrent(
     forced_artist: str = "", apply: bool = False,
     emit: Callable[[str], None] = logger.info,
     files: Optional[List[Dict[str, Any]]] = None,
+    llm=None,
 ) -> tuple:
     """Plan + (optionally) deselect one torrent. Returns (deselected, kept)."""
     thash = torrent.get("hash")
     tname = torrent.get("name") or "?"
     if files is None:
         files = qbt.files(thash)
-    plan = plan_torrent(lidarr, tname, files, forced_artist)
+    plan = plan_torrent(lidarr, tname, files, forced_artist, llm=llm)
     if not plan:
         return 0, 0
     emit(f"Torrent: {tname}")
@@ -210,7 +212,7 @@ def process_torrent(
 def auto_deselect_pass(
     qbt: QbtClient, lidarr: LidarrClient, seen: set,
     category: str = "", emit: Callable[[str], None] = logger.info,
-    pause_during_scan: bool = True,
+    pause_during_scan: bool = True, llm=None,
 ) -> int:
     """
     One scheduled pass for the pipeline: for each INCOMPLETE music torrent we
@@ -255,7 +257,7 @@ def auto_deselect_pass(
                 # (The finally-block restores the original state meanwhile.)
                 continue
             d, _k = process_torrent(
-                qbt, lidarr, t, apply=True, emit=emit, files=files
+                qbt, lidarr, t, apply=True, emit=emit, files=files, llm=llm
             )
             seen.add(h)
             if d:
@@ -374,6 +376,8 @@ def main() -> int:
     ap.add_argument("--category", default="")
     ap.add_argument("--artist", default="")
     ap.add_argument("--apply", action="store_true")
+    ap.add_argument("--no-ai", action="store_true",
+                    help="disable the LLM fallback for library matching")
     args = ap.parse_args()
 
     cfg = yaml.safe_load(args.config.read_text(encoding="utf-8"))
@@ -398,6 +402,37 @@ def main() -> int:
         print("qBittorrent login failed -- check base_url/username/password.")
         return 1
 
+    # Optional LLM client for the library-match fallback (mirrors main.py).
+    llm = None
+    if not args.no_ai:
+        oc = cfg.get("ollama") or {}
+        if oc.get("enabled", True):
+            provider = str(oc.get("provider", "ollama")).lower()
+            try:
+                if provider in ("openai", "gemini", "cloud", "openai-compatible"):
+                    from cloud_llm import CloudLLMClient
+                    llm = CloudLLMClient(
+                        base_url=oc.get("base_url", ""), model=oc.get("model", ""),
+                        api_key=oc.get("api_key", ""),
+                        timeout=int(oc.get("timeout_seconds", 60)),
+                        enabled=True,
+                    )
+                else:
+                    llm = OllamaClient(
+                        base_url=oc.get("base_url", "http://127.0.0.1:11434"),
+                        model=oc.get("model", "qwen2.5:14b"),
+                        timeout=int(oc.get("timeout_seconds", 300)),
+                        enabled=True,
+                        keep_alive=str(oc.get("keep_alive", "30m")),
+                        num_ctx=int(oc.get("num_ctx", 8192)),
+                    )
+                if llm and not llm.ping():
+                    print(f"LLM ({provider}) unreachable -- AI match disabled for this run.")
+                    llm = None
+            except Exception as exc:  # noqa: BLE001
+                print(f"LLM init failed ({exc}); AI match disabled.")
+                llm = None
+
     torrents = qbt.torrents(category=args.category or qc.get("category", ""))
     if args.hash:
         torrents = [t for t in torrents if t.get("hash") == args.hash]
@@ -412,7 +447,7 @@ def main() -> int:
     for t in torrents:
         print("")
         d, k = process_torrent(qbt, lidarr, t, forced_artist=args.artist,
-                               apply=args.apply, emit=print)
+                               apply=args.apply, emit=print, llm=llm)
         tot_d += d
         tot_k += k
     print(f"\nSummary: {tot_d} already-have album(s) (deselect), {tot_k} to download.")

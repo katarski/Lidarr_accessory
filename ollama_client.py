@@ -15,11 +15,12 @@ import json
 import logging
 import threading
 from dataclasses import asdict, replace
-from typing import List, Optional
+from typing import List, Optional, TYPE_CHECKING
 
 import requests
 
-from tagger import TagPlan
+if TYPE_CHECKING:
+    from tagger import TagPlan
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +84,18 @@ _TAG_NORMALIZE_SYSTEM = (
     "3) Unify featured-artist style to 'feat. X' (not 'ft.' or 'featuring'). "
     "4) Do NOT invent dates, ISRCs, or genres. "
     "5) Do NOT change artist names beyond obvious capitalisation fixes."
+)
+
+
+_ALBUM_MATCH_SYSTEM = (
+    "You match a downloaded music album folder to a list of albums the user "
+    "ALREADY OWNS by the same artist. The folder name often differs from an "
+    "owned album's title: edition/label tags, year, language, punctuation, "
+    "abbreviations, 'remaster'/'deluxe'/'expanded' wording, disc or box-set "
+    "naming, or extra words. Decide which owned album is the SAME underlying "
+    "release/album as the download. Reply with ONLY the exact owned title from "
+    "the list, copied verbatim, or the single word NONE if none is clearly the "
+    "same album. Never invent a title. Never explain."
 )
 
 
@@ -266,6 +279,42 @@ class OllamaClient:
                 lines = lines[:-1]
             out = "\n".join(lines)
         return out.strip()
+
+    # ---------- album match (library de-dup fallback) -------------------
+
+    def pick_owned_album(self, download_name: str, owned_titles: List[str]) -> Optional[str]:
+        """
+        Ask the LLM which OWNED album (from `owned_titles`) is the same release
+        as the downloaded folder `download_name`. Returns a title copied from
+        `owned_titles`, or None. Hallucination-safe: the answer must map back
+        to one of the supplied titles (exact or normalized) or we return None.
+        """
+        if not self.enabled or not download_name or not owned_titles:
+            return None
+        listing = "\n".join(f"- {t}" for t in owned_titles)
+        prompt = (
+            f"Downloaded album folder name:\n  {download_name}\n\n"
+            f"Albums the user already owns by this artist:\n{listing}\n\n"
+            "Which one is the SAME album as the download? "
+            "Reply with the exact owned title, or NONE."
+        )
+        out = self._generate(_ALBUM_MATCH_SYSTEM, prompt, num_predict=64, timeout=60.0)
+        ans = (out or "").strip().strip("`").strip().strip('"').strip("'").strip()
+        if not ans or ans.upper() == "NONE":
+            return None
+        for t in owned_titles:
+            if t.strip().lower() == ans.lower():
+                return t
+        # LLM may have reformatted punctuation -- try a normalized compare.
+        try:
+            from dedup_downloads import norm_title
+            na = norm_title(ans)
+            for t in owned_titles:
+                if norm_title(t) == na:
+                    return t
+        except Exception:  # noqa: BLE001
+            pass
+        return None
 
     # ---------- tag normalization ---------------------------------------
 

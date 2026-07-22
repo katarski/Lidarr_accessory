@@ -114,7 +114,7 @@ def read_tags(path: Path) -> tuple[str, str]:
 
 
 def album_complete_in_library(
-    lidarr: LidarrClient, artist: str, album: str, _cache: dict = None
+    lidarr: LidarrClient, artist: str, album: str, _cache: dict = None, llm=None
 ):
     """
     Return (complete: bool, have: int, total: int). `complete` is True only
@@ -150,6 +150,25 @@ def album_complete_in_library(
             if norm_title(a.get("title")) == target:
                 alb = a
                 break
+        # AI fallback: only when the deterministic match missed. Ask the LLM to
+        # map the download folder to an album the user ACTUALLY OWNS (has files
+        # for). It never sees not-owned albums, so it can't cause us to deselect
+        # something absent -- ownership stays grounded in Lidarr's data.
+        if alb is None and llm is not None:
+            def _owned(a: Dict[str, Any]) -> bool:
+                st = a.get("statistics") or {}
+                f = int(st.get("trackFileCount") or 0)
+                t = int(st.get("totalTrackCount") or 0)
+                return f > 0 and t > 0 and f >= t
+            owned = sorted({a.get("title", "") for a in albums
+                            if a.get("title") and _owned(a)})
+            if owned:
+                picked = llm.pick_owned_album(album, owned)
+                if picked:
+                    for a in albums:
+                        if a.get("title") == picked:
+                            alb = a
+                            break
         if not alb:
             return False, 0, 0
         album_id = alb.get("id")

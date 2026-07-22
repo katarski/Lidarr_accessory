@@ -103,6 +103,7 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     put("qbittorrent", "interval_seconds", "QBIT_INTERVAL", int)
     put("qbittorrent", "pause_during_scan", "QBIT_PAUSE_SCAN", _as_bool)
     put("qbittorrent", "manage_completed", "QBIT_MANAGE_COMPLETED", _as_bool)
+    put("qbittorrent", "ai_match", "QBIT_AI_MATCH", _as_bool)
     return cfg
 
 
@@ -354,7 +355,7 @@ def queue_reaper_loop(
 
 def qbt_auto_deselect_loop(
     qcfg: Dict[str, Any], lidarr, stop: threading.Event, interval: int,
-    download_root: str = "",
+    download_root: str = "", llm=None,
 ) -> None:
     """
     Poll qBittorrent on a schedule. Two jobs per pass:
@@ -379,6 +380,10 @@ def qbt_auto_deselect_loop(
     pause_scan = _as_bool(qcfg.get("pause_during_scan", True))
     do_deselect = _as_bool(qcfg.get("auto_deselect", False))
     manage_completed = _as_bool(qcfg.get("manage_completed", True))
+    # AI fallback for library matching: only used when the deterministic
+    # (Lidarr) match misses. Requires an enabled LLM client.
+    ai_match = _as_bool(qcfg.get("ai_match", True))
+    match_llm = llm if (ai_match and llm is not None and getattr(llm, "enabled", False)) else None
     seen: set = set()
     delay = min(cadence, 10)  # first pass right after startup
     while not stop.wait(delay):
@@ -392,7 +397,8 @@ def qbt_auto_deselect_loop(
             if do_deselect:
                 acted = auto_deselect_pass(qbt, lidarr, seen, category=category,
                                            emit=logger.info,
-                                           pause_during_scan=pause_scan)
+                                           pause_during_scan=pause_scan,
+                                           llm=match_llm)
                 if acted:
                     logger.info("qbt auto-deselect: acted on %d torrent(s)", acted)
             if manage_completed:
@@ -803,7 +809,8 @@ def main() -> int:
             interval = int(qbt_cfg.get("interval_seconds", 30) or 30)
             qbt_thread = threading.Thread(
                 target=qbt_auto_deselect_loop,
-                args=(qbt_cfg, lidarr, stop, interval, str(watch_root)),
+                args=(qbt_cfg, lidarr, stop, interval, str(watch_root),
+                      ollama_client),
                 daemon=True,
                 name="cue-qbt",
             )
