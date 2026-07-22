@@ -57,6 +57,7 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     cfg.setdefault("ollama", {})
     cfg.setdefault("staging", {})
     cfg.setdefault("qbittorrent", {})
+    cfg.setdefault("acoustid", {})
 
     def put(section: str, key: str, env: str, cast=str) -> None:
         v = os.environ.get(env)
@@ -104,6 +105,9 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     put("qbittorrent", "pause_during_scan", "QBIT_PAUSE_SCAN", _as_bool)
     put("qbittorrent", "manage_completed", "QBIT_MANAGE_COMPLETED", _as_bool)
     put("qbittorrent", "ai_match", "QBIT_AI_MATCH", _as_bool)
+    # AcoustID fingerprint identification (import fallback)
+    put("acoustid", "enabled", "ACOUSTID_ENABLED", _as_bool)
+    put("acoustid", "api_key", "ACOUSTID_KEY")
     return cfg
 
 
@@ -526,6 +530,26 @@ def main() -> int:
         else:
             logger.warning("LLM unreachable (%s) -- continuing without LLM fallback", label)
 
+    # Optional AcoustID fingerprint identifier (best-effort; identifies a
+    # pre-split folder whose tags can't, so it can still be imported).
+    acoustid_client = None
+    ac_cfg = cfg.get("acoustid") or {}
+    if _as_bool(ac_cfg.get("enabled", False)) and ac_cfg.get("api_key"):
+        from acoustid_client import AcoustIDClient
+        acoustid_client = AcoustIDClient(
+            api_key=str(ac_cfg.get("api_key", "")),
+            fpcalc=str(ac_cfg.get("fpcalc", "fpcalc")),
+            enabled=True,
+            max_rps=float(ac_cfg.get("max_rps", 3.0)),
+            timeout=int(ac_cfg.get("timeout_seconds", 20)),
+        )
+        if acoustid_client._have_fpcalc():
+            logger.info("AcoustID fingerprint identify: enabled (%.1f req/s)",
+                        float(ac_cfg.get("max_rps", 3.0)))
+        else:
+            logger.warning("AcoustID enabled but fpcalc missing -- disabled")
+            acoustid_client = None
+
     if lidarr.ping():
         logger.info("Lidarr reachable at %s", lidarr_cfg["base_url"])
     else:
@@ -650,7 +674,7 @@ def main() -> int:
         queue_reaper_state_file=reaper_state_path,
     )
 
-    orch = Orchestrator(orch_cfg, lidarr, ollama_client)
+    orch = Orchestrator(orch_cfg, lidarr, ollama_client, acoustid=acoustid_client)
     q: "queue.Queue[Path]" = queue.Queue()
     stop = threading.Event()
 

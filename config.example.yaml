@@ -102,3 +102,14 @@ qbittorrent:
   # been moved into the library. Disk-aware, so it never deletes un-imported
   # files. Supersedes the time-based lidarr.queue_reaper_* when on.
   manage_completed: true
+acoustid:
+  # Acoustic-fingerprint identification (Chromaprint/fpcalc -> AcoustID ->
+  # MusicBrainz). Fallback used at import time when a pre-split folder's TAGS
+  # can't identify it -- recovers the real artist/album from the audio so it
+  # can still be imported. Best-effort; throttled to ~3 req/s, never fatal.
+  # Needs fpcalc in the image (libchromaprint-tools) + a free AcoustID app key
+  # from https://acoustid.org/new-application.
+  enabled: false
+  api_key: ''
+  max_rps: 3
+  timeout_seconds: 20

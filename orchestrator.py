@@ -370,10 +370,15 @@ class Orchestrator:
         cfg: OrchestratorConfig,
         lidarr: LidarrClient,
         ollama: Optional[OllamaClient],
+        acoustid=None,
     ):
         self.cfg = cfg
         self.lidarr = lidarr
         self.ollama = ollama
+        # Optional AcoustID fingerprint identifier (best-effort). Used to
+        # recover artist/album for a pre-split folder whose tags can't
+        # identify it. None = disabled.
+        self.acoustid = acoustid
         # Remember CUEs we've already classified as non-disc-images so we
         # don't spam INFO logs every time the watcher re-enqueues them on
         # startup. In-memory only; a restart re-parses (cheap).
@@ -1283,6 +1288,25 @@ class Orchestrator:
             artist_name, album_name = self._read_audio_tags(a)
             if artist_name and album_name:
                 break
+        # Fingerprint fallback: tags couldn't identify it -> ask AcoustID what
+        # the audio actually is (content-based, so garbage/absent tags don't
+        # matter). Best-effort: any failure falls through to the give-up below,
+        # exactly as before. This is the "import music I don't have, by sound".
+        if not (artist_name and album_name) and self.acoustid is not None:
+            try:
+                ident = self.acoustid.identify_folder([str(a) for a in audios])
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("AcoustID identify failed for %s: %s", folder, exc)
+                ident = None
+            if ident and ident.get("artist") and ident.get("album"):
+                artist_name = artist_name or ident["artist"]
+                album_name = album_name or ident["album"]
+                logger.info(
+                    "Pre-split handoff: identified via AcoustID artist=%r "
+                    "album=%r (%d/%d tracks) for %s",
+                    ident["artist"], ident["album"],
+                    ident.get("identified", 0), ident.get("total", 0), folder,
+                )
         if not (artist_name and album_name):
             logger.warning(
                 "Pre-split handoff: could not determine artist/album from "
