@@ -15,6 +15,35 @@ deterministic parser can't handle and can normalize tag capitalization.
 If Ollama is unreachable the pipeline still works — it just falls through
 the deterministic path.
 
+## Install on Unraid (Docker) — recommended
+
+Running it as a container next to Lidarr (same `/downloads` + `/music`
+namespace) is the primary supported setup. Full step-by-step guide:
+**[UNRAID_SETUP.md](UNRAID_SETUP.md)**.
+
+TL;DR (Unraid web terminal, `>_` icon):
+
+```sh
+git clone https://github.com/katarski/Lidarr_accessory.git /mnt/user/appdata/cue_pipeline_src
+cd /mnt/user/appdata/cue_pipeline_src && docker build -t cue_pipeline:latest .
+mkdir -p /mnt/cache/appdata/cue_pipeline
+cp config.example.yaml /mnt/cache/appdata/cue_pipeline/config.yaml   # then edit it
+```
+
+Then Docker tab → **Add Container** → paste this in the **Template** field:
+
+```
+https://raw.githubusercontent.com/katarski/Lidarr_accessory/main/cue_pipeline.xml
+```
+
+Point the `/downloads` and `/music` mounts at the same host paths Lidarr uses,
+fill in your Lidarr API key, and **Apply**. On Unraid the container also:
+
+- **de-selects** albums you already own from discography torrents in qBittorrent
+  (whole folder, not just audio) — pausing new torrents so nothing leaks;
+- **manages completed torrents** — pauses a torrent while it's mid-import and
+  removes it (with data) once every album has moved into the library.
+
 ## Files
 
 | File | What it does |
@@ -191,7 +220,9 @@ wait up to `lidarr_grace_seconds` for staging to clear
 - **No CUE Splitter v2.0.8 / shntool.** ffmpeg handles FLAC/APE/WV/WAV
   directly. shntool was explicitly rejected (artifacts).
 - **No MusicBrainz lookups.** Lidarr already does that; we stay out of it.
-- **No torrent client interaction.** The watcher only triggers on new
-  `.cue` files appearing in the watch folder.
 - **No aggressive LLM use.** Ollama only runs when the CUE is malformed
   or when tag normalization is explicitly requested.
+
+(On Unraid the container *does* talk to qBittorrent — selective-download and
+completed-torrent lifecycle — see [UNRAID_SETUP.md](UNRAID_SETUP.md). The
+standalone Windows watcher above does not.)
