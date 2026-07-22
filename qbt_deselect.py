@@ -72,7 +72,9 @@ def _clean_album(name: str, artist: str = "") -> str:
     (including '& guest' credits) without eating album titles that merely
     contain ' - '.
     """
-    s = _LEAD_NUM.sub("", name)          # '01. ' / '01 - '
+    # Leading parenthesized year: "(1994) Twista - Resurrection" -> "Twista - ..."
+    s = re.sub(r"^\s*[\(\[]\s*(?:19|20)\d{2}\s*[\)\]]\s*", "", name)
+    s = _LEAD_NUM.sub("", s)             # '01. ' / '01 - '
     s = _LEAD_YEARS.sub("", s)           # '1960 ' / '1960,1961 ' / '1960 - '
     m = _ARTIST_YEAR_ALBUM.match(s)      # 'Artist - 2005 - Gospel Train' -> 'Gospel Train'
     if m:
@@ -87,7 +89,8 @@ def _clean_album(name: str, artist: str = "") -> str:
 
 def _clean_artist(name: str) -> str:
     s = re.sub(r"[\(\[\{][^)\]\}]*[\)\]\}]", " ", name)
-    s = re.sub(r"(?i)\b(discography|complete|collection|studio albums?|flac|mp3)\b", " ", s)
+    s = re.sub(r"@\S+", " ", s)  # bitrate/quality tags: @320, @192, @VBR
+    s = re.sub(r"(?i)\b(discography|complete|collection|studio albums?|flac|mp3|kbps|vbr)\b", " ", s)
     s = _YEAR.sub(" ", s)
     if " - " in s:
         s = s.split(" - ", 1)[0]
