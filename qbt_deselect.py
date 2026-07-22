@@ -153,7 +153,10 @@ def plan_torrent(
         raw_artist = parts[0] if len(parts) >= 2 else torrent_name
         artist = forced_artist or _clean_artist(raw_artist)
         album_raw = parts[-1] if parts else torrent_name
-        album = _clean_album(album_raw, artist=(forced_artist or raw_artist))
+        # Strip using the CLEANED artist ("50 Cent"), not the raw folder/torrent
+        # name ("50 Cent - Before I Self Destruct (2009) [FLAC]") -- otherwise a
+        # single-album torrent keeps its "Artist - " prefix and never matches.
+        album = _clean_album(album_raw, artist=artist)
         complete, have, total = album_complete_in_library(
             lidarr, artist, album, _cache=lib_cache, llm=llm
         )

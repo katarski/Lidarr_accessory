@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 from dataclasses import asdict, replace
 from typing import List, Optional, TYPE_CHECKING
@@ -302,19 +303,47 @@ class OllamaClient:
         ans = (out or "").strip().strip("`").strip().strip('"').strip("'").strip()
         if not ans or ans.upper() == "NONE":
             return None
+        matched = None
         for t in owned_titles:
             if t.strip().lower() == ans.lower():
-                return t
-        # LLM may have reformatted punctuation -- try a normalized compare.
+                matched = t
+                break
+        if matched is None:
+            # LLM may have reformatted punctuation -- try a normalized compare.
+            try:
+                from dedup_downloads import norm_title
+                na = norm_title(ans)
+                for t in owned_titles:
+                    if norm_title(t) == na:
+                        matched = t
+                        break
+            except Exception:  # noqa: BLE001
+                pass
+        if matched is None:
+            return None
+        # SAFETY GUARD: reject a match with no meaningful word overlap. A weak
+        # model, forced to pick from a list, will sometimes pair two unrelated
+        # albums by the same artist (e.g. "Before I Self Destruct" ->
+        # "Get Rich or Die Tryin'"). A legit edition/rename shares the core
+        # title words; a wrong pairing shares none. False positives here are
+        # costly (we'd skip an album you DON'T own), so err toward rejecting.
+        def _sig_words(s: str) -> set:
+            return {w for w in re.findall(r"[a-z0-9]+", (s or "").lower())
+                    if len(w) >= 4}
+        dw, mw = _sig_words(download_name), _sig_words(matched)
         try:
             from dedup_downloads import norm_title
-            na = norm_title(ans)
-            for t in owned_titles:
-                if norm_title(t) == na:
-                    return t
+            nd, nm = norm_title(download_name), norm_title(matched)
         except Exception:  # noqa: BLE001
-            pass
-        return None
+            nd = nm = ""
+        contained = bool(nd) and bool(nm) and (nd in nm or nm in nd)
+        if not (dw & mw) and not contained:
+            logger.info(
+                "AI album match rejected (no overlap): %r -> %r",
+                download_name, matched,
+            )
+            return None
+        return matched
 
     # ---------- tag normalization ---------------------------------------
 
