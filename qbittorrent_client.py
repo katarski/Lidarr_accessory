@@ -125,6 +125,17 @@ class QbtClient:
         # qBittorrent 5.x renamed 'resume' -> 'start'; older builds use 'resume'.
         self._post_first_ok(("start", "resume"), {"hashes": torrent_hash})
 
+    def force_start(self, torrent_hash: str, value: bool = True) -> None:
+        """Force-start a torrent so it ignores queue/ratio limits and connects
+        immediately (this also un-pauses it). value=False clears the flag."""
+        try:
+            self.s.post(f"{self.base}/api/v2/torrents/setForceStart",
+                        data={"hashes": torrent_hash,
+                              "value": "true" if value else "false"},
+                        timeout=15)
+        except Exception:  # noqa: BLE001
+            pass
+
     def remove(self, torrent_hash: str, delete_files: bool = True) -> bool:
         """Delete a torrent. delete_files=True also removes its data on disk."""
         try:

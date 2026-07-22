@@ -209,12 +209,12 @@ def auto_deselect_pass(
 
     To keep bandwidth from leaking on already-owned albums before we act, a
     freshly-seen torrent is PAUSED the instant we notice it, its file list is
-    read, the owned albums are deselected, and only then is it resumed -- so
-    for a .torrent add (file list known immediately) the unwanted albums never
-    download at all. A torrent whose metadata hasn't resolved yet (magnet,
-    empty file list) is left running and retried next pass -- no content
-    downloads before metadata anyway. Pause/resume is wrapped so an error
-    never leaves a torrent stuck paused.
+    read, the owned albums are deselected, and only then is its ORIGINAL
+    start-state restored. We never override what Lidarr/you set: a force-started
+    torrent comes back force-started, a normal one comes back normally started,
+    and a "don't start" (stopped/paused) torrent is left stopped and never
+    paused in the first place. A torrent whose metadata hasn't resolved yet
+    (magnet, empty file list) is left as-is and retried next pass.
     """
     acted = 0
     for t in qbt.torrents(category=category):
@@ -226,17 +226,23 @@ def auto_deselect_pass(
         if float(t.get("progress") or 0) >= 1.0:
             seen.add(h)
             continue
-        paused = False
+        # Capture the torrent's original start-state so we restore EXACTLY what
+        # Lidarr/you set -- never impose one.
+        state = (t.get("state") or "").lower()
+        was_forced = bool(t.get("force_start")) or state.startswith("forced")
+        was_stopped = ("paused" in state) or ("stopped" in state)
+        paused_by_us = False
         try:
-            if pause_during_scan:
+            # Pause only a running torrent (to stop owned albums downloading
+            # while we decide). A "don't start" torrent is left alone.
+            if pause_during_scan and not was_stopped:
                 qbt.pause(h)
-                paused = True
+                paused_by_us = True
             files = qbt.files(h)
             if not files:
-                # Metadata not ready yet (e.g. magnet still resolving). Can't
-                # plan without the file list -- retry next pass. Don't mark
-                # seen. (The finally-block resumes it so metadata keeps
-                # fetching.)
+                # Metadata not ready (e.g. magnet still resolving). Can't plan
+                # without the file list -- retry next pass, don't mark seen.
+                # (The finally-block restores the original state meanwhile.)
                 continue
             d, _k = process_torrent(
                 qbt, lidarr, t, apply=True, emit=emit, files=files
@@ -245,8 +251,13 @@ def auto_deselect_pass(
             if d:
                 acted += 1
         finally:
-            if paused:
-                qbt.resume(h)
+            # Restore the original intent, in priority order.
+            if was_stopped:
+                pass                      # leave a "don't start" torrent stopped
+            elif was_forced:
+                qbt.force_start(h)        # preserve Lidarr's force-start
+            elif paused_by_us:
+                qbt.resume(h)             # normal start (only if we paused it)
     return acted
 
 
