@@ -1594,6 +1594,69 @@ class Orchestrator:
             return False
         return True
 
+    @staticmethod
+    def _extract_embedded_cuesheet(path: Path) -> Optional[str]:
+        """
+        Return an embedded cuesheet's TEXT from an audio file, or None.
+        Handles APEv2 'Cuesheet' (WavPack/Monkey's Audio) and the FLAC/Ogg
+        Vorbis 'CUESHEET' comment -- the common ways a single-file disc image
+        carries its own cue. Only returns text that actually looks like a cue
+        (has TRACK + INDEX), so a stray tag can't produce a bogus split.
+        """
+        try:
+            from mutagen import File as MutagenFile
+        except Exception:  # noqa: BLE001
+            return None
+        try:
+            mf = MutagenFile(str(path))
+            tags = getattr(mf, "tags", None)
+            if not tags:
+                return None
+            for key in list(tags.keys()):
+                if str(key).strip().lower() != "cuesheet":
+                    continue
+                val = tags[key]
+                if isinstance(val, list):
+                    val = val[0] if val else ""
+                text = str(val)
+                if "TRACK" in text.upper() and "INDEX" in text.upper():
+                    return text.replace("\r\n", "\n").replace("\r", "\n")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("embedded cuesheet read failed for %s: %s", path, exc)
+        return None
+
+    def _materialize_embedded_cues(
+        self, audio_files: List[Path]
+    ) -> List[Path]:
+        """
+        For each audio file that has NO sidecar .cue but DOES carry an embedded
+        cuesheet, write '<file>.cue' next to it (with a FILE line pointing at
+        the real audio if the embedded cue lacks one -- the orchestrator heals
+        the reference otherwise). Returns the .cue paths written.
+        """
+        written: List[Path] = []
+        for af in audio_files:
+            sidecar = af.with_suffix(".cue")
+            if sidecar.exists():
+                continue
+            text = self._extract_embedded_cuesheet(af)
+            if not text:
+                continue
+            if not re.search(r'(?im)^\s*FILE\s+".*"', text):
+                text = f'FILE "{af.name}" WAVE\n' + text
+            try:
+                sidecar.write_text(text, encoding="utf-8")
+                written.append(sidecar)
+                logger.info(
+                    "Extracted embedded cuesheet from %s -> %s",
+                    af.name, sidecar.name,
+                )
+            except OSError as exc:
+                logger.warning(
+                    "Could not write extracted cue for %s: %s", af, exc
+                )
+        return written
+
     def sweep_cueless_pre_split_folders(
         self,
         watch_root: Path,
@@ -1673,6 +1736,24 @@ class Orchestrator:
                 fn.lower().endswith(".cue") for fn in filenames
             )
             if has_cue:
+                continue
+
+            # A lone disc-image file (e.g. .wv/.ape/.flac) may carry its
+            # cuesheet EMBEDDED in itself with no sidecar .cue. Extract it to a
+            # .cue so the normal split path handles it; the polling watcher then
+            # picks the new .cue up. Without this the folder sits unimportable.
+            audio_here = [
+                folder / fn for fn in filenames
+                if Path(fn).suffix.lower() in set(self.cfg.audio_extensions)
+            ]
+            extracted = self._materialize_embedded_cues(audio_here)
+            if extracted:
+                logger.info(
+                    "cueless sweep: wrote %d .cue(s) from embedded cuesheets in "
+                    "%s -- watcher will split them",
+                    len(extracted), folder,
+                )
+                self._skip_seen.add(folder)
                 continue
 
             # Needs to look pre-split.
