@@ -973,6 +973,12 @@ class Orchestrator:
         return out
 
     _DISC_SUBDIR_RE = re.compile(r"(?i)^(?:cd|disc|disk|dvd)\s*[.\-_]?\s*\d{1,2}\b")
+    _DISC_NUM_RE = re.compile(r"(?i)^(?:cd|disc|disk|dvd)\s*[.\-_]?\s*(\d{1,2})\b")
+
+    def _disc_number_from_folder(self, folder: Path) -> Optional[int]:
+        """'CD1'/'Disc 2' -> 1/2, else None."""
+        m = self._DISC_NUM_RE.match(folder.name or "")
+        return int(m.group(1)) if m else None
 
     def _album_folder_identity(self, folder: Path) -> tuple[str, str]:
         """
@@ -1187,22 +1193,54 @@ class Orchestrator:
                             len(matched_track_ids), T,
                         )
                         return False
-                elif 100 * len(importable) < pmin * T:   # partial coverage floor
-                    logger.info(
-                        "Force-import (partial): only %d/%d files matched a "
-                        "track -- below %d%% coverage floor; not forcing.",
-                        len(importable), T, pmin,
-                    )
-                    return False
-                cmd = self.lidarr.manual_import_apply(importable)
+                    cmd = self.lidarr.manual_import_apply(importable)
+                elif 100 * len(importable) >= pmin * T:   # partial, enough matched
+                    cmd = self.lidarr.manual_import_apply(importable)
+                else:
+                    # Partial, but Lidarr mapped too few files -- common for a
+                    # various-artists disc it can't identify. Disc-aware
+                    # positional rescue: if this folder is disc N of a multi-disc
+                    # release and that medium's track count equals the file
+                    # count, pair them by position (safe -- the disc's tracks are
+                    # a known contiguous block). Otherwise give up.
+                    disc = self._disc_number_from_folder(folder)
+                    disc_tracks = []
+                    if disc is not None:
+                        disc_tracks = [
+                            t for t in self.lidarr.list_tracks_for_album(album_id)
+                            if (t.get("albumReleaseId") == target_rid
+                                or not t.get("albumReleaseId"))
+                            and t.get("mediumNumber") == disc
+                        ]
+                    if disc_tracks and len(disc_tracks) == n:
+                        logger.info(
+                            "Force-import (partial): Lidarr mapped only %d/%d; "
+                            "pairing %d files positionally to disc %d (%d "
+                            "tracks) of %s / %s.",
+                            len(importable), T, n, disc, len(disc_tracks),
+                            artist_name, album_name,
+                        )
+                        cmd = self.lidarr.manual_import_positional(
+                            cands, disc_tracks, album_id, target_rid, aid,
+                        )
+                    else:
+                        logger.info(
+                            "Force-import (partial): only %d/%d files matched a "
+                            "track -- below %d%% coverage floor and no "
+                            "disc-positional fit; not forcing.",
+                            len(importable), T, pmin,
+                        )
+                        return False
 
             if not cmd:
                 return False
-            # Superset legitimately leaves the extra files behind, so don't
-            # require staging to fully clear for it; exact/partial must clear.
+            # Only EXACT should fully clear staging. Superset and PARTIAL both
+            # legitimately leave files behind (extras / unmatched), so requiring
+            # a cleared staging would reject every partial as "not trusted" --
+            # which made compilation folders re-import in an endless loop.
             if not self._wait_for_manual_import(
                 cmd, folder, timeout=self.cfg.manual_import_timeout_seconds,
-                require_cleared=(mode != "superset"),
+                require_cleared=(mode == "exact"),
             ):
                 return False
         except Exception as exc:  # noqa: BLE001
