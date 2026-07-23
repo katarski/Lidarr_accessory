@@ -4422,26 +4422,47 @@ class Orchestrator:
                 folder_r,
             )
         else:
-            try:
-                shutil.rmtree(folder, ignore_errors=False)
+            # rmtree can hit ENOTEMPTY on Unraid's shfs/FUSE even after its own
+            # child deletions "succeed" -- deletions propagate with a lag, and a
+            # torrent still seeding can briefly hold a file. This is transient,
+            # so retry: unlink files individually (unlink succeeds even while a
+            # file is held open on Linux), wait, and try the tree again.
+            removed = False
+            last_exc: Optional[OSError] = None
+            for attempt in range(5):
+                try:
+                    shutil.rmtree(folder, ignore_errors=False)
+                    removed = True
+                    break
+                except FileNotFoundError:
+                    removed = True
+                    break
+                except OSError as exc:
+                    last_exc = exc
+                    try:
+                        for child in sorted(folder.rglob("*"), reverse=True):
+                            try:
+                                if child.is_dir() and not child.is_symlink():
+                                    child.rmdir()
+                                else:
+                                    child.unlink()
+                            except OSError:
+                                pass
+                    except OSError:
+                        pass
+                    time.sleep(1.5)
+            if removed:
                 logger.info("Removed source folder: %s", folder_r)
-            except OSError as exc:
-                logger.warning(
-                    "Initial rmtree of %s failed (%s); retrying leniently.",
-                    folder_r, exc,
-                )
+            else:
                 shutil.rmtree(folder, ignore_errors=True)
                 if folder.exists():
                     logger.warning(
-                        "Source folder %s partially remained after cleanup.",
-                        folder_r,
+                        "Source folder %s still present after retries (%s) -- "
+                        "leaving it; it will be retried on the next pass.",
+                        folder_r, last_exc,
                     )
-                    # Don't walk up if the folder is still there -- we'd
-                    # see it as non-empty and bail anyway, so save the log
-                    # noise.
                     return
-                else:
-                    logger.info("Removed source folder (lenient): %s", folder_r)
+                logger.info("Removed source folder (lenient): %s", folder_r)
 
         # Walk up and remove any empty parent folders (e.g. artist dir
         # left behind after its only album was cleaned). Stop before
