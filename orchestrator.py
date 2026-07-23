@@ -972,6 +972,27 @@ class Orchestrator:
             return []
         return out
 
+    _DISC_SUBDIR_RE = re.compile(r"(?i)^(?:cd|disc|disk|dvd)\s*[.\-_]?\s*\d{1,2}\b")
+
+    def _album_folder_identity(self, folder: Path) -> tuple[str, str]:
+        """
+        Parse (artist, album) from the album FOLDER name, climbing past a disc
+        subfolder ('CD1' / 'Disc 2'). More reliable than track-1 tags for
+        various-artists or multi-disc compilations, where each track lists a
+        different collaboration as its 'artist'. Returns ("","") when the
+        folder isn't in 'Artist - Album ...' form.
+        """
+        p = folder
+        if self._DISC_SUBDIR_RE.match(p.name or ""):
+            p = p.parent
+        name = re.sub(r"[\(\[\{][^)\]\}]*[)\]\}]", " ", p.name or "")
+        name = re.sub(r"\s{2,}", " ", name).strip(" -_.")
+        if " - " not in name:
+            return "", ""
+        artist, album = name.split(" - ", 1)
+        album = re.sub(r"(?i)\bCD\s*\d+\b", "", album).strip(" -_.")
+        return artist.strip(" -_."), album.strip(" -_.")
+
     def _read_audio_tags(self, path: Path) -> tuple[str, str]:
         """
         Read (artist, album) from an audio file using mutagen's format-
@@ -1453,10 +1474,29 @@ class Orchestrator:
             # file count exactly equals a release's track count it's almost
             # certainly the right album (e.g. one file named "(Untitled)"
             # tripping "unmatched tracks"). Force-import by position.
-            if self.cfg.force_import_on_count_match and self._try_positional_force_import(
-                cue_path, folder, key_path, artist_name, album_name, audios, reason,
-            ):
-                return
+            if self.cfg.force_import_on_count_match:
+                if self._try_positional_force_import(
+                    cue_path, folder, key_path, artist_name, album_name, audios, reason,
+                ):
+                    return
+                # Tag-based identity failed (common for various-artists / multi-
+                # disc comps where track tags list per-track collaborations, so
+                # Lidarr can't resolve the album -- e.g. a ".../CD1" whose tracks
+                # are each a different artist). Retry with the ALBUM-level
+                # artist/name parsed from the folder ('Adamski - Revolt / CD1'
+                # -> Adamski / Revolt).
+                f_artist, f_album = self._album_folder_identity(folder)
+                if (f_artist and f_album
+                        and (f_artist, f_album) != (artist_name, album_name)):
+                    logger.info(
+                        "Pre-split handoff: retrying force-import with "
+                        "folder-derived identity artist=%r album=%r for %s",
+                        f_artist, f_album, folder,
+                    )
+                    if self._try_positional_force_import(
+                        cue_path, folder, key_path, f_artist, f_album, audios, reason,
+                    ):
+                        return
             logger.warning(
                 "Pre-split handoff: no acceptable candidates (floor=%.0f%%) "
                 "for %s -- leaving audio in place.",
