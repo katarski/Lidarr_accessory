@@ -58,6 +58,13 @@ lidarr:
   pre_check_library: true
   force_import_on_count_match: true
   force_import_max_missing_percent: 10
+  # Partial import: when a download matches a Lidarr album but is missing some
+  # tracks, import the matching ones anyway (album stays incomplete) instead of
+  # skipping it. The source is KEPT -- never deleted -- unless everything landed
+  # (only exact/superset imports delete). Must cover >= partial_min_percent of
+  # the release, so one disc of a box set isn't crammed in.
+  force_import_partial: true
+  force_import_partial_min_percent: 50
   force_import_max_extra_percent: 25
   strict_import_only: true
   wait_for_lidarr: true

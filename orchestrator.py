@@ -250,6 +250,15 @@ class OrchestratorConfig:
     # (100 - this)% of a release's tracks, import the files that match and
     # accept the few absent tracks. 0 = require an exact count match.
     force_import_max_missing_percent: int = 10
+    # Partial import: when a download matches a Lidarr album but is MISSING
+    # tracks (fewer than the release has), import the tracks that DO match
+    # rather than skipping the whole album. The source is then KEPT -- never
+    # deleted -- because the album is incomplete; only exact/superset imports
+    # (where everything landed) delete the source. Guarded by a coverage floor
+    # so a single disc of a box set (well under the album's track count) isn't
+    # crammed in: the download must cover at least this % of the release.
+    force_import_partial: bool = True
+    force_import_partial_min_percent: int = 50
     # Superset cap: how many EXTRA tracks (beyond a release's track count) a
     # download may carry and still be treated as a deluxe edition rather than
     # a compilation. If extras exceed max(2, this% of the release track count)
@@ -1042,6 +1051,11 @@ class Orchestrator:
             return False
         n = len(audios)
         tol = max(0, int(self.cfg.force_import_max_missing_percent))
+        # Partial-import coverage floor: the download must cover at least this
+        # % of a release to import its matching tracks. When partial import is
+        # off, fall back to the old (100 - tol)% "near-complete" behaviour.
+        pmin = (max(1, int(self.cfg.force_import_partial_min_percent))
+                if self.cfg.force_import_partial else (100 - tol))
         try:
             arec = self.lidarr.find_artist(artist_name)
             if not arec:
@@ -1085,7 +1099,7 @@ class Orchestrator:
                         superset is None or T > superset[1]
                     ):
                         superset = (r.get("id"), T)
-                elif 100 * n >= (100 - tol) * T:   # n < T, within tol% missing
+                elif 100 * n >= pmin * T:   # n < T, download covers >= pmin% of release
                     if partial is None or T < partial[1]:
                         partial = (r.get("id"), T)
             if exact_rid is not None:
@@ -1152,11 +1166,11 @@ class Orchestrator:
                             len(matched_track_ids), T,
                         )
                         return False
-                elif 100 * len(importable) < (100 - tol) * T:   # partial floor
+                elif 100 * len(importable) < pmin * T:   # partial coverage floor
                     logger.info(
                         "Force-import (partial): only %d/%d files matched a "
-                        "track -- below %d%% floor; not forcing.",
-                        len(importable), T, 100 - tol,
+                        "track -- below %d%% coverage floor; not forcing.",
+                        len(importable), T, pmin,
                     )
                     return False
                 cmd = self.lidarr.manual_import_apply(importable)
@@ -1181,7 +1195,21 @@ class Orchestrator:
         # risk losing the extras.
         ok_to_delete = True
         remaining = self._sibling_audio_files(folder)
-        if remaining:
+        if mode == "partial":
+            # Incomplete album: we imported the tracks that matched, but not the
+            # whole album. Policy: NEVER delete the source unless everything was
+            # imported -- so keep the download in place (for the missing tracks
+            # / a re-grab / manual review). Don't relocate the leftovers either;
+            # they aren't part of this album.
+            ok_to_delete = False
+            if remaining:
+                logger.info(
+                    "Force-import (partial): imported the matching tracks for "
+                    "%s / %s; %d file(s) unmatched -- keeping source (album "
+                    "incomplete, not deleting).",
+                    artist_name, album_name, len(remaining),
+                )
+        elif remaining:
             album_dir, _existing = self._find_album_on_disk(artist_name, album_name)
             if album_dir is None:
                 logger.warning(

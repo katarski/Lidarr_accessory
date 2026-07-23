@@ -85,6 +85,8 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     put("lidarr", "min_match_percent", "MIN_MATCH_PERCENT", int)
     put("lidarr", "force_import_on_count_match", "FORCE_IMPORT", _as_bool)
     put("lidarr", "force_import_max_missing_percent", "FORCE_IMPORT_MAX_MISSING", int)
+    put("lidarr", "force_import_partial", "FORCE_IMPORT_PARTIAL", _as_bool)
+    put("lidarr", "force_import_partial_min_percent", "FORCE_IMPORT_PARTIAL_MIN", int)
     put("lidarr", "force_import_max_extra_percent", "FORCE_IMPORT_MAX_EXTRA", int)
     # Library audit
     put("lidarr", "library_audit_enabled", "LIBRARY_AUDIT_ENABLED", _as_bool)
@@ -610,6 +612,12 @@ def main() -> int:
         ),
         force_import_max_missing_percent=int(
             lidarr_cfg.get("force_import_max_missing_percent", 10)
+        ),
+        force_import_partial=bool(
+            lidarr_cfg.get("force_import_partial", True)
+        ),
+        force_import_partial_min_percent=int(
+            lidarr_cfg.get("force_import_partial_min_percent", 50)
         ),
         force_import_max_extra_percent=int(
             lidarr_cfg.get("force_import_max_extra_percent", 25)
