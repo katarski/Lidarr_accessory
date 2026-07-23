@@ -295,6 +295,11 @@ def _map_to_download_root(content_path: str, save_path: str, download_root: str)
 
 
 def _count_audio_on_disk(path: str) -> int:
+    # A single-file torrent's content_path IS the file itself, not a folder --
+    # os.walk() on a file yields nothing, which previously read as "0 audio =
+    # fully imported" and got the torrent (and its data) deleted. Handle it.
+    if os.path.isfile(path):
+        return 1 if os.path.splitext(path)[1].lower() in AUDIO_EXTS else 0
     n = 0
     for _dp, _dn, fn in os.walk(path):
         for x in fn:
