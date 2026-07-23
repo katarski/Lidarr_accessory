@@ -3603,15 +3603,29 @@ class Orchestrator:
         r"(\d+(?:\.\d+)?)\s*%\s*vs\s*(\d+(?:\.\d+)?)\s*%", re.IGNORECASE
     )
 
+    # Rejections we'll forgive when the album match % clears the floor. These
+    # all mean "right album, wrong track count" -- a superset (extra tracks) or
+    # a partial (a few missing). Anything else (missing artist, no album match,
+    # permissions) stays a hard fail.
+    _OVERRIDABLE_REJECTIONS = (
+        "not close enough",
+        "unmatched tracks",
+        "missing tracks",
+    )
+
     def _filter_acceptable(self, candidates: list) -> list:
         """
         Decide which manual-import candidates we'll commit.
         A candidate is 'acceptable' if:
           - no rejections at all, OR
-          - every rejection is a 'match is not close enough' message
-            where the actual match % >= cfg.min_match_percent.
-        Anything else (missing artist, no album match, track-count
-        mismatch, permissions, etc.) is treated as a hard fail.
+          - every rejection is an "overridable" one (not-close-enough / has
+            unmatched tracks / has missing tracks), AND the album match % (when
+            Lidarr reports one) is >= cfg.min_match_percent. When no % is given
+            we only override if Lidarr still resolved the album, so an extra- or
+            missing-track batch imports its matches instead of being dropped
+            wholesale on the 80% rule.
+        Anything else (missing artist, no album match, permissions, etc.) is a
+        hard fail.
         """
         floor = self.cfg.min_match_percent
         ok: list = []
@@ -3621,19 +3635,24 @@ class Orchestrator:
                 ok.append(c)
                 continue
             override = True
+            seen_pct = None
             for r in rej:
                 reason = (r.get("reason") or "")
-                if "not close enough" not in reason.lower():
+                low = reason.lower()
+                if not any(k in low for k in self._OVERRIDABLE_REJECTIONS):
                     override = False
                     break
                 m = self._MATCH_RE.search(reason)
-                if not m:
-                    override = False
-                    break
-                actual = float(m.group(1))
-                if actual < floor:
-                    override = False
-                    break
+                if m:
+                    pct = float(m.group(1))
+                    seen_pct = pct if seen_pct is None else min(seen_pct, pct)
+                    if pct < floor:
+                        override = False
+                        break
+            # Guard: if Lidarr never reported a match %, only override when it
+            # actually resolved the album (so we don't blind-cram a compilation).
+            if override and seen_pct is None and not (c.get("album") or {}).get("id"):
+                override = False
             if override:
                 path_name = Path(c.get("path") or "").name or "?"
                 # Pull the actual % from the last rejection message so we
