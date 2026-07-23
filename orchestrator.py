@@ -39,7 +39,7 @@ from typing import Any, Dict, List, Optional
 from cue_parser import Cue, parse_cue
 from lidarr import LidarrClient
 from ollama_client import OllamaClient
-from splitter import SplitResult, probe_duration, split_cue
+from splitter import SplitResult, probe_duration, repair_leadin, split_cue
 from tagger import TagPlan, album_folder_name, tag_splits
 
 logger = logging.getLogger(__name__)
@@ -387,11 +387,15 @@ class Orchestrator:
         # Album IDs we've already release-cycled in this process lifetime,
         # so we don't hammer Lidarr with PUT+Refresh on every audit pass.
         self._audit_cycled_album_ids: set = set()
+        # Trimmed "lead-in repair" temp files created while processing the
+        # current CUE; deleted in process()'s finally so they never linger.
+        self._repair_temps: set = set()
 
     # ---- Public entry --------------------------------------------------
 
     def process(self, cue_path: Path) -> None:
         staging_dir: Optional[Path] = None
+        self._repair_temps = set()
         try:
             staging_dir = self._process(cue_path)
         except Exception as exc:
@@ -405,6 +409,15 @@ class Orchestrator:
             # Roll back any partial staging directory so it doesn't linger.
             if staging_dir is not None:
                 self._rollback_staging(staging_dir)
+        finally:
+            # Remove any lead-in-repair temp copies we made for this CUE.
+            for tmp in list(self._repair_temps):
+                try:
+                    if tmp.exists():
+                        tmp.unlink()
+                except OSError as exc:  # noqa: BLE001
+                    logger.debug("could not remove repair temp %s: %s", tmp, exc)
+            self._repair_temps = set()
 
     def _process(self, cue_path: Path) -> Optional[Path]:
         """
@@ -1997,6 +2010,18 @@ class Orchestrator:
                 errors.append(f"{cand.name}: probe crashed ({exc})")
                 continue
             if duration is None or duration < 1.0:
+                # ffmpeg couldn't read it. Some rips prepend junk before the
+                # real WavPack/APE stream -- trim to the first block and retry.
+                repaired = repair_leadin(cand, self.cfg.ffmpeg_binary)
+                if repaired is not None:
+                    self._repair_temps.add(repaired)
+                    rdur = probe_duration(self.cfg.ffmpeg_binary, repaired)
+                    if rdur and rdur >= 1.0:
+                        logger.info(
+                            "Using lead-in-repaired copy of %s for split",
+                            cand.name,
+                        )
+                        return repaired, rdur, errors
                 errors.append(
                     f"{cand.name}: ffprobe returned no usable duration "
                     f"({duration!r})"

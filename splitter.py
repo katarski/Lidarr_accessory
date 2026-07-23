@@ -58,6 +58,55 @@ def probe_duration(ffmpeg_binary: str, audio_path: Path) -> Optional[float]:
         return None
 
 
+# Block signatures for the container formats that carry their audio in a
+# self-synchronising block stream. Some rips prepend junk (a fake header,
+# a release-group watermark) before the first block -- tolerant decoders
+# (libwavpack/libmac, i.e. real media players) scan to the first block, but
+# ffmpeg demands the signature at byte 0 and rejects the file ("Invalid data").
+_LEADIN_MAGIC = {".wv": b"wvpk", ".ape": b"MAC "}
+
+
+def repair_leadin(audio_path: Path, ffmpeg_binary: str = "ffmpeg") -> Optional[Path]:
+    """
+    If `audio_path` is a WavPack/APE file whose block signature isn't at offset
+    0 (junk prepended), write a trimmed copy that starts at the first signature
+    and return it IF ffmpeg can then decode it. Returns None when no repair
+    applies (not WV/APE, signature already at 0, not found, or still unreadable
+    after trimming). The trimmed copy is a sibling named '<name>.cuefix.<ext>'.
+    """
+    magic = _LEADIN_MAGIC.get(audio_path.suffix.lower())
+    if not magic:
+        return None
+    try:
+        with open(audio_path, "rb") as fh:
+            head = fh.read(8_000_000)  # junk lead-ins are tiny; 8 MB is ample
+        off = head.find(magic)
+        if off <= 0:
+            return None  # already at start, or no signature in the head
+        out = audio_path.with_name(audio_path.stem + ".cuefix" + audio_path.suffix)
+        with open(audio_path, "rb") as src, open(out, "wb") as dst:
+            src.seek(off)
+            shutil.copyfileobj(src, dst, length=4_000_000)
+        dur = probe_duration(ffmpeg_binary, out)
+        if dur and dur > 1.0:
+            logger.info(
+                "repair_leadin: trimmed %d junk byte(s) before the %s stream in "
+                "%s -> now decodable (%.0fs)",
+                off, audio_path.suffix, audio_path.name, dur,
+            )
+            return out
+        try:
+            out.unlink()
+        except OSError:
+            pass
+        logger.warning("repair_leadin: trimmed %s but ffmpeg still can't read it",
+                       audio_path.name)
+        return None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("repair_leadin failed for %s: %s", audio_path, exc)
+        return None
+
+
 _INVALID_FS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
