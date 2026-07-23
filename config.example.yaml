@@ -9,6 +9,19 @@ watch:
   - .ape
   - .wv
   - .wav
+  - .m4a
+  - .alac
+  - .aiff
+  - .aif
+  - .tak
+  - .tta
+  - .dsf
+  - .dff
+  - .mp3
+  - .ogg
+  - .opus
+  - .wma
+  - .shn
   exclude_dirs:
   - torrents
   observer: polling

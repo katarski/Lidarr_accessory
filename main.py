@@ -574,7 +574,10 @@ def main() -> int:
     heartbeat_seconds = int(staging_cfg.get("heartbeat_seconds", 600) or 0)
 
     orch_cfg = OrchestratorConfig(
-        audio_extensions=list(watch_cfg.get("audio_extensions", [".flac", ".ape", ".wv", ".wav"])),
+        audio_extensions=list(watch_cfg.get("audio_extensions", [
+            ".flac", ".ape", ".wv", ".wav", ".m4a", ".alac", ".aiff", ".aif",
+            ".tak", ".tta", ".dsf", ".dff", ".mp3", ".ogg", ".opus", ".wma", ".shn",
+        ])),
         stable_seconds=int(watch_cfg.get("stable_seconds", 20)),
         staging_root=staging_root,
         lidarr_grace_seconds=int(staging_cfg.get("lidarr_grace_seconds", 90)),
