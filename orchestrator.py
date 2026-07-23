@@ -1196,19 +1196,26 @@ class Orchestrator:
         ok_to_delete = True
         remaining = self._sibling_audio_files(folder)
         if mode == "partial":
-            # Incomplete album: we imported the tracks that matched, but not the
-            # whole album. Policy: NEVER delete the source unless everything was
-            # imported -- so keep the download in place (for the missing tracks
-            # / a re-grab / manual review). Don't relocate the leftovers either;
-            # they aren't part of this album.
-            ok_to_delete = False
+            # Lidarr MOVES the tracks it imports out of the folder, so whatever
+            # audio is still here is exactly what Lidarr did NOT take -- extras
+            # it isn't using. Keep the source only for those; if nothing is
+            # left, every file the download had was imported and the source is
+            # redundant (the "missing" tracks were never in the download), so
+            # delete it. Don't relocate leftovers -- they stay in the download.
             if remaining:
                 logger.info(
                     "Force-import (partial): imported the matching tracks for "
-                    "%s / %s; %d file(s) unmatched -- keeping source (album "
-                    "incomplete, not deleting).",
-                    artist_name, album_name, len(remaining),
+                    "%s / %s; keeping %d un-imported extra file(s) in the "
+                    "source.", artist_name, album_name, len(remaining),
                 )
+                ok_to_delete = False
+            else:
+                logger.info(
+                    "Force-import (partial): every file the download had was "
+                    "imported for %s / %s -- source is redundant, deleting.",
+                    artist_name, album_name,
+                )
+                ok_to_delete = True
         elif remaining:
             album_dir, _existing = self._find_album_on_disk(artist_name, album_name)
             if album_dir is None:
