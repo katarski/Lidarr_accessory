@@ -66,6 +66,13 @@ lidarr:
   # same album are present, the one whose track count is closest to Lidarr's
   # release is kept and the rest skipped. Set false to attempt every folder.
   pre_split_monitored_gap_only: true
+  # DTS-CD support: a DTS audio CD rips to raw .dts surround streams (no tags,
+  # no cue) that Lidarr can't ingest. When true, the cueless sweep transcodes
+  # each .dts to a channel-preserving (5.1) FLAC, tags it (track/title from the
+  # filename; artist/album from the folder name, LLM-assisted when there's no
+  # 'Artist - Album' separator), then imports the FLACs normally. Needs ffmpeg
+  # (already in the image). Set false to ignore .dts folders.
+  transcode_dts_cd: true
   force_import_on_count_match: true
   force_import_max_missing_percent: 10
   # Partial import: when a download matches a Lidarr album but is missing some

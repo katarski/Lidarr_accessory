@@ -88,6 +88,15 @@ _TAG_NORMALIZE_SYSTEM = (
 )
 
 
+_IDENTITY_SPLIT_SYSTEM = (
+    "You split a music album FOLDER NAME into the artist and the album title. "
+    "The folder has no separator between them and may carry rip/format tags "
+    "(DTS, DTS_CD, SACD, FLAC), a year, or a catalog number, which you ignore. "
+    "Use only words present in the folder name -- never invent or correct "
+    "words. Reply with ONLY one line in the form 'ARTIST | ALBUM'. Never explain."
+)
+
+
 _ALBUM_MATCH_SYSTEM = (
     "You match a downloaded music album folder to a list of albums the user "
     "ALREADY OWNS by the same artist. The folder name often differs from an "
@@ -282,6 +291,42 @@ class OllamaClient:
         return out.strip()
 
     # ---------- album match (library de-dup fallback) -------------------
+
+    def parse_artist_album(self, folder_name: str):
+        """
+        Split a tagless folder name with no 'Artist - Album' separator (e.g.
+        'Enigma A Posteriori DTS_CD') into (artist, album). Used for DTS-CD /
+        SACD rips that carry no tags. Hallucination-safe: EVERY word the model
+        returns must appear in the folder name, else we return ("","") -- so it
+        can't invent an unrelated artist/album.
+        """
+        if not self.enabled or not folder_name:
+            return "", ""
+        prompt = (
+            f"Album folder name with no separators:\n  {folder_name}\n\n"
+            "Split it into the recording ARTIST and the ALBUM title. Ignore "
+            "format/rip tags like DTS, DTS_CD, SACD, FLAC, bitrate, year, and "
+            "catalog numbers.\nReply as EXACTLY one line: ARTIST | ALBUM"
+        )
+        out = self._generate(_IDENTITY_SPLIT_SYSTEM, prompt,
+                             num_predict=64, timeout=60.0)
+        ans = (out or "").strip().strip("`").strip()
+        if "|" not in ans:
+            return "", ""
+        parts = [x.strip().strip('"').strip("'").strip()
+                 for x in ans.split("|", 1)]
+        artist, album = parts[0], parts[1]
+        if not (artist and album):
+            return "", ""
+        folder_words = set(re.findall(r"[a-z0-9]+", folder_name.lower()))
+        ret_words = set(re.findall(r"[a-z0-9]+", f"{artist} {album}".lower()))
+        if not ret_words or not ret_words <= folder_words:
+            logger.info(
+                "AI identity split rejected (words not all in folder): "
+                "%r -> %r / %r", folder_name, artist, album,
+            )
+            return "", ""
+        return artist, album
 
     def pick_owned_album(self, download_name: str, owned_titles: List[str]) -> Optional[str]:
         """

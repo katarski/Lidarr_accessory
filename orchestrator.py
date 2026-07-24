@@ -250,6 +250,12 @@ class OrchestratorConfig:
     # When multiple editions of the SAME album are present, the sweep keeps the
     # one whose track count is closest to Lidarr's release and skips the rest.
     pre_split_monitored_gap_only: bool = True
+    # DTS-CD support: a DTS audio CD rips to raw .dts surround streams (no tags,
+    # no cue) that Lidarr can't ingest. When on, the cueless sweep transcodes
+    # each .dts to a channel-preserving (5.1) FLAC, tags it (track/title from
+    # the filename; artist/album from the folder name, LLM-assisted when there's
+    # no 'Artist - Album' separator), and hands the FLACs to the normal import.
+    transcode_dts_cd: bool = True
     # When Lidarr rejects a pre-split folder ONLY on title-mismatch grounds
     # ("unmatched tracks" / "missing tracks" / "not close enough") but the
     # on-disk file count EXACTLY equals a Lidarr release's track count, force
@@ -1344,6 +1350,111 @@ class Orchestrator:
                         logger.warning("Could not delete %s: %s", a, exc)
         return True
 
+    _DTS_MARKER_RE = re.compile(
+        r"(?i)[\s\-_.\(\[]*\bdts(?:[\s\-_.]?cd)?\b[\s\-_.\)\]]*"
+    )
+
+    def _dts_identity(self, folder: Path) -> Tuple[str, str]:
+        """
+        (artist, album) for a DTS-CD folder. Prefer the 'Artist - Album' folder
+        parser; when the name has no separator (e.g. 'Enigma A Posteriori
+        DTS_CD') and an LLM is enabled, ask it to split -- guarded so it can
+        only use words already in the folder name. ("","") if undetermined.
+        """
+        artist, album = self._album_folder_identity(folder)
+        if artist and album:
+            # Strip the DTS/DTS_CD marker the folder parser leaves on the album
+            # ("A Posteriori DTS_CD" -> "A Posteriori").
+            album = re.sub(
+                r"\s{2,}", " ", self._DTS_MARKER_RE.sub(" ", album)
+            ).strip(" -_.")
+            if album:
+                return artist, album
+        raw = self._DTS_MARKER_RE.sub(" ", folder.name or "")
+        raw = re.sub(r"\s{2,}", " ", raw).strip(" -_.")
+        if self.ollama is not None and getattr(self.ollama, "enabled", False):
+            try:
+                a, b = self.ollama.parse_artist_album(raw)
+                if a and b:
+                    logger.info(
+                        "DTS-CD: LLM parsed identity from %r -> artist=%r album=%r",
+                        folder.name, a, b,
+                    )
+                    return a, b
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("DTS-CD: LLM identity parse failed: %s", exc)
+        return "", ""
+
+    def _transcode_dts_folder(self, folder: Path) -> List[Path]:
+        """
+        Transcode a DTS-CD folder's raw .dts surround streams into
+        channel-preserving (5.1) FLAC so Lidarr can import them, tagging each
+        from the filename + folder identity. Idempotent (skips a .dts whose
+        .flac already exists) and best-effort (any failure logs, returns what
+        succeeded). Returns the FLAC paths created/present.
+        """
+        try:
+            from tagger import _apply  # lazy: needs mutagen (present in image)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("DTS-CD: tagger unavailable (%s) -- skipping.", exc)
+            return []
+        try:
+            dts = sorted(
+                p for p in folder.iterdir()
+                if p.is_file() and p.suffix.lower() == ".dts"
+            )
+        except OSError:
+            return []
+        if not dts:
+            return []
+        artist, album = self._dts_identity(folder)
+        total = str(len(dts))
+        made: List[Path] = []
+        for p in dts:
+            out = p.with_suffix(".flac")
+            if out.exists():
+                made.append(out)
+                continue
+            cmd = [
+                self.cfg.ffmpeg_binary, "-hide_banner", "-loglevel", "warning",
+                "-y", "-i", str(p),
+                "-c:a", "flac",
+                "-compression_level", str(self.cfg.flac_compression_level),
+                "-map_metadata", "-1",
+                str(out),
+            ]
+            try:
+                subprocess.run(cmd, check=True, capture_output=True, text=True)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("DTS-CD: ffmpeg failed on %s: %s", p.name, exc)
+                if out.exists():
+                    out.unlink(missing_ok=True)
+                continue
+            if not ((probe_duration(self.cfg.ffmpeg_binary, out) or 0) > 1.0):
+                logger.warning("DTS-CD: %s transcoded but is unreadable.", p.name)
+                out.unlink(missing_ok=True)
+                continue
+            m = re.match(r"\s*(\d+)\s*[-.]?\s*(.*)", p.stem)
+            tno = (m.group(1).lstrip("0") or m.group(1)) if m else ""
+            title = (m.group(2).strip(" -_.") if m and m.group(2) else p.stem)
+            try:
+                _apply(out, TagPlan(
+                    tracknumber=tno, tracktotal=total, title=title,
+                    artist=artist, albumartist=artist, album=album,
+                    date="", genre="", comment="DTS-CD 5.1 (transcoded)", isrc="",
+                ))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("DTS-CD: tag write failed for %s: %s", out.name, exc)
+            made.append(out)
+        if made:
+            logger.info(
+                "DTS-CD: %s -> %d FLAC (5.1) (artist=%r album=%r)%s",
+                folder.name, len(made), artist, album,
+                "" if (artist and album) else
+                " -- identity unknown; rename folder to 'Artist - Album' to import",
+            )
+        return made
+
     def _monitored_album_status(self, artist_name: str, album_name: str):
         """
         Decide whether a pre-split download fills a MONITORED GAP in Lidarr.
@@ -2040,6 +2151,19 @@ class Orchestrator:
                 )
                 self._skip_seen.add(folder)
                 continue
+
+            # DTS-CD: a folder of raw .dts surround streams (no recognized
+            # audio yet). Transcode them to channel-preserving FLAC in place;
+            # once written (and stable), the normal pre-split path below picks
+            # up the FLACs and imports them. Idempotent, so re-running is cheap.
+            if (
+                self.cfg.transcode_dts_cd
+                and not audio_here
+                and any(fn.lower().endswith(".dts") for fn in filenames)
+            ):
+                self._transcode_dts_folder(folder)
+                # Fall through: the just-written FLACs are usually caught by the
+                # stability guard and imported on the next sweep.
 
             # Needs to look pre-split.
             if not self._looks_pre_split(folder):
