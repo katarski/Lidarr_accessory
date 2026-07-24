@@ -72,8 +72,15 @@ def _clean_album(name: str, artist: str = "") -> str:
     (including '& guest' credits) without eating album titles that merely
     contain ' - '.
     """
-    # Leading parenthesized year: "(1994) Twista - Resurrection" -> "Twista - ..."
-    s = re.sub(r"^\s*[\(\[]\s*(?:19|20)\d{2}\s*[\)\]]\s*", "", name)
+    # Drop bracketed/parenthesized tags FIRST. Edition/source/catalog tags like
+    # "[DTSCD][UP]", "(1994)", "{KOC-5836}" often sit at the START of the name;
+    # leaving them there blocks the ANCHORED (^) year/number/artist-prefix
+    # strips below. That was the "[DTSCD][UP] Elton John - The Big Picture" bug:
+    # the leading "[DTSCD][UP]" stopped the "Elton John - " artist prefix from
+    # being stripped, so the album kept the artist words and wrongly word-subset
+    # matched the self-titled album "Elton John".
+    s = re.sub(r"[(\[\{][^)\]\}]*[)\]\}]", " ", name)   # drop (edition)[tag]{cat}
+    s = re.sub(r"\s{2,}", " ", s).strip()
     s = _LEAD_NUM.sub("", s)             # '01. ' / '01 - '
     s = _LEAD_YEARS.sub("", s)           # '1960 ' / '1960,1961 ' / '1960 - '
     m = _ARTIST_YEAR_ALBUM.match(s)      # 'Artist - 2005 - Gospel Train' -> 'Gospel Train'
@@ -83,7 +90,6 @@ def _clean_album(name: str, artist: str = "") -> str:
         na = re.escape(artist.strip())
         # 'Etta James - ...' or 'Etta James & Eddie ... - ...' at the start.
         s = re.sub(rf"(?i)^\s*{na}\b[^-]*?-\s*", "", s, count=1)
-    s = re.sub(r"[(\[\{][^)\]\}]*[)\]\}]", " ", s)   # drop (edition)[tag]{cat}
     return re.sub(r"\s{2,}", " ", s).strip(" -_.")
 
 

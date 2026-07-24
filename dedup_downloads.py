@@ -167,11 +167,19 @@ def album_complete_in_library(
         # generic 1-word title can't win over a more specific fit.
         if alb is None:
             dl_words = set(re.findall(r"[a-z0-9]+", album.lower()))
+            # A self-titled album's words ARE the artist name, which appears in
+            # virtually every download by that artist -- so it must NOT be
+            # eligible for the fuzzy word-subset match (it can still match
+            # EXACTLY above). Without this, owning "Elton John" (self-titled)
+            # would deselect "Elton John - <anything>".
+            artist_words = set(re.findall(r"[a-z0-9]+", artist.lower()))
             if dl_words:
                 best = None
                 for a in albums:
                     ow_words = set(re.findall(
                         r"[a-z0-9]+", (a.get("title") or "").lower()))
+                    if ow_words and ow_words <= artist_words:
+                        continue  # self-titled / artist-named -> exact-only
                     if ow_words and ow_words <= dl_words and _owned(a):
                         if best is None or len(ow_words) > best[0]:
                             best = (len(ow_words), a)
