@@ -150,16 +150,37 @@ def album_complete_in_library(
             if norm_title(a.get("title")) == target:
                 alb = a
                 break
-        # AI fallback: only when the deterministic match missed. Ask the LLM to
+        def _owned(a: Dict[str, Any]) -> bool:
+            st = a.get("statistics") or {}
+            f = int(st.get("trackFileCount") or 0)
+            t = int(st.get("totalTrackCount") or 0)
+            return f > 0 and t > 0 and f >= t
+        # Word-subset match: catch editions/variants of an album you OWN whose
+        # folder carries extra words that aren't in parentheses (so _clean_album
+        # can't strip them) -- "Album Deluxe Edition", "Album_Official_Release",
+        # "Album.Remastered.2020". If EVERY word of an owned album's title also
+        # appears in the download name (tokens split on spaces/_/./-), treat the
+        # download as that album so all such editions get deselected. Only OWNED
+        # (complete) albums are considered, so this never deselects something you
+        # don't have. Prefer the owned album with the most words matched, so a
+        # generic 1-word title can't win over a more specific fit.
+        if alb is None:
+            dl_words = set(re.findall(r"[a-z0-9]+", album.lower()))
+            if dl_words:
+                best = None
+                for a in albums:
+                    ow_words = set(re.findall(
+                        r"[a-z0-9]+", (a.get("title") or "").lower()))
+                    if ow_words and ow_words <= dl_words and _owned(a):
+                        if best is None or len(ow_words) > best[0]:
+                            best = (len(ow_words), a)
+                if best is not None:
+                    alb = best[1]
+        # AI fallback: only when the deterministic matches missed. Ask the LLM to
         # map the download folder to an album the user ACTUALLY OWNS (has files
         # for). It never sees not-owned albums, so it can't cause us to deselect
         # something absent -- ownership stays grounded in Lidarr's data.
         if alb is None and llm is not None:
-            def _owned(a: Dict[str, Any]) -> bool:
-                st = a.get("statistics") or {}
-                f = int(st.get("trackFileCount") or 0)
-                t = int(st.get("totalTrackCount") or 0)
-                return f > 0 and t > 0 and f >= t
             owned = sorted({a.get("title", "") for a in albums
                             if a.get("title") and _owned(a)})
             if owned:
