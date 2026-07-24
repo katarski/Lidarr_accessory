@@ -627,6 +627,13 @@ class Orchestrator:
             )
             return None
 
+        # DTS-in-WAV disc image? ffmpeg decodes it to SILENCE, so a normal split
+        # would emit silent tracks. Decode it to real 5.1 PCM with libdca first
+        # and split THAT. No-op for ordinary audio.
+        _dts_decoded = self._decode_dts_wav_source(audio_path)
+        if _dts_decoded is not None:
+            audio_path = _dts_decoded
+
         staging_dir = self._make_staging_dir(cue, cue_path, audio_path)
         logger.info("Staging to %s", staging_dir)
 
@@ -1385,6 +1392,114 @@ class Orchestrator:
                 logger.warning("DTS-CD: LLM identity parse failed: %s", exc)
         return "", ""
 
+    # DTS frame sync word (first 4 bytes) in the four orderings a DTS-CD may
+    # store it: 16-bit BE, 16-bit LE, 14-bit BE, 14-bit LE. Used to recognise a
+    # WAV whose "PCM" is really a DTS bitstream -- the same check VLC does.
+    _DTS_SYNCS = (
+        b"\x7f\xfe\x80\x01", b"\xfe\x7f\x01\x80",
+        b"\x1f\xff\xe8\x00", b"\xff\x1f\x00\xe8",
+    )
+
+    def _wav_dts_data_range(self, wav_path: Path):
+        """
+        If `wav_path` is a WAV whose audio data is actually a DTS bitstream (a
+        DTS-CD rip), return (data_offset, data_size); else None. Walks the RIFF
+        chunks to find 'data' (never assumes offset 44), then checks its first
+        4 bytes against the DTS sync words.
+        """
+        try:
+            with open(wav_path, "rb") as f:
+                hdr = f.read(12)
+                if len(hdr) < 12 or hdr[:4] != b"RIFF" or hdr[8:12] != b"WAVE":
+                    return None
+                while True:
+                    ch = f.read(8)
+                    if len(ch) < 8:
+                        return None
+                    size = int.from_bytes(ch[4:8], "little")
+                    if ch[:4] == b"data":
+                        off = f.tell()
+                        first4 = f.read(4)
+                        if any(first4 == s for s in self._DTS_SYNCS):
+                            return (off, size)
+                        return None
+                    f.seek(size + (size & 1), 1)  # chunks are word-aligned
+        except OSError:
+            return None
+
+    def _dcadec_to_wav(self, es_path: Path, out_wav: Path) -> bool:
+        """
+        Decode a raw DTS elementary stream to a 5.1 WAV using libdca's `dcadec`
+        (-o wav6). ffmpeg's built-in dca decoder can't frame 14-bit DTS-CD
+        streams, which is why we shell out to libdca (the decoder VLC uses).
+        Returns True if a real (non-empty) WAV was produced.
+        """
+        try:
+            with open(out_wav, "wb") as w:
+                subprocess.run(
+                    ["dcadec", "-o", "wav6", str(es_path)],
+                    stdout=w, stderr=subprocess.DEVNULL, timeout=3600,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("dcadec failed for %s: %s", es_path.name, exc)
+        try:
+            ok = out_wav.exists() and out_wav.stat().st_size > 1024
+        except OSError:
+            ok = False
+        if not ok and out_wav.exists():
+            out_wav.unlink(missing_ok=True)
+        return ok
+
+    def _decode_dts_wav_source(self, audio_path: Path):
+        """
+        If `audio_path` is a DTS-in-WAV disc image, decode it to a real 5.1 PCM
+        WAV (via dcadec) and return that path; else None. MUST run before the
+        split: ffmpeg reads a DTS-in-WAV as SILENCE, so splitting the original
+        would yield silent tracks. The DTS bytes are pulled straight out of the
+        data chunk (ffmpeg mis-decodes them). Temp files are registered in
+        self._repair_temps so process()'s finally cleans them up.
+        """
+        if not getattr(self.cfg, "transcode_dts_cd", True):
+            return None
+        if audio_path.suffix.lower() != ".wav":
+            return None
+        rng = self._wav_dts_data_range(audio_path)
+        if not rng:
+            return None
+        offset, size = rng
+        es = audio_path.with_suffix(".dtses.tmp")
+        dec = audio_path.with_suffix(".dts5p1.wav")
+        try:
+            logger.info(
+                "DTS-CD: %s is a DTS-in-WAV disc image -- decoding to 5.1 with "
+                "libdca before split.", audio_path.name,
+            )
+            with open(audio_path, "rb") as src, open(es, "wb") as dst:
+                src.seek(offset)
+                remaining = size
+                while remaining > 0:
+                    block = src.read(min(4_000_000, remaining))
+                    if not block:
+                        break
+                    dst.write(block)
+                    remaining -= len(block)
+            self._repair_temps.add(es)
+            if self._dcadec_to_wav(es, dec):
+                self._repair_temps.add(dec)
+                logger.info("DTS-CD: decoded %s -> %s (5.1 PCM)",
+                            audio_path.name, dec.name)
+                return dec
+            logger.warning("DTS-CD: dcadec could not decode %s", audio_path.name)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("DTS-CD decode failed for %s: %s", audio_path, exc)
+        for p in (es, dec):
+            try:
+                if p.exists():
+                    p.unlink()
+            except OSError:
+                pass
+        return None
+
     def _transcode_dts_folder(self, folder: Path) -> List[Path]:
         """
         Transcode a DTS-CD folder's raw .dts surround streams into
@@ -1392,6 +1507,9 @@ class Orchestrator:
         from the filename + folder identity. Idempotent (skips a .dts whose
         .flac already exists) and best-effort (any failure logs, returns what
         succeeded). Returns the FLAC paths created/present.
+
+        Decoding goes through libdca's dcadec (ffmpeg can't frame 14-bit DTS),
+        producing a 5.1 WAV that ffmpeg then losslessly re-encodes to FLAC.
         """
         try:
             from tagger import _apply  # lazy: needs mutagen (present in image)
@@ -1415,9 +1533,15 @@ class Orchestrator:
             if out.exists():
                 made.append(out)
                 continue
+            # libdca decode (.dts -> 5.1 wav), then ffmpeg lossless wav -> flac.
+            tmpwav = p.with_suffix(".dec.wav")
+            if not self._dcadec_to_wav(p, tmpwav):
+                logger.warning("DTS-CD: dcadec couldn't decode %s -- skipping.",
+                               p.name)
+                continue
             cmd = [
                 self.cfg.ffmpeg_binary, "-hide_banner", "-loglevel", "warning",
-                "-y", "-i", str(p),
+                "-y", "-i", str(tmpwav),
                 "-c:a", "flac",
                 "-compression_level", str(self.cfg.flac_compression_level),
                 "-map_metadata", "-1",
@@ -1426,10 +1550,13 @@ class Orchestrator:
             try:
                 subprocess.run(cmd, check=True, capture_output=True, text=True)
             except Exception as exc:  # noqa: BLE001
-                logger.warning("DTS-CD: ffmpeg failed on %s: %s", p.name, exc)
+                logger.warning("DTS-CD: flac encode failed on %s: %s", p.name, exc)
                 if out.exists():
                     out.unlink(missing_ok=True)
                 continue
+            finally:
+                if tmpwav.exists():
+                    tmpwav.unlink(missing_ok=True)
             if not ((probe_duration(self.cfg.ffmpeg_binary, out) or 0) > 1.0):
                 logger.warning("DTS-CD: %s transcoded but is unreadable.", p.name)
                 out.unlink(missing_ok=True)
