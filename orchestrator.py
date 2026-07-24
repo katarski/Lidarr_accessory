@@ -34,7 +34,7 @@ import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from cue_parser import Cue, parse_cue
 from lidarr import LidarrClient
@@ -239,6 +239,17 @@ class OrchestratorConfig:
     # delete the source folder -- there's no point re-importing what's
     # already in the library. Set False to always process.
     pre_check_lidarr_library: bool = True
+    # Discography decision logic ("fill monitored gaps only"): only hand a
+    # pre-split folder to Lidarr if it maps to an album Lidarr MONITORS and is
+    # INCOMPLETE (missing tracks). Already-complete albums are skipped as
+    # redundant (see pre_check_lidarr_library); folders with no monitored
+    # target -- compilations / live / best-of that the metadata profile
+    # excludes -- are skipped cleanly instead of being handed to Lidarr,
+    # rejected, and left thrashing on disk. This is what stops a messy
+    # discography torrent from wasting hours on albums that can never match.
+    # When multiple editions of the SAME album are present, the sweep keeps the
+    # one whose track count is closest to Lidarr's release and skips the rest.
+    pre_split_monitored_gap_only: bool = True
     # When Lidarr rejects a pre-split folder ONLY on title-mismatch grounds
     # ("unmatched tracks" / "missing tracks" / "not close enough") but the
     # on-disk file count EXACTLY equals a Lidarr release's track count, force
@@ -1333,6 +1344,119 @@ class Orchestrator:
                         logger.warning("Could not delete %s: %s", a, exc)
         return True
 
+    def _monitored_album_status(self, artist_name: str, album_name: str):
+        """
+        Decide whether a pre-split download fills a MONITORED GAP in Lidarr.
+
+        Matches the download's artist/album to a Lidarr album by normalized-
+        title EQUALITY (via _match_key) -- NOT the fuzzy both-direction
+        find_album, which over-matches a different album. Returns:
+
+          ("import",    have, total)  monitored album, incomplete -> import it
+          ("redundant", have, total)  monitored album, already complete
+          ("skip",      0, 0)         no monitored matching album -> skip clean
+          ("unknown",   0, 0)         Lidarr lookup failed -> caller shouldn't
+                                      skip (fall through to a normal attempt)
+
+        "skip" is the important one: compilations / live / best-of that the
+        metadata profile excludes have no monitored album, so we return early
+        instead of handing them to Lidarr just to be rejected.
+        """
+        artist_name = (artist_name or "").strip()
+        album_name = (album_name or "").strip()
+        if not artist_name or not album_name:
+            return ("unknown", 0, 0)
+        try:
+            artist = self.lidarr.find_artist(artist_name)
+            if not artist:
+                return ("skip", 0, 0)
+            albums = self.lidarr.list_albums_for_artist(artist["id"]) or []
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Gap check: Lidarr lookup failed for %s: %s",
+                           artist_name, exc)
+            return ("unknown", 0, 0)
+        target = _match_key(album_name)
+        match = None
+        for a in albums:
+            if _match_key(a.get("title")) == target:
+                match = a
+                break
+        if match is None:
+            return ("skip", 0, 0)
+        if not match.get("monitored", True):
+            return ("skip", 0, 0)
+        aid = match.get("id")
+        try:
+            full = (self.lidarr.get_album(aid) or {}) if aid else {}
+        except Exception:  # noqa: BLE001
+            full = {}
+        stats = full.get("statistics") or match.get("statistics") or {}
+        have = int(stats.get("trackFileCount") or 0)
+        total = int(stats.get("totalTrackCount") or 0)
+        if total > 0 and have >= total:
+            return ("redundant", have, total)
+        return ("import", have, total)
+
+    def _drop_duplicate_editions(
+        self, eligible: List[Tuple[Path, List[Path]]]
+    ) -> set:
+        """
+        Find folders in the sweep's eligible list that map to the SAME album
+        (normalized artist+album from tags) and return the ones to SKIP,
+        keeping only the edition whose track count is CLOSEST to Lidarr's
+        release. When Lidarr has no count for the album, keep the edition with
+        the most tracks (the most complete). Folders whose tags can't be read
+        are never grouped -- they pass through untouched for the handoff to
+        sort out. Returns a set of folders to skip.
+        """
+        groups: Dict[str, list] = {}
+        for folder, audios in eligible:
+            artist = album = ""
+            for a in audios:
+                artist, album = self._read_audio_tags(a)
+                if artist and album:
+                    break
+            if not (artist and album):
+                continue
+            key = _match_key(artist) + "\x00" + _match_key(album)
+            groups.setdefault(key, []).append(
+                (folder, len(audios), artist, album)
+            )
+
+        to_skip: set = set()
+        for members in groups.values():
+            if len(members) < 2:
+                continue
+            artist, album = members[0][2], members[0][3]
+            try:
+                _verdict, _have, total = self._monitored_album_status(
+                    artist, album
+                )
+            except Exception:  # noqa: BLE001
+                total = 0
+            if total and total > 0:
+                best = min(members, key=lambda m: abs(m[1] - total))
+                crit = f"closest to Lidarr's {total} tracks"
+            else:
+                best = max(members, key=lambda m: m[1])
+                crit = "most tracks (Lidarr count unknown)"
+            for folder, n, _ar, _al in members:
+                if folder == best[0]:
+                    continue
+                to_skip.add(folder)
+                logger.info(
+                    "cueless sweep: %s / %s has %d editions -- keeping %r "
+                    "(%d tracks, %s), skipping %r (%d tracks).",
+                    artist, album, len(members), best[0].name, best[1],
+                    crit, folder.name, n,
+                )
+                self._record(
+                    folder, outcome="skipped_duplicate_edition",
+                    pre_split=True, artist=artist, album=album,
+                    reason=f"duplicate edition; kept {best[0].name}",
+                )
+        return to_skip
+
     def _handoff_pre_split_to_lidarr(
         self,
         cue_path: Optional[Path],
@@ -1430,6 +1554,36 @@ class Orchestrator:
             "Pre-split handoff: artist=%r album=%r folder=%s",
             artist_name, album_name, folder,
         )
+
+        # 2a) GAP GATE ("fill monitored gaps only"): the decision logic for
+        #     messy discography torrents. Only proceed if this folder maps to a
+        #     MONITORED album in Lidarr. A folder with no monitored target --
+        #     a compilation / live / best-of that the metadata profile excludes
+        #     -- is skipped cleanly here, instead of being handed to Lidarr,
+        #     rejected ("couldn't find a similar album" / weak match), and left
+        #     thrashing on disk. Complete albums fall through to the redundancy
+        #     delete (2b); incomplete monitored albums are the gap we import.
+        if self.cfg.pre_split_monitored_gap_only:
+            verdict, _have, _total = self._monitored_album_status(
+                artist_name, album_name
+            )
+            if verdict == "skip":
+                logger.info(
+                    "Pre-split: %s / %s has no monitored album in Lidarr "
+                    "(compilation/live/best-of, or not in your metadata "
+                    "profile) -- skipping handoff, leaving audio in place. (%s)",
+                    artist_name, album_name, reason,
+                )
+                self._record(
+                    key_path, outcome="skipped_unmonitored", pre_split=True,
+                    artist=artist_name, album=album_name,
+                    reason=f"no monitored album target ({reason})",
+                )
+                return
+            # "import" -> fall through and import the gap.
+            # "redundant" -> handled by 2b just below (deletes the download).
+            # "unknown" (Lidarr lookup failed) -> fall through and attempt as
+            #           before, so a transient Lidarr hiccup never drops audio.
 
         # 2b) Space-saving dedup: if Lidarr already has this album fully in
         #     the library, this download is redundant -- delete it instead
@@ -1831,6 +1985,9 @@ class Orchestrator:
         now_ts = time.time()
 
         handed_off = 0
+        # Folders that pass every guard, collected first so duplicate editions
+        # can be de-duplicated before any handoff (see _drop_duplicate_editions).
+        eligible: List[Tuple[Path, List[Path]]] = []
         logger.info(
             "cueless sweep: scanning %s (min_stable=%ss)",
             watch_root, min_stable,
@@ -1913,6 +2070,18 @@ class Orchestrator:
                 "cueless sweep: found pre-split folder with no .cue: %s (%d audio files)",
                 folder, len(audios),
             )
+            eligible.append((folder, audios))
+
+        # Edition dedup ("best track-count match"): when several eligible
+        # folders in THIS sweep map to the same album (multiple pressings/
+        # editions of a discography grab), only hand off the one whose track
+        # count is closest to Lidarr's release; skip the rest as redundant.
+        # Done before handoff so we never import two editions into one album.
+        for folder in self._drop_duplicate_editions(eligible):
+            self._skip_seen.add(folder)
+
+        surviving = [f for (f, _a) in eligible if f not in self._skip_seen]
+        for folder in surviving:
             try:
                 self._handoff_pre_split_to_lidarr(
                     None, folder, reason="cueless sweep",

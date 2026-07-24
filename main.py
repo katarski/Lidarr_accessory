@@ -83,6 +83,7 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     put("staging", "delete_originals_on_success", "DELETE_ORIGINALS", _as_bool)
     # Matching / force-import
     put("lidarr", "min_match_percent", "MIN_MATCH_PERCENT", int)
+    put("lidarr", "pre_split_monitored_gap_only", "MONITORED_GAP_ONLY", _as_bool)
     put("lidarr", "force_import_on_count_match", "FORCE_IMPORT", _as_bool)
     put("lidarr", "force_import_max_missing_percent", "FORCE_IMPORT_MAX_MISSING", int)
     put("lidarr", "force_import_partial", "FORCE_IMPORT_PARTIAL", _as_bool)
@@ -666,6 +667,9 @@ def main() -> int:
         ),
         pre_check_lidarr_library=bool(
             lidarr_cfg.get("pre_check_library", True)
+        ),
+        pre_split_monitored_gap_only=bool(
+            lidarr_cfg.get("pre_split_monitored_gap_only", True)
         ),
         force_import_on_count_match=bool(
             lidarr_cfg.get("force_import_on_count_match", True)

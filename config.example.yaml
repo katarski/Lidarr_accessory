@@ -56,6 +56,16 @@ lidarr:
   cleanup_lidarr_queue: true
   manual_import_timeout_seconds: 300
   pre_check_library: true
+  # Discography decision logic ("fill monitored gaps only"). For messy grabs
+  # (a whole artist discography: studio + compilations + live + best-of + many
+  # editions), only hand a pre-split folder to Lidarr if it maps to an album
+  # Lidarr MONITORS and is INCOMPLETE. Already-complete albums are skipped as
+  # redundant; folders with no monitored target (comps/live/best-of your
+  # metadata profile excludes) are skipped cleanly instead of being handed to
+  # Lidarr, rejected, and left thrashing on disk. When several editions of the
+  # same album are present, the one whose track count is closest to Lidarr's
+  # release is kept and the rest skipped. Set false to attempt every folder.
+  pre_split_monitored_gap_only: true
   force_import_on_count_match: true
   force_import_max_missing_percent: 10
   # Partial import: when a download matches a Lidarr album but is missing some
