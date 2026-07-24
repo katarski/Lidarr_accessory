@@ -1814,19 +1814,42 @@ class Orchestrator:
         updated list (FLACs replacing the converted originals).
         """
         out: List[Path] = []
+        seen: set = set()
+
+        def _add(p: Path) -> None:
+            rp = p.resolve()
+            if rp not in seen:
+                seen.add(rp)
+                out.append(p)
+
         for a in audios:
             ext = a.suffix.lower()
+            if ext == ".flac":
+                _add(a)
+                continue
             convert = ext in _LOSSLESS_NONFLAC_EXTS
             if convert and ext == ".wav" and self._wav_dts_data_range(a):
                 convert = False  # DTS-in-WAV -> not a plain PCM track
             if not convert and ext in (".m4a", ".mp4", ".m4b"):
                 convert = self._audio_codec(a) == "alac"
             if not convert:
-                out.append(a)
+                _add(a)
                 continue
             flac = a.with_suffix(".flac")
             if flac.exists() and flac.resolve() != a.resolve():
-                out.append(flac)  # a prior run already produced it
+                # A FLAC for this track already exists (prior run, or a manual
+                # convert that left the lossless original behind). The lossless
+                # file is now a DUPLICATE -- delete it so Lidarr doesn't scan
+                # both "X.ape" and "X.flac" and reject the album on the phantom
+                # extra tracks. If it can't be removed, still prefer the FLAC.
+                try:
+                    a.unlink()
+                    logger.info("lossless->flac: removed duplicate %s (FLAC exists)",
+                                a.name)
+                except OSError as exc:
+                    logger.warning("lossless->flac: couldn't remove duplicate %s: %s",
+                                   a.name, exc)
+                _add(flac)
                 continue
             cmd = [
                 self.cfg.ffmpeg_binary, "-hide_banner", "-loglevel", "warning",
@@ -1846,7 +1869,7 @@ class Orchestrator:
                 )
                 if flac.exists():
                     flac.unlink(missing_ok=True)
-                out.append(a)
+                _add(a)
                 continue
             if not ((probe_duration(self.cfg.ffmpeg_binary, flac) or 0) > 0.5):
                 logger.warning(
@@ -1854,14 +1877,14 @@ class Orchestrator:
                     "original.", a.name,
                 )
                 flac.unlink(missing_ok=True)
-                out.append(a)
+                _add(a)
                 continue
             try:
                 a.unlink()   # drop the original lossless file; FLAC replaces it
             except OSError:
                 pass
             logger.info("lossless->flac: %s -> %s", a.name, flac.name)
-            out.append(flac)
+            _add(flac)
         return out
 
     def _handoff_pre_split_to_lidarr(
