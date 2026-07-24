@@ -4,9 +4,11 @@
 FROM python:3.11-slim
 
 # ffmpeg = split/probe;  tzdata = correct local timestamps in logs;
-# libchromaprint-tools = fpcalc (acoustic fingerprinting for AcoustID identify)
+# libchromaprint-tools = fpcalc (acoustic fingerprinting for AcoustID identify);
+# libdca-utils = dtsdec/dcadec, the libdca DTS decoder VLC uses -- needed for
+#   14-bit DTS-CD streams that ffmpeg's built-in dca decoder can't frame.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg tzdata libchromaprint-tools \
+    && apt-get install -y --no-install-recommends ffmpeg tzdata libchromaprint-tools libdca-utils \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
