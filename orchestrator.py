@@ -2226,6 +2226,9 @@ class Orchestrator:
         # Folders that pass every guard, collected first so duplicate editions
         # can be de-duplicated before any handoff (see _drop_duplicate_editions).
         eligible: List[Tuple[Path, List[Path]]] = []
+        # Directories that contain a .cue (top-down): the .cue path owns their
+        # whole subtree, so the sweep won't grab split-staging subfolders in it.
+        cue_dirs: set = set()
         logger.info(
             "cueless sweep: scanning %s (min_stable=%ss)",
             watch_root, min_stable,
@@ -2254,11 +2257,22 @@ class Orchestrator:
             if folder in self._skip_seen or folder_r in self._skip_seen:
                 continue
 
-            # If this folder has any .cue, the normal watcher path owns it.
+            # If this folder has any .cue, the normal watcher path owns it --
+            # remember the whole subtree so we never grab a split-STAGING
+            # subfolder the .cue path creates inside it (that caused a second,
+            # concurrent import that collided with the main one and left the
+            # album stuck: "Lidarr imported 11 files" but moved zero).
             has_cue = any(
                 fn.lower().endswith(".cue") for fn in filenames
             )
             if has_cue:
+                cue_dirs.add(folder)
+                continue
+
+            # Inside a .cue-owned tree (e.g. the main path's split staging)?
+            # Leave it to that path; os.walk is top-down so the ancestor's .cue
+            # was already seen.
+            if any(anc in cue_dirs for anc in folder.parents):
                 continue
 
             # A lone disc-image file (e.g. .wv/.ape/.flac) may carry its
