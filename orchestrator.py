@@ -1241,6 +1241,7 @@ class Orchestrator:
             if not self._wait_for_manual_import(
                 cmd, folder, timeout=self.cfg.manual_import_timeout_seconds,
                 require_cleared=(mode == "exact"),
+                staging_exts=_ALL_AUDIO_EXTS,
             ):
                 return False
         except Exception as exc:  # noqa: BLE001
@@ -1585,6 +1586,7 @@ class Orchestrator:
         if self._wait_for_manual_import(
             mi_cmd, folder,
             timeout=self.cfg.manual_import_timeout_seconds,
+            staging_exts=_ALL_AUDIO_EXTS,
         ):
             remaining = self._sibling_audio_files(folder)
             logger.info(
@@ -3384,10 +3386,29 @@ class Orchestrator:
             time.sleep(3)
         return False
 
-    def _staging_cleared(self, staging_dir: Path) -> bool:
-        """True if no .flac files remain in the staging dir."""
+    def _staging_cleared(
+        self, staging_dir: Path, exts: Optional[frozenset] = None
+    ) -> bool:
+        """
+        True if none of the audio files we handed to Lidarr remain in the dir.
+
+        Default (`exts=None`) checks `*.flac` -- correct for the MAIN split
+        flow, where staging holds our split .flac output and we must ignore
+        any source disc-image (.wv/.ape) sitting beside it in `in_place` mode.
+
+        The pre-split / force-import flows hand Lidarr already-split audio of
+        arbitrary format (.mp3/.m4a/.ape/.wv/...), so they pass the broad
+        `_ALL_AUDIO_EXTS` set: globbing only `*.flac` there would ALWAYS report
+        "cleared" (no .flac present) and defeat the `require_cleared` safety,
+        letting us delete a source whose tracks never actually moved.
+        """
         try:
-            return not any(staging_dir.glob("*.flac"))
+            if exts is None:
+                return not any(staging_dir.glob("*.flac"))
+            for p in staging_dir.iterdir():
+                if p.is_file() and p.suffix.lower() in exts:
+                    return False
+            return True
         except OSError:
             return False
 
@@ -3442,6 +3463,7 @@ class Orchestrator:
     def _wait_for_manual_import(
         self, command_id: int, staging_dir: Path, timeout: int,
         require_cleared: bool = True,
+        staging_exts: Optional[frozenset] = None,
     ) -> bool:
         """
         Wait for Lidarr's ManualImport command to reach a terminal state
@@ -3498,12 +3520,12 @@ class Orchestrator:
                     self._log_command_record("ManualImport", rec)
                     result = (rec.get("result") or "").lower()
                     if status == "completed" and result == "successful":
-                        cleared = self._staging_cleared(staging_dir)
+                        cleared = self._staging_cleared(staging_dir, staging_exts)
                         if not cleared:
                             # Grace window for SMB listing lag before we judge.
                             grace_deadline = time.monotonic() + 30
                             while time.monotonic() < grace_deadline:
-                                if self._staging_cleared(staging_dir):
+                                if self._staging_cleared(staging_dir, staging_exts):
                                     cleared = True
                                     break
                                 time.sleep(3)
@@ -3538,7 +3560,7 @@ class Orchestrator:
             # informational only -- it does NOT short-circuit the wait.
             # We log it once so you can see Lidarr is making progress,
             # but we keep waiting for the terminal signal.
-            if not staging_empty_noted and self._staging_cleared(staging_dir):
+            if not staging_empty_noted and self._staging_cleared(staging_dir, staging_exts):
                 logger.info(
                     "ManualImport cmd=%s: staging folder emptied (Lidarr status=%s) -- "
                     "waiting for command to reach terminal state",
@@ -4297,6 +4319,32 @@ class Orchestrator:
             return None
         if not album:
             return None
+
+        # GUARD against find_album's fuzzy both-direction substring match.
+        # It returns a hit when EITHER title contains the other ("pearl" in
+        # "rare pearls"), so it will happily return a DIFFERENT, complete album
+        # we own for a download we don't. This decision is DESTRUCTIVE -- a
+        # positive deletes the download WITHOUT importing -- so we only accept
+        # it when the download's normalized tokens are a subset of the owned
+        # album's tokens (owned is the same album, or a more-complete edition:
+        # download "Ebbhead" vs owned "Ebbhead (2CD)"). The dangerous direction
+        # -- owned title is a subset of the download ("Pearl" ⊂ "Rare Pearls",
+        # "Hits" ⊂ "Greatest Hits") -- is rejected: re-importing something we
+        # already own is merely wasteful, but deleting something we DON'T own
+        # is data loss.
+        ka = _match_key(album.get("title"))
+        kb = _match_key(album_name)
+        if ka != kb:
+            owned_words = set(ka.split())
+            dl_words = set(kb.split())
+            if not (dl_words and owned_words and dl_words <= owned_words):
+                logger.info(
+                    "Pre-flight: find_album returned %r for download %r but the "
+                    "titles are not a safe match -- NOT treating as owned "
+                    "(letting normal import decide).",
+                    album.get("title"), album_name,
+                )
+                return None
 
         album_id = album.get("id")
         # --- Source 1: per-album stats via the detail endpoint.

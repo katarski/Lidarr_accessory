@@ -350,15 +350,37 @@ def torrent_lifecycle_pass(
         folder = _map_to_download_root(
             t.get("content_path"), t.get("save_path"), download_root
         )
-        on_disk = _count_audio_on_disk(folder) if os.path.exists(folder) else 0
+        folder_exists = os.path.exists(folder)
+        on_disk = _count_audio_on_disk(folder) if folder_exists else 0
         state = (t.get("state") or "").lower()
         name = t.get("name") or "?"
 
-        if on_disk == 0:
-            # Everything moved to the library -> remove torrent + leftover data.
+        if folder_exists and on_disk == 0:
+            # We can SEE this torrent's folder and its audio is gone -> the
+            # pipeline moved every track into the library. Safe to remove the
+            # torrent plus any leftover data (extras / the now-empty folder),
+            # because we deleted files at a path we actually verified.
             if qbt.remove(h, delete_files=True):
                 removed += 1
                 emit(f"lifecycle: REMOVED (fully imported) {name!r}")
+        elif not folder_exists:
+            # The torrent's content can't be located under download_root.
+            # Either (a) it was imported and the source folder was already
+            # deleted, or (b) this torrent is stored on a DIFFERENT save
+            # path/share the pipeline never sees. We must not guess "imported"
+            # and delete_files here: qBittorrent deletes at the torrent's REAL
+            # content_path regardless of our mapped view, so in case (b) that
+            # would erase UN-IMPORTED data. In case (a) the files are already
+            # gone, so dropping just the dead torrent entry (delete_files=False)
+            # is correct and loses nothing. Either way, never delete data we
+            # could not confirm.
+            if qbt.remove(h, delete_files=False):
+                removed += 1
+                emit(
+                    f"lifecycle: removed torrent entry only (content not visible "
+                    f"under {download_root} -- imported+cleaned, or stored "
+                    f"elsewhere; data left untouched) {name!r}"
+                )
         elif on_disk < sel_audio:
             # Partially moved -> pause so it stops seeding while the pipeline
             # finishes importing the rest (paused torrents keep their files,

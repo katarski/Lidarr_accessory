@@ -89,6 +89,22 @@ lidarr:
   queue_reaper_remove_from_client: true
   queue_reaper_blocklist: false
   # queue_reaper_state_file: /config/queue_reaper.json   # default: next to ledger
+  # Purge-imported sweep: the CONTINUOUS form of pre_check_library. On a
+  # schedule, delete any download folder whose album Lidarr ALREADY has fully.
+  # The process-time pre-check only fires when the pipeline (re)processes a
+  # folder, so a re-download skipped via the in-memory _skip_seen set is never
+  # re-examined until a restart -- redundant copies pile up. This sweep closes
+  # that gap. Safe by design: only the fully-in-library category is removed;
+  # partial / unmatched / video / disc-subfolders are never touched, a
+  # LARGER edition is never deleted against a smaller complete album, and any
+  # folder written to within min_stable_seconds (an in-flight download/import)
+  # is skipped. Uses the same exact (non-fuzzy) title match as the pipeline.
+  purge_imported_enabled: false
+  purge_imported_interval_seconds: 1800
+  # DRY RUN by default -- it only LOGS what it would delete. Watch a few passes,
+  # then set this false to actually reclaim the space.
+  purge_imported_dry_run: true
+  purge_imported_min_stable_seconds: 300
 ollama:
   base_url: https://generativelanguage.googleapis.com/v1beta/openai
   model: gemini-2.0-flash

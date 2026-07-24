@@ -97,6 +97,12 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     put("lidarr", "queue_reaper_grace_minutes", "QUEUE_REAPER_GRACE", int)
     put("lidarr", "queue_reaper_remove_from_client", "QUEUE_REAPER_REMOVE_FROM_CLIENT", _as_bool)
     put("lidarr", "queue_reaper_blocklist", "QUEUE_REAPER_BLOCKLIST", _as_bool)
+    # Purge-imported sweep -- continuously delete download folders whose album
+    # Lidarr already has fully (catches re-downloads the pipeline skipped).
+    put("lidarr", "purge_imported_enabled", "PURGE_IMPORTED_ENABLED", _as_bool)
+    put("lidarr", "purge_imported_interval_seconds", "PURGE_IMPORTED_INTERVAL", int)
+    put("lidarr", "purge_imported_dry_run", "PURGE_IMPORTED_DRY_RUN", _as_bool)
+    put("lidarr", "purge_imported_min_stable_seconds", "PURGE_IMPORTED_MIN_STABLE", int)
     # qBittorrent selective-download
     put("qbittorrent", "base_url", "QBIT_URL")
     put("qbittorrent", "username", "QBIT_USER")
@@ -418,6 +424,60 @@ def qbt_auto_deselect_loop(
                     )
         except Exception as exc:  # noqa: BLE001
             logger.exception("qbt loop thread: %s", exc)
+
+
+def purge_imported_loop(
+    lidarr, watch_root: str, excluded: list, stop: threading.Event,
+    interval: int, delete: bool, min_stable: int, llm=None,
+) -> None:
+    """
+    Periodically delete download folders whose album Lidarr ALREADY has fully.
+
+    This is the CONTINUOUS form of the process-time `pre_check_library`: the
+    pipeline only re-checks a folder when it (re)processes it, so a re-download
+    that lands in the in-memory `_skip_seen` set is never re-examined until a
+    restart, and redundant copies accumulate on disk. This sweep closes that
+    gap. It is safe by construction (see purge_imported_downloads): only the
+    fully-in-library category is removed, disc subfolders / partial /
+    unmatched / video are never touched, and in-flight folders are skipped.
+
+    With delete=False it runs as a DRY RUN -- it only logs what it would
+    remove, so you can watch a few passes before arming it.
+    """
+    from dedup_downloads import purge_imported_downloads, human
+
+    cadence = max(300, interval)
+    excluded_res: list = []
+    for e in excluded:
+        try:
+            excluded_res.append(Path(e).resolve(strict=False))
+        except OSError:
+            pass
+    # AI is intentionally NOT used here: this sweep DELETES, so it stays on the
+    # deterministic (exact + word-subset, track-count-guarded) match only.
+    delay = min(cadence, 120)  # first sweep shortly after startup
+    while not stop.wait(delay):
+        delay = cadence
+        try:
+            deleted, freed, dupes = purge_imported_downloads(
+                lidarr, watch_root, excluded_res,
+                delete=delete, llm=None, min_stable_seconds=min_stable,
+                emit=logger.info,
+            )
+            if dupes:
+                if delete:
+                    logger.info(
+                        "purge sweep: %d album(s) already fully in library -- "
+                        "deleted %d, freed %s", len(dupes), deleted, human(freed),
+                    )
+                else:
+                    logger.info(
+                        "purge sweep (DRY RUN): %d album(s) already fully in "
+                        "library would be deleted -- set purge_imported_dry_run "
+                        "= false to arm.", len(dupes),
+                    )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("purge sweep thread: %s", exc)
 
 
 # --- Startup scan -------------------------------------------------------
@@ -857,6 +917,31 @@ def main() -> int:
                 _as_bool(qbt_cfg.get("pause_during_scan", True)),
                 qbt_cfg["base_url"], qbt_cfg.get("category", ""),
             )
+
+    # --- Purge-imported sweep (opt-in) ---------------------------------
+    # Continuously delete download folders whose album Lidarr already has
+    # fully -- the background counterpart to the process-time pre_check that
+    # also reclaims re-downloads the pipeline skipped via _skip_seen.
+    purge_thread = None
+    lidarr_cfg = cfg.get("lidarr") or {}
+    if _as_bool(lidarr_cfg.get("purge_imported_enabled", False)):
+        purge_interval = int(lidarr_cfg.get("purge_imported_interval_seconds", 1800) or 1800)
+        purge_dry_run = _as_bool(lidarr_cfg.get("purge_imported_dry_run", True))
+        purge_min_stable = int(lidarr_cfg.get("purge_imported_min_stable_seconds", 300) or 300)
+        purge_thread = threading.Thread(
+            target=purge_imported_loop,
+            args=(lidarr, str(watch_root), excluded_dirs, stop,
+                  purge_interval, not purge_dry_run, purge_min_stable),
+            daemon=True,
+            name="cue-purge-imported",
+        )
+        purge_thread.start()
+        logger.info(
+            "Purge-imported sweep: enabled (every %ds, %s, min_stable=%ds)",
+            max(300, purge_interval),
+            "DRY RUN" if purge_dry_run else "DELETING",
+            purge_min_stable,
+        )
 
     # --- Queue reaper (opt-in, legacy) ---------------------------------
     # Time-based clearing of stuck Lidarr queue rows. SUPERSEDED by the qBit

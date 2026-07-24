@@ -22,6 +22,7 @@ import os
 import re
 import shutil
 import sys
+import time
 from pathlib import Path
 
 import yaml
@@ -236,6 +237,165 @@ def human(n: int) -> str:
             return f"{x:.1f} {unit}"
         x /= 1024
     return f"{x:.1f} PB"
+
+
+def _newest_mtime(folder: Path) -> float:
+    """Most recent mtime of any file under `folder` (0.0 if empty/unreadable)."""
+    newest = 0.0
+    for dp, _dn, fn in os.walk(folder):
+        for f in fn:
+            try:
+                m = (Path(dp) / f).stat().st_mtime
+                if m > newest:
+                    newest = m
+            except OSError:
+                pass
+    return newest
+
+
+def robust_rmtree(folder: Path, emit=print, attempts: int = 5) -> bool:
+    """
+    Delete a folder tree, tolerating the transient ENOTEMPTY that Unraid's
+    shfs/FUSE throws when a just-unlinked child hasn't settled yet. Between
+    attempts it does a manual bottom-up unlink and lets the share catch up.
+    Returns True once the folder is gone.
+    """
+    for i in range(attempts):
+        try:
+            shutil.rmtree(folder)
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError as exc:
+            if i == attempts - 1:
+                emit(f"purge: failed to delete {folder}: {exc}")
+                return not folder.exists()
+            try:
+                for dp, _dn, fn in os.walk(folder, topdown=False):
+                    for f in fn:
+                        try:
+                            (Path(dp) / f).unlink()
+                        except OSError:
+                            pass
+                    try:
+                        os.rmdir(dp)
+                    except OSError:
+                        pass
+            except OSError:
+                pass
+            time.sleep(1.5)
+    return not folder.exists()
+
+
+def purge_imported_downloads(
+    lidarr, watch_root, excluded_res=None, *, delete: bool = False,
+    llm=None, min_stable_seconds: int = 300, emit=print, _now=None,
+):
+    """
+    Scan `watch_root` for album download folders whose album Lidarr ALREADY
+    has fully, and (when delete=True) remove them. This is the CONTINUOUS form
+    of the pipeline's process-time `pre_check_library`: it also catches
+    re-downloads the pipeline skipped via its in-memory `_skip_seen` set, which
+    otherwise pile up on disk until a restart.
+
+    SAFE BY DESIGN -- only the "fully in library" category is ever deleted:
+      * partial (library has SOME tracks) is never touched;
+      * unmatched (Lidarr knows nothing) is never touched;
+      * any folder with VIDEO under it (album + bonus DVD, TV, movies) is left;
+      * a disc subfolder (CD1 / Disc 2 / ...) is skipped, so a partially-
+        imported multi-disc set or discography container is never gutted --
+        each fully-imported album subfolder is removed on its own, incomplete
+        siblings stay;
+      * `total >= len(audios)` guards against deleting a LARGER edition than
+        the complete album Lidarr has;
+      * a folder whose newest file changed within `min_stable_seconds` is
+        skipped, so an in-flight download/import is never yanked mid-write.
+
+    Matching reuses `album_complete_in_library` (exact normalized title, NOT
+    Lidarr's fuzzy substring find_album). Returns (deleted, freed_bytes, dupes)
+    where `dupes` is the list of (folder, size, have, total) found regardless
+    of `delete`, so a dry run can report exactly what it WOULD remove.
+    """
+    watch_root = Path(watch_root)
+    excluded_res = list(excluded_res or [])
+    now = _now if _now is not None else time.time()
+    cache: dict = {}
+
+    def is_excluded(p: Path) -> bool:
+        try:
+            pr = p.resolve(strict=False)
+        except OSError:
+            pr = p
+        for e in excluded_res:
+            if pr == e or e in pr.parents:
+                return True
+        return "_processed" in p.parts
+
+    candidates: list = []
+    video_dirs: list = []
+    for dp, dn, fn in os.walk(watch_root):
+        folder = Path(dp)
+        if is_excluded(folder):
+            dn[:] = []
+            continue
+        exts = {Path(f).suffix.lower() for f in fn}
+        if exts & VIDEO_EXTS or folder.name.upper() == "VIDEO_TS":
+            video_dirs.append(folder)
+        if exts & AUDIO_EXTS:
+            candidates.append(folder)
+
+    def has_video_under(folder: Path) -> bool:
+        return any(vd == folder or folder in vd.parents for vd in video_dirs)
+
+    dupes: list = []
+    for folder in candidates:
+        try:
+            audios = [p for p in folder.iterdir()
+                      if p.is_file() and p.suffix.lower() in AUDIO_EXTS]
+        except OSError:
+            continue
+        if not audios:
+            continue
+        if has_video_under(folder):
+            continue
+        # A disc subfolder holds only PART of an album -> never auto-delete;
+        # this is what keeps a partially-imported multi-disc/discography set
+        # intact.
+        if is_disc_folder(folder.name):
+            continue
+        # In-flight guard: skip anything written to recently.
+        if min_stable_seconds > 0:
+            try:
+                if now - _newest_mtime(folder) < min_stable_seconds:
+                    continue
+            except OSError:
+                continue
+        artist = album = ""
+        for a in audios:
+            artist, album = read_tags(a)
+            if artist and album:
+                break
+        complete, have, total = album_complete_in_library(
+            lidarr, artist, album, _cache=cache, llm=llm
+        )
+        if complete and total >= len(audios):
+            dupes.append((folder, dir_size(folder), have, total))
+
+    # Delete each parent once -- drop any dupe nested under another dupe.
+    dupe_paths = {f for f, *_ in dupes}
+    dupes = [(f, s, h, t) for (f, s, h, t) in dupes
+             if not any(anc in dupe_paths for anc in f.parents)]
+
+    deleted = freed = 0
+    for folder, size, have, total in dupes:
+        emit(
+            f"purge: {folder} already fully in library ({have}/{total}) -- "
+            f"{'deleting' if delete else 'would delete'} ({human(size)})"
+        )
+        if delete and robust_rmtree(folder, emit=emit):
+            deleted += 1
+            freed += size
+    return deleted, freed, dupes
 
 
 def main() -> int:
