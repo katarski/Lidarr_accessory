@@ -73,6 +73,12 @@ lidarr:
   # 'Artist - Album' separator), then imports the FLACs normally. Needs ffmpeg
   # (already in the image). Set false to ignore .dts folders.
   transcode_dts_cd: true
+  # Uniform-FLAC library: re-encode pre-split lossless-but-not-FLAC tracks
+  # (.ape/.wv/.wav/.aiff/.tak/.tta/.shn and ALAC-in-.m4a) to FLAC before import,
+  # preserving tags, bit depth and sample rate (a lossless transcode). FLAC is
+  # left as-is; LOSSY files (mp3/aac/ogg/opus/wma) are never touched, and DSD is
+  # left alone. Set false to import lossless files in their original format.
+  transcode_lossless_to_flac: true
   force_import_on_count_match: true
   force_import_max_missing_percent: 10
   # Partial import: when a download matches a Lidarr album but is missing some

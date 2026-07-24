@@ -195,6 +195,14 @@ _ALL_AUDIO_EXTS = frozenset({
     ".shn",
 })
 
+# Lossless containers we re-encode to FLAC before import (NOT .flac itself, and
+# NOT lossy formats). .m4a is ambiguous (ALAC vs AAC) so it's probed separately.
+# DSD (.dsf/.dff) is deliberately excluded -- DSD->PCM is a real conversion, not
+# a lossless re-wrap, so we leave it alone.
+_LOSSLESS_NONFLAC_EXTS = frozenset({
+    ".ape", ".wv", ".wav", ".aiff", ".aif", ".tak", ".tta", ".shn", ".alac",
+})
+
 
 def _is_pre_split_reason(reason: str) -> bool:
     if not reason:
@@ -256,6 +264,12 @@ class OrchestratorConfig:
     # the filename; artist/album from the folder name, LLM-assisted when there's
     # no 'Artist - Album' separator), and hands the FLACs to the normal import.
     transcode_dts_cd: bool = True
+    # Pre-split lossless-but-not-FLAC tracks (.ape/.wv/.wav/.aiff/.tak/.tta/.shn
+    # and ALAC-in-.m4a) are re-encoded to FLAC (lossless; tags + bit depth +
+    # sample rate preserved) before hand-off to Lidarr, so the library ends up
+    # uniformly FLAC. FLAC is left as-is; LOSSY files (mp3/aac/ogg/opus/wma) are
+    # never touched (re-encoding lossy gains nothing).
+    transcode_lossless_to_flac: bool = True
     # When Lidarr rejects a pre-split folder ONLY on title-mismatch grounds
     # ("unmatched tracks" / "missing tracks" / "not close enough") but the
     # on-disk file count EXACTLY equals a Lidarr release's track count, force
@@ -1755,6 +1769,83 @@ class Orchestrator:
                 )
         return to_skip
 
+    def _audio_codec(self, path: Path) -> str:
+        """Return the a:0 codec name (lowercase) via ffprobe, or '' on failure."""
+        ffprobe = str(Path(self.cfg.ffmpeg_binary).with_name("ffprobe"))
+        if not shutil.which(ffprobe) and self.cfg.ffmpeg_binary != "ffmpeg":
+            ffprobe = "ffprobe"
+        try:
+            r = subprocess.run(
+                [ffprobe, "-v", "error", "-select_streams", "a:0",
+                 "-show_entries", "stream=codec_name",
+                 "-of", "default=nk=1:nw=1", str(path)],
+                capture_output=True, text=True, timeout=30,
+            )
+            return (r.stdout or "").strip().lower()
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _convert_lossless_to_flac(self, audios: List[Path]) -> List[Path]:
+        """
+        Re-encode pre-split LOSSLESS-but-not-FLAC tracks to FLAC before import,
+        preserving tags + bit depth + sample rate (a lossless transcode). FLAC
+        is kept as-is; LOSSY files (mp3/aac/ogg/opus/wma) are left untouched.
+        .m4a is probed (ALAC -> convert, AAC -> keep); a DTS-in-WAV .wav is left
+        alone (that's the disc-image decode path, not a plain PCM track).
+        Best-effort per file -- any failure keeps the original. Returns the
+        updated list (FLACs replacing the converted originals).
+        """
+        out: List[Path] = []
+        for a in audios:
+            ext = a.suffix.lower()
+            convert = ext in _LOSSLESS_NONFLAC_EXTS
+            if convert and ext == ".wav" and self._wav_dts_data_range(a):
+                convert = False  # DTS-in-WAV -> not a plain PCM track
+            if not convert and ext in (".m4a", ".mp4", ".m4b"):
+                convert = self._audio_codec(a) == "alac"
+            if not convert:
+                out.append(a)
+                continue
+            flac = a.with_suffix(".flac")
+            if flac.exists() and flac.resolve() != a.resolve():
+                out.append(flac)  # a prior run already produced it
+                continue
+            cmd = [
+                self.cfg.ffmpeg_binary, "-hide_banner", "-loglevel", "warning",
+                "-y", "-i", str(a),
+                "-map", "0:a:0", "-c:a", "flac",
+                "-compression_level", str(self.cfg.flac_compression_level),
+                "-map_metadata", "0",   # keep the source's artist/album/title tags
+                "-vn",
+                str(flac),
+            ]
+            try:
+                subprocess.run(cmd, check=True, capture_output=True, text=True)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "lossless->flac: could not convert %s (%s) -- keeping original.",
+                    a.name, exc,
+                )
+                if flac.exists():
+                    flac.unlink(missing_ok=True)
+                out.append(a)
+                continue
+            if not ((probe_duration(self.cfg.ffmpeg_binary, flac) or 0) > 0.5):
+                logger.warning(
+                    "lossless->flac: %s produced an unreadable FLAC -- keeping "
+                    "original.", a.name,
+                )
+                flac.unlink(missing_ok=True)
+                out.append(a)
+                continue
+            try:
+                a.unlink()   # drop the original lossless file; FLAC replaces it
+            except OSError:
+                pass
+            logger.info("lossless->flac: %s -> %s", a.name, flac.name)
+            out.append(flac)
+        return out
+
     def _handoff_pre_split_to_lidarr(
         self,
         cue_path: Optional[Path],
@@ -1813,6 +1904,10 @@ class Orchestrator:
                 reason=f"no audio files in folder ({reason})",
             )
             return
+        # Uniform-FLAC library: re-encode lossless non-FLAC tracks (.ape/.wv/...)
+        # to FLAC before import. No-op for FLAC and lossy files.
+        if self.cfg.transcode_lossless_to_flac:
+            audios = self._convert_lossless_to_flac(audios)
         artist_name, album_name = "", ""
         for a in audios:
             artist_name, album_name = self._read_audio_tags(a)
