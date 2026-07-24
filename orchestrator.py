@@ -756,8 +756,24 @@ class Orchestrator:
         # Track any artistId we learn during import so the post-success
         # RefreshArtist can target it directly without a second lookup.
         imported_artist_id: Optional[int] = None
-        command_id = self.lidarr.downloaded_albums_scan(
-            staging_dir, download_client_id=download_client_id
+        # DTS-CD decode? Its 5.1 FLACs must NOT go through DownloadedAlbumsScan.
+        # Lidarr's download-tied folder scan fails on them ("Failed to import"),
+        # copying each file into the library then rolling it back out, and that
+        # leaves the follow-up import unable to land them. Skip straight to the
+        # explicit ManualImport path (Strategy 2) -- the exact path that cleanly
+        # imported the 6-channel Enigma DTS-CD. Applies to every DTS-CD, so no
+        # manual handling at scale.
+        skip_scan = _dts_decoded is not None
+        if skip_scan:
+            logger.info(
+                "DTS-CD: skipping DownloadedAlbumsScan (it rejects 5.1 folders); "
+                "importing via ManualImport directly."
+            )
+        command_id = (
+            None if skip_scan
+            else self.lidarr.downloaded_albums_scan(
+                staging_dir, download_client_id=download_client_id
+            )
         )
         if command_id is not None:
             record = self.lidarr.wait_for_command(
