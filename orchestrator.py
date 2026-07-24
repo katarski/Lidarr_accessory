@@ -1693,6 +1693,24 @@ class Orchestrator:
             if _match_key(a.get("title")) == target:
                 match = a
                 break
+        # Edition match: the download is a Deluxe/Japan/Expanded/Remaster edition
+        # whose tag carries extra words Lidarr's plain album title lacks -- e.g.
+        # "Kiss Me Once (Japan Deluxe Edition)" vs monitored "Kiss Me Once". Match
+        # when the Lidarr title's normalized tokens are all contained in the
+        # download's; most-specific (most tokens) wins so a short generic title
+        # can't steal it. This is the import direction (download ⊇ monitored),
+        # so it can only pull MORE tracks into a monitored album, never delete.
+        if match is None:
+            target_words = set(target.split())
+            if target_words:
+                best = None
+                for a in albums:
+                    aw = set(_match_key(a.get("title")).split())
+                    if aw and aw <= target_words:
+                        if best is None or len(aw) > best[0]:
+                            best = (len(aw), a)
+                if best is not None:
+                    match = best[1]
         if match is None:
             return ("skip", 0, 0)
         if not match.get("monitored", True):
