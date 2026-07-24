@@ -737,6 +737,50 @@ class Orchestrator:
         artist_name = (plans[0].albumartist if plans else cue.performer) or ""
         album_name = (plans[0].album if plans else cue.title) or ""
 
+        # --- DTS-CD: import EXACTLY like the working Enigma case --------
+        # Lidarr's import mishandles the decoded 5.1 FLACs when they sit in a
+        # split-staging SUBfolder nested inside the tracked qBit download: it
+        # copies each file into the library then rolls it back out, leaving the
+        # album at 0/N ("Manually imported N files" but nothing lands). Enigma
+        # imported cleanly only because its FLACs were a FLAT folder at the
+        # download root with no source disc-image beside them. So mirror that:
+        # move the 5.1 tracks into a CLEAN top-level folder (not nested, no
+        # source .wav, no download-client tie), drop the source, and hand off
+        # via the same pre-split ManualImport path that landed Enigma.
+        if _dts_decoded is not None:
+            try:
+                base = cue_path.parent.parent
+                if not base or not base.exists():
+                    base = cue_path.parent
+                label = _FS_INVALID.sub("_", f"{artist_name} - {album_name}").strip(" ._-") or "dts_album"
+                clean = base / label
+                if clean.resolve() == cue_path.parent.resolve():
+                    clean = base / f"{label} (5.1)"
+                clean.mkdir(parents=True, exist_ok=True)
+                moved = 0
+                for sp in splits:
+                    try:
+                        shutil.move(str(sp.output_path), str(clean / sp.output_path.name))
+                        moved += 1
+                    except OSError as exc:
+                        logger.warning("DTS-CD: could not move %s: %s",
+                                       sp.output_path.name, exc)
+                logger.info(
+                    "DTS-CD: relocated %d/%d 5.1 FLAC(s) to clean folder %s "
+                    "(Enigma-style flat import).", moved, len(splits), clean,
+                )
+                # The source download (.wav disc image + .cue + empty staging)
+                # is no longer needed -- the tracks are safe in `clean`.
+                self._delete_source_folder(cue_path)
+                # Import via the proven pre-split ManualImport handoff.
+                self._handoff_pre_split_to_lidarr(None, clean, reason="dts-cd 5.1")
+                return clean
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "DTS-CD clean-folder import failed (%s); falling through to "
+                    "normal strategies.", exc,
+                )
+
         # --- Find the matching queue entry (if any) --------------------
         # Unpackerr-style correlation: when we tell Lidarr to scan, pass
         # the downloadClientId of the stuck queue row so Lidarr ties the
