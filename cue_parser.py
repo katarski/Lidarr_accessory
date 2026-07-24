@@ -275,6 +275,30 @@ def _promote_album_fields(cue: Cue) -> None:
             cue.performer = max(set(performers), key=performers.count)
 
 
+def _fallback_identity_from_folder(cue: Cue, cue_path: Path) -> None:
+    """
+    Many disc-image CUEs -- DTS-CD rips especially -- carry per-track TITLEs
+    but NO album-level TITLE or PERFORMER. That's a perfectly splittable cue,
+    but is_valid() needs a title. Derive the missing album/artist from the
+    containing folder name ('[DTSCD][UP] Elton John - The Big Picture' ->
+    artist 'Elton John', album 'The Big Picture'), stripping [tag]/(year)
+    noise. Only fills fields the CUE left empty.
+    """
+    if cue.title and cue.performer:
+        return
+    name = re.sub(r"[(\[\{][^)\]\}]*[)\]\}]", " ", cue_path.parent.name or "")
+    name = re.sub(r"\s{2,}", " ", name).strip(" -_.")
+    if not name:
+        return
+    artist, album = "", name
+    if " - " in name:
+        artist, album = (p.strip(" -_.") for p in name.split(" - ", 1))
+    if not cue.title and album:
+        cue.title = album
+    if not cue.performer and artist:
+        cue.performer = artist
+
+
 # --- Public entrypoint --------------------------------------------------
 
 
@@ -297,6 +321,7 @@ def parse_cue(
     cue = parse_cue_text(text)
     _fill_end_times(cue, audio_duration_seconds)
     _promote_album_fields(cue)
+    _fallback_identity_from_folder(cue, cue_path)
 
     if cue.is_valid():
         logger.info(
@@ -318,6 +343,7 @@ def parse_cue(
     cue = parse_cue_text(repaired_text)
     _fill_end_times(cue, audio_duration_seconds)
     _promote_album_fields(cue)
+    _fallback_identity_from_folder(cue, cue_path)
 
     if not cue.is_valid():
         raise ValueError(f"Even after Ollama repair, CUE {cue_path} is invalid")
