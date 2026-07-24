@@ -129,6 +129,25 @@ class AcoustIDClient:
                     time.sleep(backoff)
                     backoff = min(backoff * 2, 30)
                     continue
+                if 400 <= resp.status_code < 500:
+                    # Client error (bad/expired API key, invalid fingerprint or
+                    # meta). Retrying can't fix it, so surface AcoustID's own
+                    # message and give up. The #1 cause is an expired/invalid
+                    # application key -- the SHARED TEST KEY dies after a few
+                    # days; register your own free key at
+                    # https://acoustid.org/new-application.
+                    try:
+                        msg = (resp.json().get("error") or {}).get("message", "")
+                    except Exception:  # noqa: BLE001
+                        msg = (resp.text or "")[:200]
+                    logger.warning(
+                        "AcoustID HTTP %s: %s -- not retrying. Check ACOUSTID_KEY "
+                        "(the shared test key expires quickly; get your own free "
+                        "key at https://acoustid.org/new-application), or set "
+                        "ACOUSTID_ENABLED=false to disable fingerprinting.",
+                        resp.status_code, msg or "bad request",
+                    )
+                    return None
                 resp.raise_for_status()
                 data = resp.json()
                 if data.get("status") != "ok":
