@@ -1574,6 +1574,26 @@ class Orchestrator:
                 pass
         return None
 
+    def _track_title_from_name(self, stem: str, artist: str = "") -> Tuple[str, str]:
+        """
+        Parse (track_no, title) from a per-track filename stem such as
+        '07_M.C. Sar & The Real McCoy - Pump Up the Jam (Original Rap) DTS' ->
+        ('7', 'Pump Up the Jam (Original Rap)'). Strips a leading track number,
+        a leading 'Artist - ' credit (matching the folder artist), and a trailing
+        'DTS' marker.
+        """
+        m = re.match(r"\s*(\d+)\s*[-._ ]+\s*(.*)$", stem)
+        if m:
+            tno = m.group(1).lstrip("0") or m.group(1)
+            rest = m.group(2)
+        else:
+            tno, rest = "", stem
+        if artist:
+            rest = re.sub(rf"(?i)^\s*{re.escape(artist.strip())}\b\s*[-_]?\s*",
+                          "", rest, count=1)
+        rest = re.sub(r"(?i)[\s\-_.]*dts\s*$", "", rest)
+        return tno, (rest.strip(" -_.") or stem)
+
     def _transcode_dts_folder(self, folder: Path) -> List[Path]:
         """
         Transcode a DTS-CD folder's raw .dts surround streams into
@@ -1591,27 +1611,68 @@ class Orchestrator:
             logger.warning("DTS-CD: tagger unavailable (%s) -- skipping.", exc)
             return []
         try:
-            dts = sorted(
-                p for p in folder.iterdir()
-                if p.is_file() and p.suffix.lower() == ".dts"
-            )
+            # DTS sources: raw .dts elementary streams AND per-track DTS-in-WAV
+            # rips ("... DTS.wav"). Both decode via libdca; a .wav needs its raw
+            # data chunk extracted first (ffmpeg reads DTS-in-WAV as silence).
+            sources: List[Tuple[Path, Optional[tuple]]] = []
+            for p in sorted(folder.iterdir()):
+                if not p.is_file():
+                    continue
+                ext = p.suffix.lower()
+                if ext == ".dts":
+                    sources.append((p, None))
+                elif ext == ".wav":
+                    rng = self._wav_dts_data_range(p)
+                    if rng:
+                        sources.append((p, rng))
         except OSError:
             return []
-        if not dts:
+        if not sources:
             return []
         artist, album = self._dts_identity(folder)
-        total = str(len(dts))
+        total = str(len(sources))
         made: List[Path] = []
-        for p in dts:
+        for p, rng in sources:
             out = p.with_suffix(".flac")
-            if out.exists():
+            if out.exists() and out.resolve() != p.resolve():
                 made.append(out)
+                try:
+                    p.unlink()   # source already transcoded on a prior pass
+                except OSError:
+                    pass
                 continue
-            # libdca decode (.dts -> 5.1 wav), then ffmpeg lossless wav -> flac.
+            # Feed libdca a raw DTS elementary stream. For .dts that's the file;
+            # for DTS-in-WAV, extract the data chunk to a temp .dts first.
+            es = p
+            es_tmp: Optional[Path] = None
+            if rng is not None:
+                offset, size = rng
+                es_tmp = p.with_suffix(".dtses.tmp")
+                try:
+                    with open(p, "rb") as src, open(es_tmp, "wb") as dst:
+                        src.seek(offset)
+                        remaining = size
+                        while remaining > 0:
+                            block = src.read(min(4_000_000, remaining))
+                            if not block:
+                                break
+                            dst.write(block)
+                            remaining -= len(block)
+                    es = es_tmp
+                except OSError as exc:
+                    logger.warning("DTS: could not extract stream from %s: %s",
+                                   p.name, exc)
+                    if es_tmp.exists():
+                        es_tmp.unlink(missing_ok=True)
+                    continue
             tmpwav = p.with_suffix(".dec.wav")
-            if not self._dcadec_to_wav(p, tmpwav):
-                logger.warning("DTS-CD: dcadec couldn't decode %s -- skipping.",
-                               p.name)
+            ok = self._dcadec_to_wav(es, tmpwav)
+            if es_tmp is not None and es_tmp.exists():
+                es_tmp.unlink(missing_ok=True)
+            if not ok:
+                logger.warning("DTS: dcadec couldn't decode %s -- skipping.", p.name)
+                if tmpwav.exists():
+                    tmpwav.unlink(missing_ok=True)
                 continue
             cmd = [
                 self.cfg.ffmpeg_binary, "-hide_banner", "-loglevel", "warning",
@@ -1624,7 +1685,7 @@ class Orchestrator:
             try:
                 subprocess.run(cmd, check=True, capture_output=True, text=True)
             except Exception as exc:  # noqa: BLE001
-                logger.warning("DTS-CD: flac encode failed on %s: %s", p.name, exc)
+                logger.warning("DTS: flac encode failed on %s: %s", p.name, exc)
                 if out.exists():
                     out.unlink(missing_ok=True)
                 continue
@@ -1632,20 +1693,23 @@ class Orchestrator:
                 if tmpwav.exists():
                     tmpwav.unlink(missing_ok=True)
             if not ((probe_duration(self.cfg.ffmpeg_binary, out) or 0) > 1.0):
-                logger.warning("DTS-CD: %s transcoded but is unreadable.", p.name)
+                logger.warning("DTS: %s transcoded but is unreadable.", p.name)
                 out.unlink(missing_ok=True)
                 continue
-            m = re.match(r"\s*(\d+)\s*[-.]?\s*(.*)", p.stem)
-            tno = (m.group(1).lstrip("0") or m.group(1)) if m else ""
-            title = (m.group(2).strip(" -_.") if m and m.group(2) else p.stem)
+            tno, title = self._track_title_from_name(p.stem, artist)
             try:
                 _apply(out, TagPlan(
                     tracknumber=tno, tracktotal=total, title=title,
                     artist=artist, albumartist=artist, album=album,
-                    date="", genre="", comment="DTS-CD 5.1 (transcoded)", isrc="",
+                    date="", genre="", comment="DTS 5.1 (transcoded)", isrc="",
                 ))
             except Exception as exc:  # noqa: BLE001
-                logger.warning("DTS-CD: tag write failed for %s: %s", out.name, exc)
+                logger.warning("DTS: tag write failed for %s: %s", out.name, exc)
+            if p.suffix.lower() != ".flac":
+                try:
+                    p.unlink()   # drop the DTS source; the FLAC replaces it
+                except OSError:
+                    pass
             made.append(out)
         if made:
             logger.info(
@@ -2489,18 +2553,25 @@ class Orchestrator:
                 self._skip_seen.add(folder)
                 continue
 
-            # DTS-CD: a folder of raw .dts surround streams (no recognized
-            # audio yet). Transcode them to channel-preserving FLAC in place;
-            # once written (and stable), the normal pre-split path below picks
-            # up the FLACs and imports them. Idempotent, so re-running is cheap.
-            if (
-                self.cfg.transcode_dts_cd
-                and not audio_here
-                and any(fn.lower().endswith(".dts") for fn in filenames)
-            ):
-                self._transcode_dts_folder(folder)
-                # Fall through: the just-written FLACs are usually caught by the
-                # stability guard and imported on the next sweep.
+            # DTS content: raw .dts surround streams OR per-track DTS-in-WAV
+            # rips ("... DTS.wav"). Transcode each to channel-preserving FLAC in
+            # place (libdca); once written (and stable), the normal pre-split
+            # path below picks up the FLACs and imports them. Idempotent, so
+            # re-running is cheap. DTS-in-WAV must be caught here -- ffmpeg would
+            # read it as silence, and the plain lossless->flac converter skips it.
+            if self.cfg.transcode_dts_cd:
+                has_raw_dts = any(
+                    fn.lower().endswith(".dts") for fn in filenames
+                )
+                has_dts_wav = any(
+                    fn.lower().endswith(".wav")
+                    and self._wav_dts_data_range(folder / fn)
+                    for fn in filenames
+                )
+                if has_raw_dts or has_dts_wav:
+                    self._transcode_dts_folder(folder)
+                    # Fall through: the just-written FLACs are usually caught by
+                    # the stability guard and imported on the next sweep.
 
             # Needs to look pre-split.
             if not self._looks_pre_split(folder):
