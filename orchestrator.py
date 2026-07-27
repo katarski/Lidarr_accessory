@@ -2770,8 +2770,27 @@ class Orchestrator:
                 fn.lower().endswith(".cue") for fn in filenames
             )
             if has_cue:
-                cue_dirs.add(folder)
-                continue
+                # Exception: a pre-split DSD folder (per-track .dsf/.dff) that
+                # merely carries a stray .cue should still be transcoded to
+                # channel-preserving FLAC (multichannel stays multichannel) --
+                # so stand-alone DSD tracks are converted WITH or WITHOUT a cue.
+                # Drop the useless .cue and fall through to the DSD block below
+                # instead of ceding the folder to the cue watcher. A single
+                # whole-disc .dsf (not pre-split) still goes to the cue path.
+                dsd_pre_split = (
+                    getattr(self.cfg, "transcode_dsd", True)
+                    and any(
+                        Path(fn).suffix.lower() in (".dsf", ".dff")
+                        for fn in filenames
+                    )
+                    and self._looks_pre_split(folder)
+                )
+                if dsd_pre_split:
+                    self._remove_stray_cues(folder)
+                    # fall through -- the DSD block transcodes this folder
+                else:
+                    cue_dirs.add(folder)
+                    continue
 
             # Inside a .cue-owned tree (e.g. the main path's split staging)?
             # Leave it to that path; os.walk is top-down so the ancestor's .cue
