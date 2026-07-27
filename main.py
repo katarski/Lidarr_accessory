@@ -86,6 +86,7 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     put("lidarr", "pre_split_monitored_gap_only", "MONITORED_GAP_ONLY", _as_bool)
     put("lidarr", "transcode_dts_cd", "TRANSCODE_DTS_CD", _as_bool)
     put("lidarr", "transcode_dsd", "TRANSCODE_DSD", _as_bool)
+    put("lidarr", "extract_sacd_iso", "EXTRACT_SACD_ISO", _as_bool)
     put("lidarr", "transcode_lossless_to_flac", "TRANSCODE_LOSSLESS_TO_FLAC", _as_bool)
     put("lidarr", "force_import_on_count_match", "FORCE_IMPORT", _as_bool)
     put("lidarr", "force_import_max_missing_percent", "FORCE_IMPORT_MAX_MISSING", int)
@@ -679,6 +680,9 @@ def main() -> int:
         ),
         transcode_dsd=bool(
             lidarr_cfg.get("transcode_dsd", True)
+        ),
+        extract_sacd_iso=bool(
+            lidarr_cfg.get("extract_sacd_iso", True)
         ),
         transcode_lossless_to_flac=bool(
             lidarr_cfg.get("transcode_lossless_to_flac", True)

@@ -272,6 +272,14 @@ class OrchestratorConfig:
     # carried across -- then deletes the DSD source, so the pre-split path
     # hands the FLACs to Lidarr on the next pass.
     transcode_dsd: bool = True
+    # SACD ISO support: a download folder containing a .iso (a ripped SACD, e.g.
+    # "Incubus - A Crow Left Of The Murder.iso", often with a useless sidecar
+    # .cue) is extracted to per-track DSF with sacd_extract. The MULTICHANNEL
+    # area is preferred over stereo when present (import 5.1, discard 2.0);
+    # otherwise the 2-channel area is used. The .iso + sidecar .cue are removed
+    # after extraction so the DSD path (transcode_dsd) then converts the DSF to
+    # FLAC and hands them to Lidarr. Requires the sacd_extract binary in PATH.
+    extract_sacd_iso: bool = True
     # Pre-split lossless-but-not-FLAC tracks (.ape/.wv/.wav/.aiff/.tak/.tta/.shn
     # and ALAC-in-.m4a) are re-encoded to FLAC (lossless; tags + bit depth +
     # sample rate preserved) before hand-off to Lidarr, so the library ends up
@@ -1728,6 +1736,138 @@ class Orchestrator:
             )
         return made
 
+    def _sacd_best_area(self, iso_path: Path) -> Optional[str]:
+        """
+        Probe an ISO with `sacd_extract -P`. Return 'm' if it exposes a
+        multichannel area (>2 channels), '2' if it only has a 2-channel area,
+        or None if it isn't a readable SACD (so a video/data ISO is left
+        untouched). Multichannel wins ("import 5.1, discard stereo").
+        """
+        try:
+            proc = subprocess.run(
+                ["sacd_extract", "-P", "-i", str(iso_path)],
+                capture_output=True, text=True, timeout=600,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("SACD: probe failed for %s: %s", iso_path.name, exc)
+            return None
+        out = (proc.stdout or "") + "\n" + (proc.stderr or "")
+        if "Area count" not in out:
+            return None  # not an SACD (or unreadable)
+        chans = [int(m) for m in re.findall(
+            r"Speaker config:\s*(\d+)\s*Channel", out)]
+        if any(c > 2 for c in chans):
+            return "m"
+        if any(c == 2 for c in chans):
+            return "2"
+        return None
+
+    def _cleanup_sacd_sources(self, folder: Path, isos: List[Path]) -> None:
+        """Remove the SACD .iso(s) and any now-useless sidecar .cue."""
+        for iso in isos:
+            try:
+                if iso.exists():
+                    iso.unlink()
+            except OSError as exc:
+                logger.warning("SACD: could not remove ISO %s: %s", iso.name, exc)
+        try:
+            for cue in folder.glob("*.cue"):
+                cue.unlink()
+        except OSError:
+            pass
+
+    def _extract_sacd_folder(
+        self, folder: Path, isos: List[Path], now_ts: float, min_stable: int,
+    ) -> bool:
+        """
+        Extract a ripped SACD `.iso` in `folder` to per-track DSF *in place*
+        (multichannel area preferred over stereo), then remove the .iso and any
+        sidecar .cue so the DSD path imports the DSF. Returns True when it has
+        handled the folder and the sweep should skip the rest of this pass
+        (the DSF are picked up on the next sweep, like the DTS/DSD fall-through).
+
+        Guards: never touches a still-settling .iso; never re-extracts a folder
+        that already holds DSF/DFF/FLAC (just clears the leftover .iso/.cue);
+        leaves a non-SACD ISO (video/data) completely alone.
+        """
+        # Don't grab a still-downloading ISO (SACD rips are multi-GB).
+        settle = max(min_stable, 60)
+        for iso in isos:
+            try:
+                if now_ts - iso.stat().st_mtime < settle:
+                    logger.debug("SACD: %s still settling; deferring", iso.name)
+                    return True
+            except OSError:
+                return True
+
+        # Already extracted on a prior pass? Just drop the leftover .iso/.cue
+        # and let the DSD path (next sweep, once the ISO is gone) take over.
+        if any(folder.rglob(f"*{ext}") for ext in (".dsf", ".dff", ".flac")):
+            self._cleanup_sacd_sources(folder, isos)
+            return True
+
+        iso = max(isos, key=lambda p: p.stat().st_size if p.exists() else 0)
+        area = self._sacd_best_area(iso)
+        if area is None:
+            logger.info(
+                "SACD: %s is not a readable SACD ISO -- leaving it alone.",
+                iso.name,
+            )
+            self._skip_seen.add(folder)
+            return True
+
+        tmp = folder / ".sacd_extract_tmp"
+        shutil.rmtree(tmp, ignore_errors=True)
+        try:
+            tmp.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.warning("SACD: cannot stage extract in %s: %s", folder, exc)
+            return True
+
+        label = "multichannel" if area == "m" else "2-channel"
+        logger.info("SACD: extracting %s area from %s ...", label, iso.name)
+        cmd = ["sacd_extract", "-m" if area == "m" else "-2",
+               "-s", "-c", "-y", str(tmp), "-i", str(iso)]
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=7200,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("SACD: extraction failed for %s: %s", iso.name, exc)
+            shutil.rmtree(tmp, ignore_errors=True)
+            self._skip_seen.add(folder)
+            return True
+
+        dsfs = sorted(tmp.rglob("*.dsf")) + sorted(tmp.rglob("*.dff"))
+        if not dsfs:
+            logger.warning(
+                "SACD: extraction produced no DSF for %s -- %s",
+                iso.name, (proc.stderr or proc.stdout or "")[-200:],
+            )
+            shutil.rmtree(tmp, ignore_errors=True)
+            self._skip_seen.add(folder)
+            return True
+
+        # Flatten sacd_extract's <Album>/<Nch>/ nesting into the download folder
+        # so the folder name drives album identity. Same filesystem -> rename.
+        moved = 0
+        for src in dsfs:
+            dst = folder / src.name
+            if dst.exists():
+                dst = folder / f"{src.stem} ({moved}){src.suffix}"
+            try:
+                src.replace(dst)
+                moved += 1
+            except OSError as exc:
+                logger.warning("SACD: could not place %s: %s", src.name, exc)
+        shutil.rmtree(tmp, ignore_errors=True)
+        logger.info(
+            "SACD: %s -> %d per-track DSF (%s) in %s -- DSD path will transcode",
+            iso.name, moved, label, folder.name,
+        )
+        self._cleanup_sacd_sources(folder, isos)
+        return True
+
     def _transcode_dsd_folder(self, folder: Path) -> List[Path]:
         """
         Transcode a pre-split DSD folder's .dsf/.dff files to 48kHz/16-bit FLAC
@@ -2591,6 +2731,21 @@ class Orchestrator:
             # Skip if we already dealt with this folder this run.
             if folder in self._skip_seen or folder_r in self._skip_seen:
                 continue
+
+            # SACD ISO: a folder holding a .iso (often with a sidecar SACD .cue
+            # that the normal splitter can't use) is extracted to per-track DSF
+            # in place -- preferring the multichannel area over stereo -- then
+            # the .iso + sidecar .cue are removed. The DSD block below (this or
+            # the next sweep) transcodes the DSF to FLAC and hands them off.
+            # Done BEFORE the .cue guard so the SACD cue doesn't make us skip.
+            if getattr(self.cfg, "extract_sacd_iso", True):
+                isos = [
+                    folder / fn for fn in filenames
+                    if fn.lower().endswith(".iso")
+                ]
+                if isos and self._extract_sacd_folder(folder, isos, now_ts, min_stable):
+                    # Re-scan on the next sweep as an ordinary DSD folder.
+                    continue
 
             # If this folder has any .cue, the normal watcher path owns it --
             # remember the whole subtree so we never grab a split-STAGING
