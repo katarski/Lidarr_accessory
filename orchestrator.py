@@ -276,9 +276,11 @@ class OrchestratorConfig:
     # "Incubus - A Crow Left Of The Murder.iso", often with a useless sidecar
     # .cue) is extracted to per-track DSF with sacd_extract. The MULTICHANNEL
     # area is preferred over stereo when present (import 5.1, discard 2.0);
-    # otherwise the 2-channel area is used. The .iso + sidecar .cue are removed
-    # after extraction so the DSD path (transcode_dsd) then converts the DSF to
-    # FLAC and hands them to Lidarr. Requires the sacd_extract binary in PATH.
+    # otherwise the 2-channel area is used. Only the useless sidecar .cue is
+    # removed at extraction; the .iso is KEPT so the DSD path (transcode_dsd)
+    # can convert the DSF to FLAC and hand them to Lidarr, and is deleted only
+    # when the whole source folder is removed after a VERIFIED import (so a
+    # failed import never loses the rip). Requires sacd_extract in PATH.
     extract_sacd_iso: bool = True
     # Pre-split lossless-but-not-FLAC tracks (.ape/.wv/.wav/.aiff/.tak/.tta/.shn
     # and ALAC-in-.m4a) are re-encoded to FLAC (lossless; tags + bit depth +
@@ -1762,14 +1764,15 @@ class Orchestrator:
             return "2"
         return None
 
-    def _cleanup_sacd_sources(self, folder: Path, isos: List[Path]) -> None:
-        """Remove the SACD .iso(s) and any now-useless sidecar .cue."""
-        for iso in isos:
-            try:
-                if iso.exists():
-                    iso.unlink()
-            except OSError as exc:
-                logger.warning("SACD: could not remove ISO %s: %s", iso.name, exc)
+    def _remove_stray_cues(self, folder: Path) -> None:
+        """
+        Remove sidecar .cue file(s) so the sweep won't treat an ISO folder as
+        cue-owned (a SACD .cue references the .iso and the splitter can't use
+        it). The .iso itself is KEPT -- it is only removed when the whole source
+        folder is deleted after a VERIFIED Lidarr import
+        (delete_source_folder_on_success), so a failed import never loses the
+        original rip.
+        """
         try:
             for cue in folder.glob("*.cue"):
                 cue.unlink()
@@ -1781,14 +1784,16 @@ class Orchestrator:
     ) -> bool:
         """
         Extract a ripped SACD `.iso` in `folder` to per-track DSF *in place*
-        (multichannel area preferred over stereo), then remove the .iso and any
-        sidecar .cue so the DSD path imports the DSF. Returns True when it has
-        handled the folder and the sweep should skip the rest of this pass
-        (the DSF are picked up on the next sweep, like the DTS/DSD fall-through).
+        (multichannel area preferred over stereo), then remove only the useless
+        sidecar .cue. The .iso is KEPT so the DSD path can transcode the DSF and
+        hand them to Lidarr; the .iso is removed only when the whole source
+        folder is deleted after a verified import. Returns True when the sweep
+        should skip the rest of this pass, or False once the DSF already exist
+        so the DSD path (further down the loop) transcodes and hands them off.
 
         Guards: never touches a still-settling .iso; never re-extracts a folder
-        that already holds DSF/DFF/FLAC (just clears the leftover .iso/.cue);
-        leaves a non-SACD ISO (video/data) completely alone.
+        that already holds DSF/DFF/FLAC; leaves a non-SACD (video/data) ISO
+        completely alone.
         """
         # Don't grab a still-downloading ISO (SACD rips are multi-GB).
         settle = max(min_stable, 60)
@@ -1800,11 +1805,12 @@ class Orchestrator:
             except OSError:
                 return True
 
-        # Already extracted on a prior pass? Just drop the leftover .iso/.cue
-        # and let the DSD path (next sweep, once the ISO is gone) take over.
+        # Already extracted on a prior pass? Drop the stray .cue and fall
+        # through so the DSD path transcodes/hands off the DSF. The .iso stays
+        # until the source folder is removed after a verified import.
         if any(folder.rglob(f"*{ext}") for ext in (".dsf", ".dff", ".flac")):
-            self._cleanup_sacd_sources(folder, isos)
-            return True
+            self._remove_stray_cues(folder)
+            return False
 
         iso = max(isos, key=lambda p: p.stat().st_size if p.exists() else 0)
         area = self._sacd_best_area(iso)
@@ -1862,10 +1868,11 @@ class Orchestrator:
                 logger.warning("SACD: could not place %s: %s", src.name, exc)
         shutil.rmtree(tmp, ignore_errors=True)
         logger.info(
-            "SACD: %s -> %d per-track DSF (%s) in %s -- DSD path will transcode",
+            "SACD: %s -> %d per-track DSF (%s) in %s -- DSD path will transcode "
+            "(ISO kept until verified import)",
             iso.name, moved, label, folder.name,
         )
-        self._cleanup_sacd_sources(folder, isos)
+        self._remove_stray_cues(folder)
         return True
 
     def _transcode_dsd_folder(self, folder: Path) -> List[Path]:
@@ -2733,10 +2740,11 @@ class Orchestrator:
                 continue
 
             # SACD ISO: a folder holding a .iso (often with a sidecar SACD .cue
-            # that the normal splitter can't use) is extracted to per-track DSF
-            # in place -- preferring the multichannel area over stereo -- then
-            # the .iso + sidecar .cue are removed. The DSD block below (this or
-            # the next sweep) transcodes the DSF to FLAC and hands them off.
+            # the normal splitter can't use) is extracted to per-track DSF in
+            # place -- preferring the multichannel area over stereo -- then only
+            # the stray .cue is removed. The .iso is kept so the DSD block below
+            # (this or a later sweep) transcodes the DSF to FLAC and hands them
+            # off; the .iso is deleted with the folder after a verified import.
             # Done BEFORE the .cue guard so the SACD cue doesn't make us skip.
             if getattr(self.cfg, "extract_sacd_iso", True):
                 isos = [
