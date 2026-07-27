@@ -1808,7 +1808,13 @@ class Orchestrator:
         # Already extracted on a prior pass? Drop the stray .cue and fall
         # through so the DSD path transcodes/hands off the DSF. The .iso stays
         # until the source folder is removed after a verified import.
-        if any(folder.rglob(f"*{ext}") for ext in (".dsf", ".dff", ".flac")):
+        # (any(rglob(...)) checks each generator YIELDS a match -- a bare
+        # generator object is always truthy, so it must be consumed.)
+        already = any(
+            any(True for _ in folder.rglob(f"*{ext}"))
+            for ext in (".dsf", ".dff", ".flac")
+        )
+        if already:
             self._remove_stray_cues(folder)
             return False
 
