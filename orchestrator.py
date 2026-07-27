@@ -264,6 +264,14 @@ class OrchestratorConfig:
     # the filename; artist/album from the folder name, LLM-assisted when there's
     # no 'Artist - Album' separator), and hands the FLACs to the normal import.
     transcode_dts_cd: bool = True
+    # DSD support: SACD/DSD rips ship as per-track .dsf/.dff (1-bit DSD) that
+    # Lidarr can't import, and the lossless->flac converter deliberately skips
+    # (DSD->PCM is a real conversion, not a lossless re-wrap). When on, the
+    # cueless sweep transcodes each .dsf/.dff to 48kHz/16-bit FLAC in place --
+    # a 24kHz lowpass strips DSD's ultrasonic shaped noise, existing tags are
+    # carried across -- then deletes the DSD source, so the pre-split path
+    # hands the FLACs to Lidarr on the next pass.
+    transcode_dsd: bool = True
     # Pre-split lossless-but-not-FLAC tracks (.ape/.wv/.wav/.aiff/.tak/.tta/.shn
     # and ALAC-in-.m4a) are re-encoded to FLAC (lossless; tags + bit depth +
     # sample rate preserved) before hand-off to Lidarr, so the library ends up
@@ -1720,6 +1728,73 @@ class Orchestrator:
             )
         return made
 
+    def _transcode_dsd_folder(self, folder: Path) -> List[Path]:
+        """
+        Transcode a pre-split DSD folder's .dsf/.dff files to 48kHz/16-bit FLAC
+        so Lidarr can import them (Lidarr won't ingest raw 1-bit DSD, and the
+        lossless->flac converter deliberately skips DSD). DSD->PCM is a real
+        conversion: ffmpeg decodes the 1-bit stream, a 24kHz lowpass strips the
+        ultrasonic shaped noise DSD pushes above the audible band, then it's
+        resampled to 48kHz and dithered to 16-bit. Source channel count is
+        preserved (stereo stays stereo, 5.1 stays 5.1). Existing tags (ID3 on
+        .dsf) are carried across with -map_metadata. Idempotent (skips a source
+        whose .flac already exists) and best-effort (any failure logs and leaves
+        the source in place). Deletes each DSD source once its FLAC verifies.
+        Returns the FLAC paths created/present.
+        """
+        try:
+            sources = [
+                p for p in sorted(folder.iterdir())
+                if p.is_file() and p.suffix.lower() in (".dsf", ".dff")
+            ]
+        except OSError:
+            return []
+        if not sources:
+            return []
+        made: List[Path] = []
+        for p in sources:
+            out = p.with_suffix(".flac")
+            if out.exists() and out.resolve() != p.resolve():
+                made.append(out)
+                try:
+                    p.unlink()   # source already transcoded on a prior pass
+                except OSError:
+                    pass
+                continue
+            cmd = [
+                self.cfg.ffmpeg_binary, "-hide_banner", "-loglevel", "warning",
+                "-y", "-i", str(p),
+                "-af", "lowpass=24000",
+                "-ar", "48000",
+                "-sample_fmt", "s16",
+                "-c:a", "flac",
+                "-compression_level", str(self.cfg.flac_compression_level),
+                "-map_metadata", "0",
+                str(out),
+            ]
+            try:
+                subprocess.run(cmd, check=True, capture_output=True, text=True)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("DSD: flac encode failed on %s: %s", p.name, exc)
+                if out.exists():
+                    out.unlink(missing_ok=True)
+                continue
+            if not ((probe_duration(self.cfg.ffmpeg_binary, out) or 0) > 1.0):
+                logger.warning("DSD: %s transcoded but is unreadable.", p.name)
+                out.unlink(missing_ok=True)
+                continue
+            try:
+                p.unlink()   # drop the DSD source; the FLAC replaces it
+            except OSError:
+                pass
+            made.append(out)
+        if made:
+            logger.info(
+                "DSD->FLAC: %s -> %d FLAC (48kHz/16-bit)",
+                folder.name, len(made),
+            )
+        return made
+
     def _monitored_album_status(self, artist_name: str, album_name: str):
         """
         Decide whether a pre-split download fills a MONITORED GAP in Lidarr.
@@ -2572,6 +2647,36 @@ class Orchestrator:
                     self._transcode_dts_folder(folder)
                     # Fall through: the just-written FLACs are usually caught by
                     # the stability guard and imported on the next sweep.
+
+            # DSD content: SACD/DSD rips ship as per-track .dsf/.dff (1-bit DSD)
+            # that Lidarr can't import. Transcode each to 48kHz/16-bit FLAC in
+            # place; the pre-split path below then imports the FLACs. Only touch
+            # a folder whose DSD files are all stable, so we never start a
+            # multi-minute transcode on a still-downloading rip. Idempotent, so
+            # re-running is cheap. Like the DTS block, the just-written FLACs are
+            # usually caught by the stability guard and imported on the next sweep.
+            if getattr(self.cfg, "transcode_dsd", True):
+                dsd_files = [
+                    folder / fn for fn in filenames
+                    if Path(fn).suffix.lower() in (".dsf", ".dff")
+                ]
+                if dsd_files:
+                    dsd_stable = True
+                    for d in dsd_files:
+                        try:
+                            if now_ts - d.stat().st_mtime < min_stable:
+                                dsd_stable = False
+                                break
+                        except OSError:
+                            dsd_stable = False
+                            break
+                    if dsd_stable:
+                        self._transcode_dsd_folder(folder)
+                    else:
+                        logger.debug(
+                            "cueless sweep: %s has DSD files still downloading; "
+                            "deferring transcode", folder,
+                        )
 
             # Needs to look pre-split.
             if not self._looks_pre_split(folder):
