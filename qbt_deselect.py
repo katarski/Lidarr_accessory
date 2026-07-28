@@ -369,6 +369,71 @@ def auto_deselect_pass(
     return acted
 
 
+# Torrent states that mean "present but NOT productively downloading" -- the
+# candidates for dead-grab reaping when stuck near 0% past the grace period.
+# Deliberately excludes actively-downloading states and paused/stopped (a
+# stopped torrent is a deliberate "don't download", never reaped).
+_DEAD_STATES = frozenset({
+    "metadl", "forcedmetadl", "stalleddl", "stalledup", "forcedup",
+    "queueddl", "missingfiles", "error", "unknown",
+})
+
+
+def dead_grab_reaper_pass(
+    qbt: QbtClient, lidarr: Optional[LidarrClient], category: str = "",
+    grace_seconds: int = 172800, blocklist: bool = True,
+    emit: Callable[[str], None] = logger.info, now: Optional[float] = None,
+) -> int:
+    """
+    Remove lidarr-category torrents that were grabbed but never got anywhere:
+    progress ~0 in a dead/stalled/metadata state for longer than `grace_seconds`
+    (default 2 days, measured from the torrent's add time). Such a torrent is a
+    dead release (no seeders / no metadata) clogging qBit + Lidarr's queue.
+
+    Each is removed from qBit (with its stub data) and, when a matching Lidarr
+    queue row exists, that row is removed and BLOCKLISTED (so Lidarr re-searches
+    and grabs a live alternative -- lossless preferred). Paused/stopped torrents
+    and any that made real progress are left alone. Returns the count removed.
+    """
+    if now is None:
+        now = time.time()
+    q_by_hash: Dict[str, list] = {}
+    try:
+        for r in (lidarr.queue_list() if lidarr else []):
+            dlid = str(r.get("downloadId") or "").lower()
+            if dlid:
+                q_by_hash.setdefault(dlid, []).append(r)
+    except Exception as exc:  # noqa: BLE001
+        emit(f"dead-grab reaper: Lidarr queue fetch failed ({exc}); "
+             f"removing from qBit only")
+    removed = 0
+    for t in qbt.torrents(category=category):
+        h = (t.get("hash") or "")
+        if not h:
+            continue
+        state = (t.get("state") or "").lower()
+        prog = float(t.get("progress") or 0.0)
+        added = float(t.get("added_on") or 0)
+        if prog >= 0.01 or state not in _DEAD_STATES:
+            continue
+        age = now - added if added else 0.0
+        if age < grace_seconds:
+            continue  # still within the grace window -> wait it out
+        name = t.get("name") or h[:12]
+        for r in q_by_hash.get(h.lower(), []):
+            qid = r.get("id")
+            if qid is not None:
+                lidarr.queue_remove(
+                    qid, remove_from_client=False, blocklist=blocklist)
+        if qbt.remove(h, delete_files=True):
+            removed += 1
+            emit(f"dead-grab reaper: removed {name!r} (0% for {age/86400:.1f}d, "
+                 f"state={state}{'; blocklisted' if blocklist else ''})")
+    if removed:
+        emit(f"dead-grab reaper: removed {removed} dead grab(s)")
+    return removed
+
+
 def _map_to_download_root(content_path: str, save_path: str, download_root: str) -> str:
     """
     qBittorrent reports a torrent's content_path under ITS OWN save path

@@ -136,6 +136,9 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     put("qbittorrent", "interval_seconds", "QBIT_INTERVAL", int)
     put("qbittorrent", "pause_during_scan", "QBIT_PAUSE_SCAN", _as_bool)
     put("qbittorrent", "deselect_video", "QBIT_DESELECT_VIDEO", _as_bool)
+    put("qbittorrent", "dead_grab_reaper", "QBIT_DEAD_GRAB_REAPER", _as_bool)
+    put("qbittorrent", "dead_grab_grace_hours", "QBIT_DEAD_GRAB_GRACE_HOURS", int)
+    put("qbittorrent", "dead_grab_blocklist", "QBIT_DEAD_GRAB_BLOCKLIST", _as_bool)
     put("qbittorrent", "manage_completed", "QBIT_MANAGE_COMPLETED", _as_bool)
     put("qbittorrent", "remove_when_library_complete", "QBIT_REMOVE_WHEN_LIBRARY_COMPLETE", _as_bool)
     # #9 recurring .cue re-scan
@@ -473,7 +476,9 @@ def qbt_auto_deselect_loop(
     Cadence is kept short (min 10s). Login is re-checked each pass.
     """
     from qbittorrent_client import QbtClient
-    from qbt_deselect import auto_deselect_pass, torrent_lifecycle_pass
+    from qbt_deselect import (
+        auto_deselect_pass, torrent_lifecycle_pass, dead_grab_reaper_pass,
+    )
 
     cadence = max(10, interval)
     category = qcfg.get("category", "") or ""
@@ -481,6 +486,12 @@ def qbt_auto_deselect_loop(
     do_deselect = _as_bool(qcfg.get("auto_deselect", False))
     manage_completed = _as_bool(qcfg.get("manage_completed", True))
     deselect_video = _as_bool(qcfg.get("deselect_video", True))  # #4
+    # Dead-grab reaper: remove lidarr-category torrents stuck at ~0% past a
+    # grace window (default 2 days) + blocklist so Lidarr re-searches a live
+    # (lossless-preferred) alternative. Addresses the dead-torrent flood.
+    dead_grab_reaper = _as_bool(qcfg.get("dead_grab_reaper", True))
+    dead_grab_grace_hours = int(qcfg.get("dead_grab_grace_hours", 48) or 48)
+    dead_grab_blocklist = _as_bool(qcfg.get("dead_grab_blocklist", True))
     # AI fallback for library matching: only used when the deterministic
     # (Lidarr) match misses. Requires an enabled LLM client.
     ai_match = _as_bool(qcfg.get("ai_match", True))
@@ -540,6 +551,15 @@ def qbt_auto_deselect_loop(
                         "qbt lifecycle: removed %d fully-imported, paused %d "
                         "mid-import torrent(s)", removed, paused,
                     )
+            if dead_grab_reaper:
+                try:
+                    dead_grab_reaper_pass(
+                        qbt, lidarr, category=category,
+                        grace_seconds=dead_grab_grace_hours * 3600,
+                        blocklist=dead_grab_blocklist, emit=logger.info,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("dead-grab reaper: %s", exc)
         except Exception as exc:  # noqa: BLE001
             logger.exception("qbt loop thread: %s", exc)
 

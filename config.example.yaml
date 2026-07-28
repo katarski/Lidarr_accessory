@@ -203,6 +203,14 @@ qbittorrent:
   # containers) are deselected. A DVD-Audio AUDIO_TS zone and a whole-disc .iso
   # are AUDIO and kept. Set false to disable.
   deselect_video: true
+  # Dead-grab reaper: remove lidarr-category torrents stuck at ~0% in a dead/
+  # stalled/metadata state longer than dead_grab_grace_hours (from add time),
+  # and blocklist them so Lidarr re-searches a live (lossless-preferred)
+  # alternative. Paused/stopped torrents and any with real progress are left
+  # alone. See TUNING.md.
+  dead_grab_reaper: true
+  dead_grab_grace_hours: 48
+  dead_grab_blocklist: true
   # Completed-torrent lifecycle: for each finished music torrent, pause it while
   # the pipeline is mid-import and remove it (with data) once every album has
   # been moved into the library. Disk-aware, so it never deletes un-imported
