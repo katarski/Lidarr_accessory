@@ -289,6 +289,19 @@ class OrchestratorConfig:
     # when the whole source folder is removed after a VERIFIED import (so a
     # failed import never loses the rip). Requires sacd_extract in PATH.
     extract_sacd_iso: bool = True
+    # DVD-Audio ISO support (backlog #13): a download folder holding a .iso that
+    # is a DVD-Audio disc (has an AUDIO_TS/ with .AOB files, NOT a ScarletBook
+    # SACD -- sacd_extract rejects those) is unpacked with 7z (reads the UDF
+    # image directly, no loop-mount / no privileges) and the AUDIO_TS is decoded
+    # to per-track WAV with dvda2wav (libdvd-audio). DVD-Audio commonly ships
+    # both a multichannel and a stereo title; the MULTICHANNEL one is preferred
+    # over stereo (import 5.1, discard 2.0), same as the SACD/DSD rule. The WAVs
+    # are re-encoded to channel-preserving FLAC, tagged from the folder identity,
+    # and handed to Lidarr by the normal pre-split path. Only the useless sidecar
+    # .cue is removed; the .iso is KEPT until the whole source folder is deleted
+    # after a VERIFIED import (so a failed import never loses the rip). Requires
+    # dvda2wav (libdvd-audio) and 7z (p7zip) in PATH.
+    extract_dvda_iso: bool = True
     # Tag-based identification for pre-split "artist dump" folders (backlog #15):
     # when a leaf album folder sits under a top-level folder that matches a Lidarr
     # artist (e.g. /downloads/Hans Zimmer/<album>/...), import each album under
@@ -2095,6 +2108,280 @@ class Orchestrator:
         self._remove_stray_cues(folder)
         return True
 
+    def _dvda_identity(self, folder: Path) -> Tuple[str, str]:
+        """
+        (artist, album) for a DVD-Audio folder. Prefer the 'Artist - Album'
+        folder parser; when the name has no separator and an LLM is enabled,
+        ask it to split (guarded to words already in the folder name).
+        ("","") if undetermined. Same identity strategy as the DTS-CD path,
+        minus the DTS marker stripping.
+        """
+        artist, album = self._album_folder_identity(folder)
+        if artist and album:
+            return artist, album
+        raw = re.sub(r"\s{2,}", " ", folder.name or "").strip(" -_.")
+        if self.ollama is not None and getattr(self.ollama, "enabled", False):
+            try:
+                a, b = self.ollama.parse_artist_album(raw)
+                if a and b:
+                    logger.info(
+                        "DVD-Audio: LLM parsed identity from %r -> artist=%r "
+                        "album=%r", folder.name, a, b,
+                    )
+                    return a, b
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("DVD-Audio: LLM identity parse failed: %s", exc)
+        return "", ""
+
+    def _iso_is_dvd_audio(self, iso_path: Path) -> bool:
+        """
+        Cheap check: does this ISO look like a DVD-Audio disc? Lists the image
+        with 7z (which reads UDF/ISO9660 directly) and looks for an AUDIO_TS
+        directory holding .AOB (Audio OBject) files. A ScarletBook SACD, a
+        DVD-Video, or a data ISO won't match, so it's left to the SACD branch /
+        left alone. Returns False on any 7z failure (e.g. not installed, or a
+        still-partial image) so the caller falls through safely.
+        """
+        try:
+            proc = subprocess.run(
+                ["7z", "l", str(iso_path)],
+                capture_output=True, text=True, timeout=600,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("DVD-Audio: 7z list failed for %s: %s", iso_path.name, exc)
+            return False
+        out = (proc.stdout or "") + "\n" + (proc.stderr or "")
+        up = out.upper()
+        return "AUDIO_TS" in up and ".AOB" in up
+
+    def _unpack_audio_ts(self, iso_path: Path, dest: Path) -> Optional[Path]:
+        """
+        Extract an ISO's AUDIO_TS subtree into `dest` with 7z (no loop-mount)
+        and return the path to the AUDIO_TS directory that actually holds .AOB
+        files, or None. Tries a targeted AUDIO_TS extraction first and falls
+        back to a full extraction if 7z's case/match rules miss it.
+        """
+        def _find_audio_ts(root: Path) -> Optional[Path]:
+            try:
+                for d in root.rglob("*"):
+                    if d.is_dir() and d.name.upper() == "AUDIO_TS" and any(
+                        p.suffix.upper() == ".AOB" for p in d.iterdir()
+                        if p.is_file()
+                    ):
+                        return d
+            except OSError:
+                return None
+            return None
+
+        # First a targeted extraction of just the AUDIO_TS subtree (case-
+        # insensitive recursive glob, so a big DVD-Video zone isn't unpacked);
+        # then a full extraction as a fallback if 7z's matching missed it.
+        for args in (["-r", "AUDIO_TS/*", "audio_ts/*"], None):
+            cmd = ["7z", "x", "-y", f"-o{dest}", str(iso_path)]
+            if args:
+                cmd += args
+            try:
+                subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("DVD-Audio: 7z extract failed for %s: %s",
+                               iso_path.name, exc)
+                return None
+            found = _find_audio_ts(dest)
+            if found is not None:
+                return found
+        return None
+
+    def _extract_dvda_folder(
+        self, folder: Path, isos: List[Path], now_ts: float, min_stable: int,
+    ) -> bool:
+        """
+        Extract a DVD-Audio `.iso` in `folder` to per-track, channel-preserving
+        FLAC *in place* (multichannel title preferred over stereo), tagged from
+        the folder identity, then remove only the useless sidecar .cue. The .iso
+        is KEPT so it's deleted only when the whole source folder is removed
+        after a verified import (a failed import never loses the rip).
+
+        Returns True when the sweep should skip the rest of this pass (extracted,
+        deferred while settling, or a hard failure to be left alone). Returns
+        False when this is NOT a DVD-Audio ISO (so the SACD branch gets a turn)
+        or the folder already holds extracted audio (so the pre-split/DSD path
+        below takes over).
+
+        Guards: never touches a still-settling .iso; never re-extracts a folder
+        that already holds FLAC/WAV; leaves a non-DVD-Audio ISO alone.
+        """
+        # Don't grab a still-downloading ISO (DVD-Audio rips are multi-GB).
+        settle = max(min_stable, 60)
+        for iso in isos:
+            try:
+                if now_ts - iso.stat().st_mtime < settle:
+                    logger.debug("DVD-Audio: %s still settling; deferring", iso.name)
+                    return True
+            except OSError:
+                return True
+
+        # Already extracted on a prior pass? Drop the stray .cue and fall
+        # through so the pre-split path hands off the FLAC. The .iso stays until
+        # the source folder is removed after a verified import.
+        already = any(
+            any(True for _ in folder.rglob(f"*{ext}"))
+            for ext in (".flac", ".wav")
+        )
+        if already:
+            self._remove_stray_cues(folder)
+            return False
+
+        iso = max(isos, key=lambda p: p.stat().st_size if p.exists() else 0)
+        if not self._iso_is_dvd_audio(iso):
+            # Not a DVD-Audio disc -- let the SACD branch (or the leave-alone
+            # path) handle it. Do NOT mark seen: the SACD branch still needs it.
+            return False
+
+        tmp = folder / ".dvda_extract_tmp"
+        shutil.rmtree(tmp, ignore_errors=True)
+        try:
+            tmp.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.warning("DVD-Audio: cannot stage extract in %s: %s", folder, exc)
+            return True
+
+        logger.info("DVD-Audio: unpacking AUDIO_TS from %s ...", iso.name)
+        audio_ts = self._unpack_audio_ts(iso, tmp)
+        if audio_ts is None:
+            logger.warning(
+                "DVD-Audio: could not unpack a usable AUDIO_TS from %s -- "
+                "leaving it alone.", iso.name)
+            shutil.rmtree(tmp, ignore_errors=True)
+            self._skip_seen.add(folder)
+            return True
+
+        wav_dir = tmp / "wav"
+        try:
+            wav_dir.mkdir(exist_ok=True)
+        except OSError:
+            shutil.rmtree(tmp, ignore_errors=True)
+            self._skip_seen.add(folder)
+            return True
+
+        logger.info("DVD-Audio: decoding tracks from %s ...", iso.name)
+        try:
+            proc = subprocess.run(
+                ["dvda2wav", "-A", str(audio_ts), "-d", str(wav_dir)],
+                capture_output=True, text=True, timeout=7200,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("DVD-Audio: dvda2wav failed for %s: %s", iso.name, exc)
+            shutil.rmtree(tmp, ignore_errors=True)
+            self._skip_seen.add(folder)
+            return True
+
+        wavs = sorted(wav_dir.glob("*.wav"))
+        if not wavs:
+            logger.warning(
+                "DVD-Audio: extraction produced no WAV for %s -- %s",
+                iso.name, (proc.stderr or proc.stdout or "")[-200:],
+            )
+            shutil.rmtree(tmp, ignore_errors=True)
+            self._skip_seen.add(folder)
+            return True
+
+        # Per-track channel count: parse dvda2wav's own report
+        # ("* Extracting MLP track  6 channels ..." then "* Wrote: <path>"),
+        # falling back to a header probe. More reliable than probing the
+        # WAVE_FORMAT_EXTENSIBLE header we just wrote.
+        chan_by_name: Dict[str, int] = {}
+        last_ch = 0
+        for line in (proc.stdout or "").splitlines():
+            m = re.search(r"(\d+)\s+channels", line)
+            if m:
+                last_ch = int(m.group(1))
+            m2 = re.search(r'Wrote:\s*"?(.+?\.wav)"?\s*$', line)
+            if m2:
+                chan_by_name[Path(m2.group(1).strip()).name] = last_ch
+
+        def _ch(w: Path) -> int:
+            return chan_by_name.get(w.name) or self._audio_channels(w)
+
+        # Multichannel precedence (#3): a DVD-Audio disc usually ships both a
+        # multichannel and a stereo title. Keep the highest-channel tracks and
+        # discard the lower (stereo) ones -- same rule as the DSD/SACD paths.
+        if getattr(self.cfg, "prefer_multichannel", True) and len(wavs) > 1:
+            chans = {w: _ch(w) for w in wavs}
+            maxch = max(chans.values())
+            if maxch > 2 and any(0 < c < maxch for c in chans.values()):
+                kept = [w for w in wavs if chans[w] >= maxch]
+                logger.info(
+                    "multichannel precedence: DVD-Audio %s ships mixed titles -- "
+                    "keeping %d/%d track(s) at %dch, discarding the stereo ones",
+                    folder.name, len(kept), len(wavs), maxch)
+                wavs = kept
+
+        try:
+            from tagger import _apply  # lazy: needs mutagen (present in image)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("DVD-Audio: tagger unavailable (%s) -- skipping.", exc)
+            shutil.rmtree(tmp, ignore_errors=True)
+            self._skip_seen.add(folder)
+            return True
+
+        artist, album = self._dvda_identity(folder)
+        total = str(len(wavs))
+        made = 0
+        for idx, w in enumerate(wavs, start=1):
+            title = f"Track {idx:02d}"
+            out = folder / f"{idx:02d} - {title}.flac"
+            cmd = [
+                self.cfg.ffmpeg_binary, "-hide_banner", "-loglevel", "warning",
+                "-y", "-i", str(w),
+                "-c:a", "flac",
+                "-compression_level", str(self.cfg.flac_compression_level),
+                "-map_metadata", "-1",
+                str(out),
+            ]
+            try:
+                subprocess.run(cmd, check=True, capture_output=True, text=True)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("DVD-Audio: flac encode failed on %s: %s",
+                               w.name, exc)
+                out.unlink(missing_ok=True)
+                continue
+            if not ((probe_duration(self.cfg.ffmpeg_binary, out) or 0) > 1.0):
+                logger.warning("DVD-Audio: %s transcoded but is unreadable.",
+                               w.name)
+                out.unlink(missing_ok=True)
+                continue
+            try:
+                _apply(out, TagPlan(
+                    tracknumber=str(idx), tracktotal=total, title=title,
+                    artist=artist, albumartist=artist, album=album,
+                    date="", genre="", comment="DVD-Audio (transcoded)", isrc="",
+                ))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("DVD-Audio: tag write failed for %s: %s",
+                               out.name, exc)
+            # Drop the giant intermediate WAV as soon as its FLAC is written --
+            # a 5.1/24-bit track is ~300MB, so keeping all of them plus the
+            # extracted AOBs would balloon peak disk on the download share.
+            w.unlink(missing_ok=True)
+            made += 1
+
+        shutil.rmtree(tmp, ignore_errors=True)
+        if made == 0:
+            logger.warning(
+                "DVD-Audio: no FLAC produced from %s -- leaving ISO alone.",
+                iso.name)
+            self._skip_seen.add(folder)
+            return True
+        self._remove_stray_cues(folder)
+        logger.info(
+            "DVD-Audio: %s -> %d FLAC in %s (artist=%r album=%r) -- pre-split "
+            "path will import (ISO kept until verified import)%s",
+            iso.name, made, folder.name, artist, album or "(unknown)",
+            "" if (artist and album) else
+            " -- identity unknown; rename folder to 'Artist - Album' to import",
+        )
+        return True
+
     # Channel-variant folder names (sacd_extract etc.): multichannel wins over
     # stereo. Multichannel patterns tested first.
     _CHANNEL_VARIANT_RES = (
@@ -3077,19 +3364,31 @@ class Orchestrator:
             if folder in self._skip_seen or folder_r in self._skip_seen:
                 continue
 
+            # Optical-disc ISO handling, done BEFORE the .cue guard so a sidecar
+            # SACD/DVD-Audio .cue (which the normal splitter can't use) doesn't
+            # make us skip the folder.
+            isos = [
+                folder / fn for fn in filenames
+                if fn.lower().endswith(".iso")
+            ]
+            # DVD-Audio ISO (backlog #13): tried BEFORE SACD because a DVD-Audio
+            # disc isn't a ScarletBook SACD -- sacd_extract would reject it and
+            # mark the folder seen, so we'd never get a turn. _extract_dvda_folder
+            # returns False (fall through to the SACD branch) when the ISO is not
+            # DVD-Audio, so the two coexist cleanly.
+            if isos and getattr(self.cfg, "extract_dvda_iso", True):
+                if self._extract_dvda_folder(folder, isos, now_ts, min_stable):
+                    # Re-scan on the next sweep as an ordinary pre-split folder.
+                    continue
+
             # SACD ISO: a folder holding a .iso (often with a sidecar SACD .cue
             # the normal splitter can't use) is extracted to per-track DSF in
             # place -- preferring the multichannel area over stereo -- then only
             # the stray .cue is removed. The .iso is kept so the DSD block below
             # (this or a later sweep) transcodes the DSF to FLAC and hands them
             # off; the .iso is deleted with the folder after a verified import.
-            # Done BEFORE the .cue guard so the SACD cue doesn't make us skip.
-            if getattr(self.cfg, "extract_sacd_iso", True):
-                isos = [
-                    folder / fn for fn in filenames
-                    if fn.lower().endswith(".iso")
-                ]
-                if isos and self._extract_sacd_folder(folder, isos, now_ts, min_stable):
+            if isos and getattr(self.cfg, "extract_sacd_iso", True):
+                if self._extract_sacd_folder(folder, isos, now_ts, min_stable):
                     # Re-scan on the next sweep as an ordinary DSD folder.
                     continue
 

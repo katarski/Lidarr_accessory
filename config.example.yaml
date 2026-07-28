@@ -89,8 +89,17 @@ lidarr:
   # source ships both a stereo and a multichannel set as sibling channel folders
   # (e.g. sacd_extract "Album/2ch/" + "Album/6ch/"), convert only the
   # multichannel one and skip the stereo. (SACD ISOs already prefer the >2ch
-  # area; DTS already yields 5.1.) Does NOT affect normal download/import.
+  # area; DTS already yields 5.1; DVD-Audio ISOs prefer the multichannel title.)
+  # Does NOT affect normal download/import.
   prefer_multichannel: true
+  # #13: DVD-Audio ISO support. A .iso that is a DVD-Audio disc (has an AUDIO_TS
+  # with .AOB files -- NOT a ScarletBook SACD) is unpacked with 7z (reads the UDF
+  # image directly, no loop-mount) and decoded to per-track WAV with dvda2wav
+  # (libdvd-audio), preferring the multichannel title over stereo, then re-encoded
+  # to tagged FLAC and imported by the normal pre-split path. The .iso is kept
+  # until the source folder is deleted after a verified import. Needs dvda2wav and
+  # 7z (both in the image). Set false to ignore DVD-Audio ISOs.
+  extract_dvda_iso: true
   # Uniform-FLAC library: re-encode pre-split lossless-but-not-FLAC tracks
   # (.ape/.wv/.wav/.aiff/.tak/.tta/.shn and ALAC-in-.m4a) to FLAC before import,
   # preserving tags, bit depth and sample rate (a lossless transcode). FLAC is

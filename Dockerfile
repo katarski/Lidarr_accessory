@@ -16,19 +16,38 @@ RUN apt-get update \
     && make \
     && cp sacd_extract /sacd_extract
 
+# --- libdvd-audio builder --------------------------------------------------
+# Builds dvda2wav (libdvd-audio), which decodes a DVD-Audio disc's AUDIO_TS
+# (MLP/PCM .AOB files) to per-track WAV -- the DVD-Audio counterpart to
+# sacd_extract. Self-contained (bundles its own MLP decoder + mini-gmp), so it
+# only needs a C toolchain and m4 (for the pkg-config metadata). Only the tiny
+# statically-linked binary ships in the final image.
+FROM debian:bookworm-slim AS dvda-builder
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        git build-essential ca-certificates m4 \
+    && git clone --depth 1 https://github.com/tuffy/libdvd-audio.git /src \
+    && cd /src \
+    && make dvda2wav \
+    && cp dvda2wav /dvda2wav
+
 FROM python:3.11-slim
 
 # ffmpeg = split/probe/DSD-decode;  tzdata = correct local timestamps in logs;
 # libchromaprint-tools = fpcalc (acoustic fingerprinting for AcoustID identify);
 # libdca-utils = dtsdec/dcadec, the libdca DTS decoder VLC uses -- needed for
 #   14-bit DTS-CD streams that ffmpeg's built-in dca decoder can't frame;
-# libxml2 = runtime dependency of the sacd_extract binary copied in below.
+# libxml2 = runtime dependency of the sacd_extract binary copied in below;
+# p7zip-full = `7z`, used to unpack an AUDIO_TS out of a DVD-Audio UDF ISO
+#   without a loop-mount (the container has no loop devices / privileges).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg tzdata libchromaprint-tools libdca-utils libxml2 \
+    && apt-get install -y --no-install-recommends ffmpeg tzdata libchromaprint-tools libdca-utils libxml2 p7zip-full \
     && rm -rf /var/lib/apt/lists/*
 
 # SACD ISO ripper (built above). Present in PATH as `sacd_extract`.
 COPY --from=sacd-builder /sacd_extract /usr/local/bin/sacd_extract
+# DVD-Audio track decoder (built above). Present in PATH as `dvda2wav`.
+COPY --from=dvda-builder /dvda2wav /usr/local/bin/dvda2wav
 
 WORKDIR /app
 
