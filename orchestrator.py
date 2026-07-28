@@ -6845,13 +6845,14 @@ class Orchestrator:
             details = self._folder_audio_summary(folder)
         except Exception:  # noqa: BLE001
             details = {}
-        # Backfill artist/album from the folder layout when the failure path
-        # didn't record them (e.g. an artist-dump leaf /downloads/<Artist>/<Album>),
-        # so the row, the library compare, and unmonitor-on-resolve all work.
-        if not (artist and album):
+        # Backfill/repair artist/album from the folder layout when the failure
+        # path didn't record them, OR recorded a bare-year "artist" (a discography
+        # "YYYY - Album" leaf), so the row, library compare, and unmonitor work.
+        if not (artist and album) or self._looks_like_year(artist):
             try:
                 a2, b2 = self._identity_for_folder(folder)
-                artist = artist or a2
+                if a2 and not self._looks_like_year(a2):
+                    artist = a2
                 album = album or b2
             except Exception:  # noqa: BLE001
                 pass
@@ -7061,17 +7062,24 @@ class Orchestrator:
         node["children"] = children
         return node
 
+    @staticmethod
+    def _looks_like_year(s: str) -> bool:
+        return bool(re.fullmatch(r"\s*(?:19|20)\d{2}\s*", s or ""))
+
     def _identity_for_folder(self, folder: Path) -> Tuple[str, str]:
         """
-        (artist, album) for a held/source folder. Handles both a single
-        'Artist - Album' folder name AND the nested '<Artist>/<Album>[/CD1]'
-        artist-dump layout under the watch root (e.g. /downloads/Hans Zimmer/
-        The Power Of One), climbing a trailing disc subfolder. ('','') if it
-        genuinely can't be determined.
+        (artist, album) for a held/source folder. Handles:
+          * a single 'Artist - Album' folder,
+          * the nested '<Artist>/<Album>[/CDn]' artist-dump layout, and
+          * a discography dump '<Artist Discography ...>/[Albums/]<YYYY - Album
+            (Edition)>[/CDn]' -- where the album leaf carries NO artist and a
+            naive 'Artist - Album' split would wrongly take the leading year as
+            the artist (the Beyoncé / "2009 - I Am... Sasha Fierce" bug).
+        For a nested path the ARTIST is derived from the top-level container
+        (cleaned of "Discography"/year-range/format tags) and the ALBUM from the
+        leaf (leading year + edition brackets stripped). ('','') if unknown.
         """
-        a, b = self._album_folder_identity(folder)
-        if a and b:
-            return a, b
+        # Relative path parts under the watch root.
         parts: List[str] = []
         wr = self.cfg.watch_root
         if wr is not None:
@@ -7082,10 +7090,29 @@ class Orchestrator:
                 parts = []
         if not parts:
             parts = [folder.name]
+        # Climb a trailing disc subfolder (CD1 / Disc 2 / ...).
         while len(parts) >= 2 and self._DISC_SUBDIR_RE.match(parts[-1] or ""):
             parts = parts[:-1]
+
         if len(parts) >= 2:
-            return parts[0].strip(" -_."), parts[-1].strip(" -_.")
+            # Nested: artist from the container, album from the leaf, cleaned
+            # with the same helpers the deselect path uses.
+            try:
+                from qbt_deselect import _clean_artist, _clean_album
+                artist = _clean_artist(parts[0])
+                album = _clean_album(parts[-1], artist=artist)
+            except Exception:  # noqa: BLE001
+                artist = parts[0].strip(" -_.")
+                album = re.sub(r"^\s*(?:19|20)\d{2}\s*[-.]\s*", "",
+                               parts[-1]).strip(" -_.")
+            if artist and album:
+                return artist, album
+
+        # Single folder: fall back to the 'Artist - Album' parser, but reject a
+        # bare-year "artist" (a "YYYY - Album" leaf) -- keep only the album then.
+        a, b = self._album_folder_identity(folder)
+        if a and self._looks_like_year(a):
+            a = ""
         return a, (b or (parts[-1].strip(" -_.") if parts else ""))
 
     def existing_album_summary(self, entry: Dict[str, Any]) -> Dict[str, Any]:
@@ -7097,10 +7124,13 @@ class Orchestrator:
         """
         artist = (entry.get("artist") or "").strip()
         album = (entry.get("album") or "").strip()
-        if not (artist and album):
+        # Re-derive when identity is missing OR the stored artist is a bare year
+        # (a "YYYY - Album" discography leaf wrongly parsed year-as-artist).
+        if not (artist and album) or self._looks_like_year(artist):
             try:
                 a, b = self._identity_for_folder(Path(entry.get("source_path", "")))
-                artist = artist or a
+                if a and not self._looks_like_year(a):
+                    artist = a
                 album = album or b
             except Exception:  # noqa: BLE001
                 pass

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -263,7 +264,7 @@ function renderVFilters(){var out='';['inc','exc'].forEach(function(kind){var M=
 function chLabel(n){return n===6?'5.1':n===8?'7.1':n===2?'stereo':n===4?'quad':n?(n+'ch'):'';}
 function cell(c,x){var d=x.details||{},ex=x.existing||{};switch(c.k){
   case'title':var t=((x.artist||'')+' — '+(x.album||'')).replace(/^ — | — $/,'')||(x.source_path||'').split('/').pop();return '<span class="title">'+h(t)+'</span>';
-  case'quality':return h(d.quality||'');
+  case'quality':return h((d.quality||'')+(d.n_audio?' · '+d.n_audio+'trk':'')+(d.total_bytes?' · '+human(d.total_bytes):''));
   case'existing':
     if(!ex||ex.in_library!==true)return '<span class="ex">not in library</span>';
     return '<span class="ex">'+h(ex.quality||'')+' · '+(ex.n_audio||0)+'trk · '+human(ex.total_bytes)+'</span>';
@@ -493,9 +494,13 @@ def make_handler(store, actions: HeldActions):
                                 ex = {}
                             ex["_ts"] = now
                             fields = {"existing": ex}
-                            if not (it.get("artist") and it.get("album")) and ex.get("_artist"):
+                            # Backfill/repair identity when it's missing or the
+                            # stored artist is a bare year (discography leaf).
+                            cur_a = str(it.get("artist") or "")
+                            bad = (not (cur_a and it.get("album"))) or bool(re.fullmatch(r"(?:19|20)\d{2}", cur_a.strip()))
+                            if bad and ex.get("_artist"):
                                 fields["artist"] = ex.get("_artist", "")
-                                fields["album"] = ex.get("_album", "")
+                                fields["album"] = ex.get("_album", "") or it.get("album", "")
                                 it["artist"] = fields["artist"]
                                 it["album"] = fields["album"]
                             store.update(it["id"], **fields)
