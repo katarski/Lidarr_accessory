@@ -303,6 +303,15 @@ class OrchestratorConfig:
     # after a VERIFIED import (so a failed import never loses the rip). Requires
     # dvda2wav (libdvd-audio) and 7z (p7zip) in PATH.
     extract_dvda_iso: bool = True
+    # Archive extraction: sometimes a music download is packed in an archive
+    # (.rar/.zip/.7z/.tar[.gz]/multi-part rar). When on, the cueless sweep
+    # extracts each archive in place with 7z (handles all these formats + multi-
+    # volume sets from the first volume), then the normal cue/pre-split flow
+    # picks up the extracted audio on the next pass. A marker file records what
+    # was extracted so it isn't re-done every sweep; the archive itself is KEPT
+    # (like an ISO) and removed with the source folder after a verified import.
+    # Requires 7z (p7zip) in PATH.
+    extract_archives: bool = True
     # Tag-based identification for pre-split "artist dump" folders (backlog #15):
     # when a leaf album folder sits under a top-level folder that matches a Lidarr
     # artist (e.g. /downloads/Hans Zimmer/<album>/...), import each album under
@@ -539,6 +548,10 @@ class Orchestrator:
             if getattr(cfg, "webui_enabled", False) and cfg.held_items_file
             else None
         )
+        # Live conversion activity (SACD/DVD-Audio/DTS/DSD/archive) for the
+        # WebUI "In progress" tab. In-memory only (transient work).
+        self._activity: Dict[str, Dict[str, Any]] = {}
+        self._activity_lock = threading.Lock()
         # Album IDs we've already release-cycled in this process lifetime,
         # so we don't hammer Lidarr with PUT+Refresh on every audit pass.
         self._audit_cycled_album_ids: set = set()
@@ -2400,6 +2413,123 @@ class Orchestrator:
         )
         return True
 
+    # Archive containers we unpack with 7z. Whole-file formats plus RAR (incl.
+    # multi-volume). Secondary volumes (.r00.., .partN>1.rar, .002..) are NOT
+    # listed as "first volumes" -- 7z pulls them in automatically from the first.
+    _ARCHIVE_EXTS = frozenset({
+        ".rar", ".zip", ".7z", ".tar", ".gz", ".tgz", ".bz2", ".tbz2",
+        ".xz", ".txz", ".zipx",
+    })
+    _RAR_PARTN = re.compile(r"(?i)\.part(\d+)\.rar$")
+    _RAR_OLDVOL = re.compile(r"(?i)\.r\d{2,}$")        # .r00, .r01, ...
+    _SPLIT_VOL = re.compile(r"\.(\d{3,})$")            # .001, .002, ...
+
+    def _is_archive(self, name: str) -> bool:
+        low = name.lower()
+        if self._RAR_OLDVOL.search(low) or self._SPLIT_VOL.search(low):
+            return True  # a volume of a set -- still "an archive file" present
+        return os.path.splitext(low)[1] in self._ARCHIVE_EXTS
+
+    def _archive_first_volumes(self, archives: List[Path]) -> List[Path]:
+        """
+        From the archive files in a folder, return only the ones to feed to 7z
+        (7z pulls the rest of a multi-volume set in automatically). A plain
+        `.rar`/`.zip`/`.7z`/`.tar[.gz]` is a first volume; `.partNN.rar` only
+        when NN==1; old-style `.r00..`/`.001..` continuation volumes are skipped.
+        """
+        out: List[Path] = []
+        for a in archives:
+            low = a.name.lower()
+            m = self._RAR_PARTN.search(low)
+            if m:
+                if int(m.group(1)) == 1:
+                    out.append(a)
+                continue
+            if self._RAR_OLDVOL.search(low):
+                continue  # .r00.. -> the sibling .rar is the first volume
+            if self._SPLIT_VOL.search(low):
+                if low.endswith(".001"):
+                    out.append(a)
+                continue
+            if os.path.splitext(low)[1] in self._ARCHIVE_EXTS:
+                out.append(a)
+        return out
+
+    def _extract_archives_folder(
+        self, folder: Path, archives: List[Path], now_ts: float, min_stable: int,
+    ) -> bool:
+        """
+        Extract archive(s) in `folder` in place with 7z so the normal cue/
+        pre-split flow can pick up the audio on the next sweep. Idempotent via a
+        `.cue_pipeline_archives` marker (archives already unpacked aren't redone).
+        The archive files are KEPT (removed with the folder after a verified
+        import, like an ISO). Returns True when the sweep should skip the rest of
+        this pass (extracted / deferred / failed), False when there's nothing new
+        to unpack (fall through to the normal flow).
+        """
+        settle = max(min_stable, 60)
+        for a in archives:
+            try:
+                if now_ts - a.stat().st_mtime < settle:
+                    logger.debug("archive: %s still settling; deferring", a.name)
+                    return True
+            except OSError:
+                return True
+
+        marker = folder / ".cue_pipeline_archives"
+        done: set = set()
+        try:
+            if marker.exists():
+                done = set(
+                    ln.strip() for ln in marker.read_text(encoding="utf-8").splitlines()
+                    if ln.strip()
+                )
+        except OSError:
+            done = set()
+
+        firsts = [a for a in self._archive_first_volumes(archives) if a.name not in done]
+        if not firsts:
+            return False  # nothing new -- let the normal flow handle the audio
+
+        extracted = 0
+        for a in firsts:
+            logger.info("archive: extracting %s in %s ...", a.name, folder.name)
+            try:
+                proc = subprocess.run(
+                    ["7z", "x", "-y", "-bd", f"-o{folder}", str(a)],
+                    capture_output=True, text=True, timeout=7200,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("archive: 7z failed on %s: %s", a.name, exc)
+                continue
+            if proc.returncode != 0:
+                logger.warning(
+                    "archive: 7z returned %d on %s -- %s", proc.returncode,
+                    a.name, (proc.stderr or proc.stdout or "")[-200:])
+                continue
+            done.add(a.name)
+            extracted += 1
+
+        # Record every archive-set member as done so continuation volumes aren't
+        # retried as their own "first volume" on a later pass.
+        for a in archives:
+            done.add(a.name)
+        try:
+            marker.write_text("\n".join(sorted(done)) + "\n", encoding="utf-8")
+        except OSError:
+            pass
+
+        if extracted:
+            logger.info(
+                "archive: %s -> unpacked %d archive(s); normal flow will import "
+                "on the next sweep (archive kept until verified import)",
+                folder.name, extracted)
+            return True
+        # Nothing extracted successfully (e.g. 7z missing / bad archive) -- don't
+        # spin on it every pass.
+        self._skip_seen.add(folder)
+        return True
+
     # Channel-variant folder names (sacd_extract etc.): multichannel wins over
     # stereo. Multichannel patterns tested first.
     _CHANNEL_VARIANT_RES = (
@@ -3395,7 +3525,12 @@ class Orchestrator:
             # returns False (fall through to the SACD branch) when the ISO is not
             # DVD-Audio, so the two coexist cleanly.
             if isos and getattr(self.cfg, "extract_dvda_iso", True):
-                if self._extract_dvda_folder(folder, isos, now_ts, min_stable):
+                self._activity_start(folder, "DVD-Audio", isos[0].name)
+                try:
+                    did = self._extract_dvda_folder(folder, isos, now_ts, min_stable)
+                finally:
+                    self._activity_end(folder)
+                if did:
                     # Re-scan on the next sweep as an ordinary pre-split folder.
                     continue
 
@@ -3406,9 +3541,32 @@ class Orchestrator:
             # (this or a later sweep) transcodes the DSF to FLAC and hands them
             # off; the .iso is deleted with the folder after a verified import.
             if isos and getattr(self.cfg, "extract_sacd_iso", True):
-                if self._extract_sacd_folder(folder, isos, now_ts, min_stable):
+                self._activity_start(folder, "SACD", isos[0].name)
+                try:
+                    did = self._extract_sacd_folder(folder, isos, now_ts, min_stable)
+                finally:
+                    self._activity_end(folder)
+                if did:
                     # Re-scan on the next sweep as an ordinary DSD folder.
                     continue
+
+            # Archive (.rar/.zip/.7z/.tar...): unpack in place with 7z, then the
+            # normal flow imports the extracted audio on the next sweep. Done
+            # before the .cue guard so an archive containing a .cue is unpacked
+            # first. The archive is kept until the folder is cleaned post-import.
+            if getattr(self.cfg, "extract_archives", True):
+                archives = [
+                    folder / fn for fn in filenames if self._is_archive(fn)
+                ]
+                if archives:
+                    self._activity_start(folder, "Extracting archive", archives[0].name)
+                    try:
+                        did = self._extract_archives_folder(
+                            folder, archives, now_ts, min_stable)
+                    finally:
+                        self._activity_end(folder)
+                    if did:
+                        continue
 
             # If this folder has any .cue, the normal watcher path owns it --
             # remember the whole subtree so we never grab a split-STAGING
@@ -3481,7 +3639,11 @@ class Orchestrator:
                     for fn in filenames
                 )
                 if has_raw_dts or has_dts_wav:
-                    self._transcode_dts_folder(folder)
+                    self._activity_start(folder, "DTS→FLAC")
+                    try:
+                        self._transcode_dts_folder(folder)
+                    finally:
+                        self._activity_end(folder)
                     # Fall through: the just-written FLACs are usually caught by
                     # the stability guard and imported on the next sweep.
 
@@ -3521,7 +3683,11 @@ class Orchestrator:
                             "higher-channel sibling %s", folder.name, mch_sib.name)
                         self._skip_seen.add(folder)
                     elif dsd_stable:
-                        self._transcode_dsd_folder(folder)
+                        self._activity_start(folder, "DSD→FLAC")
+                        try:
+                            self._transcode_dsd_folder(folder)
+                        finally:
+                            self._activity_end(folder)
                     else:
                         logger.debug(
                             "cueless sweep: %s has DSD files still downloading; "
@@ -6649,9 +6815,14 @@ class Orchestrator:
                 return
         except OSError:
             return
+        try:
+            details = self._folder_audio_summary(folder)
+        except Exception:  # noqa: BLE001
+            details = {}
         self.held.add(
             source_path=str(folder), artist=artist, album=album,
-            tracks=int(track_count or 0), reason=reason, outcome=outcome,
+            tracks=int(track_count or details.get("n_audio", 0) or 0),
+            reason=reason, outcome=outcome, details=details,
         )
 
     # ---- WebUI actions (#11) ------------------------------------------
@@ -6668,6 +6839,96 @@ class Orchestrator:
         except OSError:
             pass
         return sorted(out)
+
+    @staticmethod
+    def _audio_stream_info(path: Path) -> Tuple[int, int, int]:
+        """(channels, sample_rate, bits) via mutagen header read; 0s on failure."""
+        try:
+            from mutagen import File as MutagenFile  # lazy
+            info = getattr(MutagenFile(str(path)), "info", None)
+            return (
+                int(getattr(info, "channels", 0) or 0),
+                int(getattr(info, "sample_rate", 0) or 0),
+                int(getattr(info, "bits_per_sample", 0) or 0),
+            )
+        except Exception:  # noqa: BLE001
+            return (0, 0, 0)
+
+    def _folder_audio_summary(self, folder: Path) -> Dict[str, Any]:
+        """
+        Best-effort audio profile of a folder for the WebUI details list:
+        track count, per-format counts, lossless/lossy, channel layout,
+        sample-rate/bit-depth, total size, plus a compact `quality` label.
+        Cheap header reads only (no decode), capped so a huge folder stays fast.
+        """
+        files = self._held_audio_files(folder)
+        n = len(files)
+        total = 0
+        fmt: Dict[str, int] = {}
+        lossless_n = lossy_n = 0
+        for p in files:
+            ext = p.suffix.lower()
+            fmt[ext] = fmt.get(ext, 0) + 1
+            try:
+                total += p.stat().st_size
+            except OSError:
+                pass
+            if ext in self._LOSSLESS_AUDIO_EXTS:
+                lossless_n += 1
+            else:
+                lossy_n += 1
+        maxch = maxrate = maxbits = 0
+        for p in files[:20]:
+            ch, rate, bits = self._audio_stream_info(p)
+            maxch = max(maxch, ch)
+            maxrate = max(maxrate, rate)
+            maxbits = max(maxbits, bits)
+        ch_label = {1: "mono", 2: "stereo", 4: "quad"}.get(
+            maxch, {6: "5.1", 8: "7.1"}.get(maxch, f"{maxch}ch" if maxch else ""))
+        dom = max(fmt, key=fmt.get)[1:].upper() if fmt else ""
+        bits_rate = ""
+        if maxrate:
+            bits_rate = f"{maxrate/1000:g}k" + (f"/{maxbits}" if maxbits else "")
+        quality = " · ".join(x for x in (dom, ch_label, bits_rate) if x)
+        return {
+            "n_audio": n,
+            "total_bytes": total,
+            "formats": {k: v for k, v in sorted(fmt.items())},
+            "lossless": n > 0 and lossy_n == 0,
+            "has_lossy": lossy_n > 0,
+            "multichannel": maxch > 2,
+            "max_channels": maxch,
+            "sample_rate": maxrate,
+            "bits": maxbits,
+            "quality": quality or "unknown",
+        }
+
+    # ---- Conversion activity (WebUI "In progress" tab) ----------------
+    def _activity_start(self, folder: Path, stage: str, detail: str = "") -> None:
+        """Mark a folder as undergoing a conversion (SACD/DVD-Audio/DTS/DSD/
+        archive). Shown live on the WebUI. Cleared by _activity_end."""
+        act = getattr(self, "_activity", None)
+        if act is None:
+            return
+        with self._activity_lock:
+            self._activity[str(folder)] = {
+                "folder": str(folder), "stage": stage, "detail": detail,
+                "name": folder.name, "started": time.time(),
+            }
+
+    def _activity_end(self, folder: Path) -> None:
+        act = getattr(self, "_activity", None)
+        if act is None:
+            return
+        with self._activity_lock:
+            self._activity.pop(str(folder), None)
+
+    def list_activity(self) -> List[Dict[str, Any]]:
+        act = getattr(self, "_activity", None)
+        if act is None:
+            return []
+        with self._activity_lock:
+            return sorted(self._activity.values(), key=lambda a: a.get("started", 0))
 
     def keep_existing(self, entry: Dict[str, Any]) -> Tuple[bool, str]:
         """

@@ -100,6 +100,11 @@ lidarr:
   # until the source folder is deleted after a verified import. Needs dvda2wav and
   # 7z (both in the image). Set false to ignore DVD-Audio ISOs.
   extract_dvda_iso: true
+  # Archive extraction: unpack .rar/.zip/.7z/.tar[.gz]/multi-part-rar downloads
+  # in place with 7z, then the normal cue/pre-split flow imports the audio. The
+  # archive is kept until the source folder is deleted after a verified import.
+  # Needs 7z (in the image). Set false to leave archives alone.
+  extract_archives: true
   # #11: manual-attention WebUI. A small dashboard listing items the pipeline
   # couldn't finish on its own (outcome failed / imported_unverified, files
   # still on disk). Per item you can copy the stuck path, "keep existing"
@@ -192,6 +197,12 @@ qbittorrent:
   # albums, then resume -- so a .torrent add never downloads the unwanted
   # albums at all. false = deselect without pausing (a little may leak).
   pause_during_scan: true
+  # #4: deselect video in lidarr-category torrents. Lidarr sometimes grabs a
+  # release carrying a concert DVD/BD or bundled music video; we never want that
+  # in the music library, so video files (VIDEO_TS/BDMV zones + standalone
+  # containers) are deselected. A DVD-Audio AUDIO_TS zone and a whole-disc .iso
+  # are AUDIO and kept. Set false to disable.
+  deselect_video: true
   # Completed-torrent lifecycle: for each finished music torrent, pause it while
   # the pipeline is mid-import and remove it (with data) once every album has
   # been moved into the library. Disk-aware, so it never deletes un-imported

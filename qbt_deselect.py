@@ -88,6 +88,42 @@ def _is_noise_category(key: str) -> bool:
     return any(_NOISE_DIR.match(p) for p in parts[:-1])
 
 
+# --- Video exclusion (backlog #4) ------------------------------------------
+# Lidarr sometimes grabs a release that carries video (a concert DVD/BD ripped
+# alongside the audio, a bundled music video, a DVD-Video zone). We never want
+# to download video into the music library, so deselect it. IMPORTANT: a
+# DVD-Audio disc's AUDIO_TS zone (and a whole-disc .iso) IS the audio -- keep
+# it; only the VIDEO_TS / BDMV video zones and standalone video containers are
+# dropped.
+_VIDEO_EXTS = {
+    ".mkv", ".mp4", ".m4v", ".avi", ".wmv", ".mov", ".flv", ".mpg", ".mpeg",
+    ".mpe", ".m2ts", ".mts", ".ts", ".vob", ".divx", ".ogv", ".webm", ".3gp",
+    ".rm", ".rmvb", ".asf",
+}
+# A DVD-Video / Blu-ray video zone path segment.
+_VIDEO_DIR = re.compile(r"(?i)(?:^|/)(?:video_ts|bdmv)(?:/|$)")
+# A DVD-Audio zone -- this is AUDIO, never deselected as "video".
+_AUDIO_TS_DIR = re.compile(r"(?i)(?:^|/)audio_ts(?:/|$)")
+
+
+def _video_file_indices(files: List[Dict[str, Any]]) -> List[int]:
+    """
+    qBit file indices that are VIDEO (a VIDEO_TS/BDMV zone, or a standalone
+    video container), EXCLUDING anything under a DVD-Audio AUDIO_TS zone (that's
+    audio). Used to deselect video so a music grab never pulls it.
+    """
+    out: List[int] = []
+    for f in files:
+        low = str(f.get("name", "")).replace("\\", "/").lower()
+        if _AUDIO_TS_DIR.search(low):
+            continue  # DVD-Audio zone -> keep
+        ext = os.path.splitext(low)[1]
+        if _VIDEO_DIR.search(low) or ext in _VIDEO_EXTS:
+            if "index" in f:
+                out.append(int(f["index"]))
+    return out
+
+
 def _clean_album(name: str, artist: str = "") -> str:
     """
     Turn a messy album-folder name into a bare album title:
@@ -223,15 +259,18 @@ def process_torrent(
     forced_artist: str = "", apply: bool = False,
     emit: Callable[[str], None] = logger.info,
     files: Optional[List[Dict[str, Any]]] = None,
-    llm=None,
+    llm=None, deselect_video: bool = True,
 ) -> tuple:
     """Plan + (optionally) deselect one torrent. Returns (deselected, kept)."""
     thash = torrent.get("hash")
     tname = torrent.get("name") or "?"
     if files is None:
         files = qbt.files(thash)
+    # Video exclusion (#4) is independent of the album plan: even a torrent with
+    # no owned albums (or no audio-album grouping) should drop its video files.
+    video_idx = _video_file_indices(files) if deselect_video else []
     plan = plan_torrent(lidarr, tname, files, forced_artist, llm=llm)
-    if not plan:
+    if not plan and not video_idx:
         return 0, 0
     emit(f"Torrent: {tname}")
     to_deselect: List[int] = []
@@ -250,6 +289,15 @@ def process_torrent(
             kept += 1
             why = "not in library" if a["total"] == 0 else f"library {a['have_count']}/{a['total']}"
             emit(f"  KEEP  [{human(a['size']):>9}]  {a['artist']} / {a['album']} ({why})")
+    # Merge in video files (VIDEO_TS/BDMV/containers, AUDIO_TS kept) -- always
+    # dropped for a music torrent, on top of any already-have album folders.
+    if video_idx:
+        already = set(to_deselect)
+        fresh = [i for i in video_idx if i not in already]
+        if fresh:
+            to_deselect.extend(fresh)
+            emit(f"  VIDEO -> deselect {len(fresh)} video file(s) "
+                 f"(VIDEO_TS/BDMV/containers; AUDIO_TS + .iso kept)")
     if apply and to_deselect:
         ok = qbt.set_file_priority(thash, to_deselect, 0)
         emit(f"  -> {'deselected' if ok else 'FAILED'} {len(to_deselect)} file(s)")
@@ -259,7 +307,7 @@ def process_torrent(
 def auto_deselect_pass(
     qbt: QbtClient, lidarr: LidarrClient, seen: set,
     category: str = "", emit: Callable[[str], None] = logger.info,
-    pause_during_scan: bool = True, llm=None,
+    pause_during_scan: bool = True, llm=None, deselect_video: bool = True,
 ) -> int:
     """
     One scheduled pass for the pipeline: for each INCOMPLETE music torrent we
@@ -304,7 +352,8 @@ def auto_deselect_pass(
                 # (The finally-block restores the original state meanwhile.)
                 continue
             d, _k = process_torrent(
-                qbt, lidarr, t, apply=True, emit=emit, files=files, llm=llm
+                qbt, lidarr, t, apply=True, emit=emit, files=files, llm=llm,
+                deselect_video=deselect_video,
             )
             seen.add(h)
             if d:

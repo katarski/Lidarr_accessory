@@ -81,6 +81,7 @@ class HeldStore:
         reason: str = "",
         outcome: str = "",
         kind: str = "",
+        details: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Upsert an item needing attention, keyed by its source folder."""
         source_path = str(source_path)
@@ -97,6 +98,8 @@ class HeldStore:
                 "reason": (reason or existing.get("reason", ""))[:500],
                 "outcome": outcome or existing.get("outcome", ""),
                 "kind": kind or existing.get("kind", ""),
+                "details": details if details is not None
+                else existing.get("details", {}),
                 "created": existing.get("created") or now,
                 "updated": now,
                 "seen_count": int(existing.get("seen_count", 0)) + 1,

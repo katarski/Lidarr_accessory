@@ -89,6 +89,7 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     put("lidarr", "transcode_dsd", "TRANSCODE_DSD", _as_bool)
     put("lidarr", "extract_sacd_iso", "EXTRACT_SACD_ISO", _as_bool)
     put("lidarr", "extract_dvda_iso", "EXTRACT_DVDA_ISO", _as_bool)
+    put("lidarr", "extract_archives", "EXTRACT_ARCHIVES", _as_bool)
     # Manual-attention WebUI (#11)
     put("lidarr", "webui_enabled", "WEBUI_ENABLED", _as_bool)
     put("lidarr", "webui_port", "WEBUI_PORT", int)
@@ -134,6 +135,7 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     put("qbittorrent", "auto_deselect", "QBIT_AUTO_DESELECT", _as_bool)
     put("qbittorrent", "interval_seconds", "QBIT_INTERVAL", int)
     put("qbittorrent", "pause_during_scan", "QBIT_PAUSE_SCAN", _as_bool)
+    put("qbittorrent", "deselect_video", "QBIT_DESELECT_VIDEO", _as_bool)
     put("qbittorrent", "manage_completed", "QBIT_MANAGE_COMPLETED", _as_bool)
     put("qbittorrent", "remove_when_library_complete", "QBIT_REMOVE_WHEN_LIBRARY_COMPLETE", _as_bool)
     # #9 recurring .cue re-scan
@@ -478,6 +480,7 @@ def qbt_auto_deselect_loop(
     pause_scan = _as_bool(qcfg.get("pause_during_scan", True))
     do_deselect = _as_bool(qcfg.get("auto_deselect", False))
     manage_completed = _as_bool(qcfg.get("manage_completed", True))
+    deselect_video = _as_bool(qcfg.get("deselect_video", True))  # #4
     # AI fallback for library matching: only used when the deterministic
     # (Lidarr) match misses. Requires an enabled LLM client.
     ai_match = _as_bool(qcfg.get("ai_match", True))
@@ -519,7 +522,8 @@ def qbt_auto_deselect_loop(
                 acted = auto_deselect_pass(qbt, lidarr, seen, category=category,
                                            emit=logger.info,
                                            pause_during_scan=pause_scan,
-                                           llm=match_llm)
+                                           llm=match_llm,
+                                           deselect_video=deselect_video)
                 if acted:
                     logger.info("qbt auto-deselect: acted on %d torrent(s)", acted)
             if manage_completed:
@@ -837,6 +841,9 @@ def main() -> int:
         ),
         extract_dvda_iso=bool(
             lidarr_cfg.get("extract_dvda_iso", True)
+        ),
+        extract_archives=bool(
+            lidarr_cfg.get("extract_archives", True)
         ),
         tag_identify_pre_split=bool(
             lidarr_cfg.get("tag_identify_pre_split", True)
