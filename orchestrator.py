@@ -443,6 +443,16 @@ class OrchestratorConfig:
     interactive_search_max_candidates: int = 5
     # Only consider lossless (FLAC) releases; skip lossy when this is on.
     interactive_search_require_lossless: bool = True
+    # Minimum title-relation (0..1) the best candidate must reach to be grabbed.
+    # Guards against grabbing the WRONG album for short/numeric titles (e.g.
+    # "Beyonce - 4" matching "Dangerously In Love"). Below this we skip the album
+    # and flag it for manual attention rather than grab a bad match.
+    interactive_search_min_title_ratio: float = 0.55
+    # Cap how many eligible albums are searched+grabbed per pass, so a big
+    # missing backlog doesn't hammer the indexers with hundreds of searches at
+    # once. Least-recently-attempted albums are picked first, so all rotate
+    # through over successive passes.
+    interactive_search_max_albums_per_pass: int = 15
     # JSON state file: {albumId: {first_missing, last_attempt, blocklisted[]}}.
     # Tracks how long each album has been missing (the >Ndays clock) and the
     # per-album grab cooldown, surviving restarts. Lives in /config.
@@ -5317,6 +5327,16 @@ class Orchestrator:
                 " lossless" if cfg.interactive_search_require_lossless else "")
             return False
 
+        # Title-relation floor: don't grab a weak/wrong match (short & numeric
+        # album titles like "4" / "112" attract loosely-related releases).
+        floor = float(cfg.interactive_search_min_title_ratio)
+        if float(cands[0].get("_title_ratio") or 0) < floor:
+            logger.info(
+                "interactive search: %s -- best title match %.2f < %.2f "
+                "(%r); skipping, needs manual attention", label,
+                cands[0].get("_title_ratio"), floor, cands[0].get("title"))
+            return False
+
         if cfg.interactive_search_dry_run:
             top = cands[0]
             logger.info(
@@ -5395,8 +5415,10 @@ class Orchestrator:
         except Exception:  # noqa: BLE001
             pass
 
+        # First pass over ALL missing albums: start each one's "first missing"
+        # clock and collect the ones eligible to act on now.
         missing_ids: set = set()
-        grabbed = 0
+        eligible: List[Tuple[Dict[str, Any], Dict[str, Any], int]] = []
         for alb in missing:
             aid = alb.get("id")
             if aid is None:
@@ -5411,6 +5433,21 @@ class Orchestrator:
                 continue        # already downloading -- leave it
             if now - float(st.get("last_attempt") or 0) < cooldown:
                 continue        # per-album cooldown
+            eligible.append((alb, st, aid))
+
+        # Cap the work per pass (least-recently-attempted first) so a big
+        # backlog doesn't fire hundreds of indexer searches at once; the rest
+        # rotate in on later passes.
+        eligible.sort(key=lambda t: float(t[1].get("last_attempt") or 0))
+        cap = max(1, int(cfg.interactive_search_max_albums_per_pass))
+        picked = eligible[:cap]
+        if eligible:
+            logger.info(
+                "interactive search: %d eligible album(s); processing %d "
+                "this pass", len(eligible), len(picked))
+
+        grabbed = 0
+        for alb, st, aid in picked:
             try:
                 if self._isearch_one_album(alb, st, qbt):
                     grabbed += 1

@@ -109,6 +109,8 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     put("lidarr", "interactive_search_dry_run", "ISEARCH_DRY_RUN", _as_bool)
     put("lidarr", "interactive_search_max_candidates", "ISEARCH_MAX_CANDIDATES", int)
     put("lidarr", "interactive_search_require_lossless", "ISEARCH_REQUIRE_LOSSLESS", _as_bool)
+    put("lidarr", "interactive_search_min_title_ratio", "ISEARCH_MIN_TITLE_RATIO", float)
+    put("lidarr", "interactive_search_max_albums_per_pass", "ISEARCH_MAX_ALBUMS", int)
     # Purge-imported sweep -- continuously delete download folders whose album
     # Lidarr already has fully (catches re-downloads the pipeline skipped).
     put("lidarr", "purge_imported_enabled", "PURGE_IMPORTED_ENABLED", _as_bool)
@@ -834,6 +836,12 @@ def main() -> int:
         ),
         interactive_search_require_lossless=bool(
             lidarr_cfg.get("interactive_search_require_lossless", True)
+        ),
+        interactive_search_min_title_ratio=float(
+            lidarr_cfg.get("interactive_search_min_title_ratio", 0.55)
+        ),
+        interactive_search_max_albums_per_pass=int(
+            lidarr_cfg.get("interactive_search_max_albums_per_pass", 15)
         ),
         interactive_search_cooldown_seconds=int(
             lidarr_cfg.get("interactive_search_cooldown_seconds", 43200)
