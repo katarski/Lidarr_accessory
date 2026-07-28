@@ -7154,6 +7154,53 @@ class Orchestrator:
             b = self._conservative_album(folder.name, a)
         return a, (b or (parts[-1].strip(" -_.") if parts else ""))
 
+    def _lidarr_album_state(self, artist_name: str, album_name: str) -> Dict[str, Any]:
+        """
+        Whether Lidarr knows this album (as an album record), even if no files
+        are on disk yet: {present, monitored, have, total}. Matched by the same
+        normalized-title key as the rest of the pipeline, with an edition-subset
+        fallback ("... (Deluxe)" -> the base title).
+        """
+        out = {"present": False, "monitored": False, "have": 0, "total": 0}
+        if not (artist_name and album_name):
+            return out
+        try:
+            artist = self.lidarr.find_artist(artist_name)
+            if not artist:
+                return out
+            albums = self.lidarr.list_albums_for_artist(artist["id"]) or []
+        except Exception:  # noqa: BLE001
+            return out
+        target = _match_key(album_name)
+        match = None
+        for a in albums:
+            if _match_key(a.get("title")) == target:
+                match = a
+                break
+        if match is None and target:
+            tw = set(target.split())
+            best = None
+            for a in albums:
+                aw = set(_match_key(a.get("title")).split())
+                if aw and aw <= tw and (best is None or len(aw) > best[0]):
+                    best = (len(aw), a)
+            if best:
+                match = best[1]
+        if match is None:
+            return out
+        out["present"] = True
+        out["monitored"] = bool(match.get("monitored"))
+        stats = match.get("statistics") or {}
+        aid = match.get("id")
+        try:
+            full = (self.lidarr.get_album(aid) or {}) if aid else {}
+            stats = full.get("statistics") or stats
+        except Exception:  # noqa: BLE001
+            pass
+        out["have"] = int(stats.get("trackFileCount") or 0)
+        out["total"] = int(stats.get("totalTrackCount") or 0)
+        return out
+
     def existing_album_summary(self, entry: Dict[str, Any]) -> Dict[str, Any]:
         """
         What the library ALREADY holds for this held item's album, so the WebUI
@@ -7183,9 +7230,15 @@ class Orchestrator:
         except Exception:  # noqa: BLE001
             return {}
         if not album_dir:
-            # Carry the resolved identity so the caller can still backfill the
-            # row + retry the lookup later (the album may land in the library).
-            return {"in_library": False, "_artist": artist, "_album": album}
+            # Not on disk -- but Lidarr may still know it as an album (monitored,
+            # missing files). Report that so the user can tell "unknown to Lidarr"
+            # from "Lidarr has the album, just no files yet".
+            out = {"in_library": False, "_artist": artist, "_album": album}
+            try:
+                out["lidarr"] = self._lidarr_album_state(artist, album)
+            except Exception:  # noqa: BLE001
+                out["lidarr"] = {}
+            return out
         summ = self._folder_audio_summary(album_dir)
         summ["in_library"] = True
         summ["path"] = str(album_dir)

@@ -267,8 +267,12 @@ function cell(c,x){var d=x.details||{},ex=x.existing||{};switch(c.k){
   case'title':var t=((x.artist||'')+' — '+(x.album||'')).replace(/^ — | — $/,'')||(x.source_path||'').split('/').pop();return '<span class="title">'+h(t)+'</span>';
   case'quality':return h((d.quality||'')+(d.n_audio?' · '+d.n_audio+'trk':'')+(d.total_bytes?' · '+human(d.total_bytes):''));
   case'existing':
-    if(!ex||ex.in_library!==true)return '<span class="ex">not in library</span>';
-    return '<span class="ex">'+h(ex.quality||'')+' · '+(ex.n_audio||0)+'trk · '+human(ex.total_bytes)+'</span>';
+    if(ex&&ex.in_library===true)
+      return '<span class="ex">'+h(ex.quality||'')+' · '+(ex.n_audio||0)+'trk · '+human(ex.total_bytes)+'</span>';
+    var L=(ex&&ex.lidarr)||{};
+    if(L.present)
+      return '<span class="ex">not on disk · <span class="badge b-ll">Lidarr'+(L.monitored?' ●':' ○')+' '+(L.have||0)+'/'+(L.total||0)+'</span></span>';
+    return '<span class="ex">not in library / not in Lidarr</span>';
   case'verdict':
     if(!ex||ex.in_library!==true)return '<span class="badge b-mc">held is new</span>';
     var sh=score(d),se=score(ex);
@@ -289,7 +293,7 @@ function fmtDate(ts){if(!ts)return'';try{var d=new Date(ts*1000);return d.toLoca
 function cellText(k,x){var d=x.details||{},ex=x.existing||{};switch(k){
   case'title':return ((x.artist||'')+' — '+(x.album||'')).replace(/^ — | — $/,'')||(x.source_path||'').split('/').pop();
   case'quality':return d.quality||'';
-  case'existing':return (ex&&ex.in_library)?(ex.quality||''):'not in library';
+  case'existing':return (ex&&ex.in_library)?(ex.quality||''):((ex&&ex.lidarr&&ex.lidarr.present)?('lidarr '+(ex.lidarr.have||0)+'/'+(ex.lidarr.total||0)):'not in lidarr');
   case'verdict':if(!ex||ex.in_library!==true)return 'held is new';var a=score(d),b2=score(ex);return a>b2+0.01?'held better':(b2>a+0.01?'library better':'same');
   case'formats':return fmtStr(d);
   case'ch':return d.multichannel?chLabel(d.max_channels):(d.max_channels?'stereo':'');
