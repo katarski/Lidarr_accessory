@@ -5698,6 +5698,10 @@ class Orchestrator:
                 len(by_artist), len(picked))
 
         grabbed = 0
+        # Shared budget so one prolific artist's per-album fallback can't fire
+        # a search for every one of its (often unavailable) missing albums; the
+        # rest rotate in on later passes.
+        album_budget = cap
         for art_id, g in picked:
             name, items = g["name"], g["items"]
             handled = False
@@ -5723,8 +5727,13 @@ class Orchestrator:
                 for _alb, st, _aid in items:
                     st["last_attempt"] = now
                 continue
-            # Fallback: per-album search for this artist's missing albums.
+            # Fallback: per-album search for this artist's missing albums,
+            # bounded by the shared album-search budget (deferred albums keep
+            # their old last_attempt so they sort to the front next pass).
             for alb, st, aid in items:
+                if album_budget <= 0:
+                    break
+                album_budget -= 1
                 try:
                     if self._isearch_one_album(alb, st, qbt):
                         grabbed += 1
