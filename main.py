@@ -94,6 +94,7 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     put("lidarr", "webui_enabled", "WEBUI_ENABLED", _as_bool)
     put("lidarr", "webui_port", "WEBUI_PORT", int)
     put("lidarr", "webui_host", "WEBUI_HOST")
+    put("lidarr", "webui_unmonitor_on_resolve", "WEBUI_UNMONITOR_ON_RESOLVE", _as_bool)
     put("lidarr", "tag_identify_pre_split", "TAG_IDENTIFY_PRE_SPLIT", _as_bool)
     put("lidarr", "prefer_multichannel", "PREFER_MULTICHANNEL", _as_bool)
     put("lidarr", "transcode_lossless_to_flac", "TRANSCODE_LOSSLESS_TO_FLAC", _as_bool)
@@ -918,6 +919,8 @@ def main() -> int:
         webui_enabled=bool(lidarr_cfg.get("webui_enabled", True)),
         webui_host=str(lidarr_cfg.get("webui_host", "0.0.0.0")),
         webui_port=int(lidarr_cfg.get("webui_port", 8830)),
+        webui_unmonitor_on_resolve=bool(
+            lidarr_cfg.get("webui_unmonitor_on_resolve", True)),
         held_items_file=held_items_path,
         sweep_cueless_pre_split=bool(
             watch_cfg.get("sweep_cueless_pre_split", False)

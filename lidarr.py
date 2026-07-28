@@ -157,6 +157,26 @@ class LidarrClient:
             logger.error("set_album_monitored_release failed: %s", exc)
             return False
 
+    def set_album_monitored(self, album_id: int, monitored: bool) -> bool:
+        """
+        PUT /api/v1/album/{id} with the album's `monitored` flag set.
+        Unmonitoring stops Lidarr's auto-search AND the pipeline's interactive
+        search (which only targets monitored-missing albums) from grabbing it
+        again -- used when the user resolves an item in the WebUI and wants it
+        left alone ("complete, no more downloads").
+        """
+        album = self.get_album(album_id)
+        if not album:
+            return False
+        album["monitored"] = bool(monitored)
+        try:
+            self._put(f"/api/v1/album/{album_id}", album)
+            logger.info("Set album %s monitored=%s", album_id, monitored)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.error("set_album_monitored failed: %s", exc)
+            return False
+
     def find_release_matching_track_count(
         self, album_id: int, desired_track_count: int
     ) -> Optional[int]:

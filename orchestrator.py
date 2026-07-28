@@ -374,6 +374,11 @@ class OrchestratorConfig:
     webui_host: str = "0.0.0.0"
     webui_port: int = 8830
     held_items_file: Optional[Path] = None
+    # When the user resolves a held item in the WebUI (keep-existing or
+    # move-held), unmonitor the matching Lidarr album so neither Lidarr nor the
+    # interactive search re-downloads it ("once I solve this, complete and no
+    # more downloads"). Off => the album stays monitored.
+    webui_unmonitor_on_resolve: bool = True
     # If True, NEVER do the manual-move fallback. Every successful outcome
     # must go through Lidarr's own DownloadedAlbumsScan or ManualImport so
     # that Lidarr's "Import Using Script" / Connect hooks fire. If both
@@ -6930,6 +6935,101 @@ class Orchestrator:
         with self._activity_lock:
             return sorted(self._activity.values(), key=lambda a: a.get("started", 0))
 
+    def _unmonitor_album(self, artist_name: str, album_name: str) -> bool:
+        """Unmonitor the Lidarr album matching artist+album (normalized-exact),
+        so nothing re-downloads it. Best-effort; False if not found/unavailable."""
+        artist_name = (artist_name or "").strip()
+        album_name = (album_name or "").strip()
+        if not (artist_name and album_name):
+            return False
+        try:
+            artist = self.lidarr.find_artist(artist_name)
+            if not artist:
+                return False
+            albums = self.lidarr.list_albums_for_artist(artist["id"]) or []
+        except Exception:  # noqa: BLE001
+            return False
+        target = _match_key(album_name)
+        for a in albums:
+            if _match_key(a.get("title")) == target and a.get("id"):
+                return self.lidarr.set_album_monitored(a["id"], False)
+        return False
+
+    def _resolve_unmonitor(self, entry: Dict[str, Any]) -> str:
+        """On WebUI resolve, unmonitor the album so it won't be re-downloaded
+        (user: 'once I solve this, complete and no more downloads'). Returns a
+        short suffix for the action message. Gated by webui_unmonitor_on_resolve."""
+        if not getattr(self.cfg, "webui_unmonitor_on_resolve", True):
+            return ""
+        artist = (entry.get("artist") or "").strip()
+        album = (entry.get("album") or "").strip()
+        if not (artist and album):
+            try:
+                a, b = self._album_folder_identity(Path(entry.get("source_path", "")))
+                artist = artist or a
+                album = album or b
+            except Exception:  # noqa: BLE001
+                pass
+        if artist and album and self._unmonitor_album(artist, album):
+            return " (unmonitored -- won't re-download)"
+        return ""
+
+    def folder_tree(self, entry: Dict[str, Any], which: str = "held") -> Dict[str, Any]:
+        """
+        Build a nested file tree for the WebUI's expandable compare view.
+        which='held' -> the stuck download folder; which='library' -> the
+        matched library album folder. Safety: only paths under the watch root
+        or the library root are walked. Node-capped so a huge folder can't
+        produce an unbounded payload.
+        """
+        if which == "library":
+            base = (entry.get("existing") or {}).get("path", "")
+        else:
+            base = entry.get("source_path", "")
+        if not base:
+            return {}
+        p = Path(base)
+        roots = [r for r in (self.cfg.watch_root, self.cfg.library_root_windows) if r]
+        try:
+            pr = p.resolve(strict=False)
+            ok = any(
+                pr == rr or rr in pr.parents
+                for rr in (r.resolve(strict=False) for r in roots)
+            )
+        except OSError:
+            return {}
+        if not ok or not p.exists():
+            return {}
+        return self._build_tree(p, [3000])
+
+    def _build_tree(self, p: Path, budget: List[int]) -> Dict[str, Any]:
+        node: Dict[str, Any] = {"name": p.name}
+        try:
+            is_dir = p.is_dir()
+        except OSError:
+            is_dir = False
+        if not is_dir:
+            node["type"] = "file"
+            try:
+                node["size"] = p.stat().st_size
+            except OSError:
+                node["size"] = 0
+            return node
+        node["type"] = "dir"
+        children: List[Dict[str, Any]] = []
+        try:
+            entries = sorted(p.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
+        except OSError:
+            entries = []
+        for c in entries:
+            if budget[0] <= 0:
+                node["truncated"] = True
+                break
+            budget[0] -= 1
+            children.append(self._build_tree(c, budget))
+        node["children"] = children
+        return node
+
     def existing_album_summary(self, entry: Dict[str, Any]) -> Dict[str, Any]:
         """
         What the library ALREADY holds for this held item's album, so the WebUI
@@ -6971,7 +7071,8 @@ class Orchestrator:
             return (True, "folder already gone -- nothing to discard")
         if self._delete_folder_under_watch(folder):
             logger.info("WebUI keep-existing: discarded held folder %s", folder)
-            return (True, f"Discarded held files: {folder.name}")
+            suffix = self._resolve_unmonitor(entry)
+            return (True, f"Discarded held files: {folder.name}{suffix}")
         return (False, "could not delete the folder (see logs); is it under the "
                        "watch root and not held open?")
 
@@ -7044,11 +7145,12 @@ class Orchestrator:
 
         # Remove the now-emptied held folder (and its ISO/artwork leftovers).
         self._delete_folder_under_watch(folder)
+        suffix = self._resolve_unmonitor(entry)
         logger.info(
-            "WebUI move-held: moved %d file(s) to %s and rescanned Lidarr",
-            moved, target)
+            "WebUI move-held: moved %d file(s) to %s and rescanned Lidarr%s",
+            moved, target, suffix)
         return (True, f"Moved {moved} file(s) into the library and rescanned "
-                      f"Lidarr ({target.name})")
+                      f"Lidarr ({target.name}){suffix}")
 
     def _cleanup_empty(self, staging_dir: Path) -> None:
         try:

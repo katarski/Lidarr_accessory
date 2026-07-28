@@ -91,9 +91,22 @@ _PAGE = r"""<!doctype html>
   .vf.exc{background:#3a1e1c;border-color:var(--danger)}
   td .ex{color:var(--mut)}
   .up{color:#5fe0a0}.dn{color:var(--warn)}
+  .ttog{cursor:pointer;color:var(--acc);font-weight:700;margin-right:.3rem;user-select:none;display:inline-block;width:1ch}
+  tr.det>td{background:var(--bg);border-bottom:2px solid var(--acc);padding:.6rem 1rem}
+  .cmp{display:grid;grid-template-columns:1fr 1fr;gap:1rem}
+  @media(max-width:720px){.cmp{grid-template-columns:1fr}}
+  .tcol h4{margin:.1rem 0 .4rem;font-size:.8rem;color:var(--mut)}
+  .tcol{background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:.5rem .7rem;max-height:340px;overflow:auto}
+  .td>summary{cursor:pointer;list-style:revert}
+  .tind{padding-left:1rem;border-left:1px dotted var(--bd);margin-left:.3rem}
+  .tf{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.75rem;padding:.05rem 0}
+  .tf .muted{font-size:.9em}
   .spin{color:var(--mut);font-size:.8rem}
   .prog{display:flex;flex-direction:column;gap:.5rem}
   .procard{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:.6rem .8rem;display:flex;justify-content:space-between;gap:1rem;align-items:center}
+  #bulkbar{position:sticky;top:0;z-index:6;display:flex;gap:.5rem;align-items:center;padding:.5rem 1rem;background:var(--chipOn);border-bottom:1px solid var(--acc)}
+  #bulkbar #bulkn{font-weight:600;margin-right:.4rem}
+  td.sel,th.sel{width:1.6rem;text-align:center;padding-left:.6rem}
 </style></head>
 <body>
 <header>
@@ -122,6 +135,12 @@ _PAGE = r"""<!doctype html>
   </div>
 </div>
 
+<div id="bulkbar" style="display:none">
+  <span id="bulkn">0 selected</span>
+  <button class="b-keep" onclick="bulkAct('keep')">Keep existing (selected)</button>
+  <button class="b-move" onclick="bulkAct('move')">Move held (selected)</button>
+  <button class="b-copy" onclick="clearSel()">Clear selection</button>
+</div>
 <main>
   <div id="attention"></div>
   <div id="progress" style="display:none"></div>
@@ -130,7 +149,7 @@ _PAGE = r"""<!doctype html>
 <div id="ctx"></div>
 
 <script>
-var HELD=[], ACT=[], TAB='attention';
+var HELD=[], ACT=[], TAB='attention', SEL=new Set(), VISIBLE=[];
 var FILT={lossless:false,lossy:false,multichannel:false,stereo:false,outcomes:{}};
 var COLS=[
  {k:'title',   name:'Album',            on:true},
@@ -202,7 +221,7 @@ function cell(c,x){var d=x.details||{},ex=x.existing||{};switch(c.k){
   case'size':return '<span class="muted">'+human(d.total_bytes)+'</span>';
   case'outcome':return '<span class="badge b-out">'+h(x.outcome||'held')+'</span>';
   case'reason':return '<span class="muted">'+h(x.reason||'')+'</span>';
-  case'path':return '<span class="path" id="p-'+x.id+'">'+h(x.source_path||'')+'</span>';
+  case'path':return '<span class="ttog" title="show folder tree" onclick="toggleTree(event,\''+x.id+'\')">&#9656;</span><span class="path" id="p-'+x.id+'">'+h(x.source_path||'')+'</span>';
   default:return '';}}
 // Plain-text value of a cell, used for the right-click value filters.
 function cellText(k,x){var d=x.details||{},ex=x.existing||{};switch(k){
@@ -223,23 +242,79 @@ function render(){
   var cols=COLS.filter(function(c){return c.on;});
   var rows=HELD.filter(matches);
   document.getElementById('n-att').textContent=HELD.length;
-  var head='<tr>'+cols.map(function(c){return '<th>'+h(c.name)+'</th>';}).join('')+'<th>Actions</th></tr>';
+  VISIBLE=rows.map(function(r){return r.id;});
+  var allSel=rows.length>0&&rows.every(function(r){return SEL.has(r.id);});
+  var head='<tr><th class="sel"><input type="checkbox" id="selall" '+(allSel?'checked':'')+' onclick="toggleAll(this.checked)"></th>'
+    +cols.map(function(c){return '<th>'+h(c.name)+'</th>';}).join('')+'<th>Actions</th></tr>';
   var body=rows.map(function(x){
     var tds=cols.map(function(c){return '<td data-col="'+c.k+'" data-val="'+h(cellText(c.k,x))+'">'+cell(c,x)+'</td>';}).join('');
+    var sel='<td class="sel"><input type="checkbox" class="rowsel" data-id="'+x.id+'" '+(SEL.has(x.id)?'checked':'')+' onclick="toggleSel(\''+x.id+'\',this.checked)"></td>';
     var acts='<div class="acts" data-id="'+x.id+'">'
       +'<button class="b-copy" onclick="copyPath(\''+x.id+'\')">Copy</button>'
+      +'<button class="b-copy" onclick="toggleTree(event,\''+x.id+'\')">Tree ▸</button>'
       +'<button class="b-keep" onclick="act(\''+x.id+'\',\'keep\')">Keep existing</button>'
       +'<button class="b-move" onclick="act(\''+x.id+'\',\'move\')">Move held</button></div>';
-    return '<tr>'+tds+'<td>'+acts+'</td></tr>';
+    var det='<tr class="det" id="det-'+x.id+'" style="display:none"><td colspan="'+(cols.length+2)+'">'
+      +'<div class="cmp"><div class="tcol"><h4>Held (download)</h4><div id="t-held-'+x.id+'" class="muted">…</div></div>'
+      +'<div class="tcol"><h4>Library (existing)</h4><div id="t-lib-'+x.id+'" class="muted">…</div></div></div></td></tr>';
+    return '<tr>'+sel+tds+'<td>'+acts+'</td></tr>'+det;
   }).join('');
   document.getElementById('attention').innerHTML=rows.length
     ? '<table>'+head+body+'</table>'
     : (HELD.length?'<div class="empty">No items match the current filters.</div>':'<div class="empty">Nothing needs attention right now. 🎉</div>');
+  updateBulkBar();
   // progress tab
   document.getElementById('n-prog').textContent=ACT.length;
   document.getElementById('progress').innerHTML=ACT.length
     ? '<div class="prog">'+ACT.map(function(a){return '<div class="procard"><div><span class="badge b-out">'+h(a.stage)+'</span> <span class="title">'+h(a.name)+'</span>'+(a.detail?' <span class="muted">'+h(a.detail)+'</span>':'')+'</div><span class="muted">'+ago(a.started)+'</span></div>';}).join('')+'</div>'
     : '<div class="empty">No conversions running.</div>';
+}
+function toggleSel(id,on){if(on)SEL.add(id);else SEL.delete(id);updateBulkBar();
+  var sa=document.getElementById('selall');if(sa)sa.checked=VISIBLE.length>0&&VISIBLE.every(function(v){return SEL.has(v);});}
+function toggleAll(on){VISIBLE.forEach(function(v){if(on)SEL.add(v);else SEL.delete(v);});
+  document.querySelectorAll('.rowsel').forEach(function(cb){cb.checked=on;});updateBulkBar();}
+function clearSel(){SEL.clear();document.querySelectorAll('.rowsel').forEach(function(cb){cb.checked=false;});var sa=document.getElementById('selall');if(sa)sa.checked=false;updateBulkBar();}
+function updateBulkBar(){var n=VISIBLE.filter(function(v){return SEL.has(v);}).length;
+  document.getElementById('bulkbar').style.display=(n>0&&TAB==='attention')?'flex':'none';
+  document.getElementById('bulkn').textContent=n+' selected';}
+function bulkAct(kind){
+  var ids=VISIBLE.filter(function(v){return SEL.has(v);});
+  if(!ids.length)return;
+  var verb=kind==='move'?'MOVE the held files into the library (overwriting) and rescan':'DISCARD the held files (delete the folders)';
+  if(!confirm('This will '+verb+' for '+ids.length+' selected item(s). Continue?'))return;
+  toast('Working on '+ids.length+'…');
+  var ok=0,fail=0;
+  (function next(i){
+    if(i>=ids.length){toast('Done: '+ok+' ok'+(fail?', '+fail+' failed':''));SEL.clear();refresh();return;}
+    fetch('/api/held/'+kind,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:ids[i]})})
+     .then(function(r){return r.json();}).then(function(j){if(j.ok){ok++;HELD=HELD.filter(function(x){return x.id!==ids[i];});}else fail++;})
+     .catch(function(){fail++;}).finally(function(){next(i+1);});
+  })(0);
+}
+function treeHtml(node){
+  if(!node||!node.name&&!node.children)return '<span class="muted">empty / not available</span>';
+  function rec(n){
+    if(!n)return '';
+    if(n.type==='file')return '<div class="tf">📄 '+h(n.name)+' <span class="muted">('+human(n.size)+')</span></div>';
+    var kids=(n.children||[]).map(rec).join('')+(n.truncated?'<div class="muted">… (truncated)</div>':'');
+    return '<details class="td"><summary>📁 '+h(n.name)+' <span class="muted">('+(n.children||[]).length+')</span></summary><div class="tind">'+kids+'</div></details>';
+  }
+  // Show the root's children directly (the column header already names the side).
+  if(node.type==='dir')return (node.children||[]).map(rec).join('')+(node.truncated?'<div class="muted">… (truncated)</div>':'')||'<span class="muted">(empty)</span>';
+  return rec(node);
+}
+function loadTree(id,which,elId){
+  fetch('/api/tree?id='+encodeURIComponent(id)+'&which='+which)
+   .then(function(r){return r.json();}).then(function(j){
+     var el=document.getElementById(elId);if(!el)return;
+     el.className='';el.innerHTML=(j.tree&&Object.keys(j.tree).length)?treeHtml(j.tree):'<span class="muted">not in library / no files</span>';})
+   .catch(function(){var el=document.getElementById(elId);if(el)el.innerHTML='<span class="muted">error loading</span>';});
+}
+function toggleTree(ev,id){if(ev){ev.stopPropagation();ev.preventDefault();}
+  var row=document.getElementById('det-'+id);if(!row)return;
+  var open=row.style.display==='none';
+  row.style.display=open?'table-row':'none';
+  if(open&&!row.dataset.loaded){row.dataset.loaded='1';loadTree(id,'held','t-held-'+id);loadTree(id,'library','t-lib-'+id);}
 }
 function copyPath(id){var el=document.getElementById('p-'+id);var p=el?el.textContent:(HELD.find(function(x){return x.id===id;})||{}).source_path;
   if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(p).then(function(){toast('Path copied');},function(){toast('Copy failed');});}else toast('Clipboard unavailable');}
@@ -324,6 +399,18 @@ def make_handler(store, actions: HeldActions):
             elif path == "/api/activity":
                 acts = actions.list_activity() if hasattr(actions, "list_activity") else []
                 self._json(200, {"items": acts})
+            elif path == "/api/tree":
+                qs = parse_qs(urlparse(self.path).query)
+                eid = (qs.get("id", [""]) or [""])[0]
+                which = (qs.get("which", ["held"]) or ["held"])[0]
+                entry = store.get(eid) if eid else None
+                tree = {}
+                if entry and hasattr(actions, "folder_tree"):
+                    try:
+                        tree = actions.folder_tree(entry, which)
+                    except Exception:  # noqa: BLE001
+                        tree = {}
+                self._json(200, {"tree": tree})
             elif path == "/healthz":
                 self._json(200, {"ok": True, "held": len(store.list())})
             else:
