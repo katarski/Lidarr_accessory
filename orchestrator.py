@@ -386,6 +386,8 @@ class OrchestratorConfig:
     qbt_pass: str = ""
     # Log file path (for the WebUI "Log" tab). Mirrors logging.file.
     log_file: Optional[Path] = None
+    # Container name (for the WebUI restart/shutdown via the Docker socket).
+    container_name: str = "cue_pipeline"
     # If True, NEVER do the manual-move fallback. Every successful outcome
     # must go through Lidarr's own DownloadedAlbumsScan or ManualImport so
     # that Lidarr's "Import Using Script" / Connect hooks fire. If both
@@ -7108,6 +7110,48 @@ class Orchestrator:
         summ["_artist"] = artist
         summ["_album"] = album
         return summ
+
+    def container_action(self, action: str) -> Tuple[bool, str]:
+        """
+        Restart or stop THIS container via the Docker socket (WebUI buttons).
+        Requires /var/run/docker.sock mounted in. `action` is 'restart' or
+        'stop'. Returns (ok, message). Uses stdlib only (raw HTTP over the unix
+        socket) so no docker SDK/CLI is needed.
+        """
+        if action not in ("restart", "stop"):
+            return (False, "unknown action")
+        import http.client
+        import socket as _socket
+        sock_path = "/var/run/docker.sock"
+        if not os.path.exists(sock_path):
+            return (False, "Docker socket not mounted -- add /var/run/docker.sock "
+                           "to the container to enable restart/shutdown")
+        cid = os.environ.get("HOSTNAME", "").strip()
+        candidates = [c for c in (cid, getattr(self.cfg, "container_name", "") or
+                                  "cue_pipeline") if c]
+
+        class _UnixConn(http.client.HTTPConnection):
+            def connect(self):
+                s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+                s.settimeout(15)
+                s.connect(sock_path)
+                self.sock = s
+
+        last = "no container id"
+        for name in candidates:
+            try:
+                conn = _UnixConn("localhost")
+                conn.request("POST", f"/v1.41/containers/{name}/{action}?t=10")
+                resp = conn.getresponse()
+                body = resp.read().decode("utf-8", "replace")
+                conn.close()
+                if resp.status in (204, 304):
+                    logger.info("WebUI: container %s requested (%s)", action, name)
+                    return (True, f"container {action} requested")
+                last = f"HTTP {resp.status}: {body[:120]}"
+            except Exception as exc:  # noqa: BLE001
+                last = str(exc)
+        return (False, f"{action} failed: {last}")
 
     def read_log(self, lines: int = 400) -> str:
         """Return the last `lines` of the pipeline log for the WebUI Log tab."""

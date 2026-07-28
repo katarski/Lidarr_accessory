@@ -122,6 +122,8 @@ _PAGE = r"""<!doctype html>
   <div class="grow"></div>
   <span class="spin" id="updated"></span>
   <button class="b-copy" onclick="refresh()">Refresh</button>
+  <button class="b-copy" title="Restart the cue_pipeline container" onclick="ctrl('restart')">⟳ Restart</button>
+  <button class="b-copy" title="Stop the cue_pipeline container" onclick="ctrl('shutdown')">⏻ Shutdown</button>
 </header>
 
 <div class="toolbar" id="toolbar">
@@ -192,6 +194,13 @@ function setTab(t){TAB=t;document.querySelectorAll('.tab').forEach(function(e){e
   document.getElementById('toolbar').style.display=t==='attention'?'':'none';
   updateBulkBar();
   if(t==='log')loadLog();}
+function ctrl(kind){
+  var m=kind==='restart'?'Restart the cue_pipeline container now?':'Stop the cue_pipeline container now? (you\'ll start it again from the Unraid Docker page)';
+  if(!confirm(m))return;
+  fetch('/api/'+kind,{method:'POST'}).then(function(r){return r.json();})
+   .then(function(j){toast(j.message||(j.ok?'requested':'failed'));})
+   .catch(function(){toast(kind+' requested (connection dropped, expected)');});
+}
 function loadLog(){fetch('/api/log?lines=400').then(function(r){return r.text();}).then(function(t){
   var b=document.getElementById('logbox');b.textContent=t;b.scrollTop=b.scrollHeight;});}
 function toggleFilter(el){var f=el.dataset.f;FILT[f]=!FILT[f];el.classList.toggle('on',FILT[f]);render();}
@@ -516,6 +525,14 @@ def make_handler(store, actions: HeldActions):
 
         def do_POST(self):  # noqa: N802
             path = urlparse(self.path).path
+            if path in ("/api/restart", "/api/shutdown"):
+                if not hasattr(actions, "container_action"):
+                    self._json(501, {"ok": False, "message": "not supported"})
+                    return
+                act = "restart" if path.endswith("restart") else "stop"
+                ok, msg = actions.container_action(act)
+                self._json(200 if ok else 500, {"ok": ok, "message": msg})
+                return
             if path not in ("/api/held/keep", "/api/held/move"):
                 self._json(404, {"ok": False, "message": "not found"})
                 return

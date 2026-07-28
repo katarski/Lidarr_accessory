@@ -928,6 +928,7 @@ def main() -> int:
         qbt_pass=str((cfg.get("qbittorrent") or {}).get("password", "") or ""),
         log_file=(Path((cfg.get("logging") or {}).get("file"))
                   if (cfg.get("logging") or {}).get("file") else None),
+        container_name=str(lidarr_cfg.get("container_name", "cue_pipeline") or "cue_pipeline"),
         held_items_file=held_items_path,
         sweep_cueless_pre_split=bool(
             watch_cfg.get("sweep_cueless_pre_split", False)
