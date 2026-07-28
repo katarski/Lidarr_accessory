@@ -118,6 +118,7 @@ _PAGE = r"""<!doctype html>
     <div class="tab on" data-tab="attention" onclick="setTab('attention')">Needs attention <span class="n" id="n-att">0</span></div>
     <div class="tab" data-tab="progress" onclick="setTab('progress')">In progress <span class="n" id="n-prog">0</span></div>
     <div class="tab" data-tab="log" onclick="setTab('log')">Log</div>
+    <div class="tab" data-tab="settings" onclick="setTab('settings')">Settings</div>
   </div>
   <div class="grow"></div>
   <span class="spin" id="updated"></span>
@@ -158,12 +159,21 @@ _PAGE = r"""<!doctype html>
     </div>
     <pre id="logbox" style="background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:.6rem;max-height:70vh;overflow:auto;font-size:.72rem;white-space:pre-wrap"></pre>
   </div>
+  <div id="settings" style="display:none">
+    <div class="muted" style="margin-bottom:.6rem">Change grab/behaviour settings here instead of editing the container. Saved settings win over the template and apply on <b>Restart</b>.</div>
+    <div id="setform"></div>
+    <div style="display:flex;gap:.5rem;margin-top:1rem">
+      <button class="b-move" onclick="saveSettings(false)">Save</button>
+      <button class="b-keep" onclick="saveSettings(true)">Save &amp; Restart</button>
+      <span id="setmsg" class="muted"></span>
+    </div>
+  </div>
 </main>
 <div id="toast" class="toast"></div>
 <div id="ctx"></div>
 
 <script>
-var HELD=[], ACT=[], TAB='attention', SEL=new Set(), VISIBLE=[], OPEN=new Set(), SORT={col:'detected',dir:-1};
+var HELD=[], ACT=[], TAB='attention', SEL=new Set(), VISIBLE=[], OPEN=new Set(), SORT={col:'detected',dir:-1}, SETTINGS=[];
 var FILT={lossless:false,lossy:false,multichannel:false,stereo:false,outcomes:{}};
 var COLS=[
  {k:'title',   name:'Album',            on:true},
@@ -191,9 +201,30 @@ function setTab(t){TAB=t;document.querySelectorAll('.tab').forEach(function(e){e
   document.getElementById('attention').style.display=t==='attention'?'':'none';
   document.getElementById('progress').style.display=t==='progress'?'':'none';
   document.getElementById('log').style.display=t==='log'?'':'none';
+  document.getElementById('settings').style.display=t==='settings'?'':'none';
   document.getElementById('toolbar').style.display=t==='attention'?'':'none';
   updateBulkBar();
-  if(t==='log')loadLog();}
+  if(t==='log')loadLog();
+  if(t==='settings')loadSettings();}
+function loadSettings(){fetch('/api/settings').then(function(r){return r.json();}).then(function(j){
+  var s=j.settings||[];SETTINGS=s;
+  document.getElementById('setform').innerHTML=s.map(function(o){
+    var ctl=o.type==='bool'
+      ? '<input type="checkbox" data-sid="'+h(o.id)+'" data-type="bool" '+(o.value?'checked':'')+'>'
+      : '<input type="'+(o.type==='int'?'number':'text')+'" data-sid="'+h(o.id)+'" data-type="'+h(o.type)+'" value="'+h(o.value)+'" style="width:8rem">';
+    return '<div class="procard" style="justify-content:flex-start;gap:1rem"><label style="min-width:15rem"><b>'+h(o.label)+'</b></label>'+ctl+'<span class="muted" style="flex:1">'+h(o.help)+'</span></div>';
+  }).join('');});}
+function saveSettings(restart){
+  var changes={};
+  document.querySelectorAll('#setform [data-sid]').forEach(function(el){
+    changes[el.getAttribute('data-sid')] = el.getAttribute('data-type')==='bool'? el.checked : el.value;
+  });
+  document.getElementById('setmsg').textContent='saving…';
+  fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(changes)})
+   .then(function(r){return r.json();}).then(function(j){
+     document.getElementById('setmsg').textContent=j.message||'';
+     if(j.ok&&restart){if(confirm('Saved. Restart the container now to apply?'))ctrl('restart');}
+   }).catch(function(e){document.getElementById('setmsg').textContent='error: '+e;});}
 function ctrl(kind){
   var m=kind==='restart'?'Restart the cue_pipeline container now?':'Stop the cue_pipeline container now? (you\'ll start it again from the Unraid Docker page)';
   if(!confirm(m))return;
@@ -502,6 +533,9 @@ def make_handler(store, actions: HeldActions):
                     except Exception:  # noqa: BLE001
                         tree = {}
                 self._json(200, {"tree": tree})
+            elif path == "/api/settings":
+                s = actions.get_settings() if hasattr(actions, "get_settings") else []
+                self._json(200, {"settings": s})
             elif path == "/api/log":
                 qs = parse_qs(urlparse(self.path).query)
                 try:
@@ -525,6 +559,19 @@ def make_handler(store, actions: HeldActions):
 
         def do_POST(self):  # noqa: N802
             path = urlparse(self.path).path
+            if path == "/api/settings":
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length else b"{}"
+                try:
+                    changes = json.loads(raw or b"{}") or {}
+                except Exception:  # noqa: BLE001
+                    changes = {}
+                if not hasattr(actions, "save_settings"):
+                    self._json(501, {"ok": False, "message": "not supported"})
+                    return
+                ok, msg = actions.save_settings(changes)
+                self._json(200 if ok else 500, {"ok": ok, "message": msg})
+                return
             if path in ("/api/restart", "/api/shutdown"):
                 if not hasattr(actions, "container_action"):
                     self._json(501, {"ok": False, "message": "not supported"})

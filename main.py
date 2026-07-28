@@ -151,6 +151,31 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     return cfg
 
 
+def apply_webui_overrides(cfg: Dict[str, Any], path: Path) -> Dict[str, Any]:
+    """
+    Overlay {section: {key: value}} from the WebUI's Settings tab (written to
+    `path`) on top of the config -- HIGHEST precedence (beats env/template), so
+    the WebUI is the authoritative control surface. Missing/malformed file is a
+    no-op. Guarded so a bad overrides file can never stop the pipeline starting.
+    """
+    try:
+        if not path or not path.exists():
+            return cfg
+        import json
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return cfg
+        for section, kv in data.items():
+            if isinstance(kv, dict):
+                cfg.setdefault(section, {})
+                for k, v in kv.items():
+                    cfg[section][k] = v
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger("cue_pipeline").warning(
+            "WebUI overrides (%s) ignored: %s", path, exc)
+    return cfg
+
+
 def configure_logging(cfg: Dict[str, Any]) -> None:
     root = logging.getLogger()
     level = getattr(logging, cfg.get("level", "INFO").upper(), logging.INFO)
@@ -692,6 +717,8 @@ def main() -> int:
 
     cfg = load_config(args.config)
     cfg = apply_env_overrides(cfg)
+    webui_overrides_path = Path(args.config).parent / "webui_overrides.json"
+    cfg = apply_webui_overrides(cfg, webui_overrides_path)
     configure_logging(cfg.get("logging", {}))
 
     # Permissions: create every file/dir group- AND other-writable (0666/0777),
@@ -930,6 +957,7 @@ def main() -> int:
                   if (cfg.get("logging") or {}).get("file") else None),
         container_name=str(lidarr_cfg.get("container_name", "cue_pipeline") or "cue_pipeline"),
         held_items_file=held_items_path,
+        webui_overrides_file=webui_overrides_path,
         sweep_cueless_pre_split=bool(
             watch_cfg.get("sweep_cueless_pre_split", False)
         ),
@@ -1010,7 +1038,8 @@ def main() -> int:
         interactive_search_state_file=isearch_state_path,
     )
 
-    orch = Orchestrator(orch_cfg, lidarr, ollama_client, acoustid=acoustid_client)
+    orch = Orchestrator(orch_cfg, lidarr, ollama_client, acoustid=acoustid_client,
+                        raw_cfg=cfg)
     q: "queue.Queue[Path]" = queue.Queue()
     stop = threading.Event()
 

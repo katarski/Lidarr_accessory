@@ -388,6 +388,8 @@ class OrchestratorConfig:
     log_file: Optional[Path] = None
     # Container name (for the WebUI restart/shutdown via the Docker socket).
     container_name: str = "cue_pipeline"
+    # WebUI Settings-tab overrides file (highest-precedence config the WebUI writes).
+    webui_overrides_file: Optional[Path] = None
     # If True, NEVER do the manual-move fallback. Every successful outcome
     # must go through Lidarr's own DownloadedAlbumsScan or ManualImport so
     # that Lidarr's "Import Using Script" / Connect hooks fire. If both
@@ -543,10 +545,13 @@ class Orchestrator:
         lidarr: LidarrClient,
         ollama: Optional[OllamaClient],
         acoustid=None,
+        raw_cfg: Optional[Dict[str, Any]] = None,
     ):
         self.cfg = cfg
         self.lidarr = lidarr
         self.ollama = ollama
+        # Effective config dict (for the WebUI Settings tab to read live values).
+        self._raw_cfg: Dict[str, Any] = raw_cfg or {}
         # Optional AcoustID fingerprint identifier (best-effort). Used to
         # recover artist/album for a pre-split folder whose tags can't
         # identify it. None = disabled.
@@ -7166,6 +7171,94 @@ class Orchestrator:
             return f"(log file not found: {path})"
         except OSError as exc:  # noqa: BLE001
             return f"(could not read log: {exc})"
+
+    # WebUI Settings tab: (id, section, cfgkey, label, type, default, help).
+    # Curated tunables the user changes most; saved to webui_overrides.json
+    # (highest precedence) and applied on the next restart.
+    _SETTINGS_SCHEMA = [
+        ("lidarr.interactive_search_enabled", "lidarr", "interactive_search_enabled", "Interactive search", "bool", True,
+         "Proactively grab monitored albums Lidarr left missing."),
+        ("lidarr.interactive_search_dry_run", "lidarr", "interactive_search_dry_run", "Interactive search: dry run", "bool", False,
+         "Only log what it WOULD grab; don't actually grab."),
+        ("lidarr.interactive_search_min_missing_days", "lidarr", "interactive_search_min_missing_days", "Min days missing", "int", 3,
+         "Wait this many days before grabbing, so Lidarr's own search goes first. 0 = act immediately."),
+        ("lidarr.interactive_search_max_albums_per_pass", "lidarr", "interactive_search_max_albums_per_pass", "Max albums / pass", "int", 15,
+         "Cap albums processed per pass so a big backlog doesn't flood the indexers."),
+        ("lidarr.interactive_search_interval_seconds", "lidarr", "interactive_search_interval_seconds", "Search interval (s)", "int", 3600,
+         "Seconds between interactive-search passes (min 300)."),
+        ("lidarr.interactive_search_require_lossless", "lidarr", "interactive_search_require_lossless", "Prefer lossless", "bool", True,
+         "Prefer lossless; grab lossy only when no lossless release exists."),
+        ("lidarr.prefer_multichannel", "lidarr", "prefer_multichannel", "Prefer multichannel", "bool", True,
+         "In conversions, keep the multichannel version and discard stereo."),
+        ("qbittorrent.deselect_video", "qbittorrent", "deselect_video", "Deselect video", "bool", True,
+         "Skip video files (VIDEO_TS/BDMV/containers) in music torrents; keep AUDIO_TS + .iso."),
+        ("qbittorrent.reap_useless_torrents", "qbittorrent", "reap_useless_torrents", "Reap useless torrents", "bool", True,
+         "Remove a torrent once no wanted music remains; ban (blocklist) video-only torrents."),
+        ("qbittorrent.dead_grab_reaper", "qbittorrent", "dead_grab_reaper", "Dead-grab reaper", "bool", True,
+         "Remove torrents stuck at ~0% past the grace window and blocklist so Lidarr re-searches."),
+        ("qbittorrent.dead_grab_grace_hours", "qbittorrent", "dead_grab_grace_hours", "Dead-grab grace (hours)", "int", 6,
+         "How long a torrent may sit at ~0% before it's reaped (from add time)."),
+        ("lidarr.webui_unmonitor_on_resolve", "lidarr", "webui_unmonitor_on_resolve", "Unmonitor on resolve", "bool", True,
+         "When you resolve an item here, unmonitor the album so it isn't re-downloaded."),
+        ("lidarr.extract_archives", "lidarr", "extract_archives", "Extract archives", "bool", True,
+         "Unpack .rar/.zip/.7z/.tar downloads with 7z, then import."),
+        ("lidarr.extract_dvda_iso", "lidarr", "extract_dvda_iso", "Extract DVD-Audio ISO", "bool", True,
+         "Rip DVD-Audio ISOs to multichannel FLAC."),
+        ("lidarr.extract_sacd_iso", "lidarr", "extract_sacd_iso", "Extract SACD ISO", "bool", True,
+         "Rip SACD ISOs to multichannel FLAC."),
+        ("staging.delete_source_folder_on_success", "staging", "delete_source_folder_on_success", "Delete source after import", "bool", True,
+         "After a verified import, delete the whole source download folder."),
+    ]
+
+    def get_settings(self):
+        """Current values of the curated settings (for the WebUI Settings tab)."""
+        out = []
+        for sid, section, key, label, typ, default, help_ in self._SETTINGS_SCHEMA:
+            val = (self._raw_cfg.get(section) or {}).get(key, default)
+            out.append({"id": sid, "label": label, "type": typ,
+                        "value": val, "help": help_})
+        return out
+
+    def save_settings(self, changes: Dict[str, Any]) -> Tuple[bool, str]:
+        """
+        Merge changed settings into the WebUI overrides file (highest-precedence
+        config). Applied on the next restart. `changes` is {id: value}.
+        """
+        path = getattr(self.cfg, "webui_overrides_file", None)
+        if not path:
+            return (False, "overrides file not configured")
+        schema = {s[0]: s for s in self._SETTINGS_SCHEMA}
+        try:
+            import json
+            cur = {}
+            if Path(path).exists():
+                cur = json.loads(Path(path).read_text(encoding="utf-8")) or {}
+            n = 0
+            for sid, raw in (changes or {}).items():
+                if sid not in schema:
+                    continue
+                _sid, section, key, _l, typ, _d, _h = schema[sid]
+                if typ == "bool":
+                    val = raw in (True, "true", "True", "1", 1, "on")
+                elif typ == "int":
+                    try:
+                        val = int(raw)
+                    except (TypeError, ValueError):
+                        continue
+                else:
+                    val = str(raw)
+                cur.setdefault(section, {})[key] = val
+                # keep self._raw_cfg in sync so the tab reflects the save
+                self._raw_cfg.setdefault(section, {})[key] = val
+                n += 1
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            tmp = Path(str(path) + ".tmp")
+            tmp.write_text(json.dumps(cur, indent=2), encoding="utf-8")
+            tmp.replace(path)
+            logger.info("WebUI settings saved (%d change(s)) to %s", n, path)
+            return (True, f"Saved {n} setting(s). Restart to apply.")
+        except Exception as exc:  # noqa: BLE001
+            return (False, f"save failed: {exc}")
 
     def _get_qbt(self):
         """Lazy, cached, logged-in QbtClient for WebUI torrent removal, or None
