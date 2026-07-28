@@ -421,6 +421,36 @@ class OrchestratorConfig:
     # so the grace clock survives restarts. Lives in /config.
     queue_reaper_state_file: Optional[Path] = None
 
+    # --- Interactive-search + smart-grab (backlog #10) -----------------
+    # Proactively find + grab monitored albums that Lidarr has left missing.
+    # For each monitored album still missing tracks after
+    # `interactive_search_min_missing_days`, run Lidarr's interactive indexer
+    # search, rank the torrent candidates (title relation, then lossless, then
+    # seeders), grab the best one, then VERIFY its real contents in qBittorrent
+    # (pause on arrival, inspect the file list) before committing: keep it if
+    # the track count matches / it's a splittable single-file+cue / it's DSD or
+    # SACD-ISO, else blocklist it and try the next candidate. Off by default.
+    interactive_search_enabled: bool = False
+    # How often the pass runs (seconds). Minimum 300.
+    interactive_search_interval_seconds: int = 3600
+    # An album must have been missing at least this many days before we act,
+    # so Lidarr's own auto-search gets first crack at fresh releases.
+    interactive_search_min_missing_days: int = 3
+    # DRY RUN -- only LOG the album + the release it WOULD grab; grab nothing.
+    # Watch a pass or two, then set False to actually grab.
+    interactive_search_dry_run: bool = True
+    # Max candidate releases to try (grab+verify) per album before giving up.
+    interactive_search_max_candidates: int = 5
+    # Only consider lossless (FLAC) releases; skip lossy when this is on.
+    interactive_search_require_lossless: bool = True
+    # JSON state file: {albumId: {first_missing, last_attempt, blocklisted[]}}.
+    # Tracks how long each album has been missing (the >Ndays clock) and the
+    # per-album grab cooldown, surviving restarts. Lives in /config.
+    interactive_search_state_file: Optional[Path] = None
+    # Per-album cooldown (seconds) between grab attempts, so a stuck album isn't
+    # re-searched every pass. Default 12h.
+    interactive_search_cooldown_seconds: int = 43200
+
 
 class Orchestrator:
     def __init__(
@@ -5090,6 +5120,317 @@ class Orchestrator:
             tmp.replace(path)
         except Exception as exc:  # noqa: BLE001
             logger.debug("reaper state save failed: %s", exc)
+
+    # ---- Interactive search + smart-grab (backlog #10) ------------------
+
+    _LOSSLESS_AUDIO_EXTS = frozenset(
+        {".flac", ".dsf", ".dff"} | set(_LOSSLESS_NONFLAC_EXTS)
+    )
+
+    def _load_isearch_state(self) -> Dict[str, Any]:
+        path = self.cfg.interactive_search_state_file
+        if not path:
+            return {}
+        try:
+            import json
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            return data if isinstance(data, dict) else {}
+        except FileNotFoundError:
+            return {}
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("interactive search state load failed: %s", exc)
+            return {}
+
+    def _save_isearch_state(self, state: Dict[str, Any]) -> None:
+        path = self.cfg.interactive_search_state_file
+        if not path:
+            return
+        try:
+            import json
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(state, fh)
+            tmp.replace(path)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("interactive search state save failed: %s", exc)
+
+    @staticmethod
+    def _norm_title(s: str) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
+
+    def _classify_torrent_files(
+        self, files: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """
+        Classify a qBittorrent file list (from files(hash)) for the album-match
+        decision -- paths only, nothing is downloaded yet so there are no tags.
+        Returns {audio_count, is_single_image, has_cue, is_dsd, is_iso,
+        is_lossless}.
+        """
+        audio_exts = []
+        has_cue = is_dsd = is_iso = False
+        for f in files:
+            ext = os.path.splitext(str(f.get("name") or ""))[1].lower()
+            if ext == ".cue":
+                has_cue = True
+            elif ext == ".iso":
+                is_iso = True
+            if ext in _ALL_AUDIO_EXTS:
+                audio_exts.append(ext)
+                if ext in (".dsf", ".dff"):
+                    is_dsd = True
+        audio_count = len(audio_exts)
+        lossless_hits = sum(1 for e in audio_exts if e in self._LOSSLESS_AUDIO_EXTS)
+        return {
+            "audio_count": audio_count,
+            "is_single_image": audio_count == 1,
+            "has_cue": has_cue,
+            "is_dsd": is_dsd,
+            "is_iso": is_iso,
+            "is_lossless": audio_count > 0 and lossless_hits == audio_count,
+        }
+
+    def _rank_releases(
+        self, releases, artist: str, album: str, blocklisted,
+    ) -> List[Dict[str, Any]]:
+        """
+        Filter to torrent releases (not blocklisted; lossless if required) and
+        rank by title relation to 'artist album' (dominant), then lossless,
+        then seeders. Returns scored copies with _score/_seeders/_quality/
+        _title_ratio attached, best first.
+        """
+        want = self._norm_title(f"{artist} {album}")
+        blocked = set(blocklisted or [])
+        scored: List[Dict[str, Any]] = []
+        for raw in releases or []:
+            if (raw.get("protocol") or "").lower() != "torrent":
+                continue
+            guid = raw.get("guid")
+            if not guid or guid in blocked:
+                continue
+            title = raw.get("title") or ""
+            q = raw.get("quality") or {}
+            qname = ((q.get("quality") or {}).get("name")
+                     or q.get("name") or "")
+            lossless = bool(re.search(
+                r"(?i)flac|alac|\bape\b|wavpack|\bwv\b|dsd|lossless|24 ?bit|hi-?res",
+                f"{qname} {title}"))
+            if self.cfg.interactive_search_require_lossless and not lossless:
+                continue
+            seeders = int(raw.get("seeders") or 0)
+            ratio = difflib.SequenceMatcher(
+                None, want, self._norm_title(title)).ratio()
+            score = (ratio * 100.0
+                     + (15.0 if lossless else 0.0)
+                     + min(seeders, 200) / 10.0)
+            r = dict(raw)
+            r["_score"] = score
+            r["_seeders"] = seeders
+            r["_quality"] = qname or ("lossless" if lossless else "?")
+            r["_title_ratio"] = round(ratio, 3)
+            scored.append(r)
+        scored.sort(key=lambda x: x["_score"], reverse=True)
+        return scored
+
+    def _await_queue_hash(self, artist: str, album: str, timeout: int = 90):
+        """
+        Poll Lidarr's queue for the just-grabbed item and return
+        (downloadId_hash, record) once it appears, else (None, None). Lidarr
+        adds the torrent to qBittorrent within a few seconds of the grab.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            rec = self.lidarr.queue_find_for(artist, album)
+            if rec and rec.get("downloadId"):
+                return str(rec["downloadId"]).lower(), rec
+            time.sleep(3)
+        return None, None
+
+    def _verify_torrent(self, qbt, thash: str, expected: int, label: str):
+        """
+        Pause the grabbed torrent, wait for its metadata/file list, classify it,
+        and decide. Returns (verdict, info) where verdict is 'accept' or
+        'reject:<reason>'. With no qBit client we can't inspect -- accept and let
+        it download.
+        """
+        if qbt is None:
+            return "accept", {"note": "no qbit"}
+        qbt.pause(thash)
+        files: List[Dict[str, Any]] = []
+        deadline = time.time() + 45
+        while time.time() < deadline:
+            files = qbt.files(thash)
+            if files:
+                break
+            time.sleep(3)
+        if not files:
+            return "accept", {"note": "no metadata"}
+        info = self._classify_torrent_files(files)
+        ac = info["audio_count"]
+        if info["is_dsd"] or info["is_iso"]:
+            return "accept", info                      # pipeline handles these
+        if expected > 0 and ac >= expected:
+            return "accept", info                      # complete / superset
+        if info["is_single_image"] and info["has_cue"]:
+            return "accept", info                      # splittable disc image
+        if info["is_single_image"] and not info["has_cue"]:
+            return "reject:single-file-no-cue", info
+        if expected > 0 and ac < expected:
+            return f"reject:incomplete({ac}/{expected})", info
+        if ac > 0:
+            return "accept", info                      # unknown expected count
+        return "reject:no-audio", info
+
+    def _reject_grab(self, artist: str, album: str, thash: str, qbt) -> None:
+        """Blocklist + remove the grabbed release from Lidarr's queue and qBit."""
+        try:
+            rec = self.lidarr.queue_find_for(artist, album)
+            if rec and rec.get("id") is not None:
+                self.lidarr.queue_remove(
+                    int(rec["id"]), remove_from_client=True, blocklist=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("interactive search: queue_remove failed: %s", exc)
+        if qbt is not None and thash:
+            try:
+                qbt.remove(thash, delete_files=True)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _isearch_one_album(self, alb: Dict[str, Any], st: Dict[str, Any], qbt) -> bool:
+        """Search, rank, then grab+verify candidates for one album. True if a
+        release was accepted (or grabbed but unverifiable)."""
+        cfg = self.cfg
+        aid = int(alb["id"])
+        artist = (alb.get("artist") or {}).get("artistName", "") or ""
+        album = alb.get("title", "") or ""
+        label = f"{artist} - {album}".strip(" -")
+        expected = int((alb.get("statistics") or {}).get("trackCount") or 0)
+
+        releases = self.lidarr.release_search(aid)
+        cands = self._rank_releases(
+            releases, artist, album, st.get("blocklisted") or [])
+        if not cands:
+            logger.info(
+                "interactive search: %s -- no%s torrent candidates", label,
+                " lossless" if cfg.interactive_search_require_lossless else "")
+            return False
+
+        if cfg.interactive_search_dry_run:
+            top = cands[0]
+            logger.info(
+                "interactive search (DRY RUN): %s -> would grab %r "
+                "(seeders=%s quality=%s title~%.2f score=%.1f; %d candidate(s))",
+                label, top.get("title"), top.get("_seeders"),
+                top.get("_quality"), top.get("_title_ratio"),
+                top.get("_score"), len(cands))
+            return False
+
+        blocklisted = st.setdefault("blocklisted", [])
+        tried = 0
+        for cand in cands[:max(1, int(cfg.interactive_search_max_candidates))]:
+            guid, indexer = cand.get("guid"), cand.get("indexerId")
+            if not guid or indexer is None:
+                continue
+            tried += 1
+            logger.info(
+                "interactive search: %s -> grabbing %r (seeders=%s quality=%s)",
+                label, cand.get("title"), cand.get("_seeders"),
+                cand.get("_quality"))
+            if not self.lidarr.release_grab(guid, indexer):
+                continue
+            thash, _rec = self._await_queue_hash(artist, album, timeout=90)
+            if not thash:
+                logger.warning(
+                    "interactive search: %s -- grabbed but no queue hash "
+                    "appeared; leaving it to download", label)
+                return True
+            verdict, info = self._verify_torrent(qbt, thash, expected, label)
+            if verdict == "accept":
+                if qbt is not None:
+                    qbt.resume(thash)
+                logger.info(
+                    "interactive search: %s -- ACCEPTED %r (%s audio, "
+                    "expected %d); resuming download", label, cand.get("title"),
+                    info.get("audio_count", "?"), expected)
+                return True
+            logger.info(
+                "interactive search: %s -- rejected %r (%s); blocklist + next",
+                label, cand.get("title"), verdict)
+            self._reject_grab(artist, album, thash, qbt)
+            blocklisted.append(guid)
+
+        logger.warning(
+            "interactive search: %s -- %d candidate(s) tried, none verified; "
+            "needs manual attention", label, tried)
+        return False
+
+    def interactive_search_pass(self, qbt=None) -> int:
+        """
+        One pass of backlog #10: for monitored albums missing for longer than
+        `interactive_search_min_missing_days`, run Lidarr's interactive search,
+        grab the best torrent candidate, then verify its contents in
+        qBittorrent (via `qbt`) before committing. Returns the number of albums
+        for which a release was accepted (0 in dry-run). `qbt` is a logged-in
+        QbtClient or None (no verification -> grabs are accepted as-is).
+        """
+        cfg = self.cfg
+        now = time.time()
+        state = self._load_isearch_state()
+        missing = self.lidarr.wanted_missing()
+        logger.info(
+            "interactive search: scanning %d missing monitored album(s) "
+            "(min_missing=%dd, dry_run=%s)", len(missing),
+            cfg.interactive_search_min_missing_days, cfg.interactive_search_dry_run)
+
+        min_missing = max(0, int(cfg.interactive_search_min_missing_days)) * 86400
+        cooldown = max(0, int(cfg.interactive_search_cooldown_seconds))
+        queued_ids: set = set()
+        try:
+            for rec in self.lidarr.queue_list():
+                aid = rec.get("albumId") or (rec.get("album") or {}).get("id")
+                if aid is not None:
+                    queued_ids.add(int(aid))
+        except Exception:  # noqa: BLE001
+            pass
+
+        missing_ids: set = set()
+        grabbed = 0
+        for alb in missing:
+            aid = alb.get("id")
+            if aid is None:
+                continue
+            aid = int(aid)
+            missing_ids.add(aid)
+            st = state.setdefault(str(aid), {})
+            st.setdefault("first_missing", now)
+            if now - float(st.get("first_missing") or now) < min_missing:
+                continue
+            if aid in queued_ids:
+                continue        # already downloading -- leave it
+            if now - float(st.get("last_attempt") or 0) < cooldown:
+                continue        # per-album cooldown
+            try:
+                if self._isearch_one_album(alb, st, qbt):
+                    grabbed += 1
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "interactive search: album %s failed: %s", aid, exc)
+            st["last_attempt"] = now
+
+        # Prune state for albums that are no longer missing.
+        for k in list(state.keys()):
+            try:
+                if int(k) not in missing_ids:
+                    state.pop(k, None)
+            except ValueError:
+                state.pop(k, None)
+        self._save_isearch_state(state)
+        logger.info(
+            "interactive search: pass done -- %d accepted%s", grabbed,
+            " (DRY RUN -- nothing grabbed)" if cfg.interactive_search_dry_run else "")
+        return grabbed
 
     def reap_lidarr_queue(self) -> int:
         """

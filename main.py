@@ -102,6 +102,13 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     put("lidarr", "queue_reaper_grace_minutes", "QUEUE_REAPER_GRACE", int)
     put("lidarr", "queue_reaper_remove_from_client", "QUEUE_REAPER_REMOVE_FROM_CLIENT", _as_bool)
     put("lidarr", "queue_reaper_blocklist", "QUEUE_REAPER_BLOCKLIST", _as_bool)
+    # Interactive search + smart-grab (backlog #10)
+    put("lidarr", "interactive_search_enabled", "ISEARCH_ENABLED", _as_bool)
+    put("lidarr", "interactive_search_interval_seconds", "ISEARCH_INTERVAL", int)
+    put("lidarr", "interactive_search_min_missing_days", "ISEARCH_MIN_DAYS", int)
+    put("lidarr", "interactive_search_dry_run", "ISEARCH_DRY_RUN", _as_bool)
+    put("lidarr", "interactive_search_max_candidates", "ISEARCH_MAX_CANDIDATES", int)
+    put("lidarr", "interactive_search_require_lossless", "ISEARCH_REQUIRE_LOSSLESS", _as_bool)
     # Purge-imported sweep -- continuously delete download folders whose album
     # Lidarr already has fully (catches re-downloads the pipeline skipped).
     put("lidarr", "purge_imported_enabled", "PURGE_IMPORTED_ENABLED", _as_bool)
@@ -367,6 +374,39 @@ def queue_reaper_loop(
             orch.reap_lidarr_queue()
         except Exception as exc:  # noqa: BLE001
             logger.exception("queue reaper thread: %s", exc)
+        delay = cadence
+
+
+def interactive_search_loop(
+    orch: Orchestrator,
+    qcfg: Dict[str, Any],
+    stop: threading.Event,
+    interval: int,
+) -> None:
+    """
+    Periodically run the interactive-search + smart-grab pass (backlog #10):
+    find monitored albums missing for >N days, grab the best torrent release,
+    then verify its contents in qBittorrent before committing (see
+    Orchestrator.interactive_search_pass). A fresh QbtClient is built + logged
+    in per pass (mirrors the qbt loop); if qBittorrent is unavailable the pass
+    still runs but can't content-verify. Minimum cadence 300s; first pass is
+    staggered one cadence out so startup stays light.
+    """
+    from qbittorrent_client import QbtClient
+
+    cadence = max(300, interval)
+    delay = cadence
+    while not stop.wait(delay):
+        try:
+            qbt = QbtClient(qcfg.get("base_url", ""), qcfg.get("username", ""),
+                            qcfg.get("password", ""))
+            if not (qcfg.get("base_url") and qbt.login()):
+                logger.warning("interactive search: qBittorrent unavailable "
+                               "this pass; grabs can't be content-verified")
+                qbt = None
+            orch.interactive_search_pass(qbt)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("interactive search thread: %s", exc)
         delay = cadence
 
 
@@ -638,6 +678,20 @@ def main() -> int:
         )
     else:
         reaper_state_path = None
+    # Interactive-search "how long missing" clock lives next to the other
+    # /config state files (mirrors the reaper state path resolution).
+    _isearch_state_cfg = lidarr_cfg.get("interactive_search_state_file")
+    if _isearch_state_cfg:
+        isearch_state_path = Path(_isearch_state_cfg)
+    elif ledger_path is not None:
+        isearch_state_path = ledger_path.parent / "interactive_search.json"
+    elif lidarr_cfg.get("library_audit_report_file"):
+        isearch_state_path = (
+            Path(lidarr_cfg["library_audit_report_file"]).parent
+            / "interactive_search.json"
+        )
+    else:
+        isearch_state_path = None
     heartbeat_seconds = int(staging_cfg.get("heartbeat_seconds", 600) or 0)
 
     orch_cfg = OrchestratorConfig(
@@ -763,6 +817,28 @@ def main() -> int:
             lidarr_cfg.get("queue_reaper_blocklist", False)
         ),
         queue_reaper_state_file=reaper_state_path,
+        interactive_search_enabled=bool(
+            lidarr_cfg.get("interactive_search_enabled", False)
+        ),
+        interactive_search_interval_seconds=int(
+            lidarr_cfg.get("interactive_search_interval_seconds", 3600)
+        ),
+        interactive_search_min_missing_days=int(
+            lidarr_cfg.get("interactive_search_min_missing_days", 3)
+        ),
+        interactive_search_dry_run=bool(
+            lidarr_cfg.get("interactive_search_dry_run", True)
+        ),
+        interactive_search_max_candidates=int(
+            lidarr_cfg.get("interactive_search_max_candidates", 5)
+        ),
+        interactive_search_require_lossless=bool(
+            lidarr_cfg.get("interactive_search_require_lossless", True)
+        ),
+        interactive_search_cooldown_seconds=int(
+            lidarr_cfg.get("interactive_search_cooldown_seconds", 43200)
+        ),
+        interactive_search_state_file=isearch_state_path,
     )
 
     orch = Orchestrator(orch_cfg, lidarr, ollama_client, acoustid=acoustid_client)
@@ -990,6 +1066,30 @@ def main() -> int:
         logger.info(
             "Queue reaper: superseded by qBittorrent completed-torrent "
             "lifecycle (disk-aware) -- legacy reaper not started."
+        )
+
+    # --- Interactive search + smart-grab (opt-in, backlog #10) ---------
+    # Proactively grab monitored albums Lidarr has left missing for >N days,
+    # verifying each candidate torrent's contents in qBittorrent before
+    # committing. Ships disabled + dry-run by default (no surprise downloads).
+    isearch_thread = None
+    if orch_cfg.interactive_search_enabled:
+        isearch_thread = threading.Thread(
+            target=interactive_search_loop,
+            args=(orch, cfg.get("qbittorrent") or {}, stop,
+                  orch_cfg.interactive_search_interval_seconds),
+            daemon=True,
+            name="cue-isearch",
+        )
+        isearch_thread.start()
+        logger.info(
+            "Interactive search: enabled (every %ds, min_missing=%dd, %s, "
+            "max_candidates=%d, require_lossless=%s)",
+            max(300, orch_cfg.interactive_search_interval_seconds),
+            orch_cfg.interactive_search_min_missing_days,
+            "DRY RUN" if orch_cfg.interactive_search_dry_run else "GRABBING",
+            orch_cfg.interactive_search_max_candidates,
+            orch_cfg.interactive_search_require_lossless,
         )
 
     def handle_signal(signum, _frame):

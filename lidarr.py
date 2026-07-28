@@ -164,6 +164,71 @@ class LidarrClient:
             return best_id
         return None
 
+    # ---- Interactive search + grab (backlog #10) -------------------------
+
+    def wanted_missing(self, page_size: int = 1000) -> List[Dict[str, Any]]:
+        """
+        Monitored albums that are missing tracks, via GET /api/v1/wanted/missing.
+        Each record carries id/title/artistId/artist and a `statistics` block
+        ({trackCount, trackFileCount, percentOfTracks}); an album is "missing"
+        when trackFileCount < trackCount. Returns [] on error.
+        """
+        try:
+            data = self._get(
+                "/api/v1/wanted/missing",
+                pageSize=page_size,
+                page=1,
+                sortKey="albums.title",
+                sortDirection="ascending",
+                monitored="true",
+                includeArtist="true",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("wanted/missing failed: %s", exc)
+            return []
+        if isinstance(data, dict):
+            return data.get("records") or []
+        return data if isinstance(data, list) else []
+
+    def release_search(self, album_id: int) -> List[Dict[str, Any]]:
+        """
+        Run Lidarr's INTERACTIVE indexer search for an album and return the
+        candidate releases (GET /api/v1/release?albumId=). This is the same call
+        the Lidarr UI makes when you click Interactive Search; it blocks while
+        the indexers are queried. Release dicts carry guid, indexerId, title,
+        seeders, size, protocol, quality, rejections, downloadUrl. [] on error.
+        """
+        try:
+            # Interactive search can take a while (indexers) -- use a longer
+            # timeout than the shared 30s _get helper.
+            r = self.session.get(
+                self._url(f"/api/v1/release?albumId={int(album_id)}"),
+                timeout=120,
+            )
+            r.raise_for_status()
+            data = r.json()
+            return data if isinstance(data, list) else []
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("release search failed for album %s: %s", album_id, exc)
+            return []
+
+    def release_grab(self, guid: str, indexer_id: int) -> bool:
+        """
+        Grab one specific release (interactive push): POST /api/v1/release
+        {guid, indexerId}. Lidarr sends it to its download client (qBittorrent)
+        and creates a queue item whose `downloadId` is the torrent hash. Returns
+        True on success.
+        """
+        try:
+            self._post(
+                "/api/v1/release",
+                {"guid": guid, "indexerId": int(indexer_id)},
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("release grab failed (guid=%s): %s", guid, exc)
+            return False
+
     # ---- Public API ------------------------------------------------------
 
     def ping(self) -> bool:
