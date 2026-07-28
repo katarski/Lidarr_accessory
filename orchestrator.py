@@ -100,6 +100,9 @@ _CYRILLIC_TO_LATIN = {
     "ы": "y", "э": "e", "ё": "yo",
     # Ukrainian extras
     "є": "ye", "і": "i", "ї": "yi", "ґ": "g",
+    # Serbian / Macedonian extras (phonetic Latin)
+    "ј": "j", "љ": "lj", "њ": "nj", "ћ": "c", "ђ": "dj", "џ": "dz",
+    "ѕ": "dz", "ѓ": "g", "ќ": "k", "ѐ": "e", "ѝ": "i", "ѣ": "e",
 }
 
 
@@ -6848,11 +6851,14 @@ class Orchestrator:
         # Backfill/repair artist/album from the folder layout when the failure
         # path didn't record them, OR recorded a bare-year "artist" (a discography
         # "YYYY - Album" leaf), so the row, library compare, and unmonitor work.
-        if not (artist and album) or self._looks_like_year(artist):
+        if (not (artist and album) or self._looks_like_year(artist)
+                or self._bad_album(album)):
             try:
                 a2, b2 = self._identity_for_folder(folder)
                 if a2 and not self._looks_like_year(a2):
                     artist = a2
+                if b2 and not self._bad_album(b2):
+                    album = b2
                 album = album or b2
             except Exception:  # noqa: BLE001
                 pass
@@ -7066,6 +7072,33 @@ class Orchestrator:
     def _looks_like_year(s: str) -> bool:
         return bool(re.fullmatch(r"\s*(?:19|20)\d{2}\s*", s or ""))
 
+    @staticmethod
+    def _bad_album(album: str) -> bool:
+        """An album name that clearly lost its title to over-eager tag-stripping:
+        empty, or a short bare number like '88' (a leftover sample-rate/format
+        token). A real 4-digit year-ish title ('1984') is NOT flagged."""
+        key = _match_key(album)
+        return (not key) or bool(re.fullmatch(r"\d{1,3}", key))
+
+    def _conservative_album(self, raw_name: str, artist: str = "") -> str:
+        """
+        Recover an album title from a folder name WITHOUT stripping a
+        parenthetical that IS the title -- for cases like
+        'Lynyrd Skynyrd - (pronounced 'leh-'nerd 'skin-'nerd) (1973) [FLAC] 88'
+        where the normal cleaners nuke the whole title. Drops a leading
+        'Artist - ' credit and a leading 'YYYY - ' year, plus trailing [bracket]
+        tags and trailing format/sample-rate tokens; keeps the (parenthetical)
+        title. Library matching (_match_key) collapses any leftover punctuation.
+        """
+        s = raw_name or ""
+        if artist:
+            s = re.sub(rf"(?i)^\s*{re.escape(artist)}\s*-\s*", "", s, count=1)
+        s = re.sub(r"^\s*(?:19|20)\d{2}\s*[-.\s]\s*", "", s)   # leading year
+        s = re.sub(r"\s*\[[^\]]*\]\s*", " ", s)                # [FLAC] etc.
+        s = re.sub(r"(?i)\s+(?:flac|mp3|wav|ape|24\s*bit|16\s*bit|\d{2,3})\s*$",
+                   "", s)                                       # trailing tags
+        return re.sub(r"\s{2,}", " ", s).strip(" -_.")
+
     def _identity_for_folder(self, folder: Path) -> Tuple[str, str]:
         """
         (artist, album) for a held/source folder. Handles:
@@ -7105,14 +7138,20 @@ class Orchestrator:
                 artist = parts[0].strip(" -_.")
                 album = re.sub(r"^\s*(?:19|20)\d{2}\s*[-.]\s*", "",
                                parts[-1]).strip(" -_.")
+            # A parenthetical title ("(pronounced 'leh-'nerd...)") gets nuked by
+            # the tag-stripper -> recover it conservatively.
+            if self._bad_album(album):
+                album = self._conservative_album(parts[-1], artist)
             if artist and album:
                 return artist, album
 
-        # Single folder: fall back to the 'Artist - Album' parser, but reject a
-        # bare-year "artist" (a "YYYY - Album" leaf) -- keep only the album then.
+        # Single folder: 'Artist - Album' parser; reject a bare-year "artist"
+        # ("YYYY - Album" leaf) and recover a parenthetical album title.
         a, b = self._album_folder_identity(folder)
         if a and self._looks_like_year(a):
             a = ""
+        if self._bad_album(b):
+            b = self._conservative_album(folder.name, a)
         return a, (b or (parts[-1].strip(" -_.") if parts else ""))
 
     def existing_album_summary(self, entry: Dict[str, Any]) -> Dict[str, Any]:
@@ -7124,13 +7163,16 @@ class Orchestrator:
         """
         artist = (entry.get("artist") or "").strip()
         album = (entry.get("album") or "").strip()
-        # Re-derive when identity is missing OR the stored artist is a bare year
-        # (a "YYYY - Album" discography leaf wrongly parsed year-as-artist).
-        if not (artist and album) or self._looks_like_year(artist):
+        # Re-derive when identity is missing/bogus: no artist/album, a bare-year
+        # "artist" (YYYY-Album discography leaf), or a nuked album ("88").
+        if (not (artist and album) or self._looks_like_year(artist)
+                or self._bad_album(album)):
             try:
                 a, b = self._identity_for_folder(Path(entry.get("source_path", "")))
                 if a and not self._looks_like_year(a):
                     artist = a
+                if b and not self._bad_album(b):
+                    album = b
                 album = album or b
             except Exception:  # noqa: BLE001
                 pass
@@ -7314,13 +7356,18 @@ class Orchestrator:
             logger.debug("WebUI: qBit client unavailable: %s", exc)
             return None
 
-    def _remove_torrent_for_folder(self, folder: Path) -> str:
+    def _remove_torrent_for_folder(self, folder: Path, aggressive: bool = False) -> str:
         """
-        After a WebUI resolve, remove the SOURCE TORRENT for `folder` -- but
-        ONLY when the torrent maps to exactly this folder (a single-album
-        torrent), so a discography torrent isn't nuked because one of its albums
-        was resolved (those are cleaned up by the deselect/lifecycle passes).
-        Returns a short message suffix (empty if nothing removed).
+        Remove the source TORRENT for `folder` (+ its data).
+
+        Default (copy actions Add/Overwrite): only a torrent mapping EXACTLY to
+        this folder -- a single-album torrent -- so a discography isn't nuked
+        because one album was imported.
+
+        aggressive=True (Discard): also remove a torrent whose content CONTAINS
+        this folder (e.g. the whole discography torrent when discarding one of
+        its albums) -- this is the user's "delete the torrent AND the containing
+        folder" for a thrown-away download. Returns a short message suffix.
         """
         q = self._get_qbt()
         if q is None:
@@ -7329,20 +7376,26 @@ class Orchestrator:
             fr = str(folder.resolve(strict=False)).replace("\\", "/").rstrip("/")
             wr = str((self.cfg.watch_root or Path("/")).resolve(strict=False)).replace("\\", "/").rstrip("/")
             removed = 0
+            container = False
             for t in q.torrents():
                 cp = str(t.get("content_path") or "").replace("\\", "/").rstrip("/")
                 sp = str(t.get("save_path") or "").replace("\\", "/").rstrip("/")
-                # Map the torrent's content path into the pipeline's namespace by
-                # basename under the watch root, then require an EXACT folder match.
                 name = os.path.basename(cp) if cp else (t.get("name") or "")
                 mapped = f"{wr}/{name}" if name else ""
-                if cp and (cp == fr or mapped == fr) and cp != sp:
-                    # cp != sp guards against a multi-item torrent whose content_path
-                    # is the save root (i.e. many folders) -- don't remove those.
+                exact = bool(cp) and (cp == fr or mapped == fr) and cp != sp
+                # A torrent whose content folder is an ANCESTOR of this folder
+                # (the containing discography torrent).
+                contains = aggressive and bool(cp) and (
+                    fr == cp or fr.startswith(cp + "/")
+                    or fr == mapped or fr.startswith(mapped + "/"))
+                if exact or contains:
                     if q.remove(t.get("hash"), delete_files=True):
                         removed += 1
+                        if contains and not exact:
+                            container = True
             if removed:
-                return " and removed the source torrent"
+                return (" and removed the source torrent + its folder"
+                        if container else " and removed the source torrent")
         except Exception as exc:  # noqa: BLE001
             logger.debug("WebUI: torrent removal skipped: %s", exc)
         return ""
@@ -7437,6 +7490,25 @@ class Orchestrator:
         """WebUI 'Overwrite': copy the held music in, replacing colliding
         library files."""
         return self._apply_to_library(entry, overwrite=True)
+
+    def discard(self, entry: Dict[str, Any]) -> Tuple[bool, str]:
+        """
+        WebUI 'Discard': the library copy is fine -- throw the held download
+        away WITHOUT importing. Deletes the source folder + removes the source
+        torrent, unmonitors the album (no re-download), and drops the entry.
+        Nothing is copied to the library.
+        """
+        folder = Path(entry.get("source_path", ""))
+        tmsg = ""
+        if entry.get("source_path"):
+            # Discard = throw it away: remove the containing torrent + its folder.
+            tmsg = self._remove_torrent_for_folder(folder, aggressive=True)
+            if folder.exists():
+                self._delete_folder_under_watch(folder)
+        suffix = self._resolve_unmonitor(entry)
+        logger.info("WebUI discard: dropped held download %s%s%s",
+                    folder.name, suffix, tmsg)
+        return (True, f"Discarded held download ({folder.name}){suffix}{tmsg}")
 
     def _cleanup_empty(self, staging_dir: Path) -> None:
         try:

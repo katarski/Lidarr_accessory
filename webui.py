@@ -79,7 +79,7 @@ _PAGE = r"""<!doctype html>
   .b-out{background:#3a1e1c;color:#f0857a}
   .acts{display:flex;gap:.3rem;flex-wrap:wrap}
   button{font:inherit;border:0;border-radius:7px;padding:.32rem .6rem;cursor:pointer;white-space:nowrap}
-  .b-copy{background:var(--chip);color:var(--fg)}.b-keep{background:#334155;color:#fff}.b-move{background:var(--acc);color:#fff}
+  .b-copy{background:var(--chip);color:var(--fg)}.b-keep{background:#334155;color:#fff}.b-move{background:var(--acc);color:#fff}.b-disc{background:var(--danger);color:#fff}
   button:disabled{opacity:.5;cursor:default}
   .empty{padding:3rem;text-align:center;color:var(--mut)}
   .muted{color:var(--mut)}
@@ -147,6 +147,7 @@ _PAGE = r"""<!doctype html>
   <span id="bulkn">0 selected</span>
   <button class="b-keep" onclick="bulkAct('keep')">Add to library (selected)</button>
   <button class="b-move" onclick="bulkAct('move')">Overwrite (selected)</button>
+  <button class="b-disc" onclick="bulkAct('discard')">Discard (selected)</button>
   <button class="b-copy" onclick="clearSel()">Clear selection</button>
 </div>
 <main>
@@ -325,7 +326,8 @@ function render(){
       +'<button class="b-copy" onclick="copyPath(\''+x.id+'\')">Copy</button>'
       +'<button class="b-copy" onclick="toggleTree(event,\''+x.id+'\')">Tree ▸</button>'
       +'<button class="b-keep" title="Copy the held tracks into the library, keeping existing files (adds only what is missing)" onclick="act(\''+x.id+'\',\'keep\')">Add to library</button>'
-      +'<button class="b-move" title="Copy the held tracks into the library, OVERWRITING existing files" onclick="act(\''+x.id+'\',\'move\')">Overwrite</button></div>';
+      +'<button class="b-move" title="Copy the held tracks into the library, OVERWRITING existing files" onclick="act(\''+x.id+'\',\'move\')">Overwrite</button>'
+      +'<button class="b-disc" title="Throw the held download away (delete the torrent + its folder); keep the library as-is" onclick="act(\''+x.id+'\',\'discard\')">Discard</button></div>';
     var op=OPEN.has(x.id);
     var det='<tr class="det" id="det-'+x.id+'" style="display:'+(op?'table-row':'none')+'"><td colspan="'+(cols.length+2)+'">'
       +'<div class="cmp"><div class="tcol"><h4>Held (download)</h4><div id="t-held-'+x.id+'" class="muted">…</div></div>'
@@ -355,8 +357,8 @@ function updateBulkBar(){var n=VISIBLE.filter(function(v){return SEL.has(v);}).l
 function bulkAct(kind){
   var ids=VISIBLE.filter(function(v){return SEL.has(v);});
   if(!ids.length)return;
-  var verb=kind==='move'?'OVERWRITE library files with the held tracks':'ADD the held tracks to the library (keeping existing)';
-  if(!confirm('This will '+verb+', rescan Lidarr, and delete the source torrent+folder for '+ids.length+' selected item(s). Continue?'))return;
+  var verb=kind==='discard'?'DISCARD (delete torrent + folder, keep library)':kind==='move'?'OVERWRITE library files with the held tracks':'ADD the held tracks to the library (keeping existing)';
+  if(!confirm('This will '+verb+' for '+ids.length+' selected item(s). Continue?'))return;
   toast('Working on '+ids.length+'…');
   var ok=0,fail=0;
   (function next(i){
@@ -409,7 +411,9 @@ function legacyCopy(p){
 }
 function copyPath(id){var el=document.getElementById('p-'+id);var p=el?el.textContent:(HELD.find(function(x){return x.id===id;})||{}).source_path;copyText(p);}
 function act(id,kind){
-  var msg=kind==='move'?'OVERWRITE: copy the held tracks into the library, replacing colliding files, rescan Lidarr, then delete the source torrent + folder. Continue?':'ADD TO LIBRARY: copy the held tracks into the library (keeping existing files, adding the rest), rescan Lidarr, then delete the source torrent + folder. Continue?';
+  var msg=kind==='discard'?'DISCARD: throw the held download away — delete its torrent AND containing folder — and keep the library as-is. Continue?'
+    :kind==='move'?'OVERWRITE: copy the held tracks into the library, replacing colliding files, rescan Lidarr, then delete the source torrent + folder. Continue?'
+    :'ADD TO LIBRARY: copy the held tracks into the library (keeping existing files, adding the rest), rescan Lidarr, then delete the source torrent + folder. Continue?';
   if(!confirm(msg))return;
   document.querySelectorAll('[data-id="'+id+'"] button').forEach(function(b){b.disabled=true;});
   fetch('/api/held/'+kind,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id})})
@@ -497,7 +501,10 @@ def make_handler(store, actions: HeldActions):
                             # Backfill/repair identity when it's missing or the
                             # stored artist is a bare year (discography leaf).
                             cur_a = str(it.get("artist") or "")
-                            bad = (not (cur_a and it.get("album"))) or bool(re.fullmatch(r"(?:19|20)\d{2}", cur_a.strip()))
+                            cur_b = str(it.get("album") or "")
+                            bad = (not (cur_a and cur_b)) \
+                                or bool(re.fullmatch(r"(?:19|20)\d{2}", cur_a.strip())) \
+                                or bool(re.fullmatch(r"\d{1,3}", cur_b.strip()))
                             if bad and ex.get("_artist"):
                                 fields["artist"] = ex.get("_artist", "")
                                 fields["album"] = ex.get("_album", "") or it.get("album", "")
@@ -585,7 +592,7 @@ def make_handler(store, actions: HeldActions):
                 ok, msg = actions.container_action(act)
                 self._json(200 if ok else 500, {"ok": ok, "message": msg})
                 return
-            if path not in ("/api/held/keep", "/api/held/move"):
+            if path not in ("/api/held/keep", "/api/held/move", "/api/held/discard"):
                 self._json(404, {"ok": False, "message": "not found"})
                 return
             eid = self._read_id()
@@ -596,6 +603,8 @@ def make_handler(store, actions: HeldActions):
             try:
                 if path.endswith("/keep"):
                     ok, msg = actions.keep_existing(entry)
+                elif path.endswith("/discard"):
+                    ok, msg = actions.discard(entry)
                 else:
                     ok, msg = actions.move_held(entry)
             except Exception as exc:  # noqa: BLE001
