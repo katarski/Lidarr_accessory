@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from cue_parser import Cue, parse_cue
+from held_store import HeldStore
 from lidarr import LidarrClient
 from ollama_client import OllamaClient
 from splitter import SplitResult, probe_duration, repair_leadin, split_cue
@@ -353,6 +354,17 @@ class OrchestratorConfig:
     watch_root: Optional[Path] = None
     # Ledger path; None to disable.
     ledger_file: Optional[Path] = None
+    # Manual-attention WebUI (backlog #11). When enabled, items the pipeline
+    # couldn't finish on its own (outcome failed / imported_unverified, with the
+    # files still on disk) are recorded to held_items_file and shown on a small
+    # web dashboard (webui.py) served on webui_host:webui_port, where the user
+    # can copy the stuck path, "keep existing" (discard the held files, trust
+    # Lidarr's library) or "move held" (move the held files into the library and
+    # rescan Lidarr). WebUI-only for now -- no push notifications.
+    webui_enabled: bool = True
+    webui_host: str = "0.0.0.0"
+    webui_port: int = 8830
+    held_items_file: Optional[Path] = None
     # If True, NEVER do the manual-move fallback. Every successful outcome
     # must go through Lidarr's own DownloadedAlbumsScan or ManualImport so
     # that Lidarr's "Import Using Script" / Connect hooks fire. If both
@@ -521,6 +533,12 @@ class Orchestrator:
         # startup. In-memory only; a restart re-parses (cheap).
         self._skip_seen: set = set()
         self._ledger_lock = threading.Lock()
+        # Manual-attention store for the WebUI (#11). None when disabled.
+        self.held: Optional[HeldStore] = (
+            HeldStore(cfg.held_items_file)
+            if getattr(cfg, "webui_enabled", False) and cfg.held_items_file
+            else None
+        )
         # Album IDs we've already release-cycled in this process lifetime,
         # so we don't hammer Lidarr with PUT+Refresh on every audit pass.
         self._audit_cycled_album_ids: set = set()
@@ -6588,6 +6606,153 @@ class Orchestrator:
                     w.writerow(row)
         except OSError as exc:
             logger.debug("Ledger write failed: %s", exc)
+        # Keep the manual-attention WebUI store (#11) in sync with this outcome.
+        self._update_held(cue_path, outcome, artist, album, track_count, reason)
+
+    # Outcomes that mean "the pipeline gave up and left the files on disk for
+    # the user" -- these show up in the WebUI. Everything else (successful
+    # imports, deliberate skips) clears any prior held entry for the folder.
+    _ATTENTION_OUTCOMES = frozenset({"failed", "imported_unverified"})
+
+    def _update_held(
+        self, cue_path: Path, outcome: str, artist: str, album: str,
+        track_count: int, reason: str,
+    ) -> None:
+        """Add/clear a held-items entry for this outcome (no-op if disabled)."""
+        if self.held is None:
+            return
+        watch_root = self.cfg.watch_root
+        try:
+            src = Path(cue_path)
+            folder = src if src.is_dir() else src.parent
+            folder_r = folder.resolve(strict=False)
+        except OSError:
+            return
+        if outcome not in self._ATTENTION_OUTCOMES:
+            # Resolved (imported/skipped) -> drop any stale held entry.
+            self.held.remove_by_path(str(folder))
+            return
+        # Only surface a real, still-present folder strictly under the watch
+        # root (never the root itself), so we never point the user at a path
+        # that's already gone or unsafe to act on.
+        if watch_root is None or not folder.exists():
+            return
+        try:
+            wr = watch_root.resolve(strict=False)
+            if folder_r == wr or wr not in folder_r.parents:
+                return
+        except OSError:
+            return
+        self.held.add(
+            source_path=str(folder), artist=artist, album=album,
+            tracks=int(track_count or 0), reason=reason, outcome=outcome,
+        )
+
+    # ---- WebUI actions (#11) ------------------------------------------
+    def _held_audio_files(self, folder: Path) -> List[Path]:
+        """Every audio file anywhere under a held folder (recursive)."""
+        out: List[Path] = []
+        try:
+            for p in folder.rglob("*"):
+                try:
+                    if p.is_file() and p.suffix.lower() in _ALL_AUDIO_EXTS:
+                        out.append(p)
+                except OSError:
+                    continue
+        except OSError:
+            pass
+        return sorted(out)
+
+    def keep_existing(self, entry: Dict[str, Any]) -> Tuple[bool, str]:
+        """
+        WebUI 'keep existing': discard the held files (delete the stuck
+        folder) and trust Lidarr's current library. Returns (ok, message).
+        """
+        folder = Path(entry.get("source_path", ""))
+        if not entry.get("source_path"):
+            return (False, "no source path recorded")
+        if not folder.exists():
+            return (True, "folder already gone -- nothing to discard")
+        if self._delete_folder_under_watch(folder):
+            logger.info("WebUI keep-existing: discarded held folder %s", folder)
+            return (True, f"Discarded held files: {folder.name}")
+        return (False, "could not delete the folder (see logs); is it under the "
+                       "watch root and not held open?")
+
+    def move_held(self, entry: Dict[str, Any]) -> Tuple[bool, str]:
+        """
+        WebUI 'move held': move the held audio into the Lidarr library folder
+        (overwriting what's there for this album) and rescan Lidarr. Returns
+        (ok, message).
+        """
+        folder = Path(entry.get("source_path", ""))
+        if not folder.exists():
+            return (False, "source folder is gone")
+        audios = self._held_audio_files(folder)
+        if not audios:
+            return (False, "no audio files found in the held folder")
+
+        artist_name = (entry.get("artist") or "").strip()
+        album_name = (entry.get("album") or "").strip()
+        if not (artist_name and album_name):
+            a, b = self._album_folder_identity(folder)
+            artist_name = artist_name or a
+            album_name = album_name or b
+        if not artist_name:
+            return (False, "couldn't determine the artist -- move it by hand")
+
+        # Prefer Lidarr's own artist path (canonical name/casing); else fall
+        # back to the configured library root.
+        art = None
+        try:
+            art = self.lidarr.find_artist(artist_name)
+        except Exception:  # noqa: BLE001
+            art = None
+        if art and art.get("path"):
+            base = Path(art["path"])
+        else:
+            base = self.cfg.library_root_windows / (
+                _sanitize_fs(artist_name) or "Unknown Artist")
+        album_dir = _sanitize_fs(album_name) or _sanitize_fs(folder.name) \
+            or "Unknown Album"
+        target = base / album_dir
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return (False, f"could not create {target}: {exc}")
+
+        moved = 0
+        for a in audios:
+            dst = target / a.name
+            try:
+                if dst.exists():
+                    dst.unlink()  # user chose to replace what's there
+                shutil.move(str(a), str(dst))
+                moved += 1
+            except OSError as exc:
+                logger.warning("WebUI move-held: %s -> %s failed: %s",
+                               a, dst, exc)
+        if moved == 0:
+            return (False, "moved 0 files (permission/path error) -- folder left "
+                           "in place")
+
+        # Nudge Lidarr to index the moved files.
+        try:
+            if art:
+                self.lidarr.rescan_artist(art["id"])
+                self.lidarr.refresh_artist(art["id"])
+            self.lidarr.downloaded_albums_scan_rescan(str(target))
+            self.lidarr.process_monitored_downloads()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("WebUI move-held: Lidarr rescan hiccup: %s", exc)
+
+        # Remove the now-emptied held folder (and its ISO/artwork leftovers).
+        self._delete_folder_under_watch(folder)
+        logger.info(
+            "WebUI move-held: moved %d file(s) to %s and rescanned Lidarr",
+            moved, target)
+        return (True, f"Moved {moved} file(s) into the library and rescanned "
+                      f"Lidarr ({target.name})")
 
     def _cleanup_empty(self, staging_dir: Path) -> None:
         try:
@@ -6723,14 +6888,19 @@ class Orchestrator:
 
     def _delete_source_folder(self, cue_path: Path) -> None:
         """
-        Recursively remove the folder that contained the source CUE --
-        scans/, rip logs, .nfo, .m3u, artwork, the whole lot. Then walk
-        UP the tree removing any empty parent folders (e.g. an artist
-        directory left behind after its only album was cleaned out),
-        stopping at the watch root which is never touched.
+        Recursively remove the folder that contained the source CUE.
+        Thin wrapper over _delete_folder_under_watch(cue_path.parent);
+        only intended to run in the success branch (caller sequences it).
+        """
+        self._delete_folder_under_watch(cue_path.parent)
 
-        Only intended to run in the success branch; callers are
-        responsible for that sequencing.
+    def _delete_folder_under_watch(self, folder: Path) -> bool:
+        """
+        Recursively remove `folder` (scans/, rip logs, .nfo, .m3u, artwork,
+        disc image, the whole lot), then walk UP the tree removing any empty
+        parent folders (e.g. an artist directory left behind after its only
+        album was cleaned out), stopping at the watch root which is never
+        touched. Returns True if the folder is gone afterwards.
 
         Safety: refuses to operate on
           * a path that does not resolve under the configured watch
@@ -6738,7 +6908,6 @@ class Orchestrator:
           * the watch root itself,
           * a drive root or UNC share root (no parent -> bail).
         """
-        folder = cue_path.parent
         watch_root = self.cfg.watch_root
 
         try:
@@ -6839,6 +7008,7 @@ class Orchestrator:
         # left behind after its only album was cleaned). Stop before
         # touching the watch root.
         self._rmdir_empty_parents(folder_r, watch_root_r)
+        return not folder.exists()
 
     def _rmdir_empty_parents(self, start_folder: Path, watch_root_r: Path) -> None:
         """

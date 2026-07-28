@@ -100,6 +100,15 @@ lidarr:
   # until the source folder is deleted after a verified import. Needs dvda2wav and
   # 7z (both in the image). Set false to ignore DVD-Audio ISOs.
   extract_dvda_iso: true
+  # #11: manual-attention WebUI. A small dashboard listing items the pipeline
+  # couldn't finish on its own (outcome failed / imported_unverified, files
+  # still on disk). Per item you can copy the stuck path, "keep existing"
+  # (discard the held files, trust Lidarr's library) or "move held" (move the
+  # held files into the library and rescan Lidarr). Publish the port on the
+  # container (-p 8830:8830) to reach it. WebUI-only -- no push notifications.
+  webui_enabled: true
+  webui_host: 0.0.0.0
+  webui_port: 8830
   # Uniform-FLAC library: re-encode pre-split lossless-but-not-FLAC tracks
   # (.ape/.wv/.wav/.aiff/.tak/.tta/.shn and ALAC-in-.m4a) to FLAC before import,
   # preserving tags, bit depth and sample rate (a lossless transcode). FLAC is

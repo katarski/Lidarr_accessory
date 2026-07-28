@@ -89,6 +89,10 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     put("lidarr", "transcode_dsd", "TRANSCODE_DSD", _as_bool)
     put("lidarr", "extract_sacd_iso", "EXTRACT_SACD_ISO", _as_bool)
     put("lidarr", "extract_dvda_iso", "EXTRACT_DVDA_ISO", _as_bool)
+    # Manual-attention WebUI (#11)
+    put("lidarr", "webui_enabled", "WEBUI_ENABLED", _as_bool)
+    put("lidarr", "webui_port", "WEBUI_PORT", int)
+    put("lidarr", "webui_host", "WEBUI_HOST")
     put("lidarr", "tag_identify_pre_split", "TAG_IDENTIFY_PRE_SPLIT", _as_bool)
     put("lidarr", "prefer_multichannel", "PREFER_MULTICHANNEL", _as_bool)
     put("lidarr", "transcode_lossless_to_flac", "TRANSCODE_LOSSLESS_TO_FLAC", _as_bool)
@@ -772,6 +776,19 @@ def main() -> int:
         )
     else:
         isearch_state_path = None
+    # Manual-attention WebUI (#11): held-items state lives next to the other
+    # /config state files (mirrors the reaper/isearch state path resolution).
+    _held_state_cfg = lidarr_cfg.get("held_items_file") or staging_cfg.get("held_items_file")
+    if _held_state_cfg:
+        held_items_path = Path(_held_state_cfg)
+    elif ledger_path is not None:
+        held_items_path = ledger_path.parent / "held_items.json"
+    elif lidarr_cfg.get("library_audit_report_file"):
+        held_items_path = (
+            Path(lidarr_cfg["library_audit_report_file"]).parent / "held_items.json"
+        )
+    else:
+        held_items_path = None
     heartbeat_seconds = int(staging_cfg.get("heartbeat_seconds", 600) or 0)
 
     orch_cfg = OrchestratorConfig(
@@ -859,6 +876,10 @@ def main() -> int:
         ),
         watch_root=watch_root,
         ledger_file=ledger_path,
+        webui_enabled=bool(lidarr_cfg.get("webui_enabled", True)),
+        webui_host=str(lidarr_cfg.get("webui_host", "0.0.0.0")),
+        webui_port=int(lidarr_cfg.get("webui_port", 8830)),
+        held_items_file=held_items_path,
         sweep_cueless_pre_split=bool(
             watch_cfg.get("sweep_cueless_pre_split", False)
         ),
@@ -1205,6 +1226,31 @@ def main() -> int:
             orch_cfg.interactive_search_max_candidates,
             orch_cfg.interactive_search_require_lossless,
         )
+
+    # --- Manual-attention WebUI (backlog #11) --------------------------
+    # A small dashboard of items the pipeline couldn't finish, where the user
+    # can copy the stuck path, "keep existing" (discard held files) or "move
+    # held" (move them into the library + rescan). WebUI-only, no push alerts.
+    if orch_cfg.webui_enabled and orch.held is not None:
+        try:
+            from webui import run_webui
+            webui_thread = threading.Thread(
+                target=run_webui,
+                args=(orch.held, orch, orch_cfg.webui_host,
+                      orch_cfg.webui_port, stop),
+                daemon=True,
+                name="cue-webui",
+            )
+            webui_thread.start()
+            logger.info(
+                "WebUI: enabled on http://%s:%d (held-items dashboard, "
+                "state=%s)", orch_cfg.webui_host, orch_cfg.webui_port,
+                held_items_path,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("WebUI: failed to start (%s) -- continuing without it", exc)
+    else:
+        logger.info("WebUI: disabled")
 
     def handle_signal(signum, _frame):
         logger.info("Signal %s received, shutting down.", signum)

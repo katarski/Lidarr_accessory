@@ -61,6 +61,9 @@ COPY *.py /app/
 ENV PYTHONUNBUFFERED=1 \
     TZ=Europe/Copenhagen
 
+# Manual-attention WebUI (backlog #11). Publish with -p 8830:8830 to reach it.
+EXPOSE 8830
+
 # /config  -> appdata (this holds config.yaml, logs, ledger, audit csv+sig)
 # /downloads and /music are bind-mounted at run time, same as Lidarr.
 VOLUME ["/config", "/downloads", "/music"]
