@@ -108,6 +108,17 @@ class HeldStore:
             self._save_locked()
         return entry
 
+    def update(self, eid: str, **fields: Any) -> bool:
+        """Merge fields into an entry (no seen_count bump). Used to cache the
+        computed 'existing library album' summary. Returns True if updated."""
+        with self._lock:
+            e = self._items.get(eid)
+            if e is None:
+                return False
+            e.update(fields)
+            self._save_locked()
+        return True
+
     def remove(self, eid: str) -> bool:
         with self._lock:
             gone = self._items.pop(eid, None) is not None

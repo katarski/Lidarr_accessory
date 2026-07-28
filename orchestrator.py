@@ -6930,6 +6930,35 @@ class Orchestrator:
         with self._activity_lock:
             return sorted(self._activity.values(), key=lambda a: a.get("started", 0))
 
+    def existing_album_summary(self, entry: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        What the library ALREADY holds for this held item's album, so the WebUI
+        can show held-vs-existing side by side (the "keep existing" comparison).
+        Returns an audio summary with in_library=True, {"in_library": False} if
+        the album isn't in the library, or {} if the album can't be identified.
+        """
+        artist = (entry.get("artist") or "").strip()
+        album = (entry.get("album") or "").strip()
+        if not (artist and album):
+            try:
+                a, b = self._album_folder_identity(Path(entry.get("source_path", "")))
+                artist = artist or a
+                album = album or b
+            except Exception:  # noqa: BLE001
+                pass
+        if not (artist and album):
+            return {}
+        try:
+            album_dir, _files = self._find_album_on_disk(artist, album)
+        except Exception:  # noqa: BLE001
+            return {}
+        if not album_dir:
+            return {"in_library": False}
+        summ = self._folder_audio_summary(album_dir)
+        summ["in_library"] = True
+        summ["path"] = str(album_dir)
+        return summ
+
     def keep_existing(self, entry: Dict[str, Any]) -> Tuple[bool, str]:
         """
         WebUI 'keep existing': discard the held files (delete the stuck

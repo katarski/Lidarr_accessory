@@ -103,3 +103,29 @@ Open the container's **WebUI** (port `8830`). Two tabs:
 |---|---|---|
 | `WEBUI_ENABLED` | **true** | Serve the dashboard. |
 | `WEBUI_PORT` | **8830** | Port (publish it on the container: the template already maps `8830`). |
+
+**Right-click** any cell in the table for ServiceNow-style **Show matching** /
+**Filter out** on that value; active value-filters show as removable chips.
+The **Existing (library)** and **Compare** columns show what Lidarr already has
+for the album next to the held version (e.g. "held better ↑" when the held rip
+is lossless/multichannel and the library copy is lossy/stereo), so you can
+decide **Keep existing** vs **Move held** at a glance.
+
+---
+
+## File permissions (delete from Windows/SMB)
+
+The container runs as `--user 99:100` (nobody:users) — **required**, or Lidarr
+can't import pipeline-created files (root-owned files fail with a copy/delete
+retry loop). To also let *you* delete/modify those files over SMB, the pipeline
+sets its umask to `0` so everything it (and ffmpeg/7z/sacd_extract/dvda2wav)
+creates is `0666`/`0777` — group- and other-writable, matching Unraid's
+"Docker Safe New Permissions".
+
+| Env var | Default | What it does |
+|---|---|---|
+| `FILE_UMASK` | **0** | Octal umask for created files. `0` → 0666/0777 (anyone can delete). `002` → group-writable only. |
+
+For files created **before** this was in place, run Unraid **Tools → Docker
+Safe New Permissions** on the share (or `chmod -R 666 files / 777 dirs`). Do
+**not** remove `--user 99:100` to fix permissions — that breaks Lidarr imports.

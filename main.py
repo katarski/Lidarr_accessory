@@ -691,6 +691,18 @@ def main() -> int:
     cfg = apply_env_overrides(cfg)
     configure_logging(cfg.get("logging", {}))
 
+    # Permissions: create every file/dir group- AND other-writable (0666/0777),
+    # matching Unraid's "Docker Safe New Permissions" convention. Set process-
+    # wide and BEFORE any worker/subprocess starts so ffmpeg / 7z / sacd_extract
+    # / dvda2wav all inherit it -- otherwise pipeline-created FLACs land 0644
+    # (owner 99:100) and can't be deleted over SMB. Overridable via FILE_UMASK
+    # (octal, e.g. "002" for group-writable only).
+    try:
+        _umask = int(str(os.environ.get("FILE_UMASK", "0")).strip() or "0", 8)
+    except ValueError:
+        _umask = 0
+    os.umask(_umask)
+
     watch_cfg = cfg["watch"]
     staging_cfg = cfg["staging"]
     ff_cfg = cfg["ffmpeg"]

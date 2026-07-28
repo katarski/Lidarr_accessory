@@ -81,6 +81,16 @@ _PAGE = r"""<!doctype html>
   .muted{color:var(--mut)}
   .toast{position:fixed;bottom:1rem;left:50%;transform:translateX(-50%);background:#111;color:#fff;padding:.55rem 1rem;border-radius:10px;opacity:0;transition:opacity .2s;border:1px solid #333;max-width:92vw;z-index:20}
   .toast.show{opacity:1}
+  #ctx{position:fixed;display:none;background:var(--card);border:1px solid var(--bd);border-radius:9px;padding:.25rem;z-index:30;min-width:170px;box-shadow:0 6px 24px rgba(0,0,0,.4)}
+  #ctx.on{display:block}
+  #ctx .mi{padding:.4rem .6rem;border-radius:6px;cursor:pointer;white-space:nowrap;font-size:.82rem}
+  #ctx .mi:hover{background:var(--chipOn)}
+  #ctx .mh{padding:.3rem .6rem;color:var(--mut);font-size:.72rem;border-bottom:1px solid var(--bd);margin-bottom:.2rem;max-width:260px;overflow:hidden;text-overflow:ellipsis}
+  #vfilters{display:flex;gap:.35rem;flex-wrap:wrap}
+  .vf{padding:.2rem .5rem;border-radius:999px;background:var(--chipOn);border:1px solid var(--acc);font-size:.75rem;cursor:pointer}
+  .vf.exc{background:#3a1e1c;border-color:var(--danger)}
+  td .ex{color:var(--mut)}
+  .up{color:#5fe0a0}.dn{color:var(--warn)}
   .spin{color:var(--mut);font-size:.8rem}
   .prog{display:flex;flex-direction:column;gap:.5rem}
   .procard{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:.6rem .8rem;display:flex;justify-content:space-between;gap:1rem;align-items:center}
@@ -104,6 +114,7 @@ _PAGE = r"""<!doctype html>
   <span class="chip" data-f="multichannel" onclick="toggleFilter(this)">Multichannel</span>
   <span class="chip" data-f="stereo" onclick="toggleFilter(this)">Stereo</span>
   <span id="outchips"></span>
+  <div id="vfilters"></div>
   <div class="grow"></div>
   <div class="cols">
     <button class="b-copy" onclick="document.getElementById('cm').classList.toggle('on')">Columns ▾</button>
@@ -116,21 +127,28 @@ _PAGE = r"""<!doctype html>
   <div id="progress" style="display:none"></div>
 </main>
 <div id="toast" class="toast"></div>
+<div id="ctx"></div>
 
 <script>
 var HELD=[], ACT=[], TAB='attention';
 var FILT={lossless:false,lossy:false,multichannel:false,stereo:false,outcomes:{}};
 var COLS=[
- {k:'title',  name:'Album',   on:true},
- {k:'quality',name:'Quality', on:true},
- {k:'formats',name:'Formats', on:true},
- {k:'ch',     name:'Channels',on:true},
- {k:'tracks', name:'Tracks',  on:true},
- {k:'size',   name:'Size',    on:true},
- {k:'outcome',name:'Status',  on:true},
- {k:'reason', name:'Reason',  on:false},
- {k:'path',   name:'Path',    on:true},
+ {k:'title',   name:'Album',            on:true},
+ {k:'quality', name:'Held quality',     on:true},
+ {k:'existing',name:'Existing (library)',on:true},
+ {k:'verdict', name:'Compare',          on:true},
+ {k:'formats', name:'Formats',          on:false},
+ {k:'ch',      name:'Channels',         on:true},
+ {k:'tracks',  name:'Tracks',           on:true},
+ {k:'size',    name:'Size',             on:true},
+ {k:'outcome', name:'Status',           on:true},
+ {k:'reason',  name:'Reason',           on:false},
+ {k:'path',    name:'Path',             on:true},
 ];
+// ServiceNow-style per-value filters set from the right-click menu:
+// INC[col] = set of values a row's cell MUST match; EXC[col] = must NOT match.
+var INC={}, EXC={};
+function score(d){d=d||{};return (d.lossless?2:0)+(d.multichannel?2:0)+(d.max_channels||0)/10+(d.bits||0)/100+(d.sample_rate||0)/1e7;}
 function h(s){return (s==null?'':''+s).replace(/[&<>"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
 function human(b){b=b||0;var u=['B','KB','MB','GB','TB'],i=0;while(b>=1024&&i<u.length-1){b/=1024;i++;}return b.toFixed(b<10&&i>0?1:0)+u[i];}
 function ago(t){if(!t)return'';var s=Math.max(0,Date.now()/1000-t);if(s<90)return Math.round(s)+'s';if(s<5400)return Math.round(s/60)+'m';if(s<172800)return Math.round(s/3600)+'h';return Math.round(s/86400)+'d';}
@@ -151,28 +169,63 @@ function matches(x){var d=x.details||{};
   if(FILT.stereo&&!(d.max_channels&&d.max_channels<=2))return false;
   var anyOut=Object.keys(FILT.outcomes).some(function(k){return FILT.outcomes[k];});
   if(anyOut&&!FILT.outcomes[x.outcome||'held'])return false;
+  // ServiceNow-style per-value include/exclude (from the right-click menu).
+  for(var ck in INC){if(INC[ck]&&INC[ck].size&&!INC[ck].has(cellText(ck,x)))return false;}
+  for(var ek in EXC){if(EXC[ek]&&EXC[ek].has(cellText(ek,x)))return false;}
   var q=(document.getElementById('q').value||'').toLowerCase().trim();
   if(q){var hay=((x.artist||'')+' '+(x.album||'')+' '+(x.source_path||'')+' '+(x.reason||'')).toLowerCase();if(hay.indexOf(q)<0)return false;}
   return true;}
-function cell(c,x){var d=x.details||{};switch(c.k){
+function colName(k){var c=COLS.filter(function(z){return z.k===k;})[0];return c?c.name:k;}
+function addValueFilter(kind,col,val){var M=kind==='inc'?INC:EXC;(M[col]=M[col]||new Set()).add(val);
+  // include+exclude of the same value is contradictory -> drop the opposite
+  var O=kind==='inc'?EXC:INC;if(O[col])O[col].delete(val);render();}
+function clearValueFilter(kind,col,val){var M=kind==='inc'?INC:EXC;if(M[col]){M[col].delete(val);if(!M[col].size)delete M[col];}render();}
+function renderVFilters(){var out='';['inc','exc'].forEach(function(kind){var M=kind==='inc'?INC:EXC;for(var col in M){M[col].forEach(function(v){
+  out+='<span class="vf'+(kind==='exc'?' exc':'')+'" title="click to remove" onclick="clearValueFilter(\''+kind+'\',\''+col+'\','+JSON.stringify(v).replace(/"/g,'&quot;')+')">'+(kind==='exc'?'≠ ':'= ')+h(colName(col))+': '+h(v)+' ✕</span>';});}});
+  document.getElementById('vfilters').innerHTML=out;}
+function chLabel(n){return n===6?'5.1':n===8?'7.1':n===2?'stereo':n===4?'quad':n?(n+'ch'):'';}
+function cell(c,x){var d=x.details||{},ex=x.existing||{};switch(c.k){
   case'title':var t=((x.artist||'')+' — '+(x.album||'')).replace(/^ — | — $/,'')||(x.source_path||'').split('/').pop();return '<span class="title">'+h(t)+'</span>';
   case'quality':return h(d.quality||'');
+  case'existing':
+    if(!ex||ex.in_library!==true)return '<span class="ex">not in library</span>';
+    return '<span class="ex">'+h(ex.quality||'')+' · '+(ex.n_audio||0)+'trk · '+human(ex.total_bytes)+'</span>';
+  case'verdict':
+    if(!ex||ex.in_library!==true)return '<span class="badge b-mc">held is new</span>';
+    var sh=score(d),se=score(ex);
+    if(sh>se+0.01)return '<span class="badge b-mc">held better ↑</span>';
+    if(se>sh+0.01)return '<span class="badge b-lossy">library better ↓</span>';
+    return '<span class="badge">≈ same</span>';
   case'formats':return '<span class="muted">'+h(fmtStr(d))+'</span>';
-  case'ch':var b='';if(d.multichannel)b='<span class="badge b-mc">'+h(d.max_channels===6?'5.1':d.max_channels===8?'7.1':d.max_channels+'ch')+'</span>';else if(d.max_channels)b='<span class="badge">stereo</span>';var q=d.lossless?'<span class="badge b-ll">lossless</span>':'';if(d.has_lossy)q+='<span class="badge b-lossy">lossy</span>';return b+q;
+  case'ch':var b='';if(d.multichannel)b='<span class="badge b-mc">'+h(chLabel(d.max_channels))+'</span>';else if(d.max_channels)b='<span class="badge">stereo</span>';var q=d.lossless?'<span class="badge b-ll">lossless</span>':'';if(d.has_lossy)q+='<span class="badge b-lossy">lossy</span>';return b+q;
   case'tracks':return d.n_audio||x.tracks||0;
   case'size':return '<span class="muted">'+human(d.total_bytes)+'</span>';
   case'outcome':return '<span class="badge b-out">'+h(x.outcome||'held')+'</span>';
   case'reason':return '<span class="muted">'+h(x.reason||'')+'</span>';
   case'path':return '<span class="path" id="p-'+x.id+'">'+h(x.source_path||'')+'</span>';
   default:return '';}}
+// Plain-text value of a cell, used for the right-click value filters.
+function cellText(k,x){var d=x.details||{},ex=x.existing||{};switch(k){
+  case'title':return ((x.artist||'')+' — '+(x.album||'')).replace(/^ — | — $/,'')||(x.source_path||'').split('/').pop();
+  case'quality':return d.quality||'';
+  case'existing':return (ex&&ex.in_library)?(ex.quality||''):'not in library';
+  case'verdict':if(!ex||ex.in_library!==true)return 'held is new';var a=score(d),b2=score(ex);return a>b2+0.01?'held better':(b2>a+0.01?'library better':'same');
+  case'formats':return fmtStr(d);
+  case'ch':return d.multichannel?chLabel(d.max_channels):(d.max_channels?'stereo':'');
+  case'tracks':return ''+(d.n_audio||x.tracks||0);
+  case'size':return human(d.total_bytes);
+  case'outcome':return x.outcome||'held';
+  case'reason':return x.reason||'';
+  case'path':return x.source_path||'';
+  default:return '';}}
 function render(){
-  buildOutChips();
+  buildOutChips();renderVFilters();
   var cols=COLS.filter(function(c){return c.on;});
   var rows=HELD.filter(matches);
   document.getElementById('n-att').textContent=HELD.length;
   var head='<tr>'+cols.map(function(c){return '<th>'+h(c.name)+'</th>';}).join('')+'<th>Actions</th></tr>';
   var body=rows.map(function(x){
-    var tds=cols.map(function(c){return '<td>'+cell(c,x)+'</td>';}).join('');
+    var tds=cols.map(function(c){return '<td data-col="'+c.k+'" data-val="'+h(cellText(c.k,x))+'">'+cell(c,x)+'</td>';}).join('');
     var acts='<div class="acts" data-id="'+x.id+'">'
       +'<button class="b-copy" onclick="copyPath(\''+x.id+'\')">Copy</button>'
       +'<button class="b-keep" onclick="act(\''+x.id+'\',\'keep\')">Keep existing</button>'
@@ -204,6 +257,26 @@ function refresh(){
   Promise.all([fetch('/api/held').then(function(r){return r.json();}),fetch('/api/activity').then(function(r){return r.json();}).catch(function(){return{items:[]};})])
    .then(function(res){HELD=res[0].items||[];ACT=(res[1]||{}).items||[];document.getElementById('updated').textContent='updated '+new Date().toLocaleTimeString();render();});
 }
+// Right-click a table cell -> ServiceNow-style "Show matching" / "Filter out".
+var ctx=document.getElementById('ctx');
+document.getElementById('attention').addEventListener('contextmenu',function(e){
+  var td=e.target.closest('td[data-col]');if(!td)return;e.preventDefault();
+  var col=td.getAttribute('data-col'),val=td.getAttribute('data-val')||'';
+  ctx.innerHTML='<div class="mh">'+h(colName(col))+': <b>'+h(val||'(empty)')+'</b></div>'
+   +'<div class="mi" data-a="inc">Show matching</div>'
+   +'<div class="mi" data-a="exc">Filter out</div>'
+   +'<div class="mi" data-a="clear">Clear this column\'s filters</div>';
+  ctx.style.left=Math.min(e.clientX,window.innerWidth-190)+'px';
+  ctx.style.top=Math.min(e.clientY,window.innerHeight-120)+'px';ctx.classList.add('on');
+  ctx.querySelectorAll('.mi').forEach(function(mi){mi.onclick=function(){
+    var a=mi.getAttribute('data-a');
+    if(a==='inc')addValueFilter('inc',col,val);
+    else if(a==='exc')addValueFilter('exc',col,val);
+    else{delete INC[col];delete EXC[col];render();}
+    ctx.classList.remove('on');};});
+});
+document.addEventListener('click',function(){ctx.classList.remove('on');});
+document.addEventListener('scroll',function(){ctx.classList.remove('on');},true);
 buildColMenu();setTab('attention');refresh();setInterval(refresh,15000);
 </script>
 </body></html>"""
@@ -235,7 +308,19 @@ def make_handler(store, actions: HeldActions):
                 self._send(200, _PAGE.encode("utf-8"), "text/html; charset=utf-8")
             elif path == "/api/held":
                 store.prune_missing()
-                self._json(200, {"items": store.list()})
+                items = store.list()
+                # Enrich each item with the library's EXISTING album (for the
+                # held-vs-existing compare), computed once and cached.
+                if hasattr(actions, "existing_album_summary"):
+                    for it in items:
+                        if "existing" not in it:
+                            try:
+                                ex = actions.existing_album_summary(it)
+                            except Exception:  # noqa: BLE001
+                                ex = {}
+                            store.update(it["id"], existing=ex)
+                            it["existing"] = ex
+                self._json(200, {"items": items})
             elif path == "/api/activity":
                 acts = actions.list_activity() if hasattr(actions, "list_activity") else []
                 self._json(200, {"items": acts})
