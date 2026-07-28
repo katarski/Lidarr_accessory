@@ -115,6 +115,28 @@ class HeldStore:
     def remove_by_path(self, source_path: str) -> bool:
         return self.remove(_entry_id(str(source_path)))
 
+    def prune_missing(self) -> int:
+        """
+        Drop entries whose source folder no longer exists on disk -- e.g. a
+        folder that was recorded as failed but has since been imported and
+        cleaned up, or one the user resolved by hand. Keeps the dashboard
+        truthful (only items with files actually still on disk to act on).
+        Returns the number removed.
+        """
+        removed = 0
+        with self._lock:
+            for eid in list(self._items):
+                sp = self._items[eid].get("source_path", "")
+                try:
+                    if sp and not Path(sp).exists():
+                        del self._items[eid]
+                        removed += 1
+                except OSError:
+                    continue
+            if removed:
+                self._save_locked()
+        return removed
+
     # ---- reads --------------------------------------------------------
     def get(self, eid: str) -> Optional[Dict[str, Any]]:
         with self._lock:

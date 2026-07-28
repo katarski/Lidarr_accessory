@@ -169,9 +169,11 @@ def make_handler(store, actions: HeldActions):
         def do_GET(self):  # noqa: N802
             path = urlparse(self.path).path
             if path in ("/", "/index.html"):
+                store.prune_missing()  # hide items whose folder is already gone
                 self._send(200, _render(store.list()).encode("utf-8"),
                            "text/html; charset=utf-8")
             elif path == "/api/held":
+                store.prune_missing()
                 self._json(200, {"items": store.list()})
             elif path == "/healthz":
                 self._json(200, {"ok": True, "held": len(store.list())})

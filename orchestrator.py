@@ -6610,9 +6610,15 @@ class Orchestrator:
         self._update_held(cue_path, outcome, artist, album, track_count, reason)
 
     # Outcomes that mean "the pipeline gave up and left the files on disk for
-    # the user" -- these show up in the WebUI. Everything else (successful
-    # imports, deliberate skips) clears any prior held entry for the folder.
-    _ATTENTION_OUTCOMES = frozenset({"failed", "imported_unverified"})
+    # the user" -- these show up in the WebUI. Only `failed` qualifies: it is
+    # the one outcome that reliably PRESERVES the source (every failed path
+    # returns before source cleanup). `imported_unverified` is NOT included --
+    # it means Lidarr claimed success and moved the files out (the source is
+    # then cleaned up), and the "unverified" is usually just a library
+    # name-match quirk (e.g. "Michael Buble" on disk vs "Michael Bublé" in
+    # Lidarr), so there would be nothing left on disk to keep/move. Everything
+    # else (successful imports, deliberate skips) clears any prior held entry.
+    _ATTENTION_OUTCOMES = frozenset({"failed"})
 
     def _update_held(
         self, cue_path: Path, outcome: str, artist: str, album: str,
