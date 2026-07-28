@@ -456,7 +456,10 @@ class OrchestratorConfig:
     interactive_search_dry_run: bool = True
     # Max candidate releases to try (grab+verify) per album before giving up.
     interactive_search_max_candidates: int = 5
-    # Only consider lossless (FLAC) releases; skip lossy when this is on.
+    # PREFER lossless (lossless takes precedence in ranking) -- lossy is still
+    # eligible and grabbed as a fallback when no lossless release exists; it is
+    # NOT dropped. Set False for no format preference (rank purely by title +
+    # seeders). Name kept for back-compat; despite it, lossy is never excluded.
     interactive_search_require_lossless: bool = True
     # Minimum title-relation (0..1) the best candidate must reach to be grabbed.
     # Guards against grabbing the WRONG album for short/numeric titles (e.g.
@@ -5526,13 +5529,19 @@ class Orchestrator:
         self, releases, artist: str, album: str, blocklisted,
     ) -> List[Dict[str, Any]]:
         """
-        Filter to torrent releases (not blocklisted; lossless if required) and
-        rank by title relation to 'artist album' (dominant), then lossless,
-        then seeders. Returns scored copies with _score/_seeders/_quality/
-        _title_ratio attached, best first.
+        Rank torrent releases (not blocklisted) for an album. Considers
+        EVERYTHING available -- lossy is NOT dropped -- but LOSSLESS TAKES
+        PRECEDENCE: among candidates that clear the title floor, any lossless
+        release outranks any lossy one, so lossy is only grabbed when no
+        lossless exists (`interactive_search_require_lossless` = prefer-lossless;
+        set False for no format preference). Within a format tier, ranks by
+        title relation (dominant) then seeders. Returns scored copies with
+        _score/_seeders/_quality/_title_ratio/_lossless attached, best first.
         """
         want = self._norm_title(f"{artist} {album}")
         blocked = set(blocklisted or [])
+        prefer_lossless = bool(self.cfg.interactive_search_require_lossless)
+        floor = float(self.cfg.interactive_search_min_title_ratio)
         scored: List[Dict[str, Any]] = []
         for raw in releases or []:
             if (raw.get("protocol") or "").lower() != "torrent":
@@ -5547,21 +5556,28 @@ class Orchestrator:
             lossless = bool(re.search(
                 r"(?i)flac|alac|\bape\b|wavpack|\bwv\b|dsd|lossless|24 ?bit|hi-?res",
                 f"{qname} {title}"))
-            if self.cfg.interactive_search_require_lossless and not lossless:
-                continue
             seeders = int(raw.get("seeders") or 0)
             ratio = difflib.SequenceMatcher(
                 None, want, self._norm_title(title)).ratio()
-            score = (ratio * 100.0
-                     + (15.0 if lossless else 0.0)
-                     + min(seeders, 200) / 10.0)
+            score = ratio * 100.0 + min(seeders, 200) / 10.0
             r = dict(raw)
             r["_score"] = score
             r["_seeders"] = seeders
-            r["_quality"] = qname or ("lossless" if lossless else "?")
+            r["_lossless"] = lossless
+            r["_quality"] = qname or ("lossless" if lossless else "lossy")
             r["_title_ratio"] = round(ratio, 3)
             scored.append(r)
-        scored.sort(key=lambda x: x["_score"], reverse=True)
+        # Relevant (title >= floor) first; then lossless precedence (when
+        # preferring); then title/seeder score. So a lossless of the right album
+        # wins, but an irrelevant lossless never beats a relevant lossy.
+        scored.sort(
+            key=lambda x: (
+                x["_title_ratio"] >= floor,
+                x["_lossless"] if prefer_lossless else False,
+                x["_score"],
+            ),
+            reverse=True,
+        )
         return scored
 
     def _await_queue_hash(self, artist: str, album: str, timeout: int = 90):
@@ -5643,8 +5659,7 @@ class Orchestrator:
             releases, artist, album, st.get("blocklisted") or [])
         if not cands:
             logger.info(
-                "interactive search: %s -- no%s torrent candidates", label,
-                " lossless" if cfg.interactive_search_require_lossless else "")
+                "interactive search: %s -- no torrent candidates", label)
             return False
 
         # Title-relation floor: don't grab a weak/wrong match (short & numeric
