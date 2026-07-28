@@ -5443,11 +5443,19 @@ class Orchestrator:
             if not guid or guid in blocked:
                 continue
             title = raw.get("title") or ""
-            if artn and artn not in self._norm_title(title):
-                continue
+            tnorm = self._norm_title(title)
+            # Artist-name guard. A short/numeric artist name ("112", "4") is too
+            # weak as a loose substring (it matched "Now That's What I Call Music
+            # (101 to 112)"), so require it to PREFIX the title (real releases
+            # are "Artist - ..."); longer, distinctive names may match anywhere.
+            if artn:
+                if len(artn) <= 4 or artn.replace(" ", "").isdigit():
+                    if not tnorm.startswith(artn):
+                        continue
+                elif artn not in tnorm:
+                    continue
             info = self._discography_info(title)
             # Best single missing-album match.
-            tnorm = self._norm_title(title)
             best_ratio, best_match = 0.0, None
             for mn, t, exp, aid in m_norm:
                 ratio = difflib.SequenceMatcher(None, mn, tnorm).ratio()
@@ -5460,7 +5468,8 @@ class Orchestrator:
             fill = 0
             if is_disco:
                 est = info["count"] or (info["span"] + 1 if info["span"] else 0)
-                fill = max(2, min(est or n_missing, n_missing))
+                # A discography fills at most the artist's missing-album count.
+                fill = min(max(2, est or n_missing), max(1, n_missing))
             if single_match:
                 fill = max(fill, 1)
             q = raw.get("quality") or {}
