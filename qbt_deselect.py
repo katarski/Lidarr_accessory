@@ -106,6 +106,19 @@ _VIDEO_DIR = re.compile(r"(?i)(?:^|/)(?:video_ts|bdmv)(?:/|$)")
 _AUDIO_TS_DIR = re.compile(r"(?i)(?:^|/)audio_ts(?:/|$)")
 
 
+def _blocklist_torrent(lidarr: LidarrClient, thash: str) -> None:
+    """Blocklist the Lidarr queue row for this torrent (so Lidarr won't grab the
+    same release again) -- used to BAN a video-only torrent. Best-effort."""
+    if not (lidarr and thash):
+        return
+    try:
+        for r in lidarr.queue_list():
+            if str(r.get("downloadId") or "").lower() == thash.lower() and r.get("id") is not None:
+                lidarr.queue_remove(r["id"], remove_from_client=False, blocklist=True)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("blocklist_torrent(%s) failed: %s", thash[:12], exc)
+
+
 def _video_file_indices(files: List[Dict[str, Any]]) -> List[int]:
     """
     qBit file indices that are VIDEO (a VIDEO_TS/BDMV zone, or a standalone
@@ -259,7 +272,7 @@ def process_torrent(
     forced_artist: str = "", apply: bool = False,
     emit: Callable[[str], None] = logger.info,
     files: Optional[List[Dict[str, Any]]] = None,
-    llm=None, deselect_video: bool = True,
+    llm=None, deselect_video: bool = True, reap_useless: bool = False,
 ) -> tuple:
     """Plan + (optionally) deselect one torrent. Returns (deselected, kept)."""
     thash = torrent.get("hash")
@@ -301,6 +314,23 @@ def process_torrent(
     if apply and to_deselect:
         ok = qbt.set_file_priority(thash, to_deselect, 0)
         emit(f"  -> {'deselected' if ok else 'FAILED'} {len(to_deselect)} file(s)")
+    # Reap a torrent that has nothing we want left: either every music file is
+    # deselected (all albums already owned -> only garbage remains) or the
+    # torrent carries NO music at all but has video (a video-only grab). The
+    # video-only case is also BLOCKLISTED so Lidarr never re-grabs it.
+    if reap_useless and apply:
+        desel = set(to_deselect)
+        audio_all = [f for f in files
+                     if Path(f.get("name", "")).suffix.lower() in AUDIO_EXTS]
+        audio_kept = [f for f in audio_all
+                      if int(f.get("index", -1)) not in desel]
+        if audio_all and not audio_kept:
+            if qbt.remove(thash, delete_files=True):
+                emit("  -> REMOVED torrent (all wanted music already in library)")
+        elif (not audio_all) and video_idx:
+            _blocklist_torrent(lidarr, thash)
+            if qbt.remove(thash, delete_files=True):
+                emit("  -> REMOVED + BLOCKLISTED video-only torrent (banned)")
     return deselected, kept
 
 
@@ -308,6 +338,7 @@ def auto_deselect_pass(
     qbt: QbtClient, lidarr: LidarrClient, seen: set,
     category: str = "", emit: Callable[[str], None] = logger.info,
     pause_during_scan: bool = True, llm=None, deselect_video: bool = True,
+    reap_useless: bool = True,
 ) -> int:
     """
     One scheduled pass for the pipeline: for each INCOMPLETE music torrent we
@@ -353,7 +384,7 @@ def auto_deselect_pass(
                 continue
             d, _k = process_torrent(
                 qbt, lidarr, t, apply=True, emit=emit, files=files, llm=llm,
-                deselect_video=deselect_video,
+                deselect_video=deselect_video, reap_useless=reap_useless,
             )
             seen.add(h)
             if d:

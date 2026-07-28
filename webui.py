@@ -45,6 +45,8 @@ _PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>cue_pipeline</title>
+<link rel="icon" type="image/png" href="https://raw.githubusercontent.com/lidarr/Lidarr/develop/Logo/256.png">
+<link rel="shortcut icon" href="https://raw.githubusercontent.com/lidarr/Lidarr/develop/Logo/256.png">
 <style>
   :root{color-scheme:light dark;--bg:#0f1115;--fg:#e6e6e6;--card:#1a1d24;--bd:#2a2e37;--mut:#8a93a2;--acc:#7c3aed;--chip:#232733;--chipOn:#3b2d63;--ok:#2f9e57;--warn:#f0b45e;--danger:#c0453b}
   @media(prefers-color-scheme:light){:root{--bg:#f5f6f8;--fg:#1a1a1a;--card:#fff;--bd:#e2e4e8;--mut:#5a6270;--chip:#eceef2;--chipOn:#e0d6fb}}
@@ -115,6 +117,7 @@ _PAGE = r"""<!doctype html>
   <div class="tabs">
     <div class="tab on" data-tab="attention" onclick="setTab('attention')">Needs attention <span class="n" id="n-att">0</span></div>
     <div class="tab" data-tab="progress" onclick="setTab('progress')">In progress <span class="n" id="n-prog">0</span></div>
+    <div class="tab" data-tab="log" onclick="setTab('log')">Log</div>
   </div>
   <div class="grow"></div>
   <span class="spin" id="updated"></span>
@@ -138,19 +141,27 @@ _PAGE = r"""<!doctype html>
 
 <div id="bulkbar" style="display:none">
   <span id="bulkn">0 selected</span>
-  <button class="b-keep" onclick="bulkAct('keep')">Keep existing (selected)</button>
-  <button class="b-move" onclick="bulkAct('move')">Move held (selected)</button>
+  <button class="b-keep" onclick="bulkAct('keep')">Add to library (selected)</button>
+  <button class="b-move" onclick="bulkAct('move')">Overwrite (selected)</button>
   <button class="b-copy" onclick="clearSel()">Clear selection</button>
 </div>
 <main>
   <div id="attention"></div>
   <div id="progress" style="display:none"></div>
+  <div id="log" style="display:none">
+    <div style="display:flex;gap:.5rem;align-items:center;margin-bottom:.5rem">
+      <button class="b-copy" onclick="loadLog()">Refresh log</button>
+      <label class="muted"><input type="checkbox" id="logtail" checked> auto-refresh</label>
+      <span class="muted">last 400 lines of /config/pipeline.log</span>
+    </div>
+    <pre id="logbox" style="background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:.6rem;max-height:70vh;overflow:auto;font-size:.72rem;white-space:pre-wrap"></pre>
+  </div>
 </main>
 <div id="toast" class="toast"></div>
 <div id="ctx"></div>
 
 <script>
-var HELD=[], ACT=[], TAB='attention', SEL=new Set(), VISIBLE=[];
+var HELD=[], ACT=[], TAB='attention', SEL=new Set(), VISIBLE=[], OPEN=new Set(), SORT={col:'detected',dir:-1};
 var FILT={lossless:false,lossy:false,multichannel:false,stereo:false,outcomes:{}};
 var COLS=[
  {k:'title',   name:'Album',            on:true},
@@ -162,6 +173,7 @@ var COLS=[
  {k:'tracks',  name:'Tracks',           on:true},
  {k:'size',    name:'Size',             on:true},
  {k:'outcome', name:'Status',           on:true},
+ {k:'detected',name:'Detected',         on:true},
  {k:'reason',  name:'Reason',           on:false},
  {k:'path',    name:'Path',             on:true},
 ];
@@ -176,7 +188,12 @@ function toast(m){var t=document.getElementById('toast');t.textContent=m;t.class
 function setTab(t){TAB=t;document.querySelectorAll('.tab').forEach(function(e){e.classList.toggle('on',e.dataset.tab===t);});
   document.getElementById('attention').style.display=t==='attention'?'':'none';
   document.getElementById('progress').style.display=t==='progress'?'':'none';
-  document.getElementById('toolbar').style.display=t==='attention'?'':'none';}
+  document.getElementById('log').style.display=t==='log'?'':'none';
+  document.getElementById('toolbar').style.display=t==='attention'?'':'none';
+  updateBulkBar();
+  if(t==='log')loadLog();}
+function loadLog(){fetch('/api/log?lines=400').then(function(r){return r.text();}).then(function(t){
+  var b=document.getElementById('logbox');b.textContent=t;b.scrollTop=b.scrollHeight;});}
 function toggleFilter(el){var f=el.dataset.f;FILT[f]=!FILT[f];el.classList.toggle('on',FILT[f]);render();}
 function fmtStr(d){if(!d||!d.formats)return'';return Object.keys(d.formats).map(function(k){return k.replace('.','')+'×'+d.formats[k];}).join(' ');}
 function buildColMenu(){var cm=document.getElementById('cm');cm.innerHTML=COLS.map(function(c,i){return '<label><input type="checkbox" '+(c.on?'checked':'')+' onchange="COLS['+i+'].on=this.checked;render()"> '+h(c.name)+'</label>';}).join('');}
@@ -221,9 +238,11 @@ function cell(c,x){var d=x.details||{},ex=x.existing||{};switch(c.k){
   case'tracks':return d.n_audio||x.tracks||0;
   case'size':return '<span class="muted">'+human(d.total_bytes)+'</span>';
   case'outcome':return '<span class="badge b-out">'+h(x.outcome||'held')+'</span>';
+  case'detected':return '<span class="muted">'+h(fmtDate(x.created))+'</span>';
   case'reason':return '<span class="muted">'+h(x.reason||'')+'</span>';
   case'path':return '<span class="ttog" title="show folder tree" onclick="toggleTree(event,\''+x.id+'\')">&#9656;</span><span class="path" id="p-'+x.id+'">'+h(x.source_path||'')+'</span>';
   default:return '';}}
+function fmtDate(ts){if(!ts)return'';try{var d=new Date(ts*1000);return d.toLocaleDateString()+' '+d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'});}catch(e){return'';}}
 // Plain-text value of a cell, used for the right-click value filters.
 function cellText(k,x){var d=x.details||{},ex=x.existing||{};switch(k){
   case'title':return ((x.artist||'')+' — '+(x.album||'')).replace(/^ — | — $/,'')||(x.source_path||'').split('/').pop();
@@ -235,6 +254,7 @@ function cellText(k,x){var d=x.details||{},ex=x.existing||{};switch(k){
   case'tracks':return ''+(d.n_audio||x.tracks||0);
   case'size':return human(d.total_bytes);
   case'outcome':return x.outcome||'held';
+  case'detected':return ''+(x.created||0);
   case'reason':return x.reason||'';
   case'path':return x.source_path||'';
   default:return '';}}
@@ -242,20 +262,31 @@ function render(){
   buildOutChips();renderVFilters();
   var cols=COLS.filter(function(c){return c.on;});
   var rows=HELD.filter(matches);
+  // Sort by the active column (numeric-aware for tracks/size/detected).
+  var numeric={tracks:1,size:1,detected:1};
+  rows.sort(function(a,b){
+    var va=cellText(SORT.col,a),vb=cellText(SORT.col,b);
+    if(SORT.col==='size'){va=(a.details||{}).total_bytes||0;vb=(b.details||{}).total_bytes||0;}
+    else if(numeric[SORT.col]){va=parseFloat(va)||0;vb=parseFloat(vb)||0;}
+    else{va=(''+va).toLowerCase();vb=(''+vb).toLowerCase();}
+    return (va<vb?-1:va>vb?1:0)*SORT.dir;
+  });
   document.getElementById('n-att').textContent=HELD.length;
   VISIBLE=rows.map(function(r){return r.id;});
   var allSel=rows.length>0&&rows.every(function(r){return SEL.has(r.id);});
+  var caret=function(k){return SORT.col===k?(SORT.dir>0?' ▲':' ▼'):'';};
   var head='<tr><th class="sel"><input type="checkbox" id="selall" '+(allSel?'checked':'')+' onclick="toggleAll(this.checked)"></th>'
-    +cols.map(function(c){return '<th>'+h(c.name)+'</th>';}).join('')+'<th>Actions</th></tr>';
+    +cols.map(function(c){return '<th onclick="sortBy(\''+c.k+'\')">'+h(c.name)+caret(c.k)+'</th>';}).join('')+'<th>Actions</th></tr>';
   var body=rows.map(function(x){
     var tds=cols.map(function(c){return '<td data-col="'+c.k+'" data-val="'+h(cellText(c.k,x))+'">'+cell(c,x)+'</td>';}).join('');
     var sel='<td class="sel"><input type="checkbox" class="rowsel" data-id="'+x.id+'" '+(SEL.has(x.id)?'checked':'')+' onclick="toggleSel(\''+x.id+'\',this.checked)"></td>';
     var acts='<div class="acts" data-id="'+x.id+'">'
       +'<button class="b-copy" onclick="copyPath(\''+x.id+'\')">Copy</button>'
       +'<button class="b-copy" onclick="toggleTree(event,\''+x.id+'\')">Tree ▸</button>'
-      +'<button class="b-keep" onclick="act(\''+x.id+'\',\'keep\')">Keep existing</button>'
-      +'<button class="b-move" onclick="act(\''+x.id+'\',\'move\')">Move held</button></div>';
-    var det='<tr class="det" id="det-'+x.id+'" style="display:none"><td colspan="'+(cols.length+2)+'">'
+      +'<button class="b-keep" title="Copy the held tracks into the library, keeping existing files (adds only what is missing)" onclick="act(\''+x.id+'\',\'keep\')">Add to library</button>'
+      +'<button class="b-move" title="Copy the held tracks into the library, OVERWRITING existing files" onclick="act(\''+x.id+'\',\'move\')">Overwrite</button></div>';
+    var op=OPEN.has(x.id);
+    var det='<tr class="det" id="det-'+x.id+'" style="display:'+(op?'table-row':'none')+'"><td colspan="'+(cols.length+2)+'">'
       +'<div class="cmp"><div class="tcol"><h4>Held (download)</h4><div id="t-held-'+x.id+'" class="muted">…</div></div>'
       +'<div class="tcol"><h4>Library (existing)</h4><div id="t-lib-'+x.id+'" class="muted">…</div></div></div></td></tr>';
     return '<tr>'+sel+tds+'<td>'+acts+'</td></tr>'+det;
@@ -263,6 +294,8 @@ function render(){
   document.getElementById('attention').innerHTML=rows.length
     ? '<table>'+head+body+'</table>'
     : (HELD.length?'<div class="empty">No items match the current filters.</div>':'<div class="empty">Nothing needs attention right now. 🎉</div>');
+  // Re-load trees for rows that were expanded before this re-render.
+  OPEN.forEach(function(id){if(VISIBLE.indexOf(id)>=0){loadTree(id,'held','t-held-'+id);loadTree(id,'library','t-lib-'+id);}});
   updateBulkBar();
   // progress tab
   document.getElementById('n-prog').textContent=ACT.length;
@@ -281,8 +314,8 @@ function updateBulkBar(){var n=VISIBLE.filter(function(v){return SEL.has(v);}).l
 function bulkAct(kind){
   var ids=VISIBLE.filter(function(v){return SEL.has(v);});
   if(!ids.length)return;
-  var verb=kind==='move'?'MOVE the held files into the library (overwriting) and rescan':'DISCARD the held files (delete the folders)';
-  if(!confirm('This will '+verb+' for '+ids.length+' selected item(s). Continue?'))return;
+  var verb=kind==='move'?'OVERWRITE library files with the held tracks':'ADD the held tracks to the library (keeping existing)';
+  if(!confirm('This will '+verb+', rescan Lidarr, and delete the source torrent+folder for '+ids.length+' selected item(s). Continue?'))return;
   toast('Working on '+ids.length+'…');
   var ok=0,fail=0;
   (function next(i){
@@ -311,16 +344,31 @@ function loadTree(id,which,elId){
      el.className='';el.innerHTML=(j.tree&&Object.keys(j.tree).length)?treeHtml(j.tree):'<span class="muted">not in library / no files</span>';})
    .catch(function(){var el=document.getElementById(elId);if(el)el.innerHTML='<span class="muted">error loading</span>';});
 }
+function sortBy(col){if(SORT.col===col)SORT.dir=-SORT.dir;else{SORT.col=col;SORT.dir=1;}render();}
 function toggleTree(ev,id){if(ev){ev.stopPropagation();ev.preventDefault();}
   var row=document.getElementById('det-'+id);if(!row)return;
   var open=row.style.display==='none';
   row.style.display=open?'table-row':'none';
-  if(open&&!row.dataset.loaded){row.dataset.loaded='1';loadTree(id,'held','t-held-'+id);loadTree(id,'library','t-lib-'+id);}
+  if(open){OPEN.add(id);loadTree(id,'held','t-held-'+id);loadTree(id,'library','t-lib-'+id);}
+  else OPEN.delete(id);
 }
-function copyPath(id){var el=document.getElementById('p-'+id);var p=el?el.textContent:(HELD.find(function(x){return x.id===id;})||{}).source_path;
-  if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(p).then(function(){toast('Path copied');},function(){toast('Copy failed');});}else toast('Clipboard unavailable');}
+function copyText(p){
+  // navigator.clipboard only works in a secure context (https/localhost); over
+  // plain http://<lan-ip>:8830 it's undefined -> fall back to execCommand.
+  if(navigator.clipboard&&navigator.clipboard.writeText&&window.isSecureContext){
+    navigator.clipboard.writeText(p).then(function(){toast('Copied');},function(){legacyCopy(p);});
+  }else legacyCopy(p);
+}
+function legacyCopy(p){
+  try{var ta=document.createElement('textarea');ta.value=p;ta.style.position='fixed';ta.style.opacity='0';
+    document.body.appendChild(ta);ta.focus();ta.select();
+    var ok=document.execCommand('copy');document.body.removeChild(ta);
+    toast(ok?'Copied':'Press Ctrl+C to copy');}
+  catch(e){toast('Press Ctrl+C to copy');}
+}
+function copyPath(id){var el=document.getElementById('p-'+id);var p=el?el.textContent:(HELD.find(function(x){return x.id===id;})||{}).source_path;copyText(p);}
 function act(id,kind){
-  var msg=kind==='move'?'Move the held files into the Lidarr library and rescan? This overwrites what Lidarr has for this album.':'Discard the held files and keep what Lidarr already has? The stuck folder will be deleted.';
+  var msg=kind==='move'?'OVERWRITE: copy the held tracks into the library, replacing colliding files, rescan Lidarr, then delete the source torrent + folder. Continue?':'ADD TO LIBRARY: copy the held tracks into the library (keeping existing files, adding the rest), rescan Lidarr, then delete the source torrent + folder. Continue?';
   if(!confirm(msg))return;
   document.querySelectorAll('[data-id="'+id+'"] button').forEach(function(b){b.disabled=true;});
   fetch('/api/held/'+kind,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id})})
@@ -331,7 +379,8 @@ function act(id,kind){
 }
 function refresh(){
   Promise.all([fetch('/api/held').then(function(r){return r.json();}),fetch('/api/activity').then(function(r){return r.json();}).catch(function(){return{items:[]};})])
-   .then(function(res){HELD=res[0].items||[];ACT=(res[1]||{}).items||[];document.getElementById('updated').textContent='updated '+new Date().toLocaleTimeString();render();});
+   .then(function(res){HELD=res[0].items||[];ACT=(res[1]||{}).items||[];document.getElementById('updated').textContent='updated '+new Date().toLocaleTimeString();render();
+     if(TAB==='log'&&document.getElementById('logtail').checked)loadLog();});
 }
 // Right-click a table cell -> ServiceNow-style "Show matching" / "Filter out".
 var ctx=document.getElementById('ctx');
@@ -390,29 +439,45 @@ def make_handler(store, actions: HeldActions):
                 # but keep RETRYING a negative (throttled) -- the album may not
                 # have been in the library the first time we looked, and a stale
                 # "not in library" must not stick.
+                out = []
                 if hasattr(actions, "existing_album_summary"):
                     now = time.time()
                     for it in items:
                         ex = it.get("existing")
                         found = isinstance(ex, dict) and ex.get("in_library") is True
                         fresh = isinstance(ex, dict) and (now - float(ex.get("_ts", 0)) < 120)
-                        if found or fresh:
-                            continue
-                        try:
-                            ex = actions.existing_album_summary(it) or {}
-                        except Exception:  # noqa: BLE001
-                            ex = {}
-                        ex["_ts"] = now
-                        fields = {"existing": ex}
-                        # Backfill identity we resolved so the row + unmonitor work.
-                        if not (it.get("artist") and it.get("album")) and ex.get("_artist"):
-                            fields["artist"] = ex.get("_artist", "")
-                            fields["album"] = ex.get("_album", "")
-                            it["artist"] = fields["artist"]
-                            it["album"] = fields["album"]
-                        store.update(it["id"], **fields)
-                        it["existing"] = ex
-                self._json(200, {"items": items})
+                        if not (found or fresh):
+                            try:
+                                ex = actions.existing_album_summary(it) or {}
+                            except Exception:  # noqa: BLE001
+                                ex = {}
+                            ex["_ts"] = now
+                            fields = {"existing": ex}
+                            if not (it.get("artist") and it.get("album")) and ex.get("_artist"):
+                                fields["artist"] = ex.get("_artist", "")
+                                fields["album"] = ex.get("_album", "")
+                                it["artist"] = fields["artist"]
+                                it["album"] = fields["album"]
+                            store.update(it["id"], **fields)
+                            it["existing"] = ex
+                        # Auto-dismiss "green" items: the library already has this
+                        # album complete (>= the held track count) AND the held
+                        # copy isn't a clear upgrade -> the user never wants to see
+                        # it again. A genuine upgrade (held multichannel/lossless vs
+                        # a stereo/lossy library copy) is KEPT so they can decide.
+                        ex = it.get("existing") or {}
+                        det = it.get("details") or {}
+                        held_n = int(it.get("tracks") or det.get("n_audio") or 0)
+                        if ex.get("in_library") and held_n > 0 and int(ex.get("n_audio", 0)) >= held_n:
+                            upgrade = (det.get("multichannel") and not ex.get("multichannel")) \
+                                or (det.get("lossless") and ex.get("has_lossy"))
+                            if not upgrade:
+                                store.remove(it["id"])
+                                continue
+                        out.append(it)
+                else:
+                    out = items
+                self._json(200, {"items": out})
             elif path == "/api/activity":
                 acts = actions.list_activity() if hasattr(actions, "list_activity") else []
                 self._json(200, {"items": acts})
@@ -428,6 +493,14 @@ def make_handler(store, actions: HeldActions):
                     except Exception:  # noqa: BLE001
                         tree = {}
                 self._json(200, {"tree": tree})
+            elif path == "/api/log":
+                qs = parse_qs(urlparse(self.path).query)
+                try:
+                    n = int((qs.get("lines", ["400"]) or ["400"])[0])
+                except ValueError:
+                    n = 400
+                text = actions.read_log(n) if hasattr(actions, "read_log") else "(unavailable)"
+                self._send(200, text.encode("utf-8", "replace"), "text/plain; charset=utf-8")
             elif path == "/healthz":
                 self._json(200, {"ok": True, "held": len(store.list())})
             else:

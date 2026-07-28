@@ -487,6 +487,7 @@ def qbt_auto_deselect_loop(
     do_deselect = _as_bool(qcfg.get("auto_deselect", False))
     manage_completed = _as_bool(qcfg.get("manage_completed", True))
     deselect_video = _as_bool(qcfg.get("deselect_video", True))  # #4
+    reap_useless = _as_bool(qcfg.get("reap_useless_torrents", True))
     # Dead-grab reaper: remove lidarr-category torrents stuck at ~0% past a
     # grace window (default 2 days) + blocklist so Lidarr re-searches a live
     # (lossless-preferred) alternative. Addresses the dead-torrent flood.
@@ -535,7 +536,8 @@ def qbt_auto_deselect_loop(
                                            emit=logger.info,
                                            pause_during_scan=pause_scan,
                                            llm=match_llm,
-                                           deselect_video=deselect_video)
+                                           deselect_video=deselect_video,
+                                           reap_useless=reap_useless)
                 if acted:
                     logger.info("qbt auto-deselect: acted on %d torrent(s)", acted)
             if manage_completed:
@@ -921,6 +923,11 @@ def main() -> int:
         webui_port=int(lidarr_cfg.get("webui_port", 8830)),
         webui_unmonitor_on_resolve=bool(
             lidarr_cfg.get("webui_unmonitor_on_resolve", True)),
+        qbt_url=str((cfg.get("qbittorrent") or {}).get("base_url", "") or ""),
+        qbt_user=str((cfg.get("qbittorrent") or {}).get("username", "") or ""),
+        qbt_pass=str((cfg.get("qbittorrent") or {}).get("password", "") or ""),
+        log_file=(Path((cfg.get("logging") or {}).get("file"))
+                  if (cfg.get("logging") or {}).get("file") else None),
         held_items_file=held_items_path,
         sweep_cueless_pre_split=bool(
             watch_cfg.get("sweep_cueless_pre_split", False)

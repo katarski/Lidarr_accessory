@@ -379,6 +379,13 @@ class OrchestratorConfig:
     # interactive search re-downloads it ("once I solve this, complete and no
     # more downloads"). Off => the album stays monitored.
     webui_unmonitor_on_resolve: bool = True
+    # qBittorrent connection (optional) so WebUI resolves can also remove the
+    # source torrent. Populated from the qbittorrent config section.
+    qbt_url: str = ""
+    qbt_user: str = ""
+    qbt_pass: str = ""
+    # Log file path (for the WebUI "Log" tab). Mirrors logging.file.
+    log_file: Optional[Path] = None
     # If True, NEVER do the manual-move fallback. Every successful outcome
     # must go through Lidarr's own DownloadedAlbumsScan or ManualImport so
     # that Lidarr's "Import Using Script" / Connect hooks fire. If both
@@ -557,6 +564,8 @@ class Orchestrator:
         # WebUI "In progress" tab. In-memory only (transient work).
         self._activity: Dict[str, Dict[str, Any]] = {}
         self._activity_lock = threading.Lock()
+        # Lazily-created qBittorrent client for WebUI torrent removal.
+        self._qbt_webui = None
         # Album IDs we've already release-cycled in this process lifetime,
         # so we don't hammer Lidarr with PUT+Refresh on every audit pass.
         self._audit_cycled_album_ids: set = set()
@@ -7100,98 +7109,162 @@ class Orchestrator:
         summ["_album"] = album
         return summ
 
-    def keep_existing(self, entry: Dict[str, Any]) -> Tuple[bool, str]:
-        """
-        WebUI 'keep existing': discard the held files (delete the stuck
-        folder) and trust Lidarr's current library. Returns (ok, message).
-        """
-        folder = Path(entry.get("source_path", ""))
-        if not entry.get("source_path"):
-            return (False, "no source path recorded")
-        if not folder.exists():
-            return (True, "folder already gone -- nothing to discard")
-        if self._delete_folder_under_watch(folder):
-            logger.info("WebUI keep-existing: discarded held folder %s", folder)
-            suffix = self._resolve_unmonitor(entry)
-            return (True, f"Discarded held files: {folder.name}{suffix}")
-        return (False, "could not delete the folder (see logs); is it under the "
-                       "watch root and not held open?")
+    def read_log(self, lines: int = 400) -> str:
+        """Return the last `lines` of the pipeline log for the WebUI Log tab."""
+        path = getattr(self.cfg, "log_file", None)
+        if not path:
+            return "(no log file configured)"
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                buf = fh.readlines()
+            return "".join(buf[-max(1, min(int(lines), 5000)):])
+        except FileNotFoundError:
+            return f"(log file not found: {path})"
+        except OSError as exc:  # noqa: BLE001
+            return f"(could not read log: {exc})"
 
-    def move_held(self, entry: Dict[str, Any]) -> Tuple[bool, str]:
+    def _get_qbt(self):
+        """Lazy, cached, logged-in QbtClient for WebUI torrent removal, or None
+        if qBit isn't configured / unreachable."""
+        if not getattr(self.cfg, "qbt_url", ""):
+            return None
+        q = self._qbt_webui
+        if q is not None:
+            return q
+        try:
+            from qbittorrent_client import QbtClient
+            q = QbtClient(self.cfg.qbt_url, self.cfg.qbt_user, self.cfg.qbt_pass)
+            if not q.login():
+                return None
+            self._qbt_webui = q
+            return q
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("WebUI: qBit client unavailable: %s", exc)
+            return None
+
+    def _remove_torrent_for_folder(self, folder: Path) -> str:
         """
-        WebUI 'move held': move the held audio into the Lidarr library folder
-        (overwriting what's there for this album) and rescan Lidarr. Returns
-        (ok, message).
+        After a WebUI resolve, remove the SOURCE TORRENT for `folder` -- but
+        ONLY when the torrent maps to exactly this folder (a single-album
+        torrent), so a discography torrent isn't nuked because one of its albums
+        was resolved (those are cleaned up by the deselect/lifecycle passes).
+        Returns a short message suffix (empty if nothing removed).
+        """
+        q = self._get_qbt()
+        if q is None:
+            return ""
+        try:
+            fr = str(folder.resolve(strict=False)).replace("\\", "/").rstrip("/")
+            wr = str((self.cfg.watch_root or Path("/")).resolve(strict=False)).replace("\\", "/").rstrip("/")
+            removed = 0
+            for t in q.torrents():
+                cp = str(t.get("content_path") or "").replace("\\", "/").rstrip("/")
+                sp = str(t.get("save_path") or "").replace("\\", "/").rstrip("/")
+                # Map the torrent's content path into the pipeline's namespace by
+                # basename under the watch root, then require an EXACT folder match.
+                name = os.path.basename(cp) if cp else (t.get("name") or "")
+                mapped = f"{wr}/{name}" if name else ""
+                if cp and (cp == fr or mapped == fr) and cp != sp:
+                    # cp != sp guards against a multi-item torrent whose content_path
+                    # is the save root (i.e. many folders) -- don't remove those.
+                    if q.remove(t.get("hash"), delete_files=True):
+                        removed += 1
+            if removed:
+                return " and removed the source torrent"
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("WebUI: torrent removal skipped: %s", exc)
+        return ""
+
+    def _resolve_library_target(self, entry: Dict[str, Any]):
+        """(target_folder, lidarr_artist_or_None) for a held item's album -- the
+        EXISTING library folder when present, else <artist path|library_root>/
+        <album>. Returns (None, None) if the artist can't be determined."""
+        ex = entry.get("existing") or {}
+        artist_name = (entry.get("artist") or ex.get("_artist") or "").strip()
+        album_name = (entry.get("album") or ex.get("_album") or "").strip()
+        folder = Path(entry.get("source_path", ""))
+        if not (artist_name and album_name):
+            a, b = self._identity_for_folder(folder)
+            artist_name = artist_name or a
+            album_name = album_name or b
+        art = None
+        try:
+            art = self.lidarr.find_artist(artist_name) if artist_name else None
+        except Exception:  # noqa: BLE001
+            art = None
+        if ex.get("in_library") and ex.get("path"):
+            return Path(ex["path"]), art          # merge into the real album dir
+        if not artist_name:
+            return None, None
+        base = Path(art["path"]) if (art and art.get("path")) \
+            else self.cfg.library_root_windows / (_sanitize_fs(artist_name) or "Unknown Artist")
+        return base / (_sanitize_fs(album_name) or _sanitize_fs(folder.name) or "Unknown Album"), art
+
+    def _apply_to_library(self, entry: Dict[str, Any], overwrite: bool) -> Tuple[bool, str]:
+        """
+        Shared WebUI resolve: COPY the held folder's MUSIC files into the
+        library album folder, then rescan Lidarr, unmonitor, and delete the
+        source torrent + folder. overwrite=False adds only the tracks the
+        library doesn't already have (keeps existing); overwrite=True replaces
+        colliding files. Only audio is moved -- art/logs/nfo/iso are ignored.
         """
         folder = Path(entry.get("source_path", ""))
-        if not folder.exists():
+        if not entry.get("source_path") or not folder.exists():
             return (False, "source folder is gone")
         audios = self._held_audio_files(folder)
         if not audios:
-            return (False, "no audio files found in the held folder")
-
-        artist_name = (entry.get("artist") or "").strip()
-        album_name = (entry.get("album") or "").strip()
-        if not (artist_name and album_name):
-            a, b = self._album_folder_identity(folder)
-            artist_name = artist_name or a
-            album_name = album_name or b
-        if not artist_name:
-            return (False, "couldn't determine the artist -- move it by hand")
-
-        # Prefer Lidarr's own artist path (canonical name/casing); else fall
-        # back to the configured library root.
-        art = None
-        try:
-            art = self.lidarr.find_artist(artist_name)
-        except Exception:  # noqa: BLE001
-            art = None
-        if art and art.get("path"):
-            base = Path(art["path"])
-        else:
-            base = self.cfg.library_root_windows / (
-                _sanitize_fs(artist_name) or "Unknown Artist")
-        album_dir = _sanitize_fs(album_name) or _sanitize_fs(folder.name) \
-            or "Unknown Album"
-        target = base / album_dir
+            return (False, "no music files in the held folder")
+        target, art = self._resolve_library_target(entry)
+        if target is None:
+            return (False, "couldn't determine the artist/album -- handle by hand")
         try:
             target.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             return (False, f"could not create {target}: {exc}")
-
-        moved = 0
+        copied = skipped = 0
         for a in audios:
             dst = target / a.name
             try:
+                if dst.exists() and not overwrite:
+                    skipped += 1
+                    continue
                 if dst.exists():
-                    dst.unlink()  # user chose to replace what's there
-                shutil.move(str(a), str(dst))
-                moved += 1
+                    dst.unlink(missing_ok=True)
+                shutil.copy2(str(a), str(dst))
+                copied += 1
             except OSError as exc:
-                logger.warning("WebUI move-held: %s -> %s failed: %s",
-                               a, dst, exc)
-        if moved == 0:
-            return (False, "moved 0 files (permission/path error) -- folder left "
-                           "in place")
-
-        # Nudge Lidarr to index the moved files.
+                logger.warning("WebUI resolve: copy %s -> %s failed: %s", a, dst, exc)
+        if copied == 0 and skipped == 0:
+            return (False, "copied 0 files (permission/path error) -- left in place")
+        # Immediate Lidarr scan so the album matches/appears right away.
         try:
+            self.lidarr.downloaded_albums_scan_rescan(str(target))
             if art:
                 self.lidarr.rescan_artist(art["id"])
                 self.lidarr.refresh_artist(art["id"])
-            self.lidarr.downloaded_albums_scan_rescan(str(target))
             self.lidarr.process_monitored_downloads()
         except Exception as exc:  # noqa: BLE001
-            logger.warning("WebUI move-held: Lidarr rescan hiccup: %s", exc)
-
-        # Remove the now-emptied held folder (and its ISO/artwork leftovers).
-        self._delete_folder_under_watch(folder)
+            logger.warning("WebUI resolve: Lidarr rescan hiccup: %s", exc)
         suffix = self._resolve_unmonitor(entry)
-        logger.info(
-            "WebUI move-held: moved %d file(s) to %s and rescanned Lidarr%s",
-            moved, target, suffix)
-        return (True, f"Moved {moved} file(s) into the library and rescanned "
-                      f"Lidarr ({target.name}){suffix}")
+        # Delete the source torrent (safe: only a single-folder torrent) + folder.
+        tmsg = self._remove_torrent_for_folder(folder)
+        self._delete_folder_under_watch(folder)
+        verb = "Overwrote" if overwrite else "Added"
+        logger.info("WebUI resolve (%s): %d copied / %d skipped -> %s%s%s",
+                    verb.lower(), copied, skipped, target, suffix, tmsg)
+        extra = f", skipped {skipped} already present" if skipped else ""
+        return (True, f"{verb} {copied} track(s) into {target.name}{extra}; "
+                      f"Lidarr rescanned{suffix}{tmsg}")
+
+    def keep_existing(self, entry: Dict[str, Any]) -> Tuple[bool, str]:
+        """WebUI 'Add to library': copy the held music in WITHOUT overwriting
+        what the library already has (keep existing, add the rest)."""
+        return self._apply_to_library(entry, overwrite=False)
+
+    def move_held(self, entry: Dict[str, Any]) -> Tuple[bool, str]:
+        """WebUI 'Overwrite': copy the held music in, replacing colliding
+        library files."""
+        return self._apply_to_library(entry, overwrite=True)
 
     def _cleanup_empty(self, staging_dir: Path) -> None:
         try:
