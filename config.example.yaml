@@ -73,6 +73,13 @@ lidarr:
   # 'Artist - Album' separator), then imports the FLACs normally. Needs ffmpeg
   # (already in the image). Set false to ignore .dts folders.
   transcode_dts_cd: true
+  # #15: tag-based identification for pre-split "artist dump" folders. When a
+  # leaf album folder sits under a top-level folder that matches a Lidarr artist
+  # (e.g. /downloads/Hans Zimmer/<album>/...), import each album under that
+  # artist (folder name, Lidarr-verified), take the album name from the embedded
+  # ALBUM tag, and rename uninformatively-named files ("01.mp3", "track 1") to
+  # "<NN> - <Title>" from their tags first. false = unchanged tag/folder handoff.
+  tag_identify_pre_split: true
   # Uniform-FLAC library: re-encode pre-split lossless-but-not-FLAC tracks
   # (.ape/.wv/.wav/.aiff/.tak/.tta/.shn and ALAC-in-.m4a) to FLAC before import,
   # preserving tags, bit depth and sample rate (a lossless transcode). FLAC is

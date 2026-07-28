@@ -282,6 +282,14 @@ class OrchestratorConfig:
     # when the whole source folder is removed after a VERIFIED import (so a
     # failed import never loses the rip). Requires sacd_extract in PATH.
     extract_sacd_iso: bool = True
+    # Tag-based identification for pre-split "artist dump" folders (backlog #15):
+    # when a leaf album folder sits under a top-level folder that matches a Lidarr
+    # artist (e.g. /downloads/Hans Zimmer/<album>/...), import each album under
+    # that artist (folder name, Lidarr-verified) with the album taken from the
+    # embedded ALBUM tag, and rename uninformatively-named files ("01.mp3",
+    # "track 1") to "<NN> - <Title>" from their tags first. Off => unchanged
+    # tag/folder handoff behaviour.
+    tag_identify_pre_split: bool = True
     # Pre-split lossless-but-not-FLAC tracks (.ape/.wv/.wav/.aiff/.tak/.tta/.shn
     # and ALAC-in-.m4a) are re-encoded to FLAC (lossless; tags + bit depth +
     # sample rate preserved) before hand-off to Lidarr, so the library ends up
@@ -1217,6 +1225,151 @@ class Orchestrator:
                 if not album:
                     album = parts[1]
         return artist, album
+
+    # ---- Tag-based identification for pre-split dumps (backlog #15) ------
+
+    # Uninformative track filenames that carry no useful info -- "01", "07",
+    # "track 1", "audiotrack03", "1.", etc. For these we fall back to the
+    # embedded tags for the title and rename accordingly.
+    _UNINFORMATIVE_NAME_RE = re.compile(
+        r"(?i)^(?:audio\s*)?(?:track|trk|pista|song)?[\s._\-]*\d{1,3}[\s._\-]*$"
+    )
+
+    def _is_uninformative_name(self, stem: str) -> bool:
+        return bool(self._UNINFORMATIVE_NAME_RE.match((stem or "").strip()))
+
+    def _read_track_tags(self, path: Path) -> Dict[str, str]:
+        """
+        Read per-track tags (artist, albumartist, album, title, track,
+        tracktotal) from an audio file via mutagen. Empty strings for anything
+        missing. Superset of _read_audio_tags -- used to identify + rename
+        uninformatively-named files in artist dumps.
+        """
+        out = {"artist": "", "albumartist": "", "album": "",
+               "title": "", "track": "", "tracktotal": ""}
+        try:
+            from mutagen import File as MutagenFile  # lazy
+        except Exception:  # noqa: BLE001
+            return out
+        try:
+            mf = MutagenFile(str(path))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("mutagen read failed for %s: %s", path.name, exc)
+            return out
+        if mf is None or not getattr(mf, "tags", None):
+            return out
+
+        def _first(keys: tuple) -> str:
+            for k in keys:
+                try:
+                    val = mf.tags.get(k)
+                except Exception:  # noqa: BLE001
+                    val = None
+                if not val:
+                    continue
+                if isinstance(val, list) and val:
+                    val = val[0]
+                s = str(val).strip()
+                if s:
+                    return s
+            return ""
+
+        out["albumartist"] = _first((
+            "albumartist", "ALBUMARTIST", "aART", "TPE2"))
+        out["artist"] = _first((
+            "artist", "ARTIST", "\xa9ART", "TPE1")) or out["albumartist"]
+        out["album"] = _first(("album", "ALBUM", "\xa9alb", "TALB"))
+        out["title"] = _first(("title", "TITLE", "\xa9nam", "TIT2"))
+        raw_track = _first((
+            "tracknumber", "TRACKNUMBER", "track", "trkn", "\xa9trk", "TRCK"))
+        # "n/total" or "(n, total)" tuple forms.
+        m = re.search(r"(\d+)(?:\s*/\s*(\d+))?", str(raw_track))
+        if m:
+            out["track"] = m.group(1)
+            out["tracktotal"] = m.group(2) or ""
+        return out
+
+    def _rename_uninformative_from_tags(self, audios: List[Path]) -> List[Path]:
+        """
+        Rename ONLY files whose current name is uninformative (e.g. "01.mp3",
+        "track 1.flac") to "<NN> - <Title><ext>" using their embedded tags, so a
+        bare artist-dump folder imports cleanly. Descriptive names are left
+        untouched. Best-effort and collision-safe; returns the (possibly
+        updated) list in the same order.
+        """
+        out: List[Path] = []
+        for a in audios:
+            try:
+                if not self._is_uninformative_name(a.stem):
+                    out.append(a)
+                    continue
+                tags = self._read_track_tags(a)
+                title = tags.get("title") or ""
+                if not title:
+                    out.append(a)          # nothing better to name it
+                    continue
+                trk = tags.get("track") or ""
+                num = f"{int(trk):02d}" if trk.isdigit() else ""
+                base = f"{num} - {title}" if num else title
+                safe = _sanitize_fs(base)
+                dst = a.with_name(safe + a.suffix.lower())
+                if dst == a:
+                    out.append(a)
+                    continue
+                n = 1
+                while dst.exists():
+                    dst = a.with_name(f"{safe} ({n}){a.suffix.lower()}")
+                    n += 1
+                a.rename(dst)
+                logger.info("tag-identify: renamed %s -> %s", a.name, dst.name)
+                out.append(dst)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("tag-identify: rename failed for %s: %s", a, exc)
+                out.append(a)
+        return out
+
+    def _lidarr_artist_for_container(
+        self, folder: Path, watch_root: Path,
+    ) -> Optional[str]:
+        """
+        For a leaf album folder nested under an ARTIST dump (e.g.
+        /downloads/Hans Zimmer/<album>/...), return the Lidarr artist name if
+        the top-level segment under watch_root matches a Lidarr artist, else
+        None. Cached per pass in self._isearch_artist_cache-style dict.
+        """
+        try:
+            rel = folder.resolve().relative_to(Path(watch_root).resolve())
+        except Exception:  # noqa: BLE001
+            return None
+        parts = rel.parts
+        if len(parts) < 2:
+            return None  # folder IS a watch-root child -> not a nested dump leaf
+        container = parts[0]
+        cache = getattr(self, "_container_artist_cache", None)
+        if cache is None:
+            cache = {}
+            self._container_artist_cache = cache
+        if container in cache:
+            return cache[container]
+        name: Optional[str] = None
+        try:
+            art = self.lidarr.find_artist(container)
+            if art and art.get("artistName"):
+                name = str(art["artistName"])
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("tag-identify: find_artist(%r) failed: %s", container, exc)
+        cache[container] = name
+        return name
+
+    def _album_from_tags(self, audios: List[Path]) -> str:
+        """Most common non-empty ALBUM tag across the files (the reliable album
+        name for a dump leaf, where the folder may be an 'OST'/'CD1' wrapper)."""
+        from collections import Counter
+        names = [self._read_track_tags(a).get("album", "").strip() for a in audios]
+        names = [n for n in names if n]
+        if not names:
+            return ""
+        return Counter(names).most_common(1)[0][0]
 
     def _try_positional_force_import(
         self, cue_path, folder, key_path, artist_name, album_name, audios, reason,
@@ -2235,6 +2388,8 @@ class Orchestrator:
         cue_path: Optional[Path],
         folder: Path,
         reason: str,
+        artist_override: str = "",
+        album_override: str = "",
     ) -> None:
         """
         Already-split folder. Drop the orphan .cue (if any), then ask
@@ -2290,10 +2445,18 @@ class Orchestrator:
         if self.cfg.transcode_lossless_to_flac:
             audios = self._convert_lossless_to_flac(audios)
         artist_name, album_name = "", ""
+        # Caller-supplied identity wins (backlog #15: artist = Lidarr-verified
+        # container folder, album = embedded ALBUM tag).
+        if artist_override:
+            artist_name = artist_override
+        if album_override:
+            album_name = album_override
         for a in audios:
-            artist_name, album_name = self._read_audio_tags(a)
             if artist_name and album_name:
                 break
+            t_artist, t_album = self._read_audio_tags(a)
+            artist_name = artist_name or t_artist
+            album_name = album_name or t_album
         # Fingerprint fallback: tags couldn't identify it -> ask AcoustID what
         # the audio actually is (content-based, so garbage/absent tags don't
         # matter). Best-effort: any failure falls through to the give-up below,
@@ -2791,6 +2954,9 @@ class Orchestrator:
 
         min_stable = max(0, int(self.cfg.sweep_min_stable_seconds))
         now_ts = time.time()
+        # Fresh per-pass cache of container-folder -> Lidarr artist (#15), so a
+        # newly-added Lidarr artist is picked up on the next sweep.
+        self._container_artist_cache = {}
 
         handed_off = 0
         # Folders that pass every guard, collected first so duplicate editions
@@ -2987,11 +3153,26 @@ class Orchestrator:
         for folder in self._drop_duplicate_editions(eligible):
             self._skip_seen.add(folder)
 
-        surviving = [f for (f, _a) in eligible if f not in self._skip_seen]
-        for folder in surviving:
+        surviving = [(f, a) for (f, a) in eligible if f not in self._skip_seen]
+        for folder, audios in surviving:
             try:
+                artist_ov = album_ov = ""
+                if getattr(self.cfg, "tag_identify_pre_split", True):
+                    # Artist dump? (leaf album folder nested under a top-level
+                    # folder that matches a Lidarr artist, e.g. Hans Zimmer/<album>)
+                    container_artist = self._lidarr_artist_for_container(
+                        folder, watch_root)
+                    if container_artist:
+                        audios = self._rename_uninformative_from_tags(audios)
+                        artist_ov = container_artist
+                        album_ov = self._album_from_tags(audios)
+                        logger.info(
+                            "tag-identify: %s -> artist=%r album=%r (dump leaf; "
+                            "album from tags)", folder.name, artist_ov,
+                            album_ov or "(unknown)")
                 self._handoff_pre_split_to_lidarr(
                     None, folder, reason="cueless sweep",
+                    artist_override=artist_ov, album_override=album_ov,
                 )
                 handed_off += 1
             except Exception as exc:  # noqa: BLE001
