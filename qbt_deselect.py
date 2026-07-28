@@ -54,6 +54,13 @@ _ARTIST_YEAR_ALBUM = re.compile(r"(?i)^.*?\s-\s*(?:19|20)\d{2}\s*[-.]\s*(.+)$")
 # or a titled disc like "Disc 1 - Shout Sister Shout" / "CD2 Rock Me". Requires
 # a digit right after the keyword so real albums ("Discovery") aren't matched.
 _DISC_DIR = re.compile(r"(?i)^(?:cd|disc|disk|dvd|side)\s*[.\-_]?\s*\d{1,3}\b|^\d{1,2}$")
+# A DIGIT-LESS bonus/extras disc ("Bonus", "Bonus Disc", "Bonus CD", "Bonus
+# Tracks", "Extras") -- climbed into its album so it isn't judged as a phantom
+# separate album that never matches Lidarr (backlog #12).
+_BONUS_DIR = re.compile(
+    r"(?i)^-?(?:bonus(?:[\s._-]*(?:disc|cd|dvd|tracks?|material|cuts?))?|"
+    r"extras?|bonuses)$"
+)
 # A non-audio sidecar subfolder (art/scans/etc.) -- audio never lives here, but
 # guard anyway so it never becomes an "album".
 _ART_DIR = re.compile(
@@ -136,7 +143,8 @@ def _album_dir_parts(folder_parts: list) -> list:
     becomes the album title.
     """
     p = list(folder_parts)
-    while len(p) > 1 and (_DISC_DIR.match(p[-1]) or _ART_DIR.match(p[-1])):
+    while len(p) > 1 and (_DISC_DIR.match(p[-1]) or _ART_DIR.match(p[-1])
+                          or _BONUS_DIR.match(p[-1])):
         p.pop()
     return p
 

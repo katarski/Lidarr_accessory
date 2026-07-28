@@ -67,6 +67,35 @@ def norm_title(s: str) -> str:
     s = re.sub(r"[\(\[][^)\]]*[\)\]]", " ", s)   # drop (Deluxe), [EP], (Japan)...
     return re.sub(r"[^a-z0-9]+", "", s)
 
+
+# Edition / format / filler words that an UNBRACKETED download title may carry on
+# top of the real album title ("Album Deluxe Edition", "Album Remastered 2020").
+# The word-subset fallback only bridges an owned title to a download when the
+# EXTRA download words are all in here (or a year) -- so "Disintegration Deluxe
+# Edition" still matches owned "Disintegration", but "Blue Train" does NOT match
+# owned "Blue" ("train" is a real title word) and the missing album is kept.
+_EDITION_WORDS = frozenset({
+    "the", "and", "a", "an",
+    "deluxe", "expanded", "remaster", "remastered", "remasters", "remaster's",
+    "edition", "editions", "anniversary", "bonus", "disc", "discs", "cd", "cds",
+    "mono", "stereo", "version", "versions", "reissue", "reissued",
+    "collectors", "collector", "special", "limited", "digital",
+    "hd", "hires", "hi", "res", "sacd", "hdcd", "mfsl", "dsd", "flac", "mp3",
+    "kbps", "vbr", "bit", "24bit", "16bit", "24", "16", "remaster",
+})
+
+
+def _extra_words_are_noise(dl_words: set, ow_words: set) -> bool:
+    """True if every download word NOT in the owned title is an edition/format
+    token or a 4-digit year (i.e. not a real distinguishing title word)."""
+    for w in (dl_words - ow_words):
+        if w in _EDITION_WORDS:
+            continue
+        if re.fullmatch(r"(?:19|20)\d{2}", w):
+            continue
+        return False
+    return True
+
 from lidarr import LidarrClient, LidarrConfig
 
 AUDIO_EXTS = {
@@ -180,7 +209,8 @@ def album_complete_in_library(
                         r"[a-z0-9]+", (a.get("title") or "").lower()))
                     if ow_words and ow_words <= artist_words:
                         continue  # self-titled / artist-named -> exact-only
-                    if ow_words and ow_words <= dl_words and _owned(a):
+                    if (ow_words and ow_words <= dl_words and _owned(a)
+                            and _extra_words_are_noise(dl_words, ow_words)):
                         if best is None or len(ow_words) > best[0]:
                             best = (len(ow_words), a)
                 if best is not None:

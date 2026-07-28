@@ -19,7 +19,9 @@ The `path_mapping` config handles that translation.
 from __future__ import annotations
 
 import logging
+import re
 import time
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from typing import Any, Dict, List, Optional
@@ -27,6 +29,18 @@ from typing import Any, Dict, List, Optional
 import requests
 
 logger = logging.getLogger(__name__)
+
+
+def _norm_artist(s: str) -> str:
+    """Fold an artist name for tolerant equality: casefold, strip accents
+    (NFKD, drop combining marks), '&' -> 'and', drop a leading 'the ', keep
+    [a-z0-9]. So 'Sigur Ros' == 'Sigur Rós', 'Motorhead' == 'Motörhead',
+    'AC and DC' == 'AC & DC', 'The Cure' == 'Cure'."""
+    s = (s or "").casefold().replace("&", " and ")
+    s = "".join(c for c in unicodedata.normalize("NFKD", s)
+                if not unicodedata.combining(c))
+    s = re.sub(r"^\s*the\s+", "", s)
+    return re.sub(r"[^a-z0-9]+", "", s)
 
 
 @dataclass
@@ -636,6 +650,13 @@ class LidarrClient:
         for a in results:
             if a.get("artistName", "").strip().lower() == target:
                 return a
+        # Normalized-exact (accent/&/article tolerant) -- precise, so it only
+        # adds correct matches ("Sigur Rós", "Motörhead", "AC & DC").
+        ntarget = _norm_artist(name)
+        if ntarget:
+            for a in results:
+                if _norm_artist(a.get("artistName", "")) == ntarget:
+                    return a
         # Substring fallback.
         for a in results:
             if target in a.get("artistName", "").strip().lower():
