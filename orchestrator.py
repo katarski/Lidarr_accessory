@@ -4063,8 +4063,13 @@ class Orchestrator:
             logger.debug("library root %s stat failed: %s", root, exc)
             return None, []
 
-        target_artist = _sanitize_fs(artist_name).strip().lower()
-        target_album = _sanitize_fs(album_name).strip().lower()
+        # Use the same aggressive normalization as Lidarr matching so the disk
+        # folder and the download name agree despite accents (Beyoncé vs
+        # Beyonce), punctuation (Unicode "…" vs "..."), a trailing "(2008)"
+        # year, "&"/"and", articles, etc. -- the weak lowercase compare used
+        # before missed all of these (Beyoncé/I Am… Sasha Fierce).
+        target_artist = _match_key(artist_name)
+        target_album = _match_key(album_name)
         if not target_artist or not target_album:
             return None, []
 
@@ -4081,7 +4086,7 @@ class Orchestrator:
                         continue
                 except OSError:
                     continue
-                n = _sanitize_fs(child.name).strip().lower()
+                n = _match_key(child.name)
                 if not n:
                     continue
                 if n == target:
