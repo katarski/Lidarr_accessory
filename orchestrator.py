@@ -272,6 +272,13 @@ class OrchestratorConfig:
     # carried across -- then deletes the DSD source, so the pre-split path
     # hands the FLACs to Lidarr on the next pass.
     transcode_dsd: bool = True
+    # Multichannel precedence (backlog #4), CONVERSION-only. When a DSD source
+    # ships BOTH a stereo and a multichannel set as sibling channel folders
+    # (e.g. sacd_extract "Album/2ch/" + "Album/6ch/"), convert only the
+    # multichannel one and skip the stereo. Applies to the DSD->FLAC transcode
+    # (and future DVD-Audio); SACD ISO already prefers the >2ch area and DTS
+    # already yields 5.1. Does NOT affect normal download/import/deselect.
+    prefer_multichannel: bool = True
     # SACD ISO support: a download folder containing a .iso (a ripped SACD, e.g.
     # "Incubus - A Crow Left Of The Murder.iso", often with a useless sidecar
     # .cue) is extracted to per-track DSF with sacd_extract. The MULTICHANNEL
@@ -2085,6 +2092,68 @@ class Orchestrator:
         self._remove_stray_cues(folder)
         return True
 
+    # Channel-variant folder names (sacd_extract etc.): multichannel wins over
+    # stereo. Multichannel patterns tested first.
+    _CHANNEL_VARIANT_RES = (
+        (re.compile(r"(?i)(?:^|[\s._\-])(?:multi[\s._\-]*channel|mch|surround|"
+                    r"5[\s._.]?1|7[\s._.]?1|6\s*ch|5\s*ch|7\s*ch)(?:$|[\s._\-])"), 6),
+        (re.compile(r"(?i)(?:^|[\s._\-])(?:quad|4\s*ch)(?:$|[\s._\-])"), 4),
+        (re.compile(r"(?i)(?:^|[\s._\-])(?:stereo|2[\s._.]?0|2\s*ch)(?:$|[\s._\-])"), 2),
+    )
+
+    def _channel_variant_rank(self, name: str) -> int:
+        """Approx channel count implied by a channel-variant folder name
+        ('6ch'/'Multi-Channel'/'5.1' -> 6, 'quad' -> 4, '2ch'/'stereo' -> 2),
+        else 0. Fallback when the audio can't be probed."""
+        for rx, rank in self._CHANNEL_VARIANT_RES:
+            if rx.search(name or ""):
+                return rank
+        return 0
+
+    @staticmethod
+    def _audio_channels(path: Path) -> int:
+        """Channel count of an audio file via mutagen (.info.channels); 0 on
+        failure. Works for .dsf/.dff/flac/etc. (header read, not a decode)."""
+        try:
+            from mutagen import File as MutagenFile  # lazy
+            mf = MutagenFile(str(path))
+            return int(getattr(getattr(mf, "info", None), "channels", 0) or 0)
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def _folder_max_channels(self, folder: Path) -> int:
+        """Max channel count across a folder's DSD/audio files (probe a few),
+        falling back to the folder-name variant rank when nothing probes."""
+        best = 0
+        for a in self._sibling_audio_files(folder)[:5]:
+            best = max(best, self._audio_channels(a))
+        if best == 0:
+            best = self._channel_variant_rank(folder.name)
+        return best
+
+    def _higher_channel_dsd_sibling(self, folder: Path) -> Optional[Path]:
+        """If a SIBLING folder (same parent) holds DSD with MORE channels than
+        `folder`, return it (so `folder` is the stereo/lower variant to skip).
+        Only considers siblings that actually contain .dsf/.dff."""
+        this_ch = self._folder_max_channels(folder)
+        try:
+            parent = folder.parent
+            siblings = [d for d in parent.iterdir()
+                        if d.is_dir() and d != folder]
+        except OSError:
+            return None
+        for sib in siblings:
+            try:
+                has_dsd = any(p.suffix.lower() in (".dsf", ".dff")
+                              for p in sib.iterdir() if p.is_file())
+            except OSError:
+                continue
+            if not has_dsd:
+                continue
+            if self._folder_max_channels(sib) > this_ch:
+                return sib
+        return None
+
     def _transcode_dsd_folder(self, folder: Path) -> List[Path]:
         """
         Transcode a pre-split DSD folder's .dsf/.dff files to 48kHz/16-bit FLAC
@@ -2108,6 +2177,18 @@ class Orchestrator:
             return []
         if not sources:
             return []
+        # #4: if this ONE folder mixes stereo and multichannel DSD directly,
+        # convert only the highest-channel files (discard the stereo dupes).
+        if getattr(self.cfg, "prefer_multichannel", True) and len(sources) > 1:
+            chans = {p: self._audio_channels(p) for p in sources}
+            maxch = max(chans.values())
+            if maxch > 2 and any(0 < c < maxch for c in chans.values()):
+                kept = [p for p in sources if chans[p] >= maxch]
+                logger.info(
+                    "multichannel precedence: %s mixes channels -- converting "
+                    "%d/%d file(s) at %dch, skipping the lower-channel ones",
+                    folder.name, len(kept), len(sources), maxch)
+                sources = kept
         made: List[Path] = []
         for p in sources:
             out = p.with_suffix(".flac")
@@ -3106,7 +3187,20 @@ class Orchestrator:
                         except OSError:
                             dsd_stable = False
                             break
-                    if dsd_stable:
+                    mch_sib = (
+                        self._higher_channel_dsd_sibling(folder)
+                        if getattr(self.cfg, "prefer_multichannel", True)
+                        else None
+                    )
+                    if mch_sib is not None:
+                        # #4: a higher-channel DSD sibling exists (e.g. "6ch"
+                        # next to this "2ch") -> convert only the multichannel
+                        # one; skip this stereo/lower set (don't convert/import).
+                        logger.info(
+                            "multichannel precedence: skipping DSD %s -- keeping "
+                            "higher-channel sibling %s", folder.name, mch_sib.name)
+                        self._skip_seen.add(folder)
+                    elif dsd_stable:
                         self._transcode_dsd_folder(folder)
                     else:
                         logger.debug(

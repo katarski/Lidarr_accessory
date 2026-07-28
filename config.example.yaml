@@ -85,6 +85,12 @@ lidarr:
   # ALBUM tag, and rename uninformatively-named files ("01.mp3", "track 1") to
   # "<NN> - <Title>" from their tags first. false = unchanged tag/folder handoff.
   tag_identify_pre_split: true
+  # #4: multichannel precedence in the FLAC-CONVERSION step only. When a DSD
+  # source ships both a stereo and a multichannel set as sibling channel folders
+  # (e.g. sacd_extract "Album/2ch/" + "Album/6ch/"), convert only the
+  # multichannel one and skip the stereo. (SACD ISOs already prefer the >2ch
+  # area; DTS already yields 5.1.) Does NOT affect normal download/import.
+  prefer_multichannel: true
   # Uniform-FLAC library: re-encode pre-split lossless-but-not-FLAC tracks
   # (.ape/.wv/.wav/.aiff/.tak/.tta/.shn and ALAC-in-.m4a) to FLAC before import,
   # preserving tags, bit depth and sample rate (a lossless transcode). FLAC is
