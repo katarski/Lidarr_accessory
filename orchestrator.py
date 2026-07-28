@@ -6824,6 +6824,16 @@ class Orchestrator:
             details = self._folder_audio_summary(folder)
         except Exception:  # noqa: BLE001
             details = {}
+        # Backfill artist/album from the folder layout when the failure path
+        # didn't record them (e.g. an artist-dump leaf /downloads/<Artist>/<Album>),
+        # so the row, the library compare, and unmonitor-on-resolve all work.
+        if not (artist and album):
+            try:
+                a2, b2 = self._identity_for_folder(folder)
+                artist = artist or a2
+                album = album or b2
+            except Exception:  # noqa: BLE001
+                pass
         self.held.add(
             source_path=str(folder), artist=artist, album=album,
             tracks=int(track_count or details.get("n_audio", 0) or 0),
@@ -7030,6 +7040,33 @@ class Orchestrator:
         node["children"] = children
         return node
 
+    def _identity_for_folder(self, folder: Path) -> Tuple[str, str]:
+        """
+        (artist, album) for a held/source folder. Handles both a single
+        'Artist - Album' folder name AND the nested '<Artist>/<Album>[/CD1]'
+        artist-dump layout under the watch root (e.g. /downloads/Hans Zimmer/
+        The Power Of One), climbing a trailing disc subfolder. ('','') if it
+        genuinely can't be determined.
+        """
+        a, b = self._album_folder_identity(folder)
+        if a and b:
+            return a, b
+        parts: List[str] = []
+        wr = self.cfg.watch_root
+        if wr is not None:
+            try:
+                rel = folder.resolve(strict=False).relative_to(wr.resolve(strict=False))
+                parts = [p for p in rel.parts if p not in ("", ".")]
+            except Exception:  # noqa: BLE001
+                parts = []
+        if not parts:
+            parts = [folder.name]
+        while len(parts) >= 2 and self._DISC_SUBDIR_RE.match(parts[-1] or ""):
+            parts = parts[:-1]
+        if len(parts) >= 2:
+            return parts[0].strip(" -_."), parts[-1].strip(" -_.")
+        return a, (b or (parts[-1].strip(" -_.") if parts else ""))
+
     def existing_album_summary(self, entry: Dict[str, Any]) -> Dict[str, Any]:
         """
         What the library ALREADY holds for this held item's album, so the WebUI
@@ -7041,7 +7078,7 @@ class Orchestrator:
         album = (entry.get("album") or "").strip()
         if not (artist and album):
             try:
-                a, b = self._album_folder_identity(Path(entry.get("source_path", "")))
+                a, b = self._identity_for_folder(Path(entry.get("source_path", "")))
                 artist = artist or a
                 album = album or b
             except Exception:  # noqa: BLE001
@@ -7053,10 +7090,14 @@ class Orchestrator:
         except Exception:  # noqa: BLE001
             return {}
         if not album_dir:
-            return {"in_library": False}
+            # Carry the resolved identity so the caller can still backfill the
+            # row + retry the lookup later (the album may land in the library).
+            return {"in_library": False, "_artist": artist, "_album": album}
         summ = self._folder_audio_summary(album_dir)
         summ["in_library"] = True
         summ["path"] = str(album_dir)
+        summ["_artist"] = artist
+        summ["_album"] = album
         return summ
 
     def keep_existing(self, entry: Dict[str, Any]) -> Tuple[bool, str]:

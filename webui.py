@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Protocol
 from urllib.parse import parse_qs, urlparse
@@ -385,16 +386,32 @@ def make_handler(store, actions: HeldActions):
                 store.prune_missing()
                 items = store.list()
                 # Enrich each item with the library's EXISTING album (for the
-                # held-vs-existing compare), computed once and cached.
+                # held-vs-existing compare). Cache a positive (in_library) hit,
+                # but keep RETRYING a negative (throttled) -- the album may not
+                # have been in the library the first time we looked, and a stale
+                # "not in library" must not stick.
                 if hasattr(actions, "existing_album_summary"):
+                    now = time.time()
                     for it in items:
-                        if "existing" not in it:
-                            try:
-                                ex = actions.existing_album_summary(it)
-                            except Exception:  # noqa: BLE001
-                                ex = {}
-                            store.update(it["id"], existing=ex)
-                            it["existing"] = ex
+                        ex = it.get("existing")
+                        found = isinstance(ex, dict) and ex.get("in_library") is True
+                        fresh = isinstance(ex, dict) and (now - float(ex.get("_ts", 0)) < 120)
+                        if found or fresh:
+                            continue
+                        try:
+                            ex = actions.existing_album_summary(it) or {}
+                        except Exception:  # noqa: BLE001
+                            ex = {}
+                        ex["_ts"] = now
+                        fields = {"existing": ex}
+                        # Backfill identity we resolved so the row + unmonitor work.
+                        if not (it.get("artist") and it.get("album")) and ex.get("_artist"):
+                            fields["artist"] = ex.get("_artist", "")
+                            fields["album"] = ex.get("_album", "")
+                            it["artist"] = fields["artist"]
+                            it["album"] = fields["album"]
+                        store.update(it["id"], **fields)
+                        it["existing"] = ex
                 self._json(200, {"items": items})
             elif path == "/api/activity":
                 acts = actions.list_activity() if hasattr(actions, "list_activity") else []
