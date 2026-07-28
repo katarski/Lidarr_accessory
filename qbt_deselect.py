@@ -365,6 +365,8 @@ def torrent_lifecycle_pass(
     remove_when_library_complete: bool = True,
     min_stable_seconds: int = 300,
     now: Optional[float] = None,
+    on_complete: Optional[Callable[[str], None]] = None,
+    completed_seen: Optional[set] = None,
 ) -> tuple:
     """
     Manage COMPLETED music torrents by how much of their content the pipeline
@@ -419,6 +421,17 @@ def torrent_lifecycle_pass(
         on_disk = _count_audio_on_disk(folder) if folder_exists else 0
         state = (t.get("state") or "").lower()
         name = t.get("name") or "?"
+
+        # #8a: a music torrent has just completed and still has audio on disk
+        # -> kick the pipeline to start processing NOW (enqueue its .cue), once
+        # per torrent. Fires before the remove/pause logic below.
+        if (on_complete is not None and folder_exists and on_disk > 0
+                and completed_seen is not None and h not in completed_seen):
+            completed_seen.add(h)
+            try:
+                on_complete(folder)
+            except Exception as exc:  # noqa: BLE001
+                emit(f"lifecycle: on_complete failed for {name!r}: {exc}")
 
         if folder_exists and on_disk == 0:
             # We can SEE this torrent's folder and its audio is gone -> the

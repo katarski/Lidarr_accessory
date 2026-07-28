@@ -29,6 +29,11 @@ watch:
   sweep_cueless_pre_split: true
   sweep_interval_seconds: 60
   sweep_min_stable_seconds: 10
+  # #9: recurring re-scan for .cue files the watchdog missed (the observer can
+  # drop/coalesce create events on SMB/FUSE, and the startup scan runs only
+  # once -- so a dropped .cue would otherwise wait for a restart). Only newly
+  # appeared / previously-missed cues are enqueued. Seconds; 0 disables.
+  cue_rescan_interval_seconds: 120
 staging:
   mode: in_place
   root: /downloads

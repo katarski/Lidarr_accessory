@@ -58,6 +58,7 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     cfg.setdefault("staging", {})
     cfg.setdefault("qbittorrent", {})
     cfg.setdefault("acoustid", {})
+    cfg.setdefault("watch", {})
 
     def put(section: str, key: str, env: str, cast=str) -> None:
         v = os.environ.get(env)
@@ -129,6 +130,8 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     put("qbittorrent", "pause_during_scan", "QBIT_PAUSE_SCAN", _as_bool)
     put("qbittorrent", "manage_completed", "QBIT_MANAGE_COMPLETED", _as_bool)
     put("qbittorrent", "remove_when_library_complete", "QBIT_REMOVE_WHEN_LIBRARY_COMPLETE", _as_bool)
+    # #9 recurring .cue re-scan
+    put("watch", "cue_rescan_interval_seconds", "CUE_RESCAN_INTERVAL", int)
     put("qbittorrent", "ai_match", "QBIT_AI_MATCH", _as_bool)
     # AcoustID fingerprint identification (import fallback)
     put("acoustid", "enabled", "ACOUSTID_ENABLED", _as_bool)
@@ -335,6 +338,33 @@ def cueless_sweep_loop(
         delay = cadence
 
 
+def cue_rescan_loop(
+    watch_root: Path,
+    excluded: list,
+    q: "queue.Queue[Path]",
+    stop: threading.Event,
+    interval: int,
+    seen: set,
+) -> None:
+    """
+    #9: periodically re-scan for .cue files the watchdog missed. The observer
+    only fires on live create/move events (and can drop/coalesce them on the
+    SMB/FUSE PollingObserver), and the startup scan runs only once -- so a
+    dropped .cue would otherwise sit unimported until a restart. This re-runs
+    the SMB-tolerant scan_existing walk with a shared `seen` set, so ONLY newly
+    appeared / previously-missed .cue files are enqueued (idempotent via the
+    worker's _skip_seen). Minimum cadence 60s; 0 disables the thread.
+    """
+    cadence = max(60, interval)
+    delay = cadence
+    while not stop.wait(delay):
+        try:
+            scan_existing(watch_root, excluded, q, seen=seen, quiet=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("cue re-scan thread: %s", exc)
+        delay = cadence
+
+
 def library_audit_loop(
     orch: Orchestrator,
     stop: threading.Event,
@@ -417,7 +447,7 @@ def interactive_search_loop(
 
 def qbt_auto_deselect_loop(
     qcfg: Dict[str, Any], lidarr, stop: threading.Event, interval: int,
-    download_root: str = "", llm=None,
+    download_root: str = "", llm=None, q: "Optional[queue.Queue[Path]]" = None,
 ) -> None:
     """
     Poll qBittorrent on a schedule. Two jobs per pass:
@@ -452,6 +482,24 @@ def qbt_auto_deselect_loop(
         qcfg.get("remove_when_library_complete", True))
     remove_min_stable = int(qcfg.get("remove_min_stable_seconds", 300) or 300)
     seen: set = set()
+    completed_seen: set = set()   # #8a: torrents we've already kicked to process
+
+    def _enqueue_folder_cues(folder: str) -> None:
+        """#8a: a music torrent just completed -> enqueue any .cue in its
+        download folder so the pipeline starts immediately (no wait for the
+        watcher/sweep). Cueless folders stay owned by the cueless sweep."""
+        if q is None or not folder:
+            return
+        try:
+            for dirpath, _d, files in os.walk(folder):
+                for name in files:
+                    if name.lower().endswith(".cue"):
+                        cue = Path(dirpath) / name
+                        q.put(cue)
+                        logger.info("qbt complete -> queued %s", cue)
+        except OSError as exc:
+            logger.debug("qbt complete: cue scan of %s failed: %s", folder, exc)
+
     delay = min(cadence, 10)  # first pass right after startup
     while not stop.wait(delay):
         delay = cadence
@@ -474,6 +522,8 @@ def qbt_auto_deselect_loop(
                     lidarr=lidarr, llm=match_llm,
                     remove_when_library_complete=remove_when_library_complete,
                     min_stable_seconds=remove_min_stable,
+                    on_complete=_enqueue_folder_cues if q is not None else None,
+                    completed_seen=completed_seen,
                 )
                 if removed or paused:
                     logger.info(
@@ -541,23 +591,32 @@ def purge_imported_loop(
 # --- Startup scan -------------------------------------------------------
 
 
-def scan_existing(root: Path, excluded: list, q: "queue.Queue[Path]") -> int:
-    """Enqueue any .cue files already present at startup, honoring excludes.
+def scan_existing(root: Path, excluded: list, q: "queue.Queue[Path]",
+                  seen: "Optional[set]" = None, quiet: bool = False) -> int:
+    """Enqueue any .cue files present under `root`, honoring excludes.
 
     Walks the tree manually (not Path.rglob) so a transient SMB failure on a
     single directory -- e.g. WinError 59 mid-walk over a UNC share -- logs and
-    skips that subtree instead of aborting the whole startup scan.
+    skips that subtree instead of aborting the whole scan.
+
+    Used both at startup and by the recurring #9 re-scan. When `seen` is given,
+    a .cue already in it is skipped and each newly enqueued cue is added to it,
+    so the recurring re-scan only ever enqueues .cue files the watcher missed
+    (not everything, every pass). `quiet` downgrades the summary logs to debug
+    for the recurring caller.
     """
     count = 0
     skipped = 0
     errored = 0
     started = time.monotonic()
-    logger.info("Startup scan: walking %s for existing .cue files...", root)
+    _log = logger.debug if quiet else logger.info
+    _log("%s scan: walking %s for .cue files...",
+         "re-" if quiet else "Startup", root)
 
     def _on_walk_error(err: OSError) -> None:
         nonlocal errored
         errored += 1
-        logger.warning("Startup scan: skipping unreadable dir %s: %s",
+        logger.warning("cue scan: skipping unreadable dir %s: %s",
                        getattr(err, "filename", "?"), err)
 
     for dirpath, _dirnames, filenames in os.walk(root, onerror=_on_walk_error):
@@ -568,19 +627,25 @@ def scan_existing(root: Path, excluded: list, q: "queue.Queue[Path]") -> int:
             if _is_excluded(cue, excluded):
                 skipped += 1
                 continue
+            if seen is not None:
+                key = str(cue)
+                if key in seen:
+                    continue
+                seen.add(key)
             q.put(cue)
             count += 1
     if errored:
-        logger.warning("Startup scan: %d director(y/ies) were unreadable "
+        logger.warning("cue scan: %d director(y/ies) were unreadable "
                        "(network/SMB errors); their .cue files were NOT queued.",
                        errored)
     elapsed = time.monotonic() - started
-    # Always log the result -- silence here made the service look dead
-    # after "Watching...". Now you see zero-vs-many immediately.
-    logger.info(
-        "Startup scan done in %.1fs: queued=%d skipped=%d (excluded folders)",
-        elapsed, count, skipped,
-    )
+    if count or not quiet:
+        # Startup always logs; the recurring re-scan only logs when it actually
+        # found a missed cue (otherwise it would spam like the old audit line).
+        (logger.info if (count and quiet) else _log)(
+            "%s scan done in %.1fs: queued=%d skipped=%d (excluded)",
+            "re-" if quiet else "Startup", elapsed, count, skipped,
+        )
     return count
 
 
@@ -926,9 +991,25 @@ def main() -> int:
         )
         heartbeat_thread.start()
 
-    pre_existing = scan_existing(watch_root, excluded_dirs, q)
+    # Shared with the #9 recurring re-scan so it only enqueues .cue files the
+    # watchdog later misses -- not everything, every pass.
+    cue_seen: set = set()
+    pre_existing = scan_existing(watch_root, excluded_dirs, q, seen=cue_seen)
     if pre_existing:
         logger.info("Queued %d pre-existing .cue files at startup", pre_existing)
+
+    # #9: recurring .cue re-scan so a .cue the watcher dropped is picked up
+    # without a restart. Reuses the polling cadence (watch.poll_interval_seconds
+    # -> cue_rescan_interval_seconds), 0 disables.
+    cue_rescan_interval = int(watch_cfg.get(
+        "cue_rescan_interval_seconds", 120) or 0)
+    if cue_rescan_interval > 0:
+        threading.Thread(
+            target=cue_rescan_loop,
+            args=(watch_root, excluded_dirs, q, stop, cue_rescan_interval, cue_seen),
+            daemon=True, name="cue-rescan",
+        ).start()
+        logger.info("Cue re-scan: enabled (every %ds)", max(60, cue_rescan_interval))
 
     # Optional: hand off pre-split folders that have NO .cue file at all
     # (the watcher only fires on .cue events, so those are invisible to it).
@@ -1026,7 +1107,7 @@ def main() -> int:
             qbt_thread = threading.Thread(
                 target=qbt_auto_deselect_loop,
                 args=(qbt_cfg, lidarr, stop, interval, str(watch_root),
-                      ollama_client),
+                      ollama_client, q),
                 daemon=True,
                 name="cue-qbt",
             )
