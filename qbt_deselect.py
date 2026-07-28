@@ -60,6 +60,25 @@ _ART_DIR = re.compile(
     r"(?i)^-?(?:scans?|artwork|art|covers?|cover|sleeves?|booklet|"
     r"images?|thumbs?|logs?|info)$"
 )
+# Discography "noise" category subfolders -- bootlegs, live sets, singles,
+# compilations, remixes, collaborations, etc. Inside a big discography grab
+# these are deselected by DEFAULT (only real studio albums Lidarr wants are
+# downloaded), UNLESS Lidarr explicitly tracks a matching (still-missing)
+# album in that folder. Matches a CONTAINER segment, never the album name.
+_NOISE_DIR = re.compile(
+    r"(?i)^-?(?:bootlegs?|live|lives|other|others|singles?|compilations?|"
+    r"comps?|collaborations?|collabs?|remix(?:es)?|demos?|unofficial|misc|"
+    r"rarit(?:y|ies)|b-?sides?|extras?|mixes|promos?|eps?)$"
+)
+
+
+def _is_noise_category(key: str) -> bool:
+    """True if the album-folder key sits under a discography 'noise' category
+    subfolder (Bootlegs/Live/Singles/Compilations/Remixes/...). Checks only the
+    CONTAINER segments, not the album name itself, so a real album titled e.g.
+    'Live at X' isn't caught."""
+    parts = _rel_parts(key)
+    return any(_NOISE_DIR.match(p) for p in parts[:-1])
 
 
 def _clean_album(name: str, artist: str = "") -> str:
@@ -170,9 +189,16 @@ def plan_torrent(
         complete, have, total = album_complete_in_library(
             lidarr, artist, album, _cache=lib_cache, llm=llm
         )
-        # Deselect only when the library fully has it AND has >= as many
-        # tracks as the torrent folder (don't drop a bigger edition).
-        deselect = bool(complete and total >= len(afiles))
+        if _is_noise_category(key):
+            # Noise-category folder (bootlegs/live/singles/...): deselect by
+            # default. Keep ONLY if Lidarr explicitly tracks a matching album
+            # (total > 0) that is still missing (not complete) -- i.e. Lidarr
+            # actually wants this exact release.
+            deselect = not (total > 0 and not complete)
+        else:
+            # Deselect only when the library fully has it AND has >= as many
+            # tracks as the torrent folder (don't drop a bigger edition).
+            deselect = bool(complete and total >= len(afiles))
         allf = all_by_key.get(key, afiles)
         plan.append({
             "artist": artist, "album": album,

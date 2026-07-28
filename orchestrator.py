@@ -3795,7 +3795,10 @@ class Orchestrator:
             except OSError:
                 last = ""
             if sig and sig == last:
-                logger.info(
+                # #8(b): the walk is correctly skipped when nothing changed --
+                # keep this quiet (debug) so it doesn't spam the log every
+                # interval; only real audit walks log at INFO.
+                logger.debug(
                     "Library audit: no changes since last run "
                     "(signature unchanged) -- skipping walk.",
                 )
@@ -5411,11 +5414,13 @@ class Orchestrator:
             verdict, info = self._verify_torrent(qbt, thash, expected, label)
             if verdict == "accept":
                 if qbt is not None:
-                    qbt.resume(thash)
+                    # Force active: a confirmed interactive-search grab must
+                    # download regardless of qBit queue/seeding limits.
+                    qbt.force_start(thash, True)
                 logger.info(
                     "interactive search: %s -- ACCEPTED %r (%s audio, "
-                    "expected %d); resuming download", label, cand.get("title"),
-                    info.get("audio_count", "?"), expected)
+                    "expected %d); force-started download", label,
+                    cand.get("title"), info.get("audio_count", "?"), expected)
                 return True
             logger.info(
                 "interactive search: %s -- rejected %r (%s); blocklist + next",
@@ -5648,9 +5653,10 @@ class Orchestrator:
                 detail = f"{(info or {}).get('audio_count', '?')} audio"
             if verdict == "accept":
                 if qbt is not None:
-                    qbt.resume(thash)
+                    # Force active regardless of source (backlog #10 follow-up).
+                    qbt.force_start(thash, True)
                 logger.info(
-                    "interactive search: %s -- ACCEPTED %s %r (%s); resuming"
+                    "interactive search: %s -- ACCEPTED %s %r (%s); force-started"
                     "%s", artist_name, kind, cand.get("title"), detail,
                     " -- auto-deselect drops owned albums"
                     if cand.get("_is_disco") else "")

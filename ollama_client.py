@@ -428,20 +428,28 @@ class OllamaClient:
             return None
 
         parsed = _coerce_to_list(parsed, expected_len=len(plans))
-        if not isinstance(parsed, list) or len(parsed) != len(plans):
-            # Log a preview so we can see what shape qwen actually returned.
+        if not isinstance(parsed, list) or not parsed:
+            # Truly unusable (not a non-empty list) -- keep the original tags.
             preview = (out[:300] + "...") if len(out) > 300 else out
-            logger.warning(
-                "Ollama tag output wrong shape (got %s items, expected %s). "
-                "Preview: %s",
-                len(parsed) if hasattr(parsed, "__len__") else "?",
-                len(plans),
-                preview.replace("\n", " "),
+            logger.debug(
+                "Ollama tag normalize: unusable output (not a non-empty list); "
+                "keeping original tags. Preview: %s", preview.replace("\n", " "),
             )
             return None
+        if len(parsed) != len(plans):
+            # #7: ragged output is common with small local models. Don't throw
+            # the whole normalization away -- align by POSITION (extra items are
+            # ignored; a missing tail keeps the original tags). Quiet (debug) so
+            # it never spams the log.
+            logger.debug(
+                "Ollama tag normalize: ragged output (got %d, expected %d) -- "
+                "aligning by position, keeping originals for the remainder.",
+                len(parsed), len(plans),
+            )
 
         normalized: List[TagPlan] = []
-        for original, patched in zip(plans, parsed):
+        for i, original in enumerate(plans):
+            patched = parsed[i] if i < len(parsed) else None
             if not isinstance(patched, dict):
                 normalized.append(original)
                 continue
