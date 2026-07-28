@@ -212,6 +212,27 @@ class LidarrClient:
             logger.warning("release search failed for album %s: %s", album_id, exc)
             return []
 
+    def release_search_artist(self, artist_id: int) -> List[Dict[str, Any]]:
+        """
+        Artist-scope interactive search (GET /api/v1/release?artistId=) -- the
+        same call the artist page's top 'Interactive Search' button makes.
+        Surfaces whole-artist releases (discography/collection torrents that a
+        single-album search never returns). Same release dict shape as
+        release_search. [] on error.
+        """
+        try:
+            r = self.session.get(
+                self._url(f"/api/v1/release?artistId={int(artist_id)}"),
+                timeout=120,
+            )
+            r.raise_for_status()
+            data = r.json()
+            return data if isinstance(data, list) else []
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "artist release search failed for artist %s: %s", artist_id, exc)
+            return []
+
     def release_grab(self, guid: str, indexer_id: int) -> bool:
         """
         Grab one specific release (interactive push): POST /api/v1/release

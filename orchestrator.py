@@ -453,6 +453,14 @@ class OrchestratorConfig:
     # once. Least-recently-attempted albums are picked first, so all rotate
     # through over successive passes.
     interactive_search_max_albums_per_pass: int = 15
+    # Artist-level search: before per-album search, run Lidarr's artist-scope
+    # interactive search and grab whatever best fills the artist's MISSING
+    # albums -- a discography/collection that covers several at once (verified
+    # in qBit by album-folder count; the existing auto-deselect then downloads
+    # only the still-missing albums) OR a single release that matches a missing
+    # album. Ranked by fill value first, then seeders/peers, then lossless, then
+    # title. Falls back to per-album search when nothing of value is found.
+    interactive_search_artist_level: bool = True
     # JSON state file: {albumId: {first_missing, last_attempt, blocklisted[]}}.
     # Tracks how long each album has been missing (the >Ndays clock) and the
     # per-album grab cooldown, surviving restarts. Lives in /config.
@@ -5386,6 +5394,231 @@ class Orchestrator:
             "needs manual attention", label, tried)
         return False
 
+    # Discography / collection torrent detection (artist-level search).
+    _DISCO_MARKER_RE = re.compile(
+        r"(?i)\b(discograph\w*|discograf[íi]a|anthology|collection|complete|"
+        r"boxset|box[\s.\-]?set|colecci)\b")
+    _DISCO_YEAR_RANGE_RE = re.compile(
+        r"((?:19|20)\d{2})\s*[-–—]\s*((?:19|20)\d{2})")
+    _DISCO_COUNT_RE = re.compile(
+        r"(?i)\b(\d{1,3})\s*(?:albums?|cds?|discs?|lps?)\b")
+
+    def _discography_info(self, title: str) -> Optional[Dict[str, Any]]:
+        """Return {marker, span, count} if `title` looks like a discography /
+        multi-album collection (keyword, a YYYY-YYYY range, or an 'N albums'
+        count), else None."""
+        t = title or ""
+        marker = bool(self._DISCO_MARKER_RE.search(t))
+        span = 0
+        yr = self._DISCO_YEAR_RANGE_RE.search(t)
+        if yr:
+            a, b = int(yr.group(1)), int(yr.group(2))
+            span = b - a if b >= a else 0
+        cnt = self._DISCO_COUNT_RE.search(t)
+        count = int(cnt.group(1)) if cnt else 0
+        if not (marker or span > 0 or count >= 2):
+            return None
+        return {"marker": marker, "span": span, "count": count}
+
+    def _rank_artist_releases(self, releases, artist: str, missing, blocklisted):
+        """
+        Rank artist-scope torrent releases by how much MISSING music they fill.
+        A release counts if it's a discography/collection OR its title matches
+        one of the artist's missing albums (>= the title-ratio floor). Score =
+        fill value (dominant) then seeders/peers, then lossless, then title
+        relation -- so we grab "anything of value", preferring what fills more.
+        `missing` is a list of (album_title, expected_trackcount, album_id).
+        """
+        floor = float(self.cfg.interactive_search_min_title_ratio)
+        blocked = set(blocklisted or [])
+        artn = self._norm_title(artist)
+        n_missing = len(missing)
+        m_norm = [(self._norm_title(f"{artist} {t}"), t, exp, aid)
+                  for (t, exp, aid) in missing]
+        scored: List[Dict[str, Any]] = []
+        for raw in releases or []:
+            if (raw.get("protocol") or "").lower() != "torrent":
+                continue
+            guid = raw.get("guid")
+            if not guid or guid in blocked:
+                continue
+            title = raw.get("title") or ""
+            if artn and artn not in self._norm_title(title):
+                continue
+            info = self._discography_info(title)
+            # Best single missing-album match.
+            tnorm = self._norm_title(title)
+            best_ratio, best_match = 0.0, None
+            for mn, t, exp, aid in m_norm:
+                ratio = difflib.SequenceMatcher(None, mn, tnorm).ratio()
+                if ratio > best_ratio:
+                    best_ratio, best_match = ratio, (t, exp, aid)
+            is_disco = info is not None
+            single_match = best_ratio >= floor
+            if not (is_disco or single_match):
+                continue                      # nothing of value here
+            fill = 0
+            if is_disco:
+                est = info["count"] or (info["span"] + 1 if info["span"] else 0)
+                fill = max(2, min(est or n_missing, n_missing))
+            if single_match:
+                fill = max(fill, 1)
+            q = raw.get("quality") or {}
+            qname = ((q.get("quality") or {}).get("name") or q.get("name") or "")
+            lossless = bool(re.search(
+                r"(?i)flac|alac|\bape\b|wavpack|\bwv\b|dsd|lossless",
+                f"{qname} {title}"))
+            seeders = int(raw.get("seeders") or 0)
+            leechers = int(raw.get("leechers") or 0)
+            score = (fill * 50.0 + seeders * 1.0 + leechers * 0.2
+                     + (10.0 if lossless else 0.0) + best_ratio * 20.0)
+            r = dict(raw)
+            r.update(_score=score, _seeders=seeders, _leechers=leechers,
+                     _quality=qname or ("lossless" if lossless else "?"),
+                     _disco=info, _is_disco=is_disco, _fill=fill,
+                     _match=best_match, _title_ratio=round(best_ratio, 3))
+            scored.append(r)
+        scored.sort(key=lambda x: x["_score"], reverse=True)
+        return scored
+
+    def _await_queue_hash_by_title(self, release_title: str, timeout: int = 90):
+        """Poll Lidarr's queue for the item whose title matches the grabbed
+        release, returning (downloadId_hash, record)."""
+        norm = self._norm_title(release_title)
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                for rec in self.lidarr.queue_list():
+                    if not rec.get("downloadId"):
+                        continue
+                    t = self._norm_title(rec.get("title") or "")
+                    if t and (t == norm or norm in t or t in norm):
+                        return str(rec["downloadId"]).lower(), rec
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(3)
+        return None, None
+
+    def _verify_discography(self, qbt, thash: str, tname: str):
+        """Pause + inspect: a real discography must contain >= 2 distinct album
+        folders. Returns ('accept', n_albums) or ('reject:<reason>', n)."""
+        if qbt is None:
+            return "accept", 0
+        qbt.pause(thash)
+        files: List[Dict[str, Any]] = []
+        deadline = time.time() + 45
+        while time.time() < deadline:
+            files = qbt.files(thash)
+            if files:
+                break
+            time.sleep(3)
+        if not files:
+            return "accept", 0
+        audio = [f for f in files
+                 if os.path.splitext(str(f.get("name") or ""))[1].lower()
+                 in _ALL_AUDIO_EXTS]
+        if not audio:
+            return "reject:no-audio", 0
+        try:
+            from qbt_deselect import _file_album_key  # battle-tested grouping
+            keys = {_file_album_key(f, tname) for f in audio}
+        except Exception:  # noqa: BLE001
+            keys = set()
+            for f in audio:
+                parts = [p for p in re.split(r"[\\/]", str(f.get("name") or "")) if p]
+                keys.add(parts[1] if len(parts) >= 3 else (parts[0] if parts else ""))
+        n = len(keys)
+        return ("accept", n) if n >= 2 else ("reject:single-album", n)
+
+    def _reject_by_hash(self, thash: str, qbt, blocklist: bool = True) -> None:
+        """Remove every Lidarr queue row for this torrent (blocklisting) and
+        delete it + its data from qBittorrent."""
+        try:
+            for rec in self.lidarr.queue_list():
+                if (str(rec.get("downloadId") or "").lower() == thash
+                        and rec.get("id") is not None):
+                    self.lidarr.queue_remove(
+                        int(rec["id"]), remove_from_client=True,
+                        blocklist=blocklist)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("interactive search: reject-by-hash failed: %s", exc)
+        if qbt is not None and thash:
+            try:
+                qbt.remove(thash, delete_files=True)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _try_artist_fill(self, artist_id: int, artist_name: str,
+                         missing: List[Tuple[str, int, int]],
+                         blocklisted: List[str], qbt) -> bool:
+        """
+        Artist-level: search the artist scope and grab whatever best fills the
+        MISSING albums -- a discography/collection (verified by album-folder
+        count) or a single release matching a missing album (verified by track
+        count). `missing` is [(album_title, expected_trackcount, album_id)].
+        Returns True when something was accepted (or, in dry-run, would be) so
+        the caller skips per-album search for this artist.
+        """
+        cfg = self.cfg
+        cands = self._rank_artist_releases(
+            self.lidarr.release_search_artist(artist_id), artist_name,
+            missing, blocklisted)
+        if not cands:
+            return False
+        if cfg.interactive_search_dry_run:
+            top = cands[0]
+            kind = "DISCOGRAPHY" if top.get("_is_disco") else "album"
+            logger.info(
+                "interactive search (DRY RUN): %s [%d missing] -> would grab "
+                "%s %r (fills~%s seeders=%s leechers=%s quality=%s title~%.2f; "
+                "%d candidate(s))", artist_name, len(missing), kind,
+                top.get("title"), top.get("_fill"), top.get("_seeders"),
+                top.get("_leechers"), top.get("_quality"),
+                top.get("_title_ratio"), len(cands))
+            return True
+        for cand in cands[:max(1, int(cfg.interactive_search_max_candidates))]:
+            guid, indexer = cand.get("guid"), cand.get("indexerId")
+            if not guid or indexer is None:
+                continue
+            kind = "discography" if cand.get("_is_disco") else "album"
+            logger.info(
+                "interactive search: %s -> grabbing %s %r (fills~%s seeders=%s "
+                "quality=%s)", artist_name, kind, cand.get("title"),
+                cand.get("_fill"), cand.get("_seeders"), cand.get("_quality"))
+            if not self.lidarr.release_grab(guid, indexer):
+                continue
+            thash, _rec = self._await_queue_hash_by_title(
+                cand.get("title") or "", timeout=90)
+            if not thash:
+                logger.warning(
+                    "interactive search: %s -- grabbed %s but no queue hash; "
+                    "leaving it to download", artist_name, kind)
+                return True
+            if cand.get("_is_disco"):
+                verdict, detail = self._verify_discography(
+                    qbt, thash, cand.get("title") or "")
+                detail = f"{detail} album folder(s)"
+            else:
+                exp = (cand.get("_match") or ("", 0, 0))[1]
+                verdict, info = self._verify_torrent(
+                    qbt, thash, int(exp or 0), artist_name)
+                detail = f"{(info or {}).get('audio_count', '?')} audio"
+            if verdict == "accept":
+                if qbt is not None:
+                    qbt.resume(thash)
+                logger.info(
+                    "interactive search: %s -- ACCEPTED %s %r (%s); resuming"
+                    "%s", artist_name, kind, cand.get("title"), detail,
+                    " -- auto-deselect drops owned albums"
+                    if cand.get("_is_disco") else "")
+                return True
+            logger.info(
+                "interactive search: %s -- rejected %s %r (%s); blocklist + "
+                "next", artist_name, kind, cand.get("title"), verdict)
+            self._reject_by_hash(thash, qbt)
+            blocklisted.append(guid)
+        return False
+
     def interactive_search_pass(self, qbt=None) -> int:
         """
         One pass of backlog #10: for monitored albums missing for longer than
@@ -5418,6 +5651,7 @@ class Orchestrator:
         # First pass over ALL missing albums: start each one's "first missing"
         # clock and collect the ones eligible to act on now.
         missing_ids: set = set()
+        missing_artist_ids: set = set()
         eligible: List[Tuple[Dict[str, Any], Dict[str, Any], int]] = []
         for alb in missing:
             aid = alb.get("id")
@@ -5425,6 +5659,9 @@ class Orchestrator:
                 continue
             aid = int(aid)
             missing_ids.add(aid)
+            art_all = alb.get("artistId") or (alb.get("artist") or {}).get("id")
+            if art_all is not None:
+                missing_artist_ids.add(int(art_all))
             st = state.setdefault(str(aid), {})
             st.setdefault("first_missing", now)
             if now - float(st.get("first_missing") or now) < min_missing:
@@ -5435,29 +5672,76 @@ class Orchestrator:
                 continue        # per-album cooldown
             eligible.append((alb, st, aid))
 
-        # Cap the work per pass (least-recently-attempted first) so a big
-        # backlog doesn't fire hundreds of indexer searches at once; the rest
-        # rotate in on later passes.
-        eligible.sort(key=lambda t: float(t[1].get("last_attempt") or 0))
+        # Group eligible albums by ARTIST so an artist-level discography grab can
+        # fill several at once, and cap ARTISTS per pass (least-recently-tried
+        # first) so a big backlog doesn't hammer the indexers.
+        by_artist: Dict[int, Dict[str, Any]] = {}
+        for alb, st, aid in eligible:
+            art = alb.get("artist") or {}
+            art_id = alb.get("artistId") or art.get("id")
+            if art_id is None:
+                continue
+            g = by_artist.setdefault(int(art_id), {
+                "name": art.get("artistName", "") or "", "items": []})
+            g["items"].append((alb, st, aid))
+
+        artists = sorted(
+            by_artist.items(),
+            key=lambda kv: min((float(s.get("last_attempt") or 0)
+                                for _a, s, _i in kv[1]["items"]), default=0.0))
         cap = max(1, int(cfg.interactive_search_max_albums_per_pass))
-        picked = eligible[:cap]
+        picked = artists[:cap]
         if eligible:
             logger.info(
-                "interactive search: %d eligible album(s); processing %d "
-                "this pass", len(eligible), len(picked))
+                "interactive search: %d eligible album(s) across %d artist(s); "
+                "processing %d artist(s) this pass", len(eligible),
+                len(by_artist), len(picked))
 
         grabbed = 0
-        for alb, st, aid in picked:
-            try:
-                if self._isearch_one_album(alb, st, qbt):
+        for art_id, g in picked:
+            name, items = g["name"], g["items"]
+            handled = False
+            if cfg.interactive_search_artist_level:
+                ast = state.setdefault(f"artist:{art_id}", {})
+                missing_info = [
+                    (a.get("title", "") or "",
+                     int((a.get("statistics") or {}).get("trackCount") or 0),
+                     _aid)
+                    for a, _s, _aid in items]
+                try:
+                    handled = self._try_artist_fill(
+                        art_id, name, missing_info,
+                        ast.setdefault("blocklisted", []), qbt)
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception(
+                        "interactive search: artist %s fill failed: %s",
+                        art_id, exc)
+                ast["last_attempt"] = now
+            if handled:
+                if not cfg.interactive_search_dry_run:
                     grabbed += 1
-            except Exception as exc:  # noqa: BLE001
-                logger.exception(
-                    "interactive search: album %s failed: %s", aid, exc)
-            st["last_attempt"] = now
+                for _alb, st, _aid in items:
+                    st["last_attempt"] = now
+                continue
+            # Fallback: per-album search for this artist's missing albums.
+            for alb, st, aid in items:
+                try:
+                    if self._isearch_one_album(alb, st, qbt):
+                        grabbed += 1
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception(
+                        "interactive search: album %s failed: %s", aid, exc)
+                st["last_attempt"] = now
 
-        # Prune state for albums that are no longer missing.
+        # Prune state for albums/artists that are no longer missing.
         for k in list(state.keys()):
+            if str(k).startswith("artist:"):
+                try:
+                    if int(k.split(":", 1)[1]) not in missing_artist_ids:
+                        state.pop(k, None)
+                except ValueError:
+                    state.pop(k, None)
+                continue
             try:
                 if int(k) not in missing_ids:
                     state.pop(k, None)
