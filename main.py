@@ -127,6 +127,7 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     put("qbittorrent", "interval_seconds", "QBIT_INTERVAL", int)
     put("qbittorrent", "pause_during_scan", "QBIT_PAUSE_SCAN", _as_bool)
     put("qbittorrent", "manage_completed", "QBIT_MANAGE_COMPLETED", _as_bool)
+    put("qbittorrent", "remove_when_library_complete", "QBIT_REMOVE_WHEN_LIBRARY_COMPLETE", _as_bool)
     put("qbittorrent", "ai_match", "QBIT_AI_MATCH", _as_bool)
     # AcoustID fingerprint identification (import fallback)
     put("acoustid", "enabled", "ACOUSTID_ENABLED", _as_bool)
@@ -444,6 +445,11 @@ def qbt_auto_deselect_loop(
     # (Lidarr) match misses. Requires an enabled LLM client.
     ai_match = _as_bool(qcfg.get("ai_match", True))
     match_llm = llm if (ai_match and llm is not None and getattr(llm, "enabled", False)) else None
+    # #5: also clean up a completed torrent whose album(s) Lidarr imported itself
+    # (copy/hardlink import leaves files on disk, so the disk-empty check misses it).
+    remove_when_library_complete = _as_bool(
+        qcfg.get("remove_when_library_complete", True))
+    remove_min_stable = int(qcfg.get("remove_min_stable_seconds", 300) or 300)
     seen: set = set()
     delay = min(cadence, 10)  # first pass right after startup
     while not stop.wait(delay):
@@ -463,7 +469,10 @@ def qbt_auto_deselect_loop(
                     logger.info("qbt auto-deselect: acted on %d torrent(s)", acted)
             if manage_completed:
                 removed, paused = torrent_lifecycle_pass(
-                    qbt, download_root, category=category, emit=logger.info
+                    qbt, download_root, category=category, emit=logger.info,
+                    lidarr=lidarr, llm=match_llm,
+                    remove_when_library_complete=remove_when_library_complete,
+                    min_stable_seconds=remove_min_stable,
                 )
                 if removed or paused:
                     logger.info(

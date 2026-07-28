@@ -161,6 +161,16 @@ qbittorrent:
   # been moved into the library. Disk-aware, so it never deletes un-imported
   # files. Supersedes the time-based lidarr.queue_reaper_* when on.
   manage_completed: true
+  # #5: also clean up a completed torrent whose album(s) Lidarr imported ITSELF.
+  # Lidarr's default copy/hardlink import leaves the files in the download folder,
+  # so the disk-empty check above never fires. When on, a completed music torrent
+  # whose every album Lidarr fully owns is removed (torrent + data). A hardlinked
+  # library copy survives the delete; a copied import has its own. Requires
+  # manage_completed. Set false to keep seeding such torrents.
+  remove_when_library_complete: true
+  # A torrent's folder must be untouched this many seconds before the above
+  # library-complete removal fires, so an in-progress import is never raced.
+  remove_min_stable_seconds: 300
 acoustid:
   # Acoustic-fingerprint identification (Chromaprint/fpcalc -> AcoustID ->
   # MusicBrainz). Fallback used at import time when a pre-split folder's TAGS

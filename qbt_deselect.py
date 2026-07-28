@@ -25,6 +25,7 @@ import logging
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Callable, List, Dict, Any, Optional
 
@@ -314,9 +315,30 @@ def _count_audio_on_disk(path: str) -> int:
     return n
 
 
+def _folder_newest_mtime(path: str) -> float:
+    """Newest mtime under `path` (the folder itself if empty). 0.0 on error."""
+    newest = 0.0
+    try:
+        newest = os.path.getmtime(path)
+        for root, _dirs, files in os.walk(path):
+            for fn in files:
+                try:
+                    newest = max(newest, os.path.getmtime(os.path.join(root, fn)))
+                except OSError:
+                    continue
+    except OSError:
+        return 0.0
+    return newest
+
+
 def torrent_lifecycle_pass(
     qbt: QbtClient, download_root: str, category: str = "",
     emit: Callable[[str], None] = logger.info,
+    lidarr: Optional[LidarrClient] = None,
+    llm=None,
+    remove_when_library_complete: bool = True,
+    min_stable_seconds: int = 300,
+    now: Optional[float] = None,
 ) -> tuple:
     """
     Manage COMPLETED music torrents by how much of their content the pipeline
@@ -325,12 +347,23 @@ def torrent_lifecycle_pass(
       * fully moved      (no audio left on disk)  -> REMOVE torrent + data
       * partially moved  (some audio gone)        -> PAUSE (stop seeding while
                                                       the rest finishes importing)
-      * nothing moved yet (all audio still there) -> leave running
+      * nothing moved yet (all audio still there) -> see below
+
+    For the "nothing moved yet" case, Lidarr may have imported the torrent
+    ITSELF (its default copy/hardlink import leaves the files in the download
+    folder, so the pipeline never sees them vanish). When `remove_when_library_
+    complete` is on and a `lidarr` client is supplied, ask Lidarr whether it
+    already fully owns EVERY album the torrent contains (plan_torrent +
+    album_complete_in_library); if so, REMOVE torrent + data (backlog #5). A
+    stability guard (`min_stable_seconds`) avoids racing an in-progress import.
+    Otherwise the torrent is left running.
 
     Non-music torrents (no selected audio -- TV, movies) are ignored.
     Reads the real download folder, so it never deletes a torrent whose files
     haven't actually been imported. Returns (removed, paused).
     """
+    if now is None:
+        now = time.time()
     # Guard: if the download root isn't visible, do NOTHING -- otherwise an
     # unmounted path would look like "everything moved" and nuke torrents.
     if not download_root or not os.path.isdir(download_root):
@@ -398,7 +431,29 @@ def torrent_lifecycle_pass(
                     f"lifecycle: PAUSED (imported {sel_audio - on_disk}/{sel_audio} "
                     f"so far) {name!r}"
                 )
-        # else on_disk == sel_audio: nothing imported yet -> leave running.
+        else:
+            # on_disk == sel_audio: the pipeline hasn't moved anything. But
+            # Lidarr may have imported it ITSELF (copy/hardlink import leaves the
+            # files in place). If Lidarr fully owns EVERY album this torrent
+            # contains, clean it up here -- remove torrent + data (backlog #5).
+            # delete_files removes the download copy; a hardlinked library file
+            # shares the inode and survives, and a copied import has its own.
+            if not (remove_when_library_complete and lidarr is not None):
+                continue
+            if now - _folder_newest_mtime(folder) < max(0, min_stable_seconds):
+                continue  # still settling -- don't race an in-progress import
+            try:
+                plan = plan_torrent(lidarr, name, files, llm=llm)
+            except Exception as exc:  # noqa: BLE001
+                emit(f"lifecycle: library check failed for {name!r}: {exc}")
+                continue
+            if plan and all(a.get("have") for a in plan):
+                if qbt.remove(h, delete_files=True):
+                    removed += 1
+                    emit(
+                        f"lifecycle: REMOVED (Lidarr already owns all "
+                        f"{len(plan)} album(s) -- self-import cleanup) {name!r}"
+                    )
     return removed, paused
 
 

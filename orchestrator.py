@@ -560,7 +560,7 @@ class Orchestrator:
         # where `_find_companion_audio` would otherwise accidentally match
         # the CUE against one of the split tracks (via stem fallback or
         # extension drift) and try to process it as a "disc image".
-        if self._looks_pre_split(cue_path.parent):
+        if self._looks_pre_split(cue_path.parent) and not self._cue_is_single_image(cue_path):
             audios = self._sibling_audio_files(cue_path.parent)
             logger.info(
                 "Folder %s looks pre-split (%d audio files, no dominant "
@@ -849,11 +849,14 @@ class Orchestrator:
                     "DTS-CD: relocated %d/%d 5.1 FLAC(s) to clean folder %s "
                     "(Enigma-style flat import).", moved, len(splits), clean,
                 )
-                # The source download (.wav disc image + .cue + empty staging)
-                # is no longer needed -- the tracks are safe in `clean`.
-                self._delete_source_folder(cue_path)
                 # Import via the proven pre-split ManualImport handoff.
                 self._handoff_pre_split_to_lidarr(None, clean, reason="dts-cd 5.1")
+                # Delete the source (.wav image + .cue) ONLY once the clean-folder
+                # import actually landed. The handoff removes `clean` on a
+                # verified success, so its absence is our confirmation -- never
+                # delete the source before the import is verified (backlog #6).
+                if not clean.exists():
+                    self._delete_source_folder(cue_path)
                 return clean
             except Exception as exc:  # noqa: BLE001
                 logger.exception(
@@ -2258,17 +2261,14 @@ class Orchestrator:
         # the CUE-less sweep path has something stable to key off of.
         key_path = cue_path if cue_path is not None else folder
 
-        # 1) Delete the orphan .cue (if any) so it doesn't re-enqueue on restart.
-        if cue_path is not None and self.cfg.delete_cue_if_pre_split:
-            try:
-                if cue_path.exists():
-                    cue_path.unlink()
-                    logger.info(
-                        "Deleted orphan pre-split CUE %s (%s)",
-                        cue_path.name, reason,
-                    )
-            except OSError as exc:
-                logger.warning("Could not delete orphan CUE %s: %s", cue_path, exc)
+        # NOTE (backlog #6): the orphan .cue is deliberately NOT deleted here.
+        # Deleting it up front -- before any import -- meant a folder wrongly
+        # classified as "pre-split" (a single-file disc image that actually
+        # needed splitting) lost its .cue even when the import then failed. The
+        # .cue is now removed only on a VERIFIED import success: wholesale by
+        # _delete_source_folder, or explicitly via _delete_orphan_cue() in the
+        # success branches below. On failure the .cue stays so the folder can be
+        # retried / handled by the split path.
         self._skip_seen.add(key_path)
 
         # 2) Read artist/album from the audio tags. Folder name is
@@ -2389,12 +2389,14 @@ class Orchestrator:
                             else folder / ".cueless_sweep"
                         )
                         self._delete_source_folder(sentinel)
-                    elif self.cfg.delete_originals_on_success:
-                        for a in audios:
-                            try:
-                                a.unlink()
-                            except OSError as exc:
-                                logger.warning("Could not delete %s: %s", a, exc)
+                    else:
+                        if self.cfg.delete_originals_on_success:
+                            for a in audios:
+                                try:
+                                    a.unlink()
+                                except OSError as exc:
+                                    logger.warning("Could not delete %s: %s", a, exc)
+                        self._delete_orphan_cue(cue_path, reason)
                     return
                 logger.info(
                     "Pre-split: %s / %s is in library but with fewer tracks "
@@ -2568,6 +2570,8 @@ class Orchestrator:
                 # child path so the correct folder is targeted.
                 sentinel = cue_path if cue_path is not None else folder / ".cueless_sweep"
                 self._delete_source_folder(sentinel)
+            else:
+                self._delete_orphan_cue(cue_path, reason)
             return
 
         # ManualImport didn't report clean success within the window. That
@@ -2600,6 +2604,8 @@ class Orchestrator:
             if self.cfg.delete_source_folder_on_success:
                 sentinel = cue_path if cue_path is not None else folder / ".cueless_sweep"
                 self._delete_source_folder(sentinel)
+            else:
+                self._delete_orphan_cue(cue_path, reason)
             return
 
         logger.warning(
@@ -2612,6 +2618,34 @@ class Orchestrator:
             artist=artist_name, album=album_name,
             reason=f"pre-split handoff: Lidarr terminal state not ok ({reason})",
         )
+
+    def _cue_is_single_image(self, cue_path: Optional[Path]) -> bool:
+        """
+        True if the .cue describes a single-file disc image that still NEEDS
+        splitting: exactly one FILE reference, >= 2 TRACKs, and that file exists
+        beside the cue (by name or stem). Such a folder must NOT be treated as
+        "pre-split" -- it goes to the real split path so its .cue is never
+        deleted without a split (backlog #6, the Billie Holiday case).
+        """
+        if cue_path is None:
+            return False
+        try:
+            cue = parse_cue(cue_path, None, ollama=None)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("pre-split cue check: parse failed for %s: %s",
+                         cue_path, exc)
+            return False
+        files = getattr(cue, "audio_files", None) or []
+        tracks = getattr(cue, "tracks", None) or []
+        if len(files) != 1 or len(tracks) < 2:
+            return False
+        parent = cue_path.parent
+        ref_name = Path(files[0]).name
+        if (parent / ref_name).exists():
+            return True
+        stem = Path(ref_name).stem.lower()
+        return any(s.stem.lower() == stem
+                   for s in self._sibling_audio_files(parent))
 
     def _looks_pre_split(self, folder: Path) -> bool:
         """
@@ -5885,6 +5919,26 @@ class Orchestrator:
             len(disk_files), expected_tracks, artist_name, album_name,
         )
         return True
+
+    def _delete_orphan_cue(self, cue_path: Optional[Path], reason: str = "") -> None:
+        """
+        Remove an orphan pre-split .cue AFTER a verified import, but only when
+        the source folder was kept (delete_source_folder_on_success off) --
+        otherwise _delete_source_folder already took the whole folder. Gated by
+        delete_cue_if_pre_split. Backlog #6: the .cue is never removed before a
+        confirmed success, so a failed/misclassified handoff keeps its cue.
+        """
+        if cue_path is None or not self.cfg.delete_cue_if_pre_split:
+            return
+        try:
+            if cue_path.exists():
+                cue_path.unlink()
+                logger.info(
+                    "Deleted orphan pre-split CUE %s (%s, after verified import)",
+                    cue_path.name, reason,
+                )
+        except OSError as exc:
+            logger.warning("Could not delete orphan CUE %s: %s", cue_path, exc)
 
     def _delete_originals(self, cue_path: Path, audio_path: Path) -> None:
         """
