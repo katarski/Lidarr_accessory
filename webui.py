@@ -71,6 +71,11 @@ _PAGE = r"""<!doctype html>
   main{padding:.5rem 1rem 3rem}
   table{border-collapse:collapse;width:100%}
   th,td{text-align:left;padding:.4rem .5rem;border-bottom:1px solid var(--bd);vertical-align:top}
+  tbody tr.mainrow td{transition:background .1s}
+  tbody tr.zebra td{background:rgba(255,255,255,.030)}
+  @media(prefers-color-scheme:light){tbody tr.zebra td{background:rgba(0,0,0,.028)}}
+  tbody tr.mainrow:hover td{background:rgba(124,58,237,.10)}
+  tbody tr.sel-on td{background:rgba(124,58,237,.20)!important}
   th{color:var(--mut);font-weight:600;font-size:.75rem;text-transform:uppercase;letter-spacing:.03em;cursor:pointer;white-space:nowrap}
   td.path{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:.72rem;color:var(--mut);max-width:360px;overflow-wrap:anywhere}
   .title{font-weight:600}
@@ -110,6 +115,7 @@ _PAGE = r"""<!doctype html>
   .procard{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:.6rem .8rem;display:flex;justify-content:space-between;gap:1rem;align-items:center}
   #bulkbar{position:sticky;top:0;z-index:6;display:flex;gap:.5rem;align-items:center;padding:.5rem 1rem;background:var(--chipOn);border-bottom:1px solid var(--acc)}
   #bulkbar #bulkn{font-weight:600;margin-right:.4rem}
+  #bulkbar select{font:inherit;background:var(--card);color:var(--fg);border:1px solid var(--bd);border-radius:7px;padding:.4rem .6rem}
   td.sel,th.sel{width:1.6rem;text-align:center;padding-left:.6rem}
 </style></head>
 <body>
@@ -145,9 +151,12 @@ _PAGE = r"""<!doctype html>
 
 <div id="bulkbar" style="display:none">
   <span id="bulkn">0 selected</span>
-  <button class="b-keep" onclick="bulkAct('keep')">Add to library (selected)</button>
-  <button class="b-move" onclick="bulkAct('move')">Overwrite (selected)</button>
-  <button class="b-disc" onclick="bulkAct('discard')">Discard (selected)</button>
+  <select id="bulkact" onchange="if(this.value){bulkAct(this.value);this.value='';}">
+    <option value="">Actions on selected rows…</option>
+    <option value="keep">Add to library</option>
+    <option value="move">Overwrite</option>
+    <option value="discard">Discard</option>
+  </select>
   <button class="b-copy" onclick="clearSel()">Clear selection</button>
 </div>
 <main>
@@ -323,7 +332,7 @@ function render(){
   var caret=function(k){return SORT.col===k?(SORT.dir>0?' ▲':' ▼'):'';};
   var head='<tr><th class="sel"><input type="checkbox" id="selall" '+(allSel?'checked':'')+' onclick="toggleAll(this.checked)"></th>'
     +cols.map(function(c){return '<th onclick="sortBy(\''+c.k+'\')">'+h(c.name)+caret(c.k)+'</th>';}).join('')+'<th>Actions</th></tr>';
-  var body=rows.map(function(x){
+  var body=rows.map(function(x,i){
     var tds=cols.map(function(c){return '<td data-col="'+c.k+'" data-val="'+h(cellText(c.k,x))+'">'+cell(c,x)+'</td>';}).join('');
     var sel='<td class="sel"><input type="checkbox" class="rowsel" data-id="'+x.id+'" '+(SEL.has(x.id)?'checked':'')+' onclick="toggleSel(\''+x.id+'\',this.checked)"></td>';
     var acts='<div class="acts" data-id="'+x.id+'">'
@@ -336,7 +345,8 @@ function render(){
     var det='<tr class="det" id="det-'+x.id+'" style="display:'+(op?'table-row':'none')+'"><td colspan="'+(cols.length+2)+'">'
       +'<div class="cmp"><div class="tcol"><h4>Held (download)</h4><div id="t-held-'+x.id+'" class="muted">…</div></div>'
       +'<div class="tcol"><h4>Library (existing)</h4><div id="t-lib-'+x.id+'" class="muted">…</div></div></div></td></tr>';
-    return '<tr>'+sel+tds+'<td>'+acts+'</td></tr>'+det;
+    var cls='mainrow'+(i%2?' zebra':'')+(SEL.has(x.id)?' sel-on':'');
+    return '<tr id="row-'+x.id+'" class="'+cls+'">'+sel+tds+'<td>'+acts+'</td></tr>'+det;
   }).join('');
   document.getElementById('attention').innerHTML=rows.length
     ? '<table>'+head+body+'</table>'
@@ -350,11 +360,12 @@ function render(){
     ? '<div class="prog">'+ACT.map(function(a){return '<div class="procard"><div><span class="badge b-out">'+h(a.stage)+'</span> <span class="title">'+h(a.name)+'</span>'+(a.detail?' <span class="muted">'+h(a.detail)+'</span>':'')+'</div><span class="muted">'+ago(a.started)+'</span></div>';}).join('')+'</div>'
     : '<div class="empty">No conversions running.</div>';
 }
-function toggleSel(id,on){if(on)SEL.add(id);else SEL.delete(id);updateBulkBar();
+function _rowHL(id,on){var r=document.getElementById('row-'+id);if(r)r.classList.toggle('sel-on',on);}
+function toggleSel(id,on){if(on)SEL.add(id);else SEL.delete(id);_rowHL(id,on);updateBulkBar();
   var sa=document.getElementById('selall');if(sa)sa.checked=VISIBLE.length>0&&VISIBLE.every(function(v){return SEL.has(v);});}
-function toggleAll(on){VISIBLE.forEach(function(v){if(on)SEL.add(v);else SEL.delete(v);});
+function toggleAll(on){VISIBLE.forEach(function(v){if(on)SEL.add(v);else SEL.delete(v);_rowHL(v,on);});
   document.querySelectorAll('.rowsel').forEach(function(cb){cb.checked=on;});updateBulkBar();}
-function clearSel(){SEL.clear();document.querySelectorAll('.rowsel').forEach(function(cb){cb.checked=false;});var sa=document.getElementById('selall');if(sa)sa.checked=false;updateBulkBar();}
+function clearSel(){VISIBLE.forEach(function(v){_rowHL(v,false);});SEL.clear();document.querySelectorAll('.rowsel').forEach(function(cb){cb.checked=false;});var sa=document.getElementById('selall');if(sa)sa.checked=false;updateBulkBar();}
 function updateBulkBar(){var n=VISIBLE.filter(function(v){return SEL.has(v);}).length;
   document.getElementById('bulkbar').style.display=(n>0&&TAB==='attention')?'flex':'none';
   document.getElementById('bulkn').textContent=n+' selected';}
