@@ -415,7 +415,7 @@ function legacyCopy(p){
 }
 function copyPath(id){var el=document.getElementById('p-'+id);var p=el?el.textContent:(HELD.find(function(x){return x.id===id;})||{}).source_path;copyText(p);}
 function act(id,kind){
-  var msg=kind==='discard'?'DISCARD: throw the held download away — delete its torrent AND containing folder — and keep the library as-is. Continue?'
+  var msg=kind==='discard'?'DISCARD: delete this album\'s folder and deselect it in the torrent (keeping the rest of a discography). If it\'s the only album left, the whole torrent + folder are removed. Library kept as-is. Continue?'
     :kind==='move'?'OVERWRITE: copy the held tracks into the library, replacing colliding files, rescan Lidarr, then delete the source torrent + folder. Continue?'
     :'ADD TO LIBRARY: copy the held tracks into the library (keeping existing files, adding the rest), rescan Lidarr, then delete the source torrent + folder. Continue?';
   if(!confirm(msg))return;

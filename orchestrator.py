@@ -7453,6 +7453,62 @@ class Orchestrator:
             logger.debug("WebUI: torrent removal skipped: %s", exc)
         return ""
 
+    def _discard_torrent_for_folder(self, folder: Path) -> str:
+        """
+        Torrent cleanup for a DISCARD:
+          * single-album torrent (maps exactly to this folder) -> remove it + data;
+          * album inside a bigger (discography) torrent -> DESELECT just this
+            album's files (so qBit won't re-download them) and leave the torrent
+            for its other albums -- UNLESS this was the last wanted album (no
+            other selected audio remains), in which case remove the whole torrent
+            + discography.
+        Returns a short message suffix.
+        """
+        q = self._get_qbt()
+        if q is None:
+            return ""
+        try:
+            fr = str(folder.resolve(strict=False)).replace("\\", "/").rstrip("/")
+            wr = str((self.cfg.watch_root or Path("/")).resolve(strict=False)).replace("\\", "/").rstrip("/")
+            seg = "/" + os.path.basename(fr).replace("\\", "/") + "/"  # this album's folder segment
+            for t in q.torrents():
+                cp = str(t.get("content_path") or "").replace("\\", "/").rstrip("/")
+                sp = str(t.get("save_path") or "").replace("\\", "/").rstrip("/")
+                name = os.path.basename(cp) if cp else (t.get("name") or "")
+                mapped = f"{wr}/{name}" if name else ""
+                exact = bool(cp) and (cp == fr or mapped == fr) and cp != sp
+                contains = bool(cp) and (fr.startswith(cp + "/") or fr.startswith(mapped + "/"))
+                if exact:
+                    if q.remove(t.get("hash"), delete_files=True):
+                        return " and removed the source torrent"
+                    return ""
+                if contains:
+                    files = q.files(t.get("hash")) or []
+                    desel: List[int] = []
+                    other_audio = 0
+                    for f in files:
+                        fn = "/" + str(f.get("name") or "").replace("\\", "/")
+                        idx = f.get("index")
+                        if seg in fn:                       # belongs to this album
+                            if idx is not None:
+                                desel.append(int(idx))
+                        elif (os.path.splitext(fn)[1].lower() in _ALL_AUDIO_EXTS
+                              and int(f.get("priority", 1)) != 0):
+                            other_audio += 1               # another still-wanted album
+                    if other_audio == 0:
+                        # last wanted album -> drop the whole discography torrent.
+                        if q.remove(t.get("hash"), delete_files=True):
+                            return " and removed the discography torrent (no other wanted albums left)"
+                        return ""
+                    # Keep the torrent; just stop this album from downloading.
+                    if desel:
+                        q.set_file_priority(t.get("hash"), desel, 0)
+                    return (f" (deselected this album in the torrent; "
+                            f"{other_audio} other album track(s) kept)")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("WebUI: discard torrent cleanup skipped: %s", exc)
+        return ""
+
     def _resolve_library_target(self, entry: Dict[str, Any]):
         """(target_folder, lidarr_artist_or_None) for a held item's album -- the
         EXISTING library folder when present, else <artist path|library_root>/
@@ -7554,8 +7610,10 @@ class Orchestrator:
         folder = Path(entry.get("source_path", ""))
         tmsg = ""
         if entry.get("source_path"):
-            # Discard = throw it away: remove the containing torrent + its folder.
-            tmsg = self._remove_torrent_for_folder(folder, aggressive=True)
+            # Discard: for a single-album torrent remove it wholesale; for one
+            # album inside a discography, deselect just that album (keep the rest)
+            # unless it's the last wanted one, then drop the whole torrent.
+            tmsg = self._discard_torrent_for_folder(folder)
             if folder.exists():
                 self._delete_folder_under_watch(folder)
         suffix = self._resolve_unmonitor(entry)
