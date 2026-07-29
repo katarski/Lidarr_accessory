@@ -113,9 +113,9 @@ _PAGE = r"""<!doctype html>
   .spin{color:var(--mut);font-size:.8rem}
   .prog{display:flex;flex-direction:column;gap:.5rem}
   .procard{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:.6rem .8rem;display:flex;justify-content:space-between;gap:1rem;align-items:center}
-  #bulkbar{position:sticky;top:0;z-index:6;display:flex;gap:.5rem;align-items:center;padding:.5rem 1rem;background:var(--chipOn);border-bottom:1px solid var(--acc)}
-  #bulkbar #bulkn{font-weight:600;margin-right:.4rem}
-  #bulkbar select{font:inherit;background:var(--card);color:var(--fg);border:1px solid var(--bd);border-radius:7px;padding:.4rem .6rem}
+  #bulkn{font-weight:600}
+  .toolbar select{font:inherit;background:var(--card);color:var(--fg);border:1px solid var(--bd);border-radius:7px;padding:.35rem .55rem}
+  .cols button{font-size:1rem;line-height:1;padding:.35rem .55rem}
   td.sel,th.sel{width:1.6rem;text-align:center;padding-left:.6rem}
 </style></head>
 <body>
@@ -143,21 +143,18 @@ _PAGE = r"""<!doctype html>
   <span id="outchips"></span>
   <div id="vfilters"></div>
   <div class="grow"></div>
-  <div class="cols">
-    <button class="b-copy" onclick="document.getElementById('cm').classList.toggle('on')">Columns ▾</button>
-    <div class="colmenu" id="cm"></div>
-  </div>
-</div>
-
-<div id="bulkbar" style="display:none">
-  <span id="bulkn">0 selected</span>
+  <span id="bulkn" class="muted">0 selected</span>
   <select id="bulkact" onchange="if(this.value){bulkAct(this.value);this.value='';}">
     <option value="">Actions on selected rows…</option>
     <option value="keep">Add to library</option>
     <option value="move">Overwrite</option>
     <option value="discard">Discard</option>
   </select>
-  <button class="b-copy" onclick="clearSel()">Clear selection</button>
+  <button class="b-copy" onclick="clearSel()" title="Clear selection">✕</button>
+  <div class="cols">
+    <button class="b-copy" title="Columns" aria-label="Columns" onclick="document.getElementById('cm').classList.toggle('on')">⚙</button>
+    <div class="colmenu" id="cm"></div>
+  </div>
 </div>
 <main>
   <div id="attention"></div>
@@ -367,11 +364,10 @@ function toggleAll(on){VISIBLE.forEach(function(v){if(on)SEL.add(v);else SEL.del
   document.querySelectorAll('.rowsel').forEach(function(cb){cb.checked=on;});updateBulkBar();}
 function clearSel(){VISIBLE.forEach(function(v){_rowHL(v,false);});SEL.clear();document.querySelectorAll('.rowsel').forEach(function(cb){cb.checked=false;});var sa=document.getElementById('selall');if(sa)sa.checked=false;updateBulkBar();}
 function updateBulkBar(){var n=VISIBLE.filter(function(v){return SEL.has(v);}).length;
-  document.getElementById('bulkbar').style.display=(n>0&&TAB==='attention')?'flex':'none';
   document.getElementById('bulkn').textContent=n+' selected';}
 function bulkAct(kind){
   var ids=VISIBLE.filter(function(v){return SEL.has(v);});
-  if(!ids.length)return;
+  if(!ids.length){toast('Select one or more rows first (checkboxes on the left)');return;}
   var verb=kind==='discard'?'DISCARD (delete torrent + folder, keep library)':kind==='move'?'OVERWRITE library files with the held tracks':'ADD the held tracks to the library (keeping existing)';
   if(!confirm('This will '+verb+' for '+ids.length+' selected item(s). Continue?'))return;
   toast('Working on '+ids.length+'…');
