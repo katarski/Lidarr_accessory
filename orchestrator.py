@@ -7453,6 +7453,26 @@ class Orchestrator:
             logger.debug("WebUI: torrent removal skipped: %s", exc)
         return ""
 
+    def _reap_torrent(self, thash: str, blocklist: bool = True) -> bool:
+        """
+        Remove a torrent. When blocklist=True, prefer removing it via Lidarr's
+        queue with blocklist=on -- so Lidarr won't re-grab this exact (bad)
+        release and instead searches for a DIFFERENT one -- falling back to a
+        plain qBit removal if there's no matching queue row.
+        """
+        if blocklist and thash:
+            try:
+                for r in (self.lidarr.queue_list() or []):
+                    if (str(r.get("downloadId") or "").lower() == str(thash).lower()
+                            and r.get("id") is not None):
+                        if self.lidarr.queue_remove(
+                                r["id"], remove_from_client=True, blocklist=True):
+                            return True
+            except Exception:  # noqa: BLE001
+                pass
+        q = self._get_qbt()
+        return bool(q and q.remove(thash, delete_files=True))
+
     def _discard_torrent_for_folder(self, folder: Path) -> str:
         """
         Torrent cleanup for a DISCARD:
@@ -7479,8 +7499,8 @@ class Orchestrator:
                 exact = bool(cp) and (cp == fr or mapped == fr) and cp != sp
                 contains = bool(cp) and (fr.startswith(cp + "/") or fr.startswith(mapped + "/"))
                 if exact:
-                    if q.remove(t.get("hash"), delete_files=True):
-                        return " and removed the source torrent"
+                    if self._reap_torrent(t.get("hash"), blocklist=True):
+                        return " and removed + blocklisted the torrent (Lidarr will try a different release)"
                     return ""
                 if contains:
                     files = q.files(t.get("hash")) or []
@@ -7496,9 +7516,10 @@ class Orchestrator:
                               and int(f.get("priority", 1)) != 0):
                             other_audio += 1               # another still-wanted album
                     if other_audio == 0:
-                        # last wanted album -> drop the whole discography torrent.
-                        if q.remove(t.get("hash"), delete_files=True):
-                            return " and removed the discography torrent (no other wanted albums left)"
+                        # last wanted album -> drop + blocklist the whole
+                        # discography torrent (Lidarr will re-search differently).
+                        if self._reap_torrent(t.get("hash"), blocklist=True):
+                            return " and removed + blocklisted the discography torrent (no other wanted albums left)"
                         return ""
                     # Keep the torrent; just stop this album from downloading.
                     if desel:
@@ -7533,6 +7554,44 @@ class Orchestrator:
         base = Path(art["path"]) if (art and art.get("path")) \
             else self.cfg.library_root_windows / (_sanitize_fs(artist_name) or "Unknown Artist")
         return base / (_sanitize_fs(album_name) or _sanitize_fs(folder.name) or "Unknown Album"), art
+
+    def _force_import_library_folder(self, target: Path, art) -> bool:
+        """
+        WebUI Add/Overwrite: force Lidarr to import the audio now sitting in
+        `target`, OVERRIDING its track-match-quality threshold. Lidarr matches a
+        file's embedded tags (title / length / MusicBrainz recording id) against
+        the release, so old or foreign-tagged rips score low ("15.6% vs 60%")
+        and are refused even when they're the right tracks. We pair the files to
+        the matched album's tracks by position and ManualImport them. Returns
+        True if a ManualImport was submitted (else caller falls back to a scan).
+        """
+        try:
+            cands = [c for c in (self.lidarr.manual_import_candidates(str(target)) or [])
+                     if c.get("path")]
+        except Exception:  # noqa: BLE001
+            cands = []
+        if not cands:
+            return False
+        from collections import Counter
+        cnt = Counter((c.get("album") or {}).get("id") for c in cands
+                      if (c.get("album") or {}).get("id"))
+        if not cnt:
+            return False
+        album_id = cnt.most_common(1)[0][0]
+        cands = [c for c in cands if (c.get("album") or {}).get("id") == album_id]
+        full = self.lidarr.get_album(album_id) or {}
+        rels = [r for r in (full.get("releases") or []) if r.get("monitored")] \
+            or (full.get("releases") or [])
+        if not rels:
+            return False
+        release_id = rels[0].get("id")
+        artist_id = ((art or {}).get("id") or full.get("artistId")
+                     or ((full.get("artist") or {}).get("id")))
+        tracks = self.lidarr.list_tracks_for_album(album_id) or []
+        if artist_id and release_id and tracks and len(cands) == len(tracks):
+            return self.lidarr.manual_import_positional(
+                cands, tracks, album_id, release_id, artist_id) is not None
+        return False
 
     def _apply_to_library(self, entry: Dict[str, Any], overwrite: bool) -> Tuple[bool, str]:
         """
@@ -7570,25 +7629,30 @@ class Orchestrator:
                 logger.warning("WebUI resolve: copy %s -> %s failed: %s", a, dst, exc)
         if copied == 0 and skipped == 0:
             return (False, "copied 0 files (permission/path error) -- left in place")
-        # Immediate Lidarr scan so the album matches/appears right away.
+        # Immediate Lidarr import/scan so the album matches/populates right away.
+        # IMPORTANT: do NOT unmonitor here -- Lidarr will not import files into an
+        # unmonitored album, so unmonitoring would leave it 0/N ("not populated").
+        # A fully-imported album is complete, so it won't be re-searched anyway.
         try:
-            self.lidarr.downloaded_albums_scan_rescan(str(target))
+            # Force-import (override the match-quality threshold) when the files
+            # cleanly map to one album's tracks; else fall back to a plain scan.
+            forced = self._force_import_library_folder(target, art)
+            if not forced:
+                self.lidarr.downloaded_albums_scan_rescan(str(target))
             if art:
-                self.lidarr.rescan_artist(art["id"])
                 self.lidarr.refresh_artist(art["id"])
             self.lidarr.process_monitored_downloads()
         except Exception as exc:  # noqa: BLE001
-            logger.warning("WebUI resolve: Lidarr rescan hiccup: %s", exc)
-        suffix = self._resolve_unmonitor(entry)
+            logger.warning("WebUI resolve: Lidarr import hiccup: %s", exc)
         # Delete the source torrent (safe: only a single-folder torrent) + folder.
         tmsg = self._remove_torrent_for_folder(folder)
         self._delete_folder_under_watch(folder)
         verb = "Overwrote" if overwrite else "Added"
-        logger.info("WebUI resolve (%s): %d copied / %d skipped -> %s%s%s",
-                    verb.lower(), copied, skipped, target, suffix, tmsg)
+        logger.info("WebUI resolve (%s): %d copied / %d skipped -> %s%s",
+                    verb.lower(), copied, skipped, target, tmsg)
         extra = f", skipped {skipped} already present" if skipped else ""
         return (True, f"{verb} {copied} track(s) into {target.name}{extra}; "
-                      f"Lidarr rescanned{suffix}{tmsg}")
+                      f"Lidarr rescanning to populate the album{tmsg}")
 
     def keep_existing(self, entry: Dict[str, Any]) -> Tuple[bool, str]:
         """WebUI 'Add to library': copy the held music in WITHOUT overwriting
@@ -7616,10 +7680,13 @@ class Orchestrator:
             tmsg = self._discard_torrent_for_folder(folder)
             if folder.exists():
                 self._delete_folder_under_watch(folder)
-        suffix = self._resolve_unmonitor(entry)
-        logger.info("WebUI discard: dropped held download %s%s%s",
-                    folder.name, suffix, tmsg)
-        return (True, f"Discarded held download ({folder.name}){suffix}{tmsg}")
+        # Do NOT unmonitor: a discard means "this copy is wrong" -- the album
+        # stays monitored so Lidarr will try to fetch a better one in the future
+        # (the removed release is blocklisted above so it grabs a different one).
+        logger.info("WebUI discard: dropped held download %s%s (kept monitored)",
+                    folder.name, tmsg)
+        return (True, f"Discarded ({folder.name}){tmsg}; kept monitored so Lidarr "
+                      f"will try again")
 
     def _cleanup_empty(self, staging_dir: Path) -> None:
         try:
