@@ -24,7 +24,7 @@ import time
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -690,6 +690,135 @@ class LidarrClient:
         except Exception as exc:
             logger.warning("list_albums_for_artist(%s) failed: %s", artist_id, exc)
             return []
+
+    def list_all_albums(self) -> List[Dict[str, Any]]:
+        """
+        Return EVERY album Lidarr knows, across all artists, each with its
+        `statistics` (trackFileCount/totalTrackCount) and `artist` record.
+        Used by the reconcile pass to derive Lidarr's own live list of
+        monitored-but-incomplete albums (the authoritative "still missing"
+        set) without per-artist round trips.
+        """
+        try:
+            return self._get("/api/v1/album") or []
+        except Exception as exc:
+            logger.warning("list_all_albums failed: %s", exc)
+            return []
+
+    def manual_import_folder(
+        self,
+        folder_path: str,
+        allowed_album_ids: Optional[set] = None,
+        import_mode: str = "copy",
+        album_track_totals: Optional[Dict[int, int]] = None,
+        require_full_album: bool = True,
+    ) -> Tuple[Optional[int], int, List[str]]:
+        """
+        Let Lidarr's OWN manual-import matcher decide what in `folder_path`
+        belongs to a library album, then import every file it accepts with
+        ZERO rejections. This is the authority-driven counterpart to the
+        pipeline's title-heuristic handoff: it merges albums the heuristic
+        skips or mis-titles (e.g. a parenthetical "(Original Music from the
+        Film)") as long as Lidarr itself matches them cleanly.
+
+        `allowed_album_ids`, when given, restricts imports to those album ids
+        (the reconcile pass passes Lidarr's monitored-incomplete set, so a
+        folder can only ever FILL A GAP, never touch a complete album).
+
+        ACCURACY -- track-level, source vs destination (NOT just the folder):
+        matching is per FILE -> per TRACK (Lidarr assigns each file a specific
+        track and lists a `rejection` when it doesn't fit; we drop any file
+        with a rejection). On top of that, when `require_full_album` is set
+        (the default) and `album_track_totals` gives the destination album's
+        real track count, an album is imported ONLY when the source cleanly
+        supplies EVERY track (distinct matched tracks == the album's total).
+        This is the source↔destination track comparison: a folder that maps to
+        the wrong album, or only partially overlaps one, provides fewer
+        distinct tracks than the album has and is refused rather than polluting
+        the library with a mismatched subset.
+
+        `import_mode` is "copy" (default, leaves the download in place) or
+        "move". Returns (command_id, files_imported, [album titles]).
+        """
+        cands = self.manual_import_candidates(folder_path)
+        # Group cleanly-matched files by destination album so we can compare
+        # each album's source tracks against its destination track count.
+        by_album: Dict[int, Dict[str, Any]] = {}
+        for c in cands:
+            if c.get("rejections"):
+                continue
+            album = c.get("album") or {}
+            album_id = album.get("id")
+            artist_id = album.get("artistId") or (c.get("artist") or {}).get("id")
+            release_id = c.get("albumReleaseId")
+            track_ids = [t["id"] for t in (c.get("tracks") or []) if t.get("id")]
+            path = c.get("path")
+            if not all([path, artist_id, album_id, release_id, track_ids]):
+                continue
+            if allowed_album_ids is not None and album_id not in allowed_album_ids:
+                continue
+            grp = by_album.setdefault(album_id, {
+                "title": album.get("title"), "files": [], "tracks": set(),
+            })
+            grp["files"].append({
+                "path": path,
+                "artistId": artist_id,
+                "albumId": album_id,
+                "albumReleaseId": release_id,
+                "trackIds": track_ids,
+                "quality": c.get("quality"),
+                "indexerFlags": c.get("indexerFlags", 0),
+                "disableReleaseSwitching": False,
+                "additionalFile": False,
+                "replaceExistingFiles": False,
+            })
+            grp["tracks"].update(track_ids)
+
+        files: List[Dict[str, Any]] = []
+        titles: List[str] = []
+        totals = album_track_totals or {}
+        for album_id, grp in by_album.items():
+            n_src = len(grp["tracks"])          # distinct source tracks matched
+            total = int(totals.get(album_id) or 0)  # destination album tracks
+            if require_full_album and total > 0 and n_src != total:
+                logger.info(
+                    "reconcile: %r matches %d/%d tracks of album %r -- not a "
+                    "complete album, refusing (accuracy). Source folder: %s",
+                    grp["title"], n_src, total, grp["title"], folder_path,
+                )
+                continue
+            files.extend(grp["files"])
+            if grp["title"] and grp["title"] not in titles:
+                titles.append(grp["title"])
+        if not files:
+            return (None, 0, [])
+        payload = {
+            "name": "ManualImport",
+            "files": files,
+            "importMode": import_mode,
+            "replaceExistingFiles": False,
+        }
+        try:
+            resp = self._post("/api/v1/command", payload)
+            cmd_id = resp.get("id") if isinstance(resp, dict) else None
+            logger.info(
+                "reconcile ManualImport id=%s: %d file(s) -> %s (mode=%s) from %s",
+                cmd_id, len(files), ", ".join(titles), import_mode, folder_path,
+            )
+            return (cmd_id, len(files), titles)
+        except Exception as exc:
+            body = ""
+            resp_obj = getattr(exc, "response", None)
+            if resp_obj is not None:
+                try:
+                    body = resp_obj.text[:500]
+                except Exception:
+                    body = "(body unreadable)"
+            logger.error(
+                "reconcile ManualImport failed for %s: %s | body=%s",
+                folder_path, exc, body,
+            )
+            return (None, 0, [])
 
     def find_album(
         self, artist_id: int, album_title: str

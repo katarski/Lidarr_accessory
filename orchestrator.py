@@ -540,6 +540,43 @@ class OrchestratorConfig:
     # re-searched every pass. Default 12h.
     interactive_search_cooldown_seconds: int = 43200
 
+    # --- Reconcile pass: fill monitored gaps left on disk ------------------
+    # A catch-all safety net so a downloaded album can NEVER stay stranded on
+    # disk while Lidarr still shows it missing. Every pass: ask Lidarr for its
+    # OWN list of monitored, incomplete albums (any artist), walk the download
+    # tree, and for any folder whose files Lidarr's OWN manual-import matcher
+    # accepts with ZERO rejections into one of those gap albums, import them.
+    # Lidarr is the authority -- not the pipeline's title heuristics -- so an
+    # album the cueless sweep skipped or mis-titled (e.g. a parenthetical
+    # "(Original Music from the Film)", a self-titled record, an edition tag)
+    # is still merged. Because it's driven by Lidarr's LIVE gap list and keeps
+    # no negative "seen" state, it re-checks every pass: nothing gets
+    # permanently skipped.
+    reconcile_enabled: bool = True
+    # How often the reconcile pass runs (seconds). Minimum 300.
+    reconcile_interval_seconds: int = 1800
+    # ManualImport mode: "copy" leaves the download in place (safe default so a
+    # still-seeding torrent isn't disturbed); "move" removes source as imported.
+    reconcile_import_mode: str = "copy"
+    # ACCURACY GUARD (track-level source vs destination): only import a folder
+    # into an album when the source cleanly supplies EVERY track of that album
+    # (distinct matched tracks == the album's total track count). Refuses a
+    # folder that maps to the wrong album or only partially overlaps one, so a
+    # mismatched subset can't pollute the library. Set False to also allow
+    # partial fills (import whatever cleanly matches).
+    reconcile_require_full_album: bool = True
+    # Safety cap on the number of files imported in a single pass.
+    reconcile_max_files_per_pass: int = 500
+    # Cap how many folders are PROBED (one Lidarr manual-import call each, which
+    # makes Lidarr re-parse the folder's tags -- the expensive part) per pass,
+    # so a huge first-run backlog is spread over several passes instead of
+    # hammering Lidarr at once. Remaining folders roll to the next pass.
+    reconcile_max_probes_per_pass: int = 60
+    # A folder that yielded nothing importable is not re-probed until it changes
+    # on disk OR this many seconds pass (self-healing: a newly-monitored album
+    # gets re-checked without a restart). Default 6h.
+    reconcile_recheck_seconds: int = 21600
+
 
 class Orchestrator:
     def __init__(
@@ -3452,6 +3489,180 @@ class Orchestrator:
                     "Could not write extracted cue for %s: %s", af, exc
                 )
         return written
+
+    def reconcile_monitored_gaps(
+        self,
+        watch_root: Path,
+        excluded: Optional[List[Path]] = None,
+    ) -> int:
+        """
+        Catch-all safety net (see OrchestratorConfig.reconcile_enabled): import
+        any downloaded album that Lidarr still lists as a MONITORED gap, no
+        matter why the normal flow left it behind (title mis-parse, a prior
+        "no monitored album" skip, an interrupted handoff, a torrent the user
+        deleted).
+
+        Ask Lidarr for its OWN monitored+incomplete album set (authoritative),
+        then walk the download tree and, for every folder that belongs to an
+        artist with a gap, let Lidarr's OWN manual-import matcher decide what
+        to import -- merging cleanly-matched (zero-rejection) files into the
+        gap album via ManualImport. No pipeline title heuristics and no
+        negative "seen" state, so a monitored album sitting in downloads can
+        never be permanently stranded: each pass re-derives the live gap list.
+
+        Returns the number of files imported this pass.
+        """
+        if not watch_root or not Path(watch_root).exists():
+            return 0
+        try:
+            albums = self.lidarr.list_all_albums()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("reconcile: Lidarr album list failed: %s", exc)
+            return 0
+        gap_ids: set = set()
+        gap_totals: Dict[int, int] = {}
+        gap_artist_keys: set = set()
+        for a in albums:
+            if not a.get("monitored"):
+                continue
+            st = a.get("statistics") or {}
+            total = int(st.get("totalTrackCount") or 0)
+            have = int(st.get("trackFileCount") or 0)
+            if total > 0 and have < total:
+                aid = a.get("id")
+                if aid is not None:
+                    gap_ids.add(aid)
+                    gap_totals[aid] = total
+                an = ((a.get("artist") or {}).get("artistName")) or ""
+                key = _match_key(an)
+                if key:
+                    gap_artist_keys.add(key)
+        if not gap_ids:
+            logger.debug("reconcile: no monitored gaps in Lidarr -- nothing to do")
+            return 0
+        logger.info(
+            "reconcile: %d monitored gap album(s) across %d artist(s); scanning %s",
+            len(gap_ids), len(gap_artist_keys), watch_root,
+        )
+
+        excluded_resolved: List[Path] = []
+        for ex in (excluded or []):
+            try:
+                excluded_resolved.append(Path(ex).resolve(strict=False))
+            except OSError:
+                continue
+
+        def _is_excluded(folder_r: Path) -> bool:
+            for ex in excluded_resolved:
+                if folder_r == ex or ex in folder_r.parents:
+                    return True
+            return False
+
+        min_stable = max(0, int(self.cfg.sweep_min_stable_seconds))
+        max_files = max(1, int(getattr(self.cfg, "reconcile_max_files_per_pass", 500)))
+        max_probes = max(1, int(getattr(self.cfg, "reconcile_max_probes_per_pass", 60)))
+        recheck = max(300, int(getattr(self.cfg, "reconcile_recheck_seconds", 21600)))
+        require_full = bool(getattr(self.cfg, "reconcile_require_full_album", True))
+        import_mode = getattr(self.cfg, "reconcile_import_mode", "copy") or "copy"
+        now_ts = time.time()
+        imported = 0
+        probes = 0
+        # Per-folder negative cache {path: (mtime, last_probe_ts)}: a folder that
+        # yielded nothing importable is not re-probed until its audio changes on
+        # disk or `recheck` seconds pass. This keeps the steady state cheap (the
+        # expensive Lidarr tag-parse happens once per folder) while staying
+        # self-healing -- so this scales to a whole library of any genre, not
+        # just one artist. Lives on the Orchestrator, surviving across passes.
+        cache = getattr(self, "_reconcile_cache", None)
+        if cache is None:
+            cache = {}
+            try:
+                self._reconcile_cache = cache
+            except Exception:  # noqa: BLE001 (stand-in self in tests)
+                pass
+
+        try:
+            walker = os.walk(watch_root, topdown=True, followlinks=False)
+        except OSError as exc:
+            logger.warning("reconcile: cannot walk %s: %s", watch_root, exc)
+            return 0
+
+        for dirpath, dirnames, filenames in walker:
+            if imported >= max_files:
+                logger.info("reconcile: per-pass file cap (%d) reached; stopping",
+                            max_files)
+                break
+            if probes >= max_probes:
+                logger.info("reconcile: per-pass probe cap (%d) reached; rest "
+                            "roll to next pass", max_probes)
+                break
+            folder = Path(dirpath)
+            try:
+                folder_r = folder.resolve(strict=False)
+            except OSError:
+                folder_r = folder
+            if _is_excluded(folder_r):
+                dirnames[:] = []
+                continue
+            # Only spend a Lidarr manual-import call on folders that plausibly
+            # belong to an artist that HAS a gap -- a folder-path match on the
+            # (normalized) artist name. Artist names are stable in download
+            # paths (unlike album titles, which is exactly what mis-parses),
+            # so this can only skip folders for artists Lidarr already has in
+            # full, never a real gap for a present artist. A loose false match
+            # just costs one harmless read; the allowed_album_ids gate still
+            # confines any import to a genuine gap album.
+            path_key = _match_key(str(folder))
+            if not any(k in path_key for k in gap_artist_keys):
+                continue
+            # Folder must directly hold audio (a leaf album dir).
+            audios = [
+                folder / fn for fn in filenames
+                if os.path.splitext(fn)[1].lower() in _ALL_AUDIO_EXTS
+            ]
+            if not audios:
+                continue
+            # Stability guard: don't grab an in-progress download.
+            try:
+                mtime = max(a.stat().st_mtime for a in audios)
+            except OSError:
+                continue
+            if min_stable and (now_ts - mtime) < min_stable:
+                continue
+            # Negative-cache skip: unchanged folder probed recently -> skip.
+            key = str(folder)
+            prev = cache.get(key)
+            if prev and prev[0] == mtime and (now_ts - prev[1]) < recheck:
+                continue
+            probes += 1
+            try:
+                _cmd, n, titles = self.lidarr.manual_import_folder(
+                    str(folder),
+                    allowed_album_ids=gap_ids,
+                    import_mode=import_mode,
+                    album_track_totals=gap_totals,
+                    require_full_album=require_full,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("reconcile: import failed for %s: %s", folder, exc)
+                continue
+            if n:
+                imported += n
+                # Imported: drop any cache entry so a follow-up pass re-checks
+                # (e.g. a multi-disc folder that fills more of the album later).
+                cache.pop(key, None)
+                logger.info(
+                    "reconcile: imported %d file(s) into %s from %r",
+                    n, ", ".join(titles) or "?", folder.name,
+                )
+            else:
+                cache[key] = (mtime, now_ts)
+        if imported:
+            logger.info("reconcile: imported %d file(s) this pass "
+                        "(%d folder(s) probed)", imported, probes)
+        elif probes:
+            logger.info("reconcile: nothing to import (%d folder(s) probed)", probes)
+        return imported
 
     def sweep_cueless_pre_split_folders(
         self,
@@ -7394,6 +7605,12 @@ class Orchestrator:
          "Seconds between interactive-search passes (min 300)."),
         ("lidarr.interactive_search_require_lossless", "lidarr", "interactive_search_require_lossless", "Prefer lossless", "bool", True,
          "Prefer lossless; grab lossy only when no lossless release exists."),
+        ("lidarr.reconcile_enabled", "lidarr", "reconcile_enabled", "Reconcile monitored gaps", "bool", True,
+         "Catch-all: import any downloaded album Lidarr still shows missing, using Lidarr's own matcher. Prevents albums stranding on disk."),
+        ("lidarr.reconcile_interval_seconds", "lidarr", "reconcile_interval_seconds", "Reconcile interval (s)", "int", 1800,
+         "Seconds between reconcile passes (min 300)."),
+        ("lidarr.reconcile_require_full_album", "lidarr", "reconcile_require_full_album", "Reconcile: full album only", "bool", True,
+         "Only import when the source supplies EVERY track of the album (track-level source vs destination match). Off = allow partial fills."),
         ("lidarr.prefer_multichannel", "lidarr", "prefer_multichannel", "Prefer multichannel", "bool", True,
          "In conversions, keep the multichannel version and discard stereo."),
         ("qbittorrent.deselect_video", "qbittorrent", "deselect_video", "Deselect video", "bool", True,

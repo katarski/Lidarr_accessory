@@ -122,6 +122,14 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     put("lidarr", "interactive_search_min_title_ratio", "ISEARCH_MIN_TITLE_RATIO", float)
     put("lidarr", "interactive_search_max_albums_per_pass", "ISEARCH_MAX_ALBUMS", int)
     put("lidarr", "interactive_search_artist_level", "ISEARCH_ARTIST_LEVEL", _as_bool)
+    # Reconcile pass -- import monitored gaps still sitting in downloads.
+    put("lidarr", "reconcile_enabled", "RECONCILE_ENABLED", _as_bool)
+    put("lidarr", "reconcile_interval_seconds", "RECONCILE_INTERVAL", int)
+    put("lidarr", "reconcile_import_mode", "RECONCILE_IMPORT_MODE")
+    put("lidarr", "reconcile_require_full_album", "RECONCILE_REQUIRE_FULL_ALBUM", _as_bool)
+    put("lidarr", "reconcile_max_files_per_pass", "RECONCILE_MAX_FILES", int)
+    put("lidarr", "reconcile_max_probes_per_pass", "RECONCILE_MAX_PROBES", int)
+    put("lidarr", "reconcile_recheck_seconds", "RECONCILE_RECHECK", int)
     # Purge-imported sweep -- continuously delete download folders whose album
     # Lidarr already has fully (catches re-downloads the pipeline skipped).
     put("lidarr", "purge_imported_enabled", "PURGE_IMPORTED_ENABLED", _as_bool)
@@ -480,6 +488,32 @@ def interactive_search_loop(
             orch.interactive_search_pass(qbt)
         except Exception as exc:  # noqa: BLE001
             logger.exception("interactive search thread: %s", exc)
+        delay = cadence
+
+
+def reconcile_loop(
+    orch: Orchestrator,
+    watch_root: Path,
+    excluded: list,
+    stop: threading.Event,
+    interval: int,
+) -> None:
+    """
+    Periodically reconcile downloads against Lidarr's live monitored-gap list
+    (Orchestrator.reconcile_monitored_gaps): import any downloaded album that
+    Lidarr still shows as missing, via Lidarr's own manual-import matcher. This
+    is the catch-all that guarantees a monitored album sitting in the download
+    tree is never left un-merged -- regardless of a title mis-parse, an earlier
+    "no monitored album" skip, or a deleted torrent. Minimum cadence 300s; the
+    first pass is staggered one cadence out so startup stays light.
+    """
+    cadence = max(300, interval)
+    delay = cadence
+    while not stop.wait(delay):
+        try:
+            orch.reconcile_monitored_gaps(watch_root, excluded)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("reconcile thread: %s", exc)
         delay = cadence
 
 
@@ -1046,6 +1080,25 @@ def main() -> int:
             lidarr_cfg.get("interactive_search_cooldown_seconds", 43200)
         ),
         interactive_search_state_file=isearch_state_path,
+        reconcile_enabled=bool(lidarr_cfg.get("reconcile_enabled", True)),
+        reconcile_interval_seconds=int(
+            lidarr_cfg.get("reconcile_interval_seconds", 1800)
+        ),
+        reconcile_import_mode=str(
+            lidarr_cfg.get("reconcile_import_mode", "copy")
+        ).lower(),
+        reconcile_require_full_album=bool(
+            lidarr_cfg.get("reconcile_require_full_album", True)
+        ),
+        reconcile_max_files_per_pass=int(
+            lidarr_cfg.get("reconcile_max_files_per_pass", 500)
+        ),
+        reconcile_max_probes_per_pass=int(
+            lidarr_cfg.get("reconcile_max_probes_per_pass", 60)
+        ),
+        reconcile_recheck_seconds=int(
+            lidarr_cfg.get("reconcile_recheck_seconds", 21600)
+        ),
     )
 
     orch = Orchestrator(orch_cfg, lidarr, ollama_client, acoustid=acoustid_client,
@@ -1174,6 +1227,29 @@ def main() -> int:
                 "Cueless sweep: periodic thread started (interval=%ds)",
                 orch_cfg.sweep_interval_seconds,
             )
+
+    # --- Reconcile: import monitored gaps still sitting in downloads ---
+    # Catch-all safety net so a downloaded album can never stay un-merged
+    # while Lidarr shows it missing (title mis-parse, prior skip, deleted
+    # torrent). Driven by Lidarr's own gap list + manual-import matcher, so
+    # it re-checks every pass and needs no per-artist configuration.
+    if orch_cfg.reconcile_enabled:
+        reconcile_thread = threading.Thread(
+            target=reconcile_loop,
+            args=(orch, watch_root, excluded_dirs, stop,
+                  orch_cfg.reconcile_interval_seconds),
+            daemon=True,
+            name="cue-reconcile",
+        )
+        reconcile_thread.start()
+        logger.info(
+            "Reconcile: enabled (every %ds, import_mode=%s, max_files/pass=%d)",
+            max(300, orch_cfg.reconcile_interval_seconds),
+            orch_cfg.reconcile_import_mode,
+            orch_cfg.reconcile_max_files_per_pass,
+        )
+    else:
+        logger.info("Reconcile: disabled")
 
     # --- Library audit: disk vs Lidarr (scheduled, change-gated) -------
     # Runs on a schedule only -- NOT at startup, not coupled to anything.
