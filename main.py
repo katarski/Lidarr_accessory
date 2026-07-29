@@ -138,7 +138,8 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     put("qbittorrent", "pause_during_scan", "QBIT_PAUSE_SCAN", _as_bool)
     put("qbittorrent", "deselect_video", "QBIT_DESELECT_VIDEO", _as_bool)
     put("qbittorrent", "dead_grab_reaper", "QBIT_DEAD_GRAB_REAPER", _as_bool)
-    put("qbittorrent", "dead_grab_grace_hours", "QBIT_DEAD_GRAB_GRACE_HOURS", int)
+    put("qbittorrent", "dead_grab_grace_minutes", "QBIT_DEAD_GRAB_GRACE_MINUTES", int)
+    put("qbittorrent", "dead_grab_grace_hours", "QBIT_DEAD_GRAB_GRACE_HOURS", int)  # legacy
     put("qbittorrent", "dead_grab_blocklist", "QBIT_DEAD_GRAB_BLOCKLIST", _as_bool)
     put("qbittorrent", "manage_completed", "QBIT_MANAGE_COMPLETED", _as_bool)
     put("qbittorrent", "remove_when_library_complete", "QBIT_REMOVE_WHEN_LIBRARY_COMPLETE", _as_bool)
@@ -517,7 +518,11 @@ def qbt_auto_deselect_loop(
     # grace window (default 2 days) + blocklist so Lidarr re-searches a live
     # (lossless-preferred) alternative. Addresses the dead-torrent flood.
     dead_grab_reaper = _as_bool(qcfg.get("dead_grab_reaper", True))
-    dead_grab_grace_hours = int(qcfg.get("dead_grab_grace_hours", 48) or 48)
+    # Grace is now in MINUTES; fall back to the old *_hours key if present.
+    if qcfg.get("dead_grab_grace_minutes") is not None:
+        dead_grab_grace_minutes = int(qcfg.get("dead_grab_grace_minutes") or 360)
+    else:
+        dead_grab_grace_minutes = int(qcfg.get("dead_grab_grace_hours", 6) or 6) * 60
     dead_grab_blocklist = _as_bool(qcfg.get("dead_grab_blocklist", True))
     # AI fallback for library matching: only used when the deterministic
     # (Lidarr) match misses. Requires an enabled LLM client.
@@ -588,7 +593,7 @@ def qbt_auto_deselect_loop(
                 try:
                     dead_grab_reaper_pass(
                         qbt, lidarr, category=category,
-                        grace_seconds=dead_grab_grace_hours * 3600,
+                        grace_seconds=dead_grab_grace_minutes * 60,
                         blocklist=dead_grab_blocklist, emit=logger.info,
                     )
                 except Exception as exc:  # noqa: BLE001

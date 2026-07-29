@@ -204,12 +204,12 @@ qbittorrent:
   # are AUDIO and kept. Set false to disable.
   deselect_video: true
   # Dead-grab reaper: remove lidarr-category torrents stuck at ~0% in a dead/
-  # stalled/metadata state longer than dead_grab_grace_hours (from add time),
+  # stalled/metadata state longer than dead_grab_grace_minutes (from add time),
   # and blocklist them so Lidarr re-searches a live (lossless-preferred)
   # alternative. Paused/stopped torrents and any with real progress are left
   # alone. See TUNING.md.
   dead_grab_reaper: true
-  dead_grab_grace_hours: 48
+  dead_grab_grace_minutes: 360
   dead_grab_blocklist: true
   # Completed-torrent lifecycle: for each finished music torrent, pause it while
   # the pipeline is mid-import and remove it (with data) once every album has
