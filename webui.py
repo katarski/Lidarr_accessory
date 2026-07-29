@@ -489,6 +489,14 @@ def make_handler(store, actions: HeldActions):
                 self._send(200, _PAGE.encode("utf-8"), "text/html; charset=utf-8")
             elif path == "/api/held":
                 store.prune_missing()
+                # Expand any multi-album container (box set / titled discs) into
+                # one entry per album subfolder, then re-list.
+                if hasattr(actions, "expand_box_set"):
+                    for it in store.list():
+                        try:
+                            actions.expand_box_set(it)
+                        except Exception:  # noqa: BLE001
+                            pass
                 items = store.list()
                 # Enrich each item with the library's EXISTING album (for the
                 # held-vs-existing compare). Cache a positive (in_library) hit,

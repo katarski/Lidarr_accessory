@@ -6844,29 +6844,105 @@ class Orchestrator:
                 return
         except OSError:
             return
+        # Box set / multi-album container: record EACH album subfolder as its
+        # own held entry (matched to its own library album), not one lump.
+        subs = self._album_subfolders(folder)
+        if len(subs) >= 2:
+            self.held.remove_by_path(str(folder))
+            cont_artist = self._identity_for_folder(folder)[0]
+            for sub in subs:
+                self._add_held_one(sub, outcome, reason,
+                                   artist=cont_artist,
+                                   album=self._strip_disc_prefix(sub.name))
+            return
+        self._add_held_one(folder, outcome, reason, artist=artist, album=album)
+
+    # Bare disc folder ("CD1"/"Disc 2") = one album across discs, NOT separate
+    # albums -- so a normal multi-disc album is never split.
+    _BARE_DISC_RE = re.compile(r"(?i)^(?:cd|disc|disk|dvd|side)\s*\.?\s*\d+$")
+
+    def _strip_disc_prefix(self, name: str) -> str:
+        """'Disc 3 - Plastic Letters' -> 'Plastic Letters'; a bare 'CD1' stays."""
+        s = re.sub(r"(?i)^\s*(?:cd|disc|disk|dvd)\s*\.?\s*\d+\s*[-–—:.]+\s*", "",
+                   name or "")
+        return s.strip(" -–—_.") or (name or "")
+
+    def _album_subfolders(self, folder: Path) -> List[Path]:
+        """
+        Immediate subfolders that are SEPARATE albums (a box set of titled discs,
+        or a container of album-named folders) -- each with audio and a real
+        title. Returns [] for a plain album (audio directly, or only bare
+        CD1/CD2 discs of ONE album), so normal albums are never split.
+        """
+        subs: List[Path] = []
+        try:
+            children = sorted(p for p in folder.iterdir() if p.is_dir())
+        except OSError:
+            return []
+        for d in children:
+            if self._ART_DIR_RE.match(d.name or ""):
+                continue
+            if not any(True for _ in self._held_audio_files(d)[:1]):
+                continue  # no audio -> not an album disc
+            subs.append(d)
+        if len(subs) < 2:
+            return []
+        # If every audio subfolder is a BARE disc (CD1/CD2), it's one multi-disc
+        # album -> don't split. Split only when the discs carry real titles.
+        if all(self._BARE_DISC_RE.match(d.name or "") for d in subs):
+            return []
+        return subs
+
+    _ART_DIR_RE = re.compile(
+        r"(?i)^-?(?:scans?|artwork|art|covers?|cover|sleeves?|booklet|images?|"
+        r"thumbs?|logs?|info|extras?|bonus)$")
+
+    def _add_held_one(self, folder: Path, outcome: str, reason: str,
+                      artist: str = "", album: str = "") -> None:
+        """Record a single held-items entry (details + identity repair)."""
         try:
             details = self._folder_audio_summary(folder)
         except Exception:  # noqa: BLE001
             details = {}
-        # Backfill/repair artist/album from the folder layout when the failure
-        # path didn't record them, OR recorded a bare-year "artist" (a discography
-        # "YYYY - Album" leaf), so the row, library compare, and unmonitor work.
         if (not (artist and album) or self._looks_like_year(artist)
                 or self._bad_album(album)):
             try:
                 a2, b2 = self._identity_for_folder(folder)
                 if a2 and not self._looks_like_year(a2):
-                    artist = a2
+                    artist = artist if (artist and not self._looks_like_year(artist)) else a2
                 if b2 and not self._bad_album(b2):
-                    album = b2
+                    album = album if (album and not self._bad_album(album)) else b2
                 album = album or b2
             except Exception:  # noqa: BLE001
                 pass
         self.held.add(
             source_path=str(folder), artist=artist, album=album,
-            tracks=int(track_count or details.get("n_audio", 0) or 0),
+            tracks=int(details.get("n_audio", 0) or 0),
             reason=reason, outcome=outcome, details=details,
         )
+
+    def expand_box_set(self, entry: Dict[str, Any]) -> bool:
+        """
+        WebUI helper: if an EXISTING held entry is a multi-album container,
+        replace it in the store with one entry per album subfolder. Returns
+        True if it expanded (so the caller drops the parent from the view).
+        """
+        if self.held is None:
+            return False
+        folder = Path(entry.get("source_path", ""))
+        if not folder.exists():
+            return False
+        subs = self._album_subfolders(folder)
+        if len(subs) < 2:
+            return False
+        cont_artist = self._identity_for_folder(folder)[0]
+        self.held.remove(entry.get("id", "") or "")
+        self.held.remove_by_path(str(folder))
+        for sub in subs:
+            self._add_held_one(sub, entry.get("outcome", "failed"),
+                               entry.get("reason", ""), artist=cont_artist,
+                               album=self._strip_disc_prefix(sub.name))
+        return True
 
     # ---- WebUI actions (#11) ------------------------------------------
     def _held_audio_files(self, folder: Path) -> List[Path]:
