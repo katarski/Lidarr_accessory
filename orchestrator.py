@@ -7400,6 +7400,8 @@ class Orchestrator:
          "Skip video files (VIDEO_TS/BDMV/containers) in music torrents; keep AUDIO_TS + .iso."),
         ("qbittorrent.reap_useless_torrents", "qbittorrent", "reap_useless_torrents", "Reap useless torrents", "bool", True,
          "Remove a torrent once no wanted music remains; ban (blocklist) video-only torrents."),
+        ("qbittorrent.reap_completed_wanted_only", "qbittorrent", "reap_completed_wanted_only", "Reap completed once wanted albums in", "bool", True,
+         "Remove a completed torrent once every album Lidarr WANTS from it is in the library (delete leftover compilations/live with it)."),
         ("qbittorrent.dead_grab_reaper", "qbittorrent", "dead_grab_reaper", "Dead-grab reaper", "bool", True,
          "Remove torrents stuck at ~0% past the grace window and blocklist so Lidarr re-searches."),
         ("qbittorrent.dead_grab_grace_hours", "qbittorrent", "dead_grab_grace_hours", "Dead-grab grace (hours)", "int", 6,

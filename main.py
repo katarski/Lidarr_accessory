@@ -527,6 +527,10 @@ def qbt_auto_deselect_loop(
     # (copy/hardlink import leaves files on disk, so the disk-empty check misses it).
     remove_when_library_complete = _as_bool(
         qcfg.get("remove_when_library_complete", True))
+    # Remove a completed torrent once every album Lidarr WANTS from it is owned
+    # (treat compilations/live/unknown leftovers as not-needed, deleted with it).
+    reap_completed_wanted_only = _as_bool(
+        qcfg.get("reap_completed_wanted_only", True))
     remove_min_stable = int(qcfg.get("remove_min_stable_seconds", 300) or 300)
     seen: set = set()
     completed_seen: set = set()   # #8a: torrents we've already kicked to process
@@ -573,6 +577,7 @@ def qbt_auto_deselect_loop(
                     min_stable_seconds=remove_min_stable,
                     on_complete=_enqueue_folder_cues if q is not None else None,
                     completed_seen=completed_seen,
+                    wanted_only=reap_completed_wanted_only,
                 )
                 if removed or paused:
                     logger.info(

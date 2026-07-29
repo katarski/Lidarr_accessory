@@ -520,6 +520,7 @@ def torrent_lifecycle_pass(
     now: Optional[float] = None,
     on_complete: Optional[Callable[[str], None]] = None,
     completed_seen: Optional[set] = None,
+    wanted_only: bool = True,
 ) -> tuple:
     """
     Manage COMPLETED music torrents by how much of their content the pipeline
@@ -612,40 +613,49 @@ def torrent_lifecycle_pass(
                     f"under {download_root} -- imported+cleaned, or stored "
                     f"elsewhere; data left untouched) {name!r}"
                 )
-        elif on_disk < sel_audio:
-            # Partially moved -> pause so it stops seeding while the pipeline
-            # finishes importing the rest (paused torrents keep their files,
-            # so the pipeline can still read them).
-            if "paused" not in state and "stopped" not in state:
+        else:
+            # Audio still on disk (partly moved, or Lidarr self-imported in
+            # place). Decide from the library plan. With wanted_only (default),
+            # remove the torrent + data once every album Lidarr WANTS from it is
+            # owned -- treating compilations / live / box-exclusive / albums
+            # Lidarr doesn't know (total==0) as "not needed" leftovers that go
+            # with the torrent. An album Lidarr KNOWS but we don't fully own yet
+            # (total>0 and not have) still blocks removal, so un-imported wanted
+            # content is never deleted (it stays for the WebUI to resolve).
+            reaped = False
+            if (remove_when_library_complete and lidarr is not None
+                    and now - _folder_newest_mtime(folder) >= max(0, min_stable_seconds)):
+                try:
+                    plan = plan_torrent(lidarr, name, files, llm=llm)
+                except Exception as exc:  # noqa: BLE001
+                    plan = None
+                    emit(f"lifecycle: library check failed for {name!r}: {exc}")
+                if plan:
+                    def _blocks(a):
+                        return int(a.get("total") or 0) > 0 and not a.get("have")
+                    ok = (not any(_blocks(a) for a in plan) if wanted_only
+                          else all(a.get("have") for a in plan))
+                    if ok:
+                        owned = sum(1 for a in plan if a.get("have"))
+                        leftover = len(plan) - owned
+                        if qbt.remove(h, delete_files=True):
+                            removed += 1
+                            reaped = True
+                            emit(
+                                f"lifecycle: REMOVED (all wanted albums in library"
+                                + (f"; {leftover} un-wanted leftover(s) deleted" if leftover else "")
+                                + f") {name!r}"
+                            )
+            if (not reaped and on_disk < sel_audio
+                    and "paused" not in state and "stopped" not in state):
+                # Partially moved, still has wanted content -> pause seeding
+                # while the pipeline finishes the rest.
                 qbt.pause(h)
                 paused += 1
                 emit(
                     f"lifecycle: PAUSED (imported {sel_audio - on_disk}/{sel_audio} "
                     f"so far) {name!r}"
                 )
-        else:
-            # on_disk == sel_audio: the pipeline hasn't moved anything. But
-            # Lidarr may have imported it ITSELF (copy/hardlink import leaves the
-            # files in place). If Lidarr fully owns EVERY album this torrent
-            # contains, clean it up here -- remove torrent + data (backlog #5).
-            # delete_files removes the download copy; a hardlinked library file
-            # shares the inode and survives, and a copied import has its own.
-            if not (remove_when_library_complete and lidarr is not None):
-                continue
-            if now - _folder_newest_mtime(folder) < max(0, min_stable_seconds):
-                continue  # still settling -- don't race an in-progress import
-            try:
-                plan = plan_torrent(lidarr, name, files, llm=llm)
-            except Exception as exc:  # noqa: BLE001
-                emit(f"lifecycle: library check failed for {name!r}: {exc}")
-                continue
-            if plan and all(a.get("have") for a in plan):
-                if qbt.remove(h, delete_files=True):
-                    removed += 1
-                    emit(
-                        f"lifecycle: REMOVED (Lidarr already owns all "
-                        f"{len(plan)} album(s) -- self-import cleanup) {name!r}"
-                    )
     return removed, paused
 
 
