@@ -417,18 +417,28 @@ class LidarrClient:
             time.sleep(poll_interval)
         return last
 
-    def manual_import_candidates(self, folder_path: str) -> List[Dict[str, Any]]:
+    def manual_import_candidates(
+        self, folder_path: str, artist_id: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
         """
         Ask Lidarr what it would do with the given folder via its manual
         import endpoint. Returns the list of parsed track records, each
         with whatever match Lidarr found plus a `rejections` array that
         explains *why* a file wouldn't auto-import. Invaluable for
         diagnosing silent refusals.
+
+        Pass `artist_id` whenever it's known (resolved from the audio TAGS):
+        Lidarr's manual-import parses the FOLDER NAME to guess the artist, so a
+        folder named without it -- e.g. "[1996] Infinite" -- yields ZERO
+        candidates unless we hand Lidarr the artistId hint.
         """
+        params = {"folder": folder_path, "filterExistingFiles": "false"}
+        if artist_id:
+            params["artistId"] = int(artist_id)
         try:
             r = self.session.get(
                 self._url("/api/v1/manualimport"),
-                params={"folder": folder_path, "filterExistingFiles": "false"},
+                params=params,
                 timeout=30,
             )
             r.raise_for_status()

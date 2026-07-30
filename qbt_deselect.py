@@ -671,8 +671,23 @@ def torrent_lifecycle_pass(
                         return int(a.get("total") or 0) > 0 and not a.get("have")
                     ok = (not any(_blocks(a) for a in plan) if wanted_only
                           else all(a.get("have") for a in plan))
+                    owned = sum(1 for a in plan if a.get("have"))
+                    # DATA-LOSS GUARD: never delete a torrent's data when NOT ONE
+                    # of its albums is confirmed present in the library. An
+                    # album Lidarr can't resolve comes back total==0 (looks like
+                    # a "leftover"), and a Lidarr timeout makes EVERY album look
+                    # that way -- which previously deleted a fully-downloaded,
+                    # not-yet-imported album (e.g. Eminem "Infinite" during a
+                    # Lidarr overload). If nothing is owned, there is nothing to
+                    # clean up after: keep the data and retry next pass.
+                    if ok and owned < 1:
+                        emit(
+                            f"lifecycle: NOT removing {name!r} -- no album "
+                            f"confirmed in library (still importing, or Lidarr "
+                            f"unreachable); keeping data for a later pass"
+                        )
+                        ok = False
                     if ok:
-                        owned = sum(1 for a in plan if a.get("have"))
                         leftover = len(plan) - owned
                         if qbt.remove(h, delete_files=True):
                             removed += 1

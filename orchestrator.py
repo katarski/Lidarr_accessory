@@ -1590,7 +1590,7 @@ class Orchestrator:
                     rcmd, timeout_seconds=45, poll_interval=1.5,
                 )
             lidarr_path = self.lidarr.windows_to_lidarr(folder)
-            cands = self.lidarr.manual_import_candidates(lidarr_path)
+            cands = self.lidarr.manual_import_candidates(lidarr_path, artist_id=aid)
 
             if mode == "exact":
                 tracks_all = self.lidarr.list_tracks_for_album(album_id)
@@ -3309,10 +3309,21 @@ class Orchestrator:
         except Exception as exc:  # noqa: BLE001
             logger.debug("pre-split queue lookup failed: %s", exc)
 
-        # 4) Probe ManualImport candidates for the folder.
+        # 4) Probe ManualImport candidates for the folder. Pass the artistId
+        #    (resolved from the tag-derived artist name) so Lidarr can match
+        #    even when the FOLDER NAME lacks the artist -- e.g. "[1996] Infinite"
+        #    yields zero candidates without the hint, so the album never imports.
+        probe_artist_id: Optional[int] = None
+        try:
+            arec = self.lidarr.find_artist(artist_name)
+            if arec:
+                probe_artist_id = int(arec["id"])
+        except Exception:  # noqa: BLE001
+            probe_artist_id = None
         lidarr_path = self.lidarr.windows_to_lidarr(folder)
         try:
-            candidates = self.lidarr.manual_import_candidates(lidarr_path)
+            candidates = self.lidarr.manual_import_candidates(
+                lidarr_path, artist_id=probe_artist_id)
         except Exception as exc:  # noqa: BLE001
             logger.warning("ManualImport probe failed for %s: %s", folder, exc)
             candidates = []
