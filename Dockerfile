@@ -40,8 +40,11 @@ FROM python:3.11-slim
 # libxml2 = runtime dependency of the sacd_extract binary copied in below;
 # p7zip-full = `7z`, used to unpack an AUDIO_TS out of a DVD-Audio UDF ISO
 #   without a loop-mount (the container has no loop devices / privileges).
+# unar = The Unarchiver (`unar`/`lsar`), a full RAR decoder used as a FALLBACK
+#   when 7z can't decode a RAR (p7zip lacks some RAR compression methods and
+#   silently writes 0-byte files -- see _extract_archives_folder).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg tzdata libchromaprint-tools libdca-utils libxml2 p7zip-full \
+    && apt-get install -y --no-install-recommends ffmpeg tzdata libchromaprint-tools libdca-utils libxml2 p7zip-full unar \
     && rm -rf /var/lib/apt/lists/*
 
 # SACD ISO ripper (built above). Present in PATH as `sacd_extract`.

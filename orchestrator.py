@@ -2516,6 +2516,71 @@ class Orchestrator:
                 out.append(a)
         return out
 
+    def _has_zero_byte_audio(self, folder: Path) -> bool:
+        """True if any audio file under `folder` is 0 bytes (a stub left by a
+        failed/partial extraction)."""
+        try:
+            for dp, _dn, fns in os.walk(folder):
+                for fn in fns:
+                    if os.path.splitext(fn)[1].lower() in _ALL_AUDIO_EXTS:
+                        try:
+                            if (Path(dp) / fn).stat().st_size == 0:
+                                return True
+                        except OSError:
+                            continue
+        except OSError:
+            pass
+        return False
+
+    def _purge_zero_byte_audio(self, folder: Path) -> int:
+        """Delete any 0-byte audio files under `folder` so a failed extraction
+        can never feed empty stubs into the import flow. Returns the count."""
+        n = 0
+        try:
+            for dp, _dn, fns in os.walk(folder):
+                for fn in fns:
+                    if os.path.splitext(fn)[1].lower() in _ALL_AUDIO_EXTS:
+                        p = Path(dp) / fn
+                        try:
+                            if p.stat().st_size == 0:
+                                p.unlink()
+                                n += 1
+                        except OSError:
+                            continue
+        except OSError:
+            pass
+        return n
+
+    def _extract_one_archive(self, archive: Path, folder: Path) -> bool:
+        """
+        Unpack one archive into `folder`. Tries 7z first; if 7z errors OR leaves
+        0-byte stubs behind (p7zip can't decode some RAR compression methods and
+        silently writes empty files), falls back to `unar` (a full RAR decoder).
+        Returns True only when extraction completed without a tool error.
+        """
+        def _run(cmd):
+            try:
+                p = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+                return p.returncode, (p.stderr or p.stdout or "")
+            except Exception as exc:  # noqa: BLE001
+                return -1, str(exc)
+
+        logger.info("archive: extracting %s in %s ...", archive.name, folder.name)
+        rc, msg = _run(["7z", "x", "-y", "-bd", f"-o{folder}", str(archive)])
+        if rc == 0 and not self._has_zero_byte_audio(folder):
+            return True
+        reason = f"7z rc={rc}" if rc != 0 else "7z produced 0-byte file(s)"
+        logger.warning("archive: %s on %s -- falling back to unar (%s)",
+                       reason, archive.name, msg[-160:])
+        rc2, msg2 = _run(["unar", "-force-overwrite", "-quiet",
+                          "-output-directory", str(folder), str(archive)])
+        if rc2 == 0 and not self._has_zero_byte_audio(folder):
+            logger.info("archive: unar extracted %s successfully", archive.name)
+            return True
+        logger.warning("archive: unar fallback failed on %s (rc=%d: %s)",
+                       archive.name, rc2, msg2[-160:])
+        return False
+
     def _extract_archives_folder(
         self, folder: Path, archives: List[Path], now_ts: float, min_stable: int,
     ) -> bool:
@@ -2554,22 +2619,15 @@ class Orchestrator:
 
         extracted = 0
         for a in firsts:
-            logger.info("archive: extracting %s in %s ...", a.name, folder.name)
-            try:
-                proc = subprocess.run(
-                    ["7z", "x", "-y", "-bd", f"-o{folder}", str(a)],
-                    capture_output=True, text=True, timeout=7200,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("archive: 7z failed on %s: %s", a.name, exc)
-                continue
-            if proc.returncode != 0:
-                logger.warning(
-                    "archive: 7z returned %d on %s -- %s", proc.returncode,
-                    a.name, (proc.stderr or proc.stdout or "")[-200:])
-                continue
-            done.add(a.name)
-            extracted += 1
+            if self._extract_one_archive(a, folder):
+                done.add(a.name)
+                extracted += 1
+        # Never leave 0-byte stubs behind for the import flow to pick up (a
+        # half-decoded RAR would otherwise present empty "audio" to Lidarr).
+        purged = self._purge_zero_byte_audio(folder)
+        if purged:
+            logger.warning("archive: removed %d zero-byte file(s) from a failed "
+                           "extraction in %s", purged, folder.name)
 
         # Record every archive-set member as done so continuation volumes aren't
         # retried as their own "first volume" on a later pass.
