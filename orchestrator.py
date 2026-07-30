@@ -2861,6 +2861,90 @@ class Orchestrator:
             return ("redundant", have, total)
         return ("import", have, total)
 
+    def _multidisc_audio_files(self, folder: Path) -> List[Path]:
+        """Every audio file under `folder`'s disc subfolders (CD1/Disc 2/...),
+        in disc order. Used to import a multi-disc album handed off at the
+        PARENT as one unit."""
+        out: List[Path] = []
+        try:
+            for d in sorted(p for p in folder.iterdir() if p.is_dir()):
+                if self._DISC_SUBDIR_RE.match(d.name or ""):
+                    out.extend(self._sibling_audio_files(d))
+        except OSError:
+            pass
+        return out
+
+    def _present_disc_subfolders(self, parent: Path) -> List[Path]:
+        """Immediate CD1/Disc 2/... subfolders of `parent` that hold audio."""
+        subs: List[Path] = []
+        try:
+            for d in sorted(p for p in parent.iterdir() if p.is_dir()):
+                if self._DISC_SUBDIR_RE.match(d.name or "") and \
+                        self._sibling_audio_files(d):
+                    subs.append(d)
+        except OSError:
+            pass
+        return subs
+
+    def _unify_multidisc_eligible(
+        self, eligible: List[Tuple[Path, List[Path]]], now_ts: float,
+        min_stable: int,
+    ) -> List[Tuple[Path, List[Path]]]:
+        """
+        Collapse the sweep's per-DISC leaf folders (CD1/Disc 2/...) of one album
+        into a SINGLE handoff at their parent, so a multi-disc album imports as
+        ONE unit -- all discs together -- instead of each disc being treated as
+        a rival "edition" (which made _drop_duplicate_editions keep only the
+        disc closest to Lidarr's track count and DROP the others, e.g. Pet Shop
+        Boys "Nonetheless" 2CD where only the 14-track disc imported and CD1's
+        10 tracks were stranded). Importing every disc at once also lets Lidarr
+        pick the correct multi-disc release (24 files -> the 24-track edition),
+        rather than snapping to a partial-matching one.
+
+        A multi-disc album is DEFERRED (retried next sweep, not handed off) until
+        every disc's audio is stable, so we never import it half-complete.
+        Non-disc folders pass through unchanged.
+        """
+        parents: Dict[Path, bool] = {}
+        singles: List[Tuple[Path, List[Path]]] = []
+        for folder, audios in eligible:
+            if self._DISC_SUBDIR_RE.match(folder.name or ""):
+                parents[folder.parent] = True
+            else:
+                singles.append((folder, audios))
+        result: List[Tuple[Path, List[Path]]] = list(singles)
+        for parent in parents:
+            discs = self._present_disc_subfolders(parent)
+            allaudio: List[Path] = []
+            for d in discs:
+                allaudio.extend(self._sibling_audio_files(d))
+            if not allaudio:
+                continue
+            unstable = False
+            for a in allaudio:
+                try:
+                    if (now_ts - a.stat().st_mtime) < min_stable:
+                        unstable = True
+                        break
+                except OSError:
+                    unstable = True
+                    break
+            if unstable:
+                logger.info(
+                    "cueless sweep: deferring multi-disc album %r -- a disc is "
+                    "still settling; will retry", parent.name)
+                continue
+            logger.info(
+                "cueless sweep: multi-disc album %r -- importing %d disc(s) / "
+                "%d tracks together (as ONE album, not separate editions)",
+                parent.name, len(discs), len(allaudio))
+            # Mark the individual disc leaves handled so they aren't also walked
+            # into a separate per-disc handoff.
+            for d in discs:
+                self._skip_seen.add(d)
+            result.append((parent, allaudio))
+        return result
+
     def _drop_duplicate_editions(
         self, eligible: List[Tuple[Path, List[Path]]]
     ) -> set:
@@ -3067,6 +3151,12 @@ class Orchestrator:
         # 2) Read artist/album from the audio tags. Folder name is
         #    unreliable (it's usually the album, not the artist).
         audios = self._sibling_audio_files(folder)
+        if not audios:
+            # Multi-disc album handed off at the PARENT (no direct audio, only
+            # CD1/CD2 subfolders) -- gather every disc's tracks so all discs
+            # import together into the one album (Lidarr scans the parent
+            # recursively anyway). See _unify_multidisc_eligible.
+            audios = self._multidisc_audio_files(folder)
         if not audios:
             logger.warning(
                 "Pre-split handoff: folder %s has no audio files after .cue "
@@ -4017,6 +4107,12 @@ class Orchestrator:
                 folder, len(audios),
             )
             eligible.append((folder, audios))
+
+        # Multi-disc unification FIRST: fold CD1/CD2/... leaf folders of one
+        # album into a single parent handoff, so a 2-CD album imports as one
+        # unit (never a disc dropped as a rival "edition"; the whole-album
+        # import also makes Lidarr select the correct multi-disc release).
+        eligible = self._unify_multidisc_eligible(eligible, now_ts, min_stable)
 
         # Edition dedup ("best track-count match"): when several eligible
         # folders in THIS sweep map to the same album (multiple pressings/
