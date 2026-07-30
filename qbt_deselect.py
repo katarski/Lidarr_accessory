@@ -311,15 +311,24 @@ def process_torrent(
             to_deselect.extend(fresh)
             emit(f"  VIDEO -> deselect {len(fresh)} video file(s) "
                  f"(VIDEO_TS/BDMV/containers; AUDIO_TS + .iso kept)")
-    if apply and to_deselect:
-        ok = qbt.set_file_priority(thash, to_deselect, 0)
-        emit(f"  -> {'deselected' if ok else 'FAILED'} {len(to_deselect)} file(s)")
+    # Idempotent apply: only touch files NOT already deselected, so a periodic
+    # re-check (see auto_deselect_pass recheck) is quiet and issues no needless
+    # priority churn on a torrent it already handled. `cur` is every file's
+    # current priority; `desel_all` is what WILL be deselected (already-0 plus
+    # this pass's picks) and drives the "nothing wanted left" reap decision.
+    cur = {int(f["index"]): int(f.get("priority", 1))
+           for f in files if "index" in f}
+    desel_all = {i for i, p in cur.items() if p == 0} | set(to_deselect)
+    to_apply = sorted(i for i in to_deselect if cur.get(i, 1) != 0)
+    if apply and to_apply:
+        ok = qbt.set_file_priority(thash, to_apply, 0)
+        emit(f"  -> {'deselected' if ok else 'FAILED'} {len(to_apply)} file(s)")
     # Reap a torrent that has nothing we want left: either every music file is
     # deselected (all albums already owned -> only garbage remains) or the
     # torrent carries NO music at all but has video (a video-only grab). The
     # video-only case is also BLOCKLISTED so Lidarr never re-grabs it.
     if reap_useless and apply:
-        desel = set(to_deselect)
+        desel = desel_all
         audio_all = [f for f in files
                      if Path(f.get("name", "")).suffix.lower() in AUDIO_EXTS]
         audio_kept = [f for f in audio_all
@@ -339,31 +348,55 @@ def auto_deselect_pass(
     category: str = "", emit: Callable[[str], None] = logger.info,
     pause_during_scan: bool = True, llm=None, deselect_video: bool = True,
     reap_useless: bool = True,
+    planned: Optional[Dict[str, float]] = None, recheck_seconds: int = 0,
+    now: Optional[float] = None,
 ) -> int:
     """
-    One scheduled pass for the pipeline: for each INCOMPLETE music torrent we
-    haven't handled yet, deselect already-have albums. Marks torrents seen so
-    we don't reprocess. Returns number of torrents acted on.
+    One scheduled pass for the pipeline: for each INCOMPLETE music torrent,
+    deselect already-have albums. Returns number of torrents acted on.
 
     To keep bandwidth from leaking on already-owned albums before we act, a
-    freshly-seen torrent is PAUSED the instant we notice it, its file list is
+    FRESHLY-seen torrent is PAUSED the instant we notice it, its file list is
     read, the owned albums are deselected, and only then is its ORIGINAL
     start-state restored. We never override what Lidarr/you set: a force-started
     torrent comes back force-started, a normal one comes back normally started,
     and a "don't start" (stopped/paused) torrent is left stopped and never
     paused in the first place. A torrent whose metadata hasn't resolved yet
     (magnet, empty file list) is left as-is and retried next pass.
+
+    RE-CHECK (fixes owned-later leaks): an album a torrent carries can become
+    owned AFTER the torrent was first planned -- Lidarr imports it, the reconcile
+    pass fills it, another torrent completes it. With a permanent "seen" skip
+    those newly-owned albums would keep downloading forever. So when `planned`
+    (a persistent {hash: last_plan_ts}) and a positive `recheck_seconds` are
+    given, a still-incomplete torrent is RE-PLANNED once that interval elapses
+    and any newly-owned albums are deselected too. Re-checks don't pause (the
+    apply is idempotent and only touches not-yet-deselected files), so a
+    long-running download isn't disturbed. Without `planned` the old
+    plan-once/`seen` behaviour is unchanged.
     """
+    if now is None:
+        now = time.time()
     acted = 0
     for t in qbt.torrents(category=category):
         h = t.get("hash")
-        if not h or h in seen:
+        if not h:
             continue
         # Only touch torrents that are still downloading (progress < 1.0);
-        # nothing to gain deselecting a finished one.
+        # nothing to gain deselecting a finished one -- mark it permanently.
         if float(t.get("progress") or 0) >= 1.0:
             seen.add(h)
+            if planned is not None:
+                planned.pop(h, None)
             continue
+        first_sight = h not in seen
+        if not first_sight:
+            # Already handled once. Re-plan only if the recheck window is
+            # enabled and has elapsed; otherwise skip (cheap steady state).
+            if planned is None or recheck_seconds <= 0:
+                continue
+            if (now - planned.get(h, 0.0)) < recheck_seconds:
+                continue
         # Capture the torrent's original start-state so we restore EXACTLY what
         # Lidarr/you set -- never impose one.
         state = (t.get("state") or "").lower()
@@ -371,9 +404,10 @@ def auto_deselect_pass(
         was_stopped = ("paused" in state) or ("stopped" in state)
         paused_by_us = False
         try:
-            # Pause only a running torrent (to stop owned albums downloading
-            # while we decide). A "don't start" torrent is left alone.
-            if pause_during_scan and not was_stopped:
+            # Pause only on FIRST sight of a running torrent (to stop owned
+            # albums downloading while we first decide). A re-check doesn't
+            # pause -- the idempotent apply only flips not-yet-deselected files.
+            if pause_during_scan and not was_stopped and first_sight:
                 qbt.pause(h)
                 paused_by_us = True
             files = qbt.files(h)
@@ -387,16 +421,18 @@ def auto_deselect_pass(
                 deselect_video=deselect_video, reap_useless=reap_useless,
             )
             seen.add(h)
+            if planned is not None:
+                planned[h] = now
             if d:
                 acted += 1
         finally:
-            # Restore the original intent, in priority order.
-            if was_stopped:
-                pass                      # leave a "don't start" torrent stopped
-            elif was_forced:
-                qbt.force_start(h)        # preserve Lidarr's force-start
-            elif paused_by_us:
-                qbt.resume(h)             # normal start (only if we paused it)
+            # Restore the original intent -- only if WE paused it (a re-check
+            # never pauses, so it never touches start-state).
+            if paused_by_us:
+                if was_forced:
+                    qbt.force_start(h)    # preserve Lidarr's force-start
+                else:
+                    qbt.resume(h)         # normal start
     return acted
 
 

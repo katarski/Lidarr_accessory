@@ -145,6 +145,7 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     put("qbittorrent", "interval_seconds", "QBIT_INTERVAL", int)
     put("qbittorrent", "pause_during_scan", "QBIT_PAUSE_SCAN", _as_bool)
     put("qbittorrent", "deselect_video", "QBIT_DESELECT_VIDEO", _as_bool)
+    put("qbittorrent", "redeselect_recheck_seconds", "QBIT_REDESELECT_RECHECK", int)
     put("qbittorrent", "dead_grab_reaper", "QBIT_DEAD_GRAB_REAPER", _as_bool)
     put("qbittorrent", "dead_grab_grace_minutes", "QBIT_DEAD_GRAB_GRACE_MINUTES", int)
     put("qbittorrent", "dead_grab_grace_hours", "QBIT_DEAD_GRAB_GRACE_HOURS", int)  # legacy
@@ -572,6 +573,12 @@ def qbt_auto_deselect_loop(
         qcfg.get("reap_completed_wanted_only", True))
     remove_min_stable = int(qcfg.get("remove_min_stable_seconds", 300) or 300)
     seen: set = set()
+    # {hash: last_plan_ts} so an INCOMPLETE torrent is re-planned every
+    # `redeselect_recheck` seconds -- catches albums that become owned AFTER the
+    # torrent was first planned (Lidarr import, reconcile fill, another torrent
+    # completing) instead of downloading them forever. 0 disables re-checks.
+    planned_deselect: dict = {}
+    redeselect_recheck = int(qcfg.get("redeselect_recheck_seconds", 1800) or 0)
     completed_seen: set = set()   # #8a: torrents we've already kicked to process
 
     def _enqueue_folder_cues(folder: str) -> None:
@@ -605,7 +612,9 @@ def qbt_auto_deselect_loop(
                                            pause_during_scan=pause_scan,
                                            llm=match_llm,
                                            deselect_video=deselect_video,
-                                           reap_useless=reap_useless)
+                                           reap_useless=reap_useless,
+                                           planned=planned_deselect,
+                                           recheck_seconds=redeselect_recheck)
                 if acted:
                     logger.info("qbt auto-deselect: acted on %d torrent(s)", acted)
             if manage_completed:

@@ -7615,6 +7615,8 @@ class Orchestrator:
          "In conversions, keep the multichannel version and discard stereo."),
         ("qbittorrent.deselect_video", "qbittorrent", "deselect_video", "Deselect video", "bool", True,
          "Skip video files (VIDEO_TS/BDMV/containers) in music torrents; keep AUDIO_TS + .iso."),
+        ("qbittorrent.redeselect_recheck_seconds", "qbittorrent", "redeselect_recheck_seconds", "Re-deselect recheck (s)", "int", 1800,
+         "Re-scan a still-downloading torrent this often to deselect albums that became owned after it was first planned. 0 = plan once only."),
         ("qbittorrent.reap_useless_torrents", "qbittorrent", "reap_useless_torrents", "Reap useless torrents", "bool", True,
          "Remove a torrent once no wanted music remains; ban (blocklist) video-only torrents."),
         ("qbittorrent.reap_completed_wanted_only", "qbittorrent", "reap_completed_wanted_only", "Reap completed once wanted albums in", "bool", True,
