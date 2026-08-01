@@ -95,6 +95,7 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     put("lidarr", "webui_port", "WEBUI_PORT", int)
     put("lidarr", "webui_host", "WEBUI_HOST")
     put("lidarr", "webui_unmonitor_on_resolve", "WEBUI_UNMONITOR_ON_RESOLVE", _as_bool)
+    put("lidarr", "webui_held_refresh_seconds", "WEBUI_HELD_REFRESH", int)
     put("lidarr", "tag_identify_pre_split", "TAG_IDENTIFY_PRE_SPLIT", _as_bool)
     put("lidarr", "prefer_multichannel", "PREFER_MULTICHANNEL", _as_bool)
     put("lidarr", "transcode_lossless_to_flac", "TRANSCODE_LOSSLESS_TO_FLAC", _as_bool)
@@ -520,6 +521,28 @@ def reconcile_loop(
             orch.reconcile_monitored_gaps(watch_root, excluded)
         except Exception as exc:  # noqa: BLE001
             logger.exception("reconcile thread: %s", exc)
+        delay = cadence
+
+
+def held_curator_loop(
+    orch: Orchestrator, stop: threading.Event, interval: int,
+) -> None:
+    """
+    Keep the needs-attention store fresh in the BACKGROUND
+    (Orchestrator.curate_held_pass) so the WebUI serves it instantly instead
+    of regenerating every entry per page load. First pass runs shortly after
+    startup so the dashboard is warm, then every `interval` seconds.
+    """
+    cadence = max(60, interval)
+    delay = min(30, cadence)
+    while not stop.wait(delay):
+        try:
+            n = orch.curate_held_pass()
+            if n:
+                logger.info("held curator: refreshed %d entr%s",
+                            n, "y" if n == 1 else "ies")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("held curator thread: %s", exc)
         delay = cadence
 
 
@@ -1008,11 +1031,16 @@ def main() -> int:
         webui_port=int(lidarr_cfg.get("webui_port", 8830)),
         webui_unmonitor_on_resolve=bool(
             lidarr_cfg.get("webui_unmonitor_on_resolve", True)),
+        webui_held_refresh_seconds=int(
+            lidarr_cfg.get("webui_held_refresh_seconds", 300)),
         qbt_url=str((cfg.get("qbittorrent") or {}).get("base_url", "") or ""),
         qbt_user=str((cfg.get("qbittorrent") or {}).get("username", "") or ""),
         qbt_pass=str((cfg.get("qbittorrent") or {}).get("password", "") or ""),
         log_file=(Path((cfg.get("logging") or {}).get("file"))
                   if (cfg.get("logging") or {}).get("file") else None),
+        flac2mp3_log=str(
+            os.environ.get("FLAC2MP3_LOG")
+            or lidarr_cfg.get("flac2mp3_log", "/lidarr-logs/flac2mp3.txt")),
         container_name=str(lidarr_cfg.get("container_name", "cue_pipeline") or "cue_pipeline"),
         held_items_file=held_items_path,
         webui_overrides_file=webui_overrides_path,
@@ -1431,6 +1459,14 @@ def main() -> int:
                 "state=%s)", orch_cfg.webui_host, orch_cfg.webui_port,
                 held_items_path,
             )
+            curator_thread = threading.Thread(
+                target=held_curator_loop,
+                args=(orch, stop,
+                      int(getattr(orch_cfg, "webui_held_refresh_seconds", 300))),
+                daemon=True,
+                name="cue-held-curator",
+            )
+            curator_thread.start()
         except Exception as exc:  # noqa: BLE001
             logger.warning("WebUI: failed to start (%s) -- continuing without it", exc)
     else:

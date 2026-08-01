@@ -376,6 +376,10 @@ class OrchestratorConfig:
     webui_enabled: bool = True
     webui_host: str = "0.0.0.0"
     webui_port: int = 8830
+    # How often the background curator refreshes the needs-attention store
+    # (prune / box-set expand / library compare / auto-dismiss). The page
+    # itself always serves the store as-is -- see curate_held_pass.
+    webui_held_refresh_seconds: int = 300
     held_items_file: Optional[Path] = None
     # When the user resolves a held item in the WebUI (keep-existing or
     # move-held), unmonitor the matching Lidarr album so neither Lidarr nor the
@@ -389,6 +393,9 @@ class OrchestratorConfig:
     qbt_pass: str = ""
     # Log file path (for the WebUI "Log" tab). Mirrors logging.file.
     log_file: Optional[Path] = None
+    # The Lidarr flac2mp3/downsampler log, mounted read-only into this
+    # container (recreate with -v <lidarr appdata>/logs:/lidarr-logs:ro).
+    flac2mp3_log: str = "/lidarr-logs/flac2mp3.txt"
     # Container name (for the WebUI restart/shutdown via the Docker socket).
     container_name: str = "cue_pipeline"
     # WebUI Settings-tab overrides file (highest-precedence config the WebUI writes).
@@ -3593,6 +3600,17 @@ class Orchestrator:
             t_artist, t_album = self._read_audio_tags(a)
             artist_name = artist_name or t_artist
             album_name = album_name or t_album
+        # Multi-disc parent handoff: each disc's ALBUM tag usually carries its
+        # own disc marker ("Catalog Strays, Disc 1"), which then fails every
+        # name match against Lidarr's plain album title. Strip the trailing
+        # disc designator -- only when this folder really has disc subfolders.
+        if album_name and self._present_disc_subfolders(folder):
+            stripped = re.sub(
+                r"(?i)[\s,\-]*[\(\[]?\s*(?:disc|disk|cd)\.?"
+                r"\s*\d{1,2}\s*[\)\]]?\s*$",
+                "", album_name).strip(" -_,")
+            if stripped:
+                album_name = stripped
         # Fingerprint fallback: tags couldn't identify it -> ask AcoustID what
         # the audio actually is (content-based, so garbage/absent tags don't
         # matter). Best-effort: any failure falls through to the give-up below,
@@ -3663,6 +3681,36 @@ class Orchestrator:
                     album_name = ident
                     verdict, _have, _total = self._monitored_album_status(
                         artist_name, album_name)
+            if verdict == "skip":
+                # Tag identity can be pure garbage (artist '01', a track title
+                # as the album -- a mis-tagged rip). Before writing the folder
+                # off, retry the gate with the FOLDER-derived identity
+                # ('Third Eye Blind - Ursa Major 2009' -> Third Eye Blind /
+                # Ursa Major 2009), then content-identify under that artist.
+                f_artist, f_album = self._album_folder_identity(folder)
+                if (f_artist and f_album
+                        and (f_artist, f_album) != (artist_name, album_name)):
+                    f_verdict, f_have, f_total = self._monitored_album_status(
+                        f_artist, f_album)
+                    if f_verdict != "skip":
+                        logger.info(
+                            "Pre-split: tag identity %r / %r found nothing; "
+                            "folder identity %r / %r matches -- using it.",
+                            artist_name, album_name, f_artist, f_album)
+                        artist_name, album_name = f_artist, f_album
+                        verdict, _have, _total = f_verdict, f_have, f_total
+                    else:
+                        f_ident = self._identify_album_by_content(
+                            folder, audios, f_artist, album_hint=f_album)
+                        if f_ident:
+                            logger.info(
+                                "Pre-split: folder-artist %r + track content "
+                                "identify this as %r -- using it.",
+                                f_artist, f_ident)
+                            artist_name, album_name = f_artist, f_ident
+                            verdict, _have, _total = (
+                                self._monitored_album_status(
+                                    f_artist, f_ident))
             if verdict == "skip":
                 logger.info(
                     "Pre-split: %s / %s has no monitored album in Lidarr "
@@ -7645,15 +7693,20 @@ class Orchestrator:
         self._update_held(cue_path, outcome, artist, album, track_count, reason)
 
     # Outcomes that mean "the pipeline gave up and left the files on disk for
-    # the user" -- these show up in the WebUI. Only `failed` qualifies: it is
-    # the one outcome that reliably PRESERVES the source (every failed path
-    # returns before source cleanup). `imported_unverified` is NOT included --
-    # it means Lidarr claimed success and moved the files out (the source is
-    # then cleaned up), and the "unverified" is usually just a library
-    # name-match quirk (e.g. "Michael Buble" on disk vs "Michael Bublé" in
-    # Lidarr), so there would be nothing left on disk to keep/move. Everything
-    # else (successful imports, deliberate skips) clears any prior held entry.
-    _ATTENTION_OUTCOMES = frozenset({"failed"})
+    # the user" -- these show up in the WebUI. Both reliably PRESERVE the
+    # source (their paths return before any cleanup):
+    #   * failed              -- an attempted import that didn't land.
+    #   * skipped_unmonitored -- music with NO monitored Lidarr target
+    #     (compilation / collection / not in the metadata profile). Without a
+    #     held entry these sat in downloads invisibly forever; now the user
+    #     sees them and decides Add/Overwrite/Discard from the dashboard.
+    # `imported_unverified` is NOT included -- it means Lidarr claimed success
+    # and moved the files out (the source is then cleaned up), and the
+    # "unverified" is usually just a library name-match quirk (e.g. "Michael
+    # Buble" on disk vs "Michael Bublé" in Lidarr), so there would be nothing
+    # left on disk to keep/move. Everything else (successful imports, other
+    # deliberate skips) clears any prior held entry.
+    _ATTENTION_OUTCOMES = frozenset({"failed", "skipped_unmonitored"})
 
     def _update_held(
         self, cue_path: Path, outcome: str, artist: str, album: str,
@@ -7783,6 +7836,81 @@ class Orchestrator:
                                entry.get("reason", ""), artist=cont_artist,
                                album=self._strip_disc_prefix(sub.name))
         return True
+
+    def curate_held_pass(self) -> int:
+        """
+        Background curator for the needs-attention store, so the WebUI never
+        regenerates entries per page load: `/api/held` serves the store file
+        AS-IS (instant), and this pass -- run on its own thread every
+        cfg.webui_held_refresh_seconds -- keeps that file correct: drops
+        entries whose folder vanished, expands box-set containers, refreshes
+        each entry's library-compare summary once it's stale, backfills bad
+        identities, and auto-dismisses entries the library already covers.
+        New conflicts are appended by _record() the moment they happen (and
+        the store dedupes by source folder), so the file cycles: filled on
+        detection, emptied on resolve/auto-dismiss -- never rebuilt.
+        Returns the number of entries refreshed this pass.
+        """
+        store = self.held
+        if store is None:
+            return 0
+        try:
+            store.prune_missing()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("held curator: prune failed: %s", exc)
+        for it in store.list():
+            try:
+                self.expand_box_set(it)
+            except Exception:  # noqa: BLE001
+                pass
+        refreshed = 0
+        now = time.time()
+        ttl = max(60, int(getattr(self.cfg, "webui_held_refresh_seconds", 300)))
+        for it in store.list():
+            # Refresh the library compare. Cache a positive (in_library) hit;
+            # keep RETRYING a stale negative -- the album may not have been in
+            # the library the first time we looked, and a stale "not in
+            # library" must not stick.
+            ex = it.get("existing")
+            found = isinstance(ex, dict) and ex.get("in_library") is True
+            fresh = isinstance(ex, dict) and (now - float(ex.get("_ts", 0)) < ttl)
+            if not (found or fresh):
+                try:
+                    ex = self.existing_album_summary(it) or {}
+                except Exception:  # noqa: BLE001
+                    ex = {}
+                ex["_ts"] = now
+                fields: Dict[str, Any] = {"existing": ex}
+                # Backfill/repair identity when it's missing or the stored
+                # artist is a bare year (discography leaf).
+                cur_a = str(it.get("artist") or "")
+                cur_b = str(it.get("album") or "")
+                bad = (not (cur_a and cur_b)) \
+                    or bool(re.fullmatch(r"(?:19|20)\d{2}", cur_a.strip())) \
+                    or bool(re.fullmatch(r"\d{1,3}", cur_b.strip()))
+                if bad and ex.get("_artist"):
+                    fields["artist"] = ex.get("_artist", "")
+                    fields["album"] = ex.get("_album", "") or it.get("album", "")
+                    it["artist"] = fields["artist"]
+                    it["album"] = fields["album"]
+                store.update(it["id"], **fields)
+                it["existing"] = ex
+                refreshed += 1
+            # Auto-dismiss "green" items: the library already has this album
+            # complete (>= the held track count) AND the held copy isn't a
+            # clear upgrade -> the user never wants to see it again. A genuine
+            # upgrade (held multichannel/lossless vs a stereo/lossy library
+            # copy) is KEPT so they can decide.
+            ex = it.get("existing") or {}
+            det = it.get("details") or {}
+            held_n = int(it.get("tracks") or det.get("n_audio") or 0)
+            if (ex.get("in_library") and held_n > 0
+                    and int(ex.get("n_audio", 0)) >= held_n):
+                upgrade = (det.get("multichannel") and not ex.get("multichannel")) \
+                    or (det.get("lossless") and ex.get("has_lossy"))
+                if not upgrade:
+                    store.remove(it["id"])
+        return refreshed
 
     # ---- WebUI actions (#11) ------------------------------------------
     def _held_audio_files(self, folder: Path) -> List[Path]:
@@ -8204,15 +8332,42 @@ class Orchestrator:
                 last = str(exc)
         return (False, f"{action} failed: {last}")
 
-    def read_log(self, lines: int = 400) -> str:
-        """Return the last `lines` of the pipeline log for the WebUI Log tab."""
-        path = getattr(self.cfg, "log_file", None)
+    def read_log(self, lines: int = 400, which: str = "pipeline") -> str:
+        """
+        Last `lines` of a log for the WebUI Log tab (`lines` <= 0 -> whole
+        file). `which` selects "pipeline" (our own log) or "flac2mp3" (the
+        Lidarr downsampler scripts' log, mounted read-only from the lidarr
+        container's config). Reads only the tail bytes it needs -- the tab is
+        a plain reflection of the file, not a rendered view.
+        """
+        if which == "flac2mp3":
+            path = getattr(self.cfg, "flac2mp3_log", None) or "/lidarr-logs/flac2mp3.txt"
+        else:
+            path = getattr(self.cfg, "log_file", None)
         if not path:
             return "(no log file configured)"
         try:
-            with open(path, "r", encoding="utf-8", errors="replace") as fh:
-                buf = fh.readlines()
-            return "".join(buf[-max(1, min(int(lines), 5000)):])
+            n = int(lines)
+            with open(path, "rb") as fh:
+                if n <= 0:
+                    # Entire file, straight reflection (no line processing).
+                    data = fh.read()
+                else:
+                    # Tail read: seek back only ~enough bytes for n lines so a
+                    # 400-line refresh never reads a multi-MB file.
+                    fh.seek(0, 2)
+                    size = fh.tell()
+                    want = min(size, max(4096, n * 220))
+                    fh.seek(size - want)
+                    data = fh.read()
+                    nl = data.count(b"\n")
+                    if nl > n:
+                        # Drop the extra leading lines (and the partial first).
+                        idx = 0
+                        for _ in range(nl - n):
+                            idx = data.find(b"\n", idx) + 1
+                        data = data[idx:]
+            return data.decode("utf-8", "replace")
         except FileNotFoundError:
             return f"(log file not found: {path})"
         except OSError as exc:  # noqa: BLE001
@@ -8260,6 +8415,8 @@ class Orchestrator:
          "How long (minutes) a torrent may sit at ~0% before it's reaped (from add time)."),
         ("lidarr.webui_unmonitor_on_resolve", "lidarr", "webui_unmonitor_on_resolve", "Unmonitor on resolve", "bool", True,
          "When you resolve an item here, unmonitor the album so it isn't re-downloaded."),
+        ("lidarr.webui_held_refresh_seconds", "lidarr", "webui_held_refresh_seconds", "Needs-attention refresh (s)", "int", 300,
+         "How often the background curator refreshes this list (library compare, auto-dismiss). The page itself always loads instantly from the stored file."),
         ("lidarr.extract_archives", "lidarr", "extract_archives", "Extract archives", "bool", True,
          "Unpack .rar/.zip/.7z/.tar downloads with 7z, then import."),
         ("lidarr.extract_dvda_iso", "lidarr", "extract_dvda_iso", "Extract DVD-Audio ISO", "bool", True,

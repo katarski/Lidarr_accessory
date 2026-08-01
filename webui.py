@@ -161,9 +161,18 @@ _PAGE = r"""<!doctype html>
   <div id="progress" style="display:none"></div>
   <div id="log" style="display:none">
     <div style="display:flex;gap:.5rem;align-items:center;margin-bottom:.5rem">
+      <select id="logwhich" onchange="loadLog()">
+        <option value="pipeline">pipeline.log</option>
+        <option value="flac2mp3">flac2mp3 (downsampler)</option>
+      </select>
+      <select id="loglines" onchange="loadLog()">
+        <option value="400">last 400 lines</option>
+        <option value="4000">last 4,000 lines</option>
+        <option value="40000">last 40,000 lines</option>
+        <option value="0">entire file</option>
+      </select>
       <button class="b-copy" onclick="loadLog()">Refresh log</button>
       <label class="muted"><input type="checkbox" id="logtail" checked> auto-refresh</label>
-      <span class="muted">last 400 lines of /config/pipeline.log</span>
     </div>
     <pre id="logbox" style="background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:.6rem;max-height:70vh;overflow:auto;font-size:.72rem;white-space:pre-wrap"></pre>
   </div>
@@ -240,8 +249,11 @@ function ctrl(kind){
    .then(function(j){toast(j.message||(j.ok?'requested':'failed'));})
    .catch(function(){toast(kind+' requested (connection dropped, expected)');});
 }
-function loadLog(){fetch('/api/log?lines=400').then(function(r){return r.text();}).then(function(t){
-  var b=document.getElementById('logbox');b.textContent=t;b.scrollTop=b.scrollHeight;});}
+function loadLog(){
+  var n=document.getElementById('loglines').value;
+  var w=document.getElementById('logwhich').value;
+  fetch('/api/log?lines='+n+'&which='+w).then(function(r){return r.text();}).then(function(t){
+    var b=document.getElementById('logbox');b.textContent=t;b.scrollTop=b.scrollHeight;});}
 function toggleFilter(el){var f=el.dataset.f;FILT[f]=!FILT[f];el.classList.toggle('on',FILT[f]);render();}
 function fmtStr(d){if(!d||!d.formats)return'';return Object.keys(d.formats).map(function(k){return k.replace('.','')+'×'+d.formats[k];}).join(' ');}
 function buildColMenu(){var cm=document.getElementById('cm');cm.innerHTML=COLS.map(function(c,i){return '<label><input type="checkbox" '+(c.on?'checked':'')+' onchange="COLS['+i+'].on=this.checked;render()"> '+h(c.name)+'</label>';}).join('');}
@@ -488,67 +500,14 @@ def make_handler(store, actions: HeldActions):
             if path in ("/", "/index.html"):
                 self._send(200, _PAGE.encode("utf-8"), "text/html; charset=utf-8")
             elif path == "/api/held":
-                store.prune_missing()
-                # Expand any multi-album container (box set / titled discs) into
-                # one entry per album subfolder, then re-list.
-                if hasattr(actions, "expand_box_set"):
-                    for it in store.list():
-                        try:
-                            actions.expand_box_set(it)
-                        except Exception:  # noqa: BLE001
-                            pass
-                items = store.list()
-                # Enrich each item with the library's EXISTING album (for the
-                # held-vs-existing compare). Cache a positive (in_library) hit,
-                # but keep RETRYING a negative (throttled) -- the album may not
-                # have been in the library the first time we looked, and a stale
-                # "not in library" must not stick.
-                out = []
-                if hasattr(actions, "existing_album_summary"):
-                    now = time.time()
-                    for it in items:
-                        ex = it.get("existing")
-                        found = isinstance(ex, dict) and ex.get("in_library") is True
-                        fresh = isinstance(ex, dict) and (now - float(ex.get("_ts", 0)) < 120)
-                        if not (found or fresh):
-                            try:
-                                ex = actions.existing_album_summary(it) or {}
-                            except Exception:  # noqa: BLE001
-                                ex = {}
-                            ex["_ts"] = now
-                            fields = {"existing": ex}
-                            # Backfill/repair identity when it's missing or the
-                            # stored artist is a bare year (discography leaf).
-                            cur_a = str(it.get("artist") or "")
-                            cur_b = str(it.get("album") or "")
-                            bad = (not (cur_a and cur_b)) \
-                                or bool(re.fullmatch(r"(?:19|20)\d{2}", cur_a.strip())) \
-                                or bool(re.fullmatch(r"\d{1,3}", cur_b.strip()))
-                            if bad and ex.get("_artist"):
-                                fields["artist"] = ex.get("_artist", "")
-                                fields["album"] = ex.get("_album", "") or it.get("album", "")
-                                it["artist"] = fields["artist"]
-                                it["album"] = fields["album"]
-                            store.update(it["id"], **fields)
-                            it["existing"] = ex
-                        # Auto-dismiss "green" items: the library already has this
-                        # album complete (>= the held track count) AND the held
-                        # copy isn't a clear upgrade -> the user never wants to see
-                        # it again. A genuine upgrade (held multichannel/lossless vs
-                        # a stereo/lossy library copy) is KEPT so they can decide.
-                        ex = it.get("existing") or {}
-                        det = it.get("details") or {}
-                        held_n = int(it.get("tracks") or det.get("n_audio") or 0)
-                        if ex.get("in_library") and held_n > 0 and int(ex.get("n_audio", 0)) >= held_n:
-                            upgrade = (det.get("multichannel") and not ex.get("multichannel")) \
-                                or (det.get("lossless") and ex.get("has_lossy"))
-                            if not upgrade:
-                                store.remove(it["id"])
-                                continue
-                        out.append(it)
-                else:
-                    out = items
-                self._json(200, {"items": out})
+                # FAST PATH: serve straight from the file-backed store. Every
+                # heavy step that used to run here per page load -- pruning
+                # vanished folders, box-set expansion, the library compare,
+                # identity backfill, auto-dismissing greens -- now runs in the
+                # background curator thread (Orchestrator.curate_held_pass),
+                # which keeps the store file itself fresh. The page load is
+                # just this in-memory list dump.
+                self._json(200, {"items": store.list()})
             elif path == "/api/activity":
                 acts = actions.list_activity() if hasattr(actions, "list_activity") else []
                 self._json(200, {"items": acts})
@@ -573,7 +532,12 @@ def make_handler(store, actions: HeldActions):
                     n = int((qs.get("lines", ["400"]) or ["400"])[0])
                 except ValueError:
                     n = 400
-                text = actions.read_log(n) if hasattr(actions, "read_log") else "(unavailable)"
+                which = (qs.get("which", ["pipeline"]) or ["pipeline"])[0]
+                try:
+                    text = (actions.read_log(n, which)
+                            if hasattr(actions, "read_log") else "(unavailable)")
+                except TypeError:
+                    text = actions.read_log(n)
                 self._send(200, text.encode("utf-8", "replace"), "text/plain; charset=utf-8")
             elif path == "/healthz":
                 self._json(200, {"ok": True, "held": len(store.list())})
