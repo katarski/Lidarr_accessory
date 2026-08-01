@@ -130,6 +130,11 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     put("lidarr", "reconcile_max_files_per_pass", "RECONCILE_MAX_FILES", int)
     put("lidarr", "reconcile_max_probes_per_pass", "RECONCILE_MAX_PROBES", int)
     put("lidarr", "reconcile_recheck_seconds", "RECONCILE_RECHECK", int)
+    # Content-based album identification (folder-naming-discrepancy fix).
+    put("lidarr", "content_identify", "CONTENT_IDENTIFY", _as_bool)
+    put("lidarr", "content_identify_min_coverage",
+        "CONTENT_IDENTIFY_MIN_COVERAGE", int)
+    put("lidarr", "content_identify_llm", "CONTENT_IDENTIFY_LLM", _as_bool)
     # Purge-imported sweep -- continuously delete download folders whose album
     # Lidarr already has fully (catches re-downloads the pipeline skipped).
     put("lidarr", "purge_imported_enabled", "PURGE_IMPORTED_ENABLED", _as_bool)
@@ -1108,6 +1113,11 @@ def main() -> int:
         reconcile_recheck_seconds=int(
             lidarr_cfg.get("reconcile_recheck_seconds", 21600)
         ),
+        content_identify=bool(lidarr_cfg.get("content_identify", True)),
+        content_identify_min_coverage=int(
+            lidarr_cfg.get("content_identify_min_coverage", 60)
+        ),
+        content_identify_llm=bool(lidarr_cfg.get("content_identify_llm", True)),
     )
 
     orch = Orchestrator(orch_cfg, lidarr, ollama_client, acoustid=acoustid_client,

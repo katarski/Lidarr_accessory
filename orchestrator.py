@@ -577,6 +577,24 @@ class OrchestratorConfig:
     # gets re-checked without a restart). Default 6h.
     reconcile_recheck_seconds: int = 21600
 
+    # --- Content-based album identification (the folder-naming-discrepancy
+    # fix). When a downloaded album folder can't be matched to a Lidarr album
+    # BY NAME (folder/tag naming differs from Lidarr's title), identify it by
+    # its CONTENT instead: compare the download's track titles (embedded tags,
+    # informative filenames, or a tracklist scraped from a sidecar
+    # .nfo/.txt/.log) against the track lists of the artist's monitored albums,
+    # and import into the album whose tracks they unambiguously are.
+    # Accuracy-first: needs a coverage floor AND a clear margin over the
+    # runner-up album, refuses live/demo/remix lookalikes the album title
+    # doesn't claim, and can ask the LLM to confirm an inconclusive match
+    # (still verified against the album's track count).
+    content_identify: bool = True
+    # Min % of the download's TITLED files that must map to distinct tracks of
+    # ONE album for a title-based identification to count.
+    content_identify_min_coverage: int = 60
+    # Allow the LLM confirmation step for ambiguous / title-less folders.
+    content_identify_llm: bool = True
+
 
 class Orchestrator:
     def __init__(
@@ -2861,6 +2879,396 @@ class Orchestrator:
             return ("redundant", have, total)
         return ("import", have, total)
 
+    # --- Content-based album identification (cfg.content_identify) ---------
+    # Variant markers that make a source a DIFFERENT recording of the same
+    # songs (a live set / demo / remix has the same track TITLES as the studio
+    # album, so title matching alone would happily mis-file it).
+    _NOISE_IDENT_TOKENS = frozenset({
+        "live", "bootleg", "bootlegs", "demo", "demos", "karaoke",
+        "instrumental", "instrumentals", "unplugged", "acapella",
+        "remix", "remixes", "tribute", "covers", "megamix",
+    })
+
+    def _source_track_titles(
+        self, audios: List[Path], artist: str = "",
+    ) -> List[str]:
+        """
+        Best-effort per-file track titles: embedded TITLE tag first, then an
+        informative filename ("07 - Some Song.flac"). A file with neither
+        (e.g. "track 1.mp3", no tags) yields "". Order follows `audios`.
+        """
+        titles: List[str] = []
+        for a in audios:
+            t = ""
+            try:
+                t = (self._read_track_tags(a).get("title") or "").strip()
+            except Exception:  # noqa: BLE001
+                t = ""
+            if not t and not self._is_uninformative_name(a.stem):
+                _tno, t = self._track_title_from_name(a.stem, artist)
+            titles.append(t or "")
+        return titles
+
+    _SIDECAR_TRACK_RE = re.compile(
+        r"^\s*(\d{1,3})\s*[.\-):\]]\s+(.{2,90}?)\s*$"
+    )
+    _SIDECAR_TIME_RE = re.compile(r"\s*[\(\[]?\d{1,2}:\d{2}[\)\]]?\s*$")
+
+    def _titles_from_sidecars(self, folder: Path) -> List[str]:
+        """
+        Tracklist scraped from sidecar .nfo/.txt/.log files in the folder or
+        its parent: lines like "07. Some Song" / "07 - Some Song (3:45)".
+        Returns titles in track order from the richest such file, or [] when
+        nothing tracklist-like is found. Used when the audio files themselves
+        carry no titles (ambiguous names, no tags).
+        """
+        best: List[str] = []
+        for parent in (folder, folder.parent):
+            try:
+                entries = list(parent.iterdir())
+            except OSError:
+                continue
+            for f in entries:
+                if f.suffix.lower() not in (".nfo", ".txt", ".log"):
+                    continue
+                try:
+                    if f.stat().st_size > 200_000:
+                        continue
+                    text = f.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                found: Dict[int, str] = {}
+                for line in text.splitlines():
+                    m = self._SIDECAR_TRACK_RE.match(line)
+                    if not m:
+                        continue
+                    num = int(m.group(1))
+                    if not (1 <= num <= 199):
+                        continue
+                    title = self._SIDECAR_TIME_RE.sub("", m.group(2)).strip()
+                    # Drop obvious non-title lines (pure numbers, urls, sizes).
+                    if (len(title) < 2 or title.lower().startswith("http")
+                            or re.fullmatch(r"[\d\s.,:x*-]+", title)):
+                        continue
+                    found.setdefault(num, title)
+                if len(found) >= 3 and min(found) == 1:
+                    ordered = [found[k] for k in sorted(found)]
+                    if len(ordered) > len(best):
+                        best = ordered
+        return best
+
+    def _identify_album_by_content(
+        self,
+        folder: Path,
+        audios: List[Path],
+        artist_name: str,
+        album_hint: str = "",
+        gap_only: bool = False,
+    ) -> Optional[str]:
+        """
+        Identify WHICH Lidarr album a downloaded folder is by its CONTENT,
+        for the case where the folder/tag album NAME doesn't match Lidarr
+        (the artist-dump naming-discrepancy class). Returns the Lidarr album
+        TITLE (verbatim, so downstream name matching succeeds) on a confident
+        match, else None.
+
+        Accuracy-first ladder:
+          1. TITLE MATCH -- fuzzy-pair the download's track titles (tags, then
+             informative filenames, then a sidecar .nfo/.txt tracklist)
+             against each candidate album's track list; distinct tracks only.
+             Accept only with >= content_identify_min_coverage% of titled
+             files matched AND a clear margin over the runner-up album.
+          2. LLM CONFIRM (cfg.content_identify_llm) -- for an ambiguous or
+             title-less folder, ask the LLM to pick among candidate titles
+             given the folder/file/sidecar context; the pick is only accepted
+             when the album also fits the file count (a release with that
+             track count, or within the partial-import tolerance).
+        A live/demo/remix-marked source is refused unless the matched album
+        title claims the same marker (same titles, different recording).
+        """
+        if not getattr(self.cfg, "content_identify", True):
+            return None
+        n = len(audios)
+        if n == 0 or not (artist_name or "").strip():
+            return None
+        try:
+            art = self.lidarr.find_artist(artist_name)
+            if not art:
+                return None
+            albums = self.lidarr.list_albums_for_artist(int(art["id"])) or []
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("content-identify: Lidarr lookup failed for %r: %s",
+                         artist_name, exc)
+            return None
+        cands: List[Tuple[Dict[str, Any], int, int]] = []
+        for a in albums:
+            if not a.get("monitored"):
+                continue
+            st = a.get("statistics") or {}
+            total = int(st.get("totalTrackCount") or 0)
+            have = int(st.get("trackFileCount") or 0)
+            if total <= 0:
+                continue
+            if gap_only and have >= total:
+                continue
+            cands.append((a, total, have))
+        if not cands:
+            return None
+
+        # Probe order: NAME-PLAUSIBLE candidates first (the hint is a partial/
+        # mangled album name, so a word-subset or fuzzy-similar Lidarr title --
+        # "Gladiator" vs "Gladiator: Music From the Motion Picture" -- is the
+        # likeliest target), then closest track count. Without the plausibility
+        # bucket a big-discography artist pushes the right album past the probe
+        # cap purely on track-count distance.
+        hint = _match_key(album_hint or folder.name)
+        hint_words = set(hint.split()) if hint else set()
+
+        def _order(c):
+            a, total, _have = c
+            t = _match_key(a.get("title") or "")
+            sim = difflib.SequenceMatcher(None, hint, t).ratio() if hint else 0.0
+            tw = set(t.split())
+            plausible = sim >= 0.5 or bool(
+                hint_words and tw and (hint_words <= tw or tw <= hint_words))
+            return (0 if plausible else 1, abs(total - n), -sim)
+
+        cands.sort(key=_order)
+        max_probe = 60
+
+        src_titles = self._source_track_titles(audios, artist_name)
+        titled = [t for t in src_titles if t]
+        if len(titled) < max(2, n // 2):
+            sidecar = self._titles_from_sidecars(folder)
+            if len(sidecar) >= max(2, n // 2):
+                logger.info(
+                    "content-identify: %s -- using %d-track sidecar tracklist "
+                    "(files carry no titles)", folder.name, len(sidecar))
+                titled = sidecar
+        keys = [k for k in (self._title_key(t) for t in titled) if k]
+
+        floor = 0.78
+        min_cov = max(1, int(
+            getattr(self.cfg, "content_identify_min_coverage", 60)))
+        results: List[Tuple[int, float, Dict[str, Any]]] = []
+        if len(keys) >= 2:
+            # Rival window: once some album matches EVERY titled file, probe a
+            # few more candidates so an equally-perfect rival (e.g. the live
+            # album with identical track titles) is still seen by the margin
+            # check below -- then stop (probing the whole discography after a
+            # perfect fit would be pure waste).
+            probes_after_perfect = 0
+            perfect_found = False
+            for a, total, _have in cands[:max_probe]:
+                if perfect_found:
+                    probes_after_perfect += 1
+                    if probes_after_perfect > 8:
+                        break
+                matched = 0
+                for tkeys in self._album_candidate_title_sets(a, n):
+                    free = dict.fromkeys(tkeys, True)
+                    m = 0
+                    for k in keys:
+                        best_tk, best_score = None, 0.0
+                        for tk, ok in free.items():
+                            if not ok:
+                                continue
+                            s = difflib.SequenceMatcher(None, k, tk).ratio()
+                            if s > best_score:
+                                best_tk, best_score = tk, s
+                        if best_tk is not None and best_score >= floor:
+                            free[best_tk] = False
+                            m += 1
+                    matched = max(matched, m)
+                    if m == len(keys):
+                        break
+                if not matched:
+                    continue
+                cov = 100.0 * matched / len(keys)
+                results.append((matched, cov, a))
+                # Perfect fit: every titled file mapped -- open the rival
+                # window (see probes_after_perfect above).
+                if matched == len(keys) and matched >= 3:
+                    perfect_found = True
+            results.sort(key=lambda r: (-r[0], -r[1]))
+
+        winner: Optional[Dict[str, Any]] = None
+        via = ""
+        if results:
+            m1, cov1, alb1 = results[0]
+            m2 = results[1][0] if len(results) > 1 else 0
+            clear_margin = (m1 >= m2 + 2) or (
+                cov1 >= 90.0 and (len(results) < 2 or results[1][1] < 50.0))
+            if cov1 >= min_cov and m1 >= 2 and clear_margin:
+                winner, via = alb1, f"titles {m1}/{len(keys)} ({cov1:.0f}%)"
+            elif cov1 >= min_cov and m1 >= 2:
+                # Ambiguous between top candidates -> let the LLM break the
+                # tie among ONLY the plausible ones (never invents a title).
+                top = [r[2] for r in results[:5] if r[1] >= min_cov]
+                pick = self._llm_confirm_album(
+                    folder, audios, titled, [t.get("title") or "" for t in top])
+                if pick:
+                    for r in results[:5]:
+                        if (r[2].get("title") or "") == pick:
+                            winner, via = r[2], (
+                                f"titles ambiguous, LLM pick ({r[0]}/{len(keys)})")
+                            break
+
+        if winner is None and not keys:
+            # No usable titles anywhere: LLM on folder/file/sidecar context,
+            # verified against the album's release track counts (exact or
+            # within the partial tolerance) before we trust it.
+            pick = self._llm_confirm_album(
+                folder, audios, [],
+                [a.get("title") or "" for a, _t, _h in cands[:25]])
+            if pick:
+                for a, total, _have in cands:
+                    if (a.get("title") or "") == pick:
+                        if self._album_fits_file_count(a, n):
+                            winner, via = a, "LLM (count-verified)"
+                        else:
+                            logger.info(
+                                "content-identify: LLM picked %r but no "
+                                "release fits %d files -- refusing.", pick, n)
+                        break
+
+        if winner is None:
+            return None
+
+        # Variant guard: a live/demo/remix-marked SOURCE may share every track
+        # title with the studio album -- refuse unless the matched album title
+        # claims the same marker.
+        src_text = " ".join(
+            [folder.name, folder.parent.name, album_hint or ""]).lower()
+        src_noise = set(re.findall(r"[a-z]+", src_text)) & self._NOISE_IDENT_TOKENS
+        alb_words = set(re.findall(
+            r"[a-z]+", (winner.get("title") or "").lower()))
+        if src_noise - alb_words:
+            logger.info(
+                "content-identify: %s matches %r by tracks but source is "
+                "marked %s and the album title isn't -- refusing (different "
+                "recording of the same songs).",
+                folder.name, winner.get("title"),
+                "/".join(sorted(src_noise - alb_words)))
+            return None
+
+        logger.info(
+            "content-identify: %s -> %s / %r via %s",
+            folder.name, artist_name, winner.get("title"), via)
+        return winner.get("title") or None
+
+    def _album_candidate_title_sets(
+        self, album_rec: Dict[str, Any], n: int,
+    ) -> List[set]:
+        """
+        Track-title key sets worth scoring for an album: the SELECTED
+        release's tracks, plus -- when that release's size doesn't equal the
+        download's file count -- up to two other releases whose trackCount
+        DOES. Lidarr's plain /track call returns only the selected release,
+        which would hide e.g. the classic 17-track OST pressing behind a
+        selected 64-track anniversary edition.
+        """
+        try:
+            aid = int(album_rec["id"])
+        except Exception:  # noqa: BLE001
+            return []
+        sets: List[set] = []
+        try:
+            tracks = self.lidarr.list_tracks_for_album(aid) or []
+        except Exception:  # noqa: BLE001
+            tracks = []
+        sel = {self._title_key(t.get("title") or "") for t in tracks}
+        sel.discard("")
+        if sel:
+            sets.append(sel)
+        if len(tracks) != n:
+            try:
+                full = self.lidarr.get_album(aid) or album_rec
+            except Exception:  # noqa: BLE001
+                full = album_rec
+            extra = 0
+            for r in (full.get("releases") or []):
+                if extra >= 2:
+                    break
+                if int(r.get("trackCount") or 0) != n or not r.get("id"):
+                    continue
+                try:
+                    tr = self.lidarr.list_tracks_for_release(
+                        aid, int(r["id"])) or []
+                except Exception:  # noqa: BLE001
+                    continue
+                ks = {self._title_key(t.get("title") or "") for t in tr}
+                ks.discard("")
+                if ks and ks not in sets:
+                    sets.append(ks)
+                    extra += 1
+        return sets
+
+    def _album_fits_file_count(self, album_rec: Dict[str, Any], n: int) -> bool:
+        """True when some release of the album has exactly n tracks, or n is
+        within the configured partial-import tolerance of one."""
+        try:
+            full = self.lidarr.get_album(int(album_rec["id"])) or album_rec
+        except Exception:  # noqa: BLE001
+            full = album_rec
+        pmin = (max(1, int(self.cfg.force_import_partial_min_percent))
+                if self.cfg.force_import_partial
+                else (100 - max(0, int(self.cfg.force_import_max_missing_percent))))
+        for r in (full.get("releases") or []):
+            t = int(r.get("trackCount") or 0)
+            if t <= 0:
+                continue
+            if n == t or (n < t and 100 * n >= pmin * t):
+                return True
+        return False
+
+    def _llm_confirm_album(
+        self,
+        folder: Path,
+        audios: List[Path],
+        titled: List[str],
+        candidate_titles: List[str],
+    ) -> Optional[str]:
+        """LLM album pick with folder/file/sidecar context. Returns one of
+        `candidate_titles` or None. Gated by cfg.content_identify_llm."""
+        if not getattr(self.cfg, "content_identify_llm", True):
+            return None
+        if self.ollama is None or not getattr(self.ollama, "enabled", False):
+            return None
+        cand = [t for t in candidate_titles if t]
+        if not cand:
+            return None
+        lines = [f"folder: {folder.parent.name}/{folder.name}"]
+        if titled:
+            lines.append("track titles:")
+            lines.extend(f"  {t}" for t in titled[:25])
+        else:
+            lines.append("files:")
+            lines.extend(f"  {a.name}" for a in audios[:25])
+            for parent in (folder, folder.parent):
+                try:
+                    entries = list(parent.iterdir())
+                except OSError:
+                    continue
+                for f in entries:
+                    if f.suffix.lower() in (".nfo", ".txt", ".log"):
+                        try:
+                            excerpt = f.read_text(
+                                encoding="utf-8", errors="replace")[:600]
+                        except OSError:
+                            continue
+                        lines.append(f"{f.name} says:")
+                        lines.append(excerpt)
+                        break
+                else:
+                    continue
+                break
+        try:
+            return self.ollama.confirm_album_match("\n".join(lines), cand)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("content-identify: LLM confirm failed: %s", exc)
+            return None
+
     def _multidisc_audio_files(self, folder: Path) -> List[Path]:
         """Every audio file under `folder`'s disc subfolders (CD1/Disc 2/...),
         in disc order. Used to import a multi-disc album handed off at the
@@ -3204,6 +3612,12 @@ class Orchestrator:
                     ident["artist"], ident["album"],
                     ident.get("identified", 0), ident.get("total", 0), folder,
                 )
+        if artist_name and not album_name:
+            # Artist known, album not (empty/garbage tags): identify the album
+            # by its track CONTENT against the artist's monitored albums.
+            ident = self._identify_album_by_content(folder, audios, artist_name)
+            if ident:
+                album_name = ident
         if not (artist_name and album_name):
             logger.warning(
                 "Pre-split handoff: could not determine artist/album from "
@@ -3232,6 +3646,23 @@ class Orchestrator:
             verdict, _have, _total = self._monitored_album_status(
                 artist_name, album_name
             )
+            if verdict == "skip":
+                # Naming discrepancy? Before writing the folder off as
+                # unmonitored, check whether its track CONTENT identifies it
+                # as one of the artist's monitored albums under a different
+                # name (the artist-dump folder-naming class). On a confident
+                # match, adopt Lidarr's own title so every downstream name
+                # lookup (queue, dedup, force-import) succeeds.
+                ident = self._identify_album_by_content(
+                    folder, audios, artist_name, album_hint=album_name)
+                if ident and _match_key(ident) != _match_key(album_name):
+                    logger.info(
+                        "Pre-split: %r / %r didn't match by name, but its "
+                        "tracks identify it as %r -- importing under that "
+                        "album.", artist_name, album_name, ident)
+                    album_name = ident
+                    verdict, _have, _total = self._monitored_album_status(
+                        artist_name, album_name)
             if verdict == "skip":
                 logger.info(
                     "Pre-split: %s / %s has no monitored album in Lidarr "
@@ -3681,6 +4112,7 @@ class Orchestrator:
         gap_ids: set = set()
         gap_totals: Dict[int, int] = {}
         gap_artist_keys: set = set()
+        gap_artist_names: Dict[str, str] = {}
         for a in albums:
             if not a.get("monitored"):
                 continue
@@ -3696,6 +4128,7 @@ class Orchestrator:
                 key = _match_key(an)
                 if key:
                     gap_artist_keys.add(key)
+                    gap_artist_names.setdefault(key, an)
         if not gap_ids:
             logger.debug("reconcile: no monitored gaps in Lidarr -- nothing to do")
             return 0
@@ -3726,6 +4159,9 @@ class Orchestrator:
         now_ts = time.time()
         imported = 0
         probes = 0
+        # Per-pass budget for the content-identify fallback (each attempt can
+        # cost several Lidarr track-list fetches + maybe an LLM call).
+        ident_budget = 8
         # Per-folder negative cache {path: (mtime, last_probe_ts)}: a folder that
         # yielded nothing importable is not re-probed until its audio changes on
         # disk or `recheck` seconds pass. This keeps the steady state cheap (the
@@ -3815,7 +4251,35 @@ class Orchestrator:
                     n, ", ".join(titles) or "?", folder.name,
                 )
             else:
-                cache[key] = (mtime, now_ts)
+                # Lidarr's own matcher couldn't place this folder (bad tags /
+                # folder-name discrepancy). Content-identify fallback: match
+                # the download's track titles against the gap artist's
+                # monitored gap albums and, on a confident hit, import via the
+                # release-flipping force-import (which re-verifies the file
+                # count against a concrete release).
+                did = False
+                if (getattr(self.cfg, "content_identify", True)
+                        and ident_budget > 0):
+                    matched_key = next(
+                        (k for k in gap_artist_keys if k in path_key), None)
+                    artist_nm = gap_artist_names.get(matched_key or "", "")
+                    if not artist_nm and audios:
+                        tags = self._read_track_tags(audios[0])
+                        artist_nm = (tags.get("albumartist")
+                                     or tags.get("artist") or "")
+                    if artist_nm:
+                        ident_budget -= 1
+                        title = self._identify_album_by_content(
+                            folder, audios, artist_nm, gap_only=True)
+                        if title:
+                            did = self._try_positional_force_import(
+                                None, folder, folder, artist_nm, title,
+                                audios, "reconcile content-identify")
+                            if did:
+                                imported += len(audios)
+                                cache.pop(key, None)
+                if not did:
+                    cache[key] = (mtime, now_ts)
         if imported:
             logger.info("reconcile: imported %d file(s) this pass "
                         "(%d folder(s) probed)", imported, probes)
@@ -7776,6 +8240,10 @@ class Orchestrator:
          "Seconds between reconcile passes (min 300)."),
         ("lidarr.reconcile_require_full_album", "lidarr", "reconcile_require_full_album", "Reconcile: full album only", "bool", True,
          "Only import when the source supplies EVERY track of the album (track-level source vs destination match). Off = allow partial fills."),
+        ("lidarr.content_identify", "lidarr", "content_identify", "Content-identify albums", "bool", True,
+         "When a download's folder/tag name doesn't match Lidarr, identify the album by its track titles (tags, filenames, .nfo tracklist) and import it under Lidarr's own title."),
+        ("lidarr.content_identify_llm", "lidarr", "content_identify_llm", "Content-identify: AI confirm", "bool", True,
+         "Let the AI pick among candidate albums when track titles alone are inconclusive (the pick is verified against the album's track count)."),
         ("lidarr.prefer_multichannel", "lidarr", "prefer_multichannel", "Prefer multichannel", "bool", True,
          "In conversions, keep the multichannel version and discard stereo."),
         ("qbittorrent.deselect_video", "qbittorrent", "deselect_video", "Deselect video", "bool", True,

@@ -390,6 +390,51 @@ class OllamaClient:
             return None
         return matched
 
+    def confirm_album_match(
+        self, context: str, candidate_titles: List[str],
+    ) -> Optional[str]:
+        """
+        Ask the LLM which CANDIDATE album (a Lidarr album title) the described
+        download IS, given richer context than a bare folder name: track titles,
+        file listing, any tracklist scraped from a sidecar .nfo/.txt. Used by
+        the content-identify sweep when title matching alone is inconclusive.
+
+        Hallucination-safe: the answer must map back to one of the supplied
+        titles (exact or normalized) or we return None. Unlike
+        pick_owned_album there is NO word-overlap guard against the folder
+        name -- the whole point of this path is that the folder name does NOT
+        match the album title; the caller re-verifies the pick against the
+        album's track count before acting on it.
+        """
+        if not self.enabled or not context or not candidate_titles:
+            return None
+        listing = "\n".join(f"- {t}" for t in candidate_titles)
+        prompt = (
+            f"Downloaded album (folder name, files, any tracklist found):\n"
+            f"{context}\n\n"
+            f"Albums by this artist it could be:\n{listing}\n\n"
+            "Which one IS this download? Reply with the exact title from the "
+            "list, copied verbatim, or NONE if unsure."
+        )
+        out = self._generate(
+            _ALBUM_MATCH_SYSTEM, prompt, num_predict=64, timeout=60.0)
+        ans = (out or "").strip().strip("`").strip().strip('"').strip("'").strip()
+        if not ans or ans.upper() == "NONE":
+            return None
+        for t in candidate_titles:
+            if t.strip().lower() == ans.lower():
+                return t
+        try:
+            from dedup_downloads import norm_title
+            na = norm_title(ans)
+            for t in candidate_titles:
+                if norm_title(t) == na:
+                    return t
+        except Exception:  # noqa: BLE001
+            pass
+        logger.info("AI album confirm rejected (not in candidate list): %r", ans)
+        return None
+
     # ---------- tag normalization ---------------------------------------
 
     def normalize_tags(self, plans: List[TagPlan]) -> Optional[List[TagPlan]]:

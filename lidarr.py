@@ -858,11 +858,28 @@ class LidarrClient:
             return None
 
     def list_tracks_for_album(self, album_id: int) -> List[Dict[str, Any]]:
-        """Return the track list for an album."""
+        """Return the track list for an album (SELECTED release only)."""
         try:
             return self._get("/api/v1/track", albumId=album_id) or []
         except Exception as exc:
             logger.warning("list_tracks_for_album(%s) failed: %s", album_id, exc)
+            return []
+
+    def list_tracks_for_release(
+        self, album_id: int, release_id: int,
+    ) -> List[Dict[str, Any]]:
+        """Track list of a SPECIFIC release of an album -- the plain /track
+        call returns only the SELECTED release's tracks, which hides every
+        other pressing (e.g. the classic 17-track OST behind a selected
+        64-track anniversary edition)."""
+        try:
+            return self._get(
+                "/api/v1/track", albumId=album_id, albumReleaseId=release_id,
+            ) or []
+        except Exception as exc:
+            logger.warning(
+                "list_tracks_for_release(%s, %s) failed: %s",
+                album_id, release_id, exc)
             return []
 
     def refresh_artist(self, artist_id: int) -> Optional[int]:

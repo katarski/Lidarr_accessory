@@ -86,6 +86,31 @@ verified import**, so a failed import never loses the original.
 
 ---
 
+## Content-identify — import albums whose folder name doesn't match Lidarr
+
+When a downloaded album can't be matched to a Lidarr album **by name** (artist
+dumps like `Hans Zimmer/Gladiator` vs Lidarr's "Gladiator: Music From the
+Motion Picture"), the pipeline identifies it by its **content**: the download's
+track titles (embedded tags → informative filenames → a tracklist scraped from
+a sidecar `.nfo`/`.txt`) are fuzzy-matched against the track lists of the
+artist's monitored albums — **including non-selected releases**, so a classic
+17-track pressing hidden behind a selected anniversary edition still matches.
+Runs in the cueless sweep's handoff **and** as a reconcile-pass fallback.
+
+Accuracy first: it refuses when coverage is below the floor, when a rival album
+matches almost as well, or when the source is marked live/demo/remix and the
+album title isn't (same titles, different recording). Ambiguous or title-less
+folders can be sent to the LLM for a pick, which is then verified against the
+album's release track counts before anything is imported.
+
+| Env var | Default | What it does |
+|---|---|---|
+| `CONTENT_IDENTIFY` | **true** | Enable content-based album identification. |
+| `CONTENT_IDENTIFY_MIN_COVERAGE` | **60** | Min % of the download's titled files that must map to distinct tracks of ONE album. |
+| `CONTENT_IDENTIFY_LLM` | **true** | Allow the LLM confirmation step for ambiguous/title-less folders. |
+
+---
+
 ## WebUI — see & resolve what's stuck
 
 Open the container's **WebUI** (port `8830`). Two tabs:
