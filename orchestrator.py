@@ -3420,6 +3420,37 @@ class Orchestrator:
                 )
         return to_skip
 
+    # Truncated/legacy extensions some rips ship with -> what the content
+    # usually is. ".fla" (8.3-era FLAC) is invisible to the whole pipeline AND
+    # to Lidarr, so a folder of them (e.g. a FLAC-EAC-CUE vinyl rip) sits
+    # unimported forever. Renamed in the sweep after an ffprobe verify.
+    _MISNAMED_AUDIO_EXTS = {".fla": ("flac", ".flac")}
+
+    def _fix_misnamed_audio_exts(self, folder: Path, filenames) -> int:
+        """Rename audio files with a truncated/legacy extension (.fla ->
+        .flac) once ffprobe confirms the content matches. Returns renames."""
+        fixed = 0
+        for fn in filenames:
+            ext = os.path.splitext(fn)[1].lower()
+            want = self._MISNAMED_AUDIO_EXTS.get(ext)
+            if not want:
+                continue
+            codec, new_ext = want
+            p = folder / fn
+            try:
+                if self._audio_codec(p) != codec:
+                    continue
+                dst = p.with_suffix(new_ext)
+                if dst.exists():
+                    continue
+                p.rename(dst)
+                fixed += 1
+                logger.info("cueless sweep: renamed misnamed %s -> %s",
+                            p.name, dst.name)
+            except OSError as exc:
+                logger.warning("could not rename %s: %s", p, exc)
+        return fixed
+
     def _audio_codec(self, path: Path) -> str:
         """Return the a:0 codec name (lowercase) via ffprobe, or '' on failure."""
         ffprobe = str(Path(self.cfg.ffmpeg_binary).with_name("ffprobe"))
@@ -4417,6 +4448,14 @@ class Orchestrator:
             # Skip if we already dealt with this folder this run.
             if folder in self._skip_seen or folder_r in self._skip_seen:
                 continue
+
+            # Misnamed audio (.fla = truncated FLAC): rename first -- these
+            # files are otherwise invisible to the sweep, the cue watcher AND
+            # Lidarr. Re-scan the folder next sweep under the correct names.
+            if any(os.path.splitext(fn)[1].lower() in self._MISNAMED_AUDIO_EXTS
+                   for fn in filenames):
+                if self._fix_misnamed_audio_exts(folder, filenames):
+                    continue
 
             # Optical-disc ISO handling, done BEFORE the .cue guard so a sidecar
             # SACD/DVD-Audio .cue (which the normal splitter can't use) doesn't
