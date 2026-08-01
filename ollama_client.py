@@ -140,6 +140,13 @@ class OllamaClient:
         # Guard against stacking re-warm threads if timeouts cluster.
         self._rewarm_lock = threading.Lock()
         self._rewarm_in_flight = False
+        # Session-lifetime answer cache for album matching: the deselect
+        # re-check and lifecycle passes ask the SAME (download, owned-albums)
+        # question every cycle, so without this the model re-runs -- and the
+        # log re-spams "AI album match rejected" -- forever. Caches positive
+        # AND negative answers; cleared only by restart (library growth that
+        # changes the owned list changes the key, so staleness self-heals).
+        self._match_cache: dict = {}
 
     # ---------- low-level ------------------------------------------------
 
@@ -337,6 +344,10 @@ class OllamaClient:
         """
         if not self.enabled or not download_name or not owned_titles:
             return None
+        cache_key = ("owned", download_name.strip().lower(),
+                     frozenset(t.strip().lower() for t in owned_titles))
+        if cache_key in self._match_cache:
+            return self._match_cache[cache_key]
         listing = "\n".join(f"- {t}" for t in owned_titles)
         prompt = (
             f"Downloaded album folder name:\n  {download_name}\n\n"
@@ -347,6 +358,7 @@ class OllamaClient:
         out = self._generate(_ALBUM_MATCH_SYSTEM, prompt, num_predict=64, timeout=60.0)
         ans = (out or "").strip().strip("`").strip().strip('"').strip("'").strip()
         if not ans or ans.upper() == "NONE":
+            self._match_cache[cache_key] = None
             return None
         matched = None
         for t in owned_titles:
@@ -365,6 +377,7 @@ class OllamaClient:
             except Exception:  # noqa: BLE001
                 pass
         if matched is None:
+            self._match_cache[cache_key] = None
             return None
         # SAFETY GUARD: reject a match with no meaningful word overlap. A weak
         # model, forced to pick from a list, will sometimes pair two unrelated
@@ -387,7 +400,9 @@ class OllamaClient:
                 "AI album match rejected (no overlap): %r -> %r",
                 download_name, matched,
             )
+            self._match_cache[cache_key] = None
             return None
+        self._match_cache[cache_key] = matched
         return matched
 
     def confirm_album_match(
@@ -408,6 +423,10 @@ class OllamaClient:
         """
         if not self.enabled or not context or not candidate_titles:
             return None
+        cache_key = ("confirm", context.strip().lower()[:500],
+                     frozenset(t.strip().lower() for t in candidate_titles))
+        if cache_key in self._match_cache:
+            return self._match_cache[cache_key]
         listing = "\n".join(f"- {t}" for t in candidate_titles)
         prompt = (
             f"Downloaded album (folder name, files, any tracklist found):\n"
@@ -419,21 +438,28 @@ class OllamaClient:
         out = self._generate(
             _ALBUM_MATCH_SYSTEM, prompt, num_predict=64, timeout=60.0)
         ans = (out or "").strip().strip("`").strip().strip('"').strip("'").strip()
-        if not ans or ans.upper() == "NONE":
-            return None
-        for t in candidate_titles:
-            if t.strip().lower() == ans.lower():
-                return t
-        try:
-            from dedup_downloads import norm_title
-            na = norm_title(ans)
+        result = None
+        if ans and ans.upper() != "NONE":
             for t in candidate_titles:
-                if norm_title(t) == na:
-                    return t
-        except Exception:  # noqa: BLE001
-            pass
-        logger.info("AI album confirm rejected (not in candidate list): %r", ans)
-        return None
+                if t.strip().lower() == ans.lower():
+                    result = t
+                    break
+            if result is None:
+                try:
+                    from dedup_downloads import norm_title
+                    na = norm_title(ans)
+                    for t in candidate_titles:
+                        if norm_title(t) == na:
+                            result = t
+                            break
+                except Exception:  # noqa: BLE001
+                    pass
+            if result is None:
+                logger.info(
+                    "AI album confirm rejected (not in candidate list): %r",
+                    ans)
+        self._match_cache[cache_key] = result
+        return result
 
     # ---------- tag normalization ---------------------------------------
 

@@ -557,6 +557,8 @@ def torrent_lifecycle_pass(
     on_complete: Optional[Callable[[str], None]] = None,
     completed_seen: Optional[set] = None,
     wanted_only: bool = True,
+    checked: Optional[dict] = None,
+    recheck_seconds: int = 21600,
 ) -> tuple:
     """
     Manage COMPLETED music torrents by how much of their content the pipeline
@@ -659,13 +661,30 @@ def torrent_lifecycle_pass(
             # (total>0 and not have) still blocks removal, so un-imported wanted
             # content is never deleted (it stays for the WebUI to resolve).
             reaped = False
+            # Re-check throttle: a completed torrent whose DISK STATE hasn't
+            # changed since the last library check is not re-planned until
+            # `recheck_seconds` pass. Without this, every pass re-ran the
+            # full Lidarr+LLM plan for every stuck compilation ("NOT removing
+            # ..." cycling in the log every few minutes, forever). Any change
+            # in the folder (an import moved files out) re-checks immediately.
+            newest_mtime = _folder_newest_mtime(folder)
+            if checked is not None:
+                sig = (on_disk, int(newest_mtime))
+                prev = checked.get(h)
+                if (prev and prev[0] == sig
+                        and now - prev[1] < max(60, recheck_seconds)):
+                    continue
             if (remove_when_library_complete and lidarr is not None
-                    and now - _folder_newest_mtime(folder) >= max(0, min_stable_seconds)):
+                    and now - newest_mtime >= max(0, min_stable_seconds)):
                 try:
                     plan = plan_torrent(lidarr, name, files, llm=llm)
                 except Exception as exc:  # noqa: BLE001
                     plan = None
                     emit(f"lifecycle: library check failed for {name!r}: {exc}")
+                if plan and checked is not None:
+                    # Only a SUCCESSFUL plan is throttled -- a Lidarr hiccup
+                    # keeps retrying every pass as before.
+                    checked[h] = ((on_disk, int(newest_mtime)), now)
                 if plan:
                     def _blocks(a):
                         return int(a.get("total") or 0) > 0 and not a.get("have")

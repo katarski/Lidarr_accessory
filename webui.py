@@ -27,9 +27,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import threading
 import time
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, Protocol
 from urllib.parse import parse_qs, urlparse
@@ -117,13 +119,38 @@ _PAGE = r"""<!doctype html>
   .toolbar select{font:inherit;background:var(--card);color:var(--fg);border:1px solid var(--bd);border-radius:7px;padding:.35rem .55rem}
   .cols button{font-size:1rem;line-height:1;padding:.35rem .55rem}
   td.sel,th.sel{width:1.6rem;text-align:center;padding-left:.6rem}
+  /* Converter tab */
+  .cvsec{background:var(--card);border:1px solid var(--bd);border-radius:10px;margin-bottom:.55rem;padding:.15rem .7rem}
+  .cvsec>summary{cursor:pointer;font-weight:600;padding:.4rem 0;user-select:none}
+  .cvbody{padding:.3rem 0 .55rem;display:flex;flex-direction:column;gap:.4rem}
+  .cvbar{display:flex;gap:.7rem;align-items:center;flex-wrap:wrap;background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:.5rem .7rem;margin-bottom:.55rem}
+  .cvbar label{display:flex;flex-direction:column;font-size:.68rem;color:var(--mut);gap:.15rem}
+  .cvbar select{font:inherit;font-size:.78rem;background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:7px;padding:.28rem .45rem}
+  .cvtree{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:.4rem .6rem;max-height:62vh;overflow:auto;font-size:.78rem}
+  .cvrow{display:flex;align-items:center;gap:.45rem;padding:.12rem .25rem;border-radius:6px;white-space:nowrap}
+  .cvrow:hover{background:rgba(125,125,125,.12)}
+  .cvrow .nm{overflow:hidden;text-overflow:ellipsis;flex:0 1 auto;min-width:0}
+  .cvrow .grow{flex:1}
+  .cvrow .meta{color:var(--mut);font-size:.72rem;flex:0 0 auto}
+  .cvcaret{cursor:pointer;width:1rem;display:inline-block;text-align:center;color:var(--mut)}
+  .cvkids{margin-left:1.25rem;border-left:1px dotted var(--bd);padding-left:.45rem}
+  .pbar{height:.55rem;background:rgba(125,125,125,.18);border-radius:5px;overflow:hidden;flex:1;min-width:8rem}
+  .pfill{height:100%;background:#4f8ef7;border-radius:5px;transition:width .6s}
+  .pline{display:flex;align-items:center;gap:.6rem}
+  .pline .plab{flex:0 0 22rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:.74rem}
+  .pline .ppct{flex:0 0 3.2rem;text-align:right;font-size:.72rem;color:var(--mut)}
+  #cv-modal{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;z-index:60}
+  #cv-modal .mbox{background:var(--card);border:1px solid var(--bd);border-radius:12px;max-width:44rem;max-height:80vh;overflow:auto;padding:1rem 1.2rem;min-width:24rem}
+  #cv-modal table{width:100%;font-size:.75rem}
+  #cv-modal td{padding:.15rem .4rem;vertical-align:top}
+  #cv-modal td:first-child{color:var(--mut);white-space:nowrap}
 </style></head>
 <body>
 <header>
   <h1>cue_pipeline</h1>
   <div class="tabs">
     <div class="tab on" data-tab="attention" onclick="setTab('attention')">Needs attention <span class="n" id="n-att">0</span></div>
-    <div class="tab" data-tab="progress" onclick="setTab('progress')">In progress <span class="n" id="n-prog">0</span></div>
+    <div class="tab" data-tab="progress" onclick="setTab('progress')">Converter <span class="n" id="n-prog">0</span></div>
     <div class="tab" data-tab="log" onclick="setTab('log')">Log</div>
     <div class="tab" data-tab="settings" onclick="setTab('settings')">Settings</div>
   </div>
@@ -158,7 +185,26 @@ _PAGE = r"""<!doctype html>
 </div>
 <main>
   <div id="attention"></div>
-  <div id="progress" style="display:none"></div>
+  <div id="progress" style="display:none">
+    <details id="cv-sec-prog" class="cvsec" open><summary>Progress</summary><div id="cv-prog" class="cvbody"><span class="muted">nothing running</span></div></details>
+    <details id="cv-sec-conv" class="cvsec"><summary>Conversions <span class="n" id="cv-nconv">0</span></summary><div id="cv-convlist" class="cvbody"></div></details>
+    <details id="cv-sec-split" class="cvsec"><summary>Cue splits <span class="n" id="cv-nsplit">0</span></summary><div id="cv-splitlist" class="cvbody"></div></details>
+    <div class="cvbar">
+      <label>Codec <select id="cv-codec" onchange="cvCodecChanged()"></select></label>
+      <label>Mode <select id="cv-mode" onchange="cvModeChanged()"></select></label>
+      <label>Bitrate <select id="cv-bitrate"></select></label>
+      <label>Quality <select id="cv-quality"></select></label>
+      <label>Sample rate <select id="cv-sr"></select></label>
+      <label>Channels <select id="cv-ch"></select></label>
+      <label>Files at a time <select id="cv-conc"></select></label>
+      <span class="muted" id="cv-codechelp"></span>
+      <div class="grow"></div>
+      <span id="cv-seln" class="muted">0 selected</span>
+      <button class="b-move" onclick="cvConvertSel()">Convert selected</button>
+      <button class="b-disc" onclick="cvDeleteSel()">Delete selected</button>
+    </div>
+    <div id="cv-tree" class="cvtree"><div class="empty">Loading library…</div></div>
+  </div>
   <div id="log" style="display:none">
     <div style="display:flex;gap:.5rem;align-items:center;margin-bottom:.5rem">
       <select id="logwhich" onchange="loadLog()">
@@ -222,7 +268,8 @@ function setTab(t){TAB=t;document.querySelectorAll('.tab').forEach(function(e){e
   document.getElementById('toolbar').style.display=t==='attention'?'':'none';
   updateBulkBar();
   if(t==='log')loadLog();
-  if(t==='settings')loadSettings();}
+  if(t==='settings')loadSettings();
+  if(t==='progress')cvEnter();}
 function loadSettings(){fetch('/api/settings').then(function(r){return r.json();}).then(function(j){
   var s=j.settings||[];SETTINGS=s;
   document.getElementById('setform').innerHTML=s.map(function(o){
@@ -363,11 +410,6 @@ function render(){
   // Re-load trees for rows that were expanded before this re-render.
   OPEN.forEach(function(id){if(VISIBLE.indexOf(id)>=0){loadTree(id,'held','t-held-'+id);loadTree(id,'library','t-lib-'+id);}});
   updateBulkBar();
-  // progress tab
-  document.getElementById('n-prog').textContent=ACT.length;
-  document.getElementById('progress').innerHTML=ACT.length
-    ? '<div class="prog">'+ACT.map(function(a){return '<div class="procard"><div><span class="badge b-out">'+h(a.stage)+'</span> <span class="title">'+h(a.name)+'</span>'+(a.detail?' <span class="muted">'+h(a.detail)+'</span>':'')+'</div><span class="muted">'+ago(a.started)+'</span></div>';}).join('')+'</div>'
-    : '<div class="empty">No conversions running.</div>';
 }
 function _rowHL(id,on){var r=document.getElementById('row-'+id);if(r)r.classList.toggle('sel-on',on);}
 function toggleSel(id,on){if(on)SEL.add(id);else SEL.delete(id);_rowHL(id,on);updateBulkBar();
@@ -471,8 +513,210 @@ document.getElementById('attention').addEventListener('contextmenu',function(e){
 document.addEventListener('click',function(){ctx.classList.remove('on');});
 document.addEventListener('scroll',function(){ctx.classList.remove('on');},true);
 buildColMenu();setTab('attention');refresh();setInterval(refresh,15000);
+
+/* ===================== Converter tab ===================== */
+var CVOPT=null, CVSEL=new Set(), CVINIT=false, CVPOLL=null;
+function cvEnter(){
+  if(!CVINIT){CVINIT=true;
+    fetch('/api/convert/options').then(function(r){return r.json();}).then(function(j){
+      CVOPT=j.codecs||{};
+      var cs=document.getElementById('cv-codec');
+      cs.innerHTML=Object.keys(CVOPT).map(function(k){return '<option value="'+k+'">'+h(CVOPT[k].label)+'</option>';}).join('');
+      var cc=document.getElementById('cv-conc');
+      cc.innerHTML=(j.concurrency||[1,2,3,4,5,6,7,8,9,10]).map(function(n){return '<option '+(n===2?'selected':'')+'>'+n+'</option>';}).join('');
+      cvCodecChanged();
+    });
+    cvLoadDir('', 'cv-tree');
+  }
+  cvPollOnce();
+  if(CVPOLL)clearInterval(CVPOLL);
+  CVPOLL=setInterval(function(){if(TAB==='progress')cvPollOnce();},3000);
+}
+function cvCodecChanged(){
+  var k=document.getElementById('cv-codec').value,o=CVOPT[k];if(!o)return;
+  document.getElementById('cv-mode').innerHTML=o.modes.map(function(m){return '<option>'+m+'</option>';}).join('');
+  document.getElementById('cv-bitrate').innerHTML=o.bitrates.map(function(b){return '<option value="'+b+'">'+b+' kbps</option>';}).join('');
+  document.getElementById('cv-quality').innerHTML=o.quality.map(function(q2){return '<option>'+h(q2)+'</option>';}).join('');
+  document.getElementById('cv-sr').innerHTML=o.sample_rates.map(function(s){return '<option value="'+s+'">'+(s==='keep'?'keep source':h(''+s))+'</option>';}).join('');
+  document.getElementById('cv-ch').innerHTML=o.channels.map(function(c){return '<option>'+h(c)+'</option>';}).join('');
+  document.getElementById('cv-codechelp').textContent=o.help||'';
+  cvModeChanged();
+}
+function cvModeChanged(){
+  var k=document.getElementById('cv-codec').value,m=document.getElementById('cv-mode').value;
+  var isVbr=(m==='VBR'&&k!=='opus');
+  document.getElementById('cv-bitrate').disabled=isVbr;
+  document.getElementById('cv-quality').disabled=(k==='mp3'||k==='aac')&&m==='CBR';
+}
+function cvLoadDir(rel,elId){
+  fetch('/api/library/ls?path='+encodeURIComponent(rel)).then(function(r){return r.json();}).then(function(j){
+    var el=document.getElementById(elId);if(!el)return;
+    if(j.scanning){el.innerHTML='<div class="empty">First library scan running… this can take a few minutes. The tree loads from cache afterwards.</div>';
+      setTimeout(function(){cvLoadDir(rel,elId);},8000);return;}
+    var out='';
+    (j.folders||[]).forEach(function(f){
+      var id='cvk-'+btoa(unescape(encodeURIComponent(f.rel))).replace(/[^a-zA-Z0-9]/g,'');
+      out+='<div class="cvrow" data-rel="'+h(f.rel)+'" data-dir="1">'
+        +'<span class="cvcaret" onclick="cvToggleDir(this,\''+h(f.rel).replace(/'/g,"\\'")+'\',\''+id+'\')">▸</span>'
+        +'<input type="checkbox" '+(CVSEL.has(f.rel)?'checked':'')+' onclick="cvSel(\''+h(f.rel).replace(/'/g,"\\'")+'\',this.checked)">'
+        +'<span class="nm">📁 '+h(f.name)+'</span><span class="grow"></span>'
+        +'<span class="meta">'+f.files+' files · '+h(f.size_h)+'</span></div>'
+        +'<div class="cvkids" id="'+id+'" style="display:none"></div>';
+    });
+    (j.files||[]).forEach(function(f){
+      var meta=[f.format,f.bitrate,chLabel(f.channels)||'',(f.sample_rate?(f.sample_rate/1000)+'k':'')+(f.bits?'/'+f.bits:''),h(f.size_h)].filter(function(x){return x;}).join(' · ');
+      out+='<div class="cvrow" data-rel="'+h(f.rel)+'">'
+        +'<span class="cvcaret"></span>'
+        +'<input type="checkbox" '+(CVSEL.has(f.rel)?'checked':'')+' onclick="cvSel(\''+h(f.rel).replace(/'/g,"\\'")+'\',this.checked)">'
+        +'<span class="nm">'+h(f.name)+'</span><span class="grow"></span>'
+        +'<span class="meta">'+meta+'</span></div>';
+    });
+    el.innerHTML=out||'<div class="empty">(no audio here)</div>';
+  }).catch(function(e){var el=document.getElementById(elId);if(el)el.innerHTML='<div class="empty">error: '+h(''+e)+'</div>';});
+}
+function cvToggleDir(caret,rel,kidsId){
+  var kids=document.getElementById(kidsId);if(!kids)return;
+  var open=kids.style.display==='none';
+  kids.style.display=open?'':'none';
+  caret.textContent=open?'▾':'▸';
+  if(open&&!kids.dataset.loaded){kids.dataset.loaded='1';kids.innerHTML='<span class="muted">loading…</span>';cvLoadDir(rel,kidsId);}
+}
+function cvSel(rel,on){if(on)CVSEL.add(rel);else CVSEL.delete(rel);
+  document.getElementById('cv-seln').textContent=CVSEL.size+' selected';}
+function cvSettingsSummary(){
+  var k=document.getElementById('cv-codec').value,o=CVOPT[k]||{};
+  var m=document.getElementById('cv-mode').value;
+  var parts=[o.label||k,m];
+  if(!document.getElementById('cv-bitrate').disabled)parts.push(document.getElementById('cv-bitrate').value+' kbps');
+  if(!document.getElementById('cv-quality').disabled)parts.push(document.getElementById('cv-quality').value);
+  parts.push('sr '+document.getElementById('cv-sr').value);
+  parts.push('ch '+document.getElementById('cv-ch').value);
+  return parts.join(', ');
+}
+function cvConvertSel(){cvConvert(Array.from(CVSEL));}
+function cvConvert(rels){
+  if(!rels.length){toast('Nothing selected');return;}
+  if(!confirm('Convert '+rels.length+' item(s) (folders expand to their audio files) to:\n'+cvSettingsSummary()+'\n\nConverted files are written NEXT TO the originals. Continue?'))return;
+  var body={files:rels,codec:document.getElementById('cv-codec').value,
+    opts:{mode:document.getElementById('cv-mode').value,
+      bitrate:document.getElementById('cv-bitrate').value,
+      quality:document.getElementById('cv-quality').value,
+      sample_rate:document.getElementById('cv-sr').value,
+      channels:document.getElementById('cv-ch').value},
+    concurrency:parseInt(document.getElementById('cv-conc').value||'2',10)};
+  fetch('/api/convert/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+   .then(function(r){return r.json();}).then(function(j){
+     toast(j.ok?('Queued '+j.queued+' conversion(s)'):(j.message||'failed'));
+     document.getElementById('cv-sec-prog').open=true;cvPollOnce();})
+   .catch(function(e){toast('Error: '+e);});
+}
+function cvDeleteSel(){cvDelete(Array.from(CVSEL));}
+function cvDelete(rels){
+  if(!rels.length){toast('Nothing selected');return;}
+  if(!confirm('DELETE '+rels.length+' selected item(s) from the LIBRARY?\n\n'+rels.slice(0,12).join('\n')+(rels.length>12?'\n… and '+(rels.length-12)+' more':'')+'\n\nThis cannot be undone.'))return;
+  fetch('/api/library/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({paths:rels})})
+   .then(function(r){return r.json();}).then(function(j){
+     toast(j.ok?('Deleted '+j.deleted+' item(s)'):(j.errors||[]).join('; ')||'failed');
+     CVSEL.clear();cvSel('',false);cvLoadDir('','cv-tree');})
+   .catch(function(e){toast('Error: '+e);});
+}
+function cvInfo(rel){
+  fetch('/api/library/info?path='+encodeURIComponent(rel)).then(function(r){return r.json();}).then(function(j){
+    var i=j.info||{},d=i.detail||{},t=i.tags||{};
+    var specs=[['File',i.name],['Format',d.format+(d.lossless?' (lossless)':'')],
+      ['Bitrate',d.bitrate?Math.round(d.bitrate/1000)+' kbps':''],['Channels',chLabel(d.channels)||d.channels],
+      ['Sample rate',d.sample_rate?d.sample_rate+' Hz':''],['Bit depth',d.bits||''],
+      ['Length',d.length?Math.floor(d.length/60)+':'+('0'+Math.round(d.length%60)).slice(-2):''],['Size',human(d.size)]];
+    var html='<div class="mbox"><h3 style="margin:.2rem 0 .6rem">'+h(i.name||rel)+'</h3><table>'
+      +specs.filter(function(s){return s[1];}).map(function(s){return '<tr><td>'+h(s[0])+'</td><td>'+h(''+s[1])+'</td></tr>';}).join('')
+      +'<tr><td colspan="2" style="border-top:1px solid var(--bd);padding-top:.4rem"><b>ID tags</b></td></tr>'
+      +Object.keys(t).map(function(k){return '<tr><td>'+h(k)+'</td><td>'+h(t[k])+'</td></tr>';}).join('')
+      +'</table><div style="text-align:right;margin-top:.6rem"><button class="b-copy" onclick="document.getElementById(\'cv-modal\').remove()">Close</button></div></div>';
+    var m=document.createElement('div');m.id='cv-modal';m.innerHTML=html;
+    m.onclick=function(e){if(e.target===m)m.remove();};
+    document.body.appendChild(m);
+  });
+}
+function cvPollOnce(){
+  fetch('/api/progress').then(function(r){return r.json();}).then(function(j){
+    var conv=j.conversions||{},act=j.activity||[],splitq=j.split_queue||[];
+    var running=(conv.active||[]);
+    document.getElementById('n-prog').textContent=(running.length+act.length)||0;
+    // Progress section: total bar + each running conversion + each activity.
+    var out='';
+    if(running.length){
+      out+='<div class="pline"><span class="plab"><b>Conversion total ('+running.length+' file(s))</b></span><div class="pbar"><div class="pfill" style="width:'+(conv.total_pct||0)+'%"></div></div><span class="ppct">'+(conv.total_pct||0)+'%</span></div>';
+      running.forEach(function(jb){
+        out+='<div class="pline"><span class="plab">'+h(jb.name)+'</span><div class="pbar"><div class="pfill" style="width:'+(jb.pct||0)+'%"></div></div><span class="ppct">'+(jb.state==='queued'?'queued':(jb.pct||0)+'%')+'</span></div>';
+      });
+    }
+    act.forEach(function(a){
+      var pct=(typeof a.pct==='number')?a.pct:null;
+      out+='<div class="pline"><span class="plab"><span class="badge b-out">'+h(a.stage)+'</span> '+h(a.name)+(a.detail?' <span class="muted">'+h(a.detail)+'</span>':'')+'</span>'
+        +(pct!==null?'<div class="pbar"><div class="pfill" style="width:'+pct+'%"></div></div><span class="ppct">'+pct+'%</span>':'<span class="ppct">'+ago(a.started)+'</span>')+'</div>';
+    });
+    document.getElementById('cv-prog').innerHTML=out||'<span class="muted">nothing running</span>';
+    // Conversions section: queue + recent results.
+    document.getElementById('cv-nconv').textContent=running.length;
+    var cl='';
+    running.forEach(function(jb){cl+='<div class="pline"><span class="plab">'+h(jb.rel)+'</span><span class="muted">'+h(jb.state)+'</span></div>';});
+    (conv.done||[]).slice().reverse().forEach(function(jb){cl+='<div class="pline"><span class="plab">'+h(jb.rel)+'</span><span class="'+(jb.state==='done'?'muted':'badge b-lossy')+'">'+h(jb.state)+' '+h(jb.msg||'')+'</span></div>';});
+    document.getElementById('cv-convlist').innerHTML=cl||'<span class="muted">no conversions yet</span>';
+    // Cue splits section.
+    document.getElementById('cv-nsplit').textContent=splitq.length;
+    document.getElementById('cv-splitlist').innerHTML=splitq.length
+      ? splitq.map(function(p){return '<div class="pline"><span class="plab">'+h(p)+'</span><span class="muted">queued</span></div>';}).join('')
+      : '<span class="muted">no cue files queued</span>';
+  }).catch(function(){});
+}
+// Right-click on a converter row -> Show info / Convert / Delete.
+document.getElementById('cv-tree').addEventListener('contextmenu',function(e){
+  var row=e.target.closest('.cvrow');if(!row)return;e.preventDefault();
+  var rel=row.getAttribute('data-rel'),isDir=row.getAttribute('data-dir')==='1';
+  if(!CVSEL.has(rel)){CVSEL.add(rel);var cb=row.querySelector('input[type=checkbox]');if(cb)cb.checked=true;cvSel(rel,true);}
+  var sel=Array.from(CVSEL);
+  ctx.innerHTML='<div class="mh">'+h(rel.split('/').pop())+(sel.length>1?' <span class="muted">(+'+(sel.length-1)+' more selected)</span>':'')+'</div>'
+   +(!isDir?'<div class="mi" data-a="info">Show info</div>':'')
+   +'<div class="mi" data-a="convert">Convert selection…</div>'
+   +'<div class="mi" data-a="delete">Delete selection…</div>';
+  ctx.style.left=Math.min(e.clientX,window.innerWidth-190)+'px';
+  ctx.style.top=Math.min(e.clientY,window.innerHeight-140)+'px';ctx.classList.add('on');
+  ctx.querySelectorAll('.mi').forEach(function(mi){mi.onclick=function(){
+    var a=mi.getAttribute('data-a');ctx.classList.remove('on');
+    if(a==='info')cvInfo(rel);
+    else if(a==='convert')cvConvert(sel);
+    else if(a==='delete')cvDelete(sel);};});
+});
 </script>
 </body></html>"""
+
+
+def _expand_audio(lt, rels, cap: int = 1000):
+    """Expand selected folders to their audio files (recursive), pass files
+    through, keep everything inside the library root. Capped for sanity."""
+    try:
+        from converter import AUDIO_EXTS
+    except Exception:  # noqa: BLE001
+        return []
+    out = []
+    for rel in rels:
+        p = lt._safe_rel(rel)
+        if p is None:
+            continue
+        if p.is_dir():
+            for dirpath, _d, fns in os.walk(p):
+                for fn in sorted(fns):
+                    if os.path.splitext(fn)[1].lower() in AUDIO_EXTS:
+                        r = os.path.relpath(os.path.join(dirpath, fn),
+                                            lt.root).replace("\\", "/")
+                        out.append(r)
+                        if len(out) >= cap:
+                            return out
+        else:
+            out.append(rel.strip("/"))
+        if len(out) >= cap:
+            break
+    return out
 
 
 def make_handler(store, actions: HeldActions):
@@ -511,6 +755,53 @@ def make_handler(store, actions: HeldActions):
             elif path == "/api/activity":
                 acts = actions.list_activity() if hasattr(actions, "list_activity") else []
                 self._json(200, {"items": acts})
+            elif path == "/api/convert/options":
+                conv = getattr(actions, "converter", None)
+                if conv is None:
+                    self._json(503, {"ok": False, "message": "converter unavailable"})
+                else:
+                    self._json(200, conv.options())
+            elif path == "/api/progress":
+                conv = getattr(actions, "converter", None)
+                acts = (actions.list_activity()
+                        if hasattr(actions, "list_activity") else [])
+                split_q: list = []
+                wq = getattr(actions, "work_queue", None)
+                if wq is not None:
+                    try:
+                        split_q = [str(p) for p in list(wq.queue)[:50]]
+                    except Exception:  # noqa: BLE001
+                        split_q = []
+                self._json(200, {
+                    "conversions": conv.status() if conv else {},
+                    "activity": acts,
+                    "split_queue": split_q,
+                })
+            elif path == "/api/library/ls":
+                lt = getattr(actions, "library_tree", None)
+                if lt is None:
+                    self._json(503, {"ok": False, "message": "library tree unavailable"})
+                    return
+                if lt._scanned_ts == 0:
+                    # First scan not done yet: kick it off and tell the UI.
+                    if not lt._scanning:
+                        threading.Thread(target=lt.scan, daemon=True,
+                                         name="lib-scan").start()
+                    self._json(200, {"scanning": True})
+                    return
+                qs = parse_qs(urlparse(self.path).query)
+                rel = (qs.get("path", [""]) or [""])[0]
+                out = lt.list_dir(rel)
+                if out is None:
+                    self._json(400, {"ok": False, "message": "bad path"})
+                else:
+                    self._json(200, out)
+            elif path == "/api/library/info":
+                lt = getattr(actions, "library_tree", None)
+                qs = parse_qs(urlparse(self.path).query)
+                rel = (qs.get("path", [""]) or [""])[0]
+                info = lt.file_info(rel) if lt is not None else None
+                self._json(200 if info else 404, {"info": info or {}})
             elif path == "/api/tree":
                 qs = parse_qs(urlparse(self.path).query)
                 eid = (qs.get("id", [""]) or [""])[0]
@@ -566,6 +857,40 @@ def make_handler(store, actions: HeldActions):
                     return
                 ok, msg = actions.save_settings(changes)
                 self._json(200 if ok else 500, {"ok": ok, "message": msg})
+                return
+            if path == "/api/convert/start":
+                conv = getattr(actions, "converter", None)
+                lt = getattr(actions, "library_tree", None)
+                if conv is None or lt is None:
+                    self._json(503, {"ok": False, "message": "converter unavailable"})
+                    return
+                length = int(self.headers.get("Content-Length") or 0)
+                try:
+                    body = json.loads(self.rfile.read(length) or b"{}") or {}
+                except Exception:  # noqa: BLE001
+                    body = {}
+                rels = _expand_audio(lt, list(body.get("files") or []))
+                queued, errs = conv.start(
+                    rels, str(body.get("codec") or "mp3"),
+                    dict(body.get("opts") or {}),
+                    int(body.get("concurrency") or 2))
+                self._json(200, {"ok": queued > 0, "queued": queued,
+                                 "errors": errs,
+                                 "message": "; ".join(errs)[:300]})
+                return
+            if path == "/api/library/delete":
+                lt = getattr(actions, "library_tree", None)
+                if lt is None:
+                    self._json(503, {"ok": False, "message": "library tree unavailable"})
+                    return
+                length = int(self.headers.get("Content-Length") or 0)
+                try:
+                    body = json.loads(self.rfile.read(length) or b"{}") or {}
+                except Exception:  # noqa: BLE001
+                    body = {}
+                deleted, errs = lt.delete(list(body.get("paths") or []))
+                self._json(200, {"ok": deleted > 0 and not errs,
+                                 "deleted": deleted, "errors": errs})
                 return
             if path in ("/api/restart", "/api/shutdown"):
                 if not hasattr(actions, "container_action"):

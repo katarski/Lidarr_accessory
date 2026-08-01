@@ -152,6 +152,7 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     put("qbittorrent", "pause_during_scan", "QBIT_PAUSE_SCAN", _as_bool)
     put("qbittorrent", "deselect_video", "QBIT_DESELECT_VIDEO", _as_bool)
     put("qbittorrent", "redeselect_recheck_seconds", "QBIT_REDESELECT_RECHECK", int)
+    put("qbittorrent", "lifecycle_recheck_seconds", "QBIT_LIFECYCLE_RECHECK", int)
     put("qbittorrent", "dead_grab_reaper", "QBIT_DEAD_GRAB_REAPER", _as_bool)
     put("qbittorrent", "dead_grab_grace_minutes", "QBIT_DEAD_GRAB_GRACE_MINUTES", int)
     put("qbittorrent", "dead_grab_grace_hours", "QBIT_DEAD_GRAB_GRACE_HOURS", int)  # legacy
@@ -608,6 +609,10 @@ def qbt_auto_deselect_loop(
     planned_deselect: dict = {}
     redeselect_recheck = int(qcfg.get("redeselect_recheck_seconds", 1800) or 0)
     completed_seen: set = set()   # #8a: torrents we've already kicked to process
+    # {hash: (disk_signature, ts)}: a completed torrent whose disk state hasn't
+    # changed isn't re-planned (Lidarr+LLM) until this interval passes.
+    lifecycle_checked: dict = {}
+    lifecycle_recheck = int(qcfg.get("lifecycle_recheck_seconds", 21600) or 21600)
 
     def _enqueue_folder_cues(folder: str) -> None:
         """#8a: a music torrent just completed -> enqueue any .cue in its
@@ -654,6 +659,8 @@ def qbt_auto_deselect_loop(
                     on_complete=_enqueue_folder_cues if q is not None else None,
                     completed_seen=completed_seen,
                     wanted_only=reap_completed_wanted_only,
+                    checked=lifecycle_checked,
+                    recheck_seconds=lifecycle_recheck,
                 )
                 if removed or paused:
                     logger.info(
@@ -1152,6 +1159,31 @@ def main() -> int:
                         raw_cfg=cfg)
     q: "queue.Queue[Path]" = queue.Queue()
     stop = threading.Event()
+    # WebUI Converter tab (library browser + AAC/MP3/Opus conversion) --
+    # file-backed library tree cache + conversion job manager on the orch so
+    # the webui handler reaches them through `actions`.
+    try:
+        from converter import ConvertManager, LibraryTree
+        lib_root = Path(orch_cfg.library_root_windows)
+        cache_path = (Path(args.config).parent / "library_tree.json")
+        orch.library_tree = LibraryTree(lib_root, cache_path)
+        orch.converter = ConvertManager(
+            lib_root, ffmpeg=orch_cfg.ffmpeg_binary, llm=ollama_client)
+        orch.work_queue = q   # cue-split queue, shown in the Converter tab
+
+        def _lib_rescan_loop():
+            interval = max(300, int(os.environ.get("LIBRARY_RESCAN", "3600")))
+            while not stop.wait(60 if orch.library_tree._scanned_ts == 0
+                                else interval):
+                try:
+                    orch.library_tree.maybe_scan(interval)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("library rescan: %s", exc)
+
+        threading.Thread(target=_lib_rescan_loop, daemon=True,
+                         name="cue-lib-rescan").start()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Converter tab disabled: %s", exc)
 
     excluded_dirs = _resolve_exclude_dirs(
         watch_root,

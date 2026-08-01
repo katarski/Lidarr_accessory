@@ -145,19 +145,28 @@ def split_cue(
     flac_compression_level: int = 8,
     extra_args: Optional[List[str]] = None,
     filename_template: Optional[str] = None,
+    progress=None,
 ) -> List[SplitResult]:
     """
     Split `audio_path` into per-track FLAC files using the timings in `cue`.
     Files are written into `staging_dir` which will be created if missing.
+    `progress(i, n, name)`, when given, is called before each track encode
+    (feeds the WebUI's live split-progress display).
     """
     extra_args = extra_args or []
     staging_dir.mkdir(parents=True, exist_ok=True)
 
     results: List[SplitResult] = []
 
-    for track in cue.tracks:
+    n_tracks = len(cue.tracks)
+    for t_idx, track in enumerate(cue.tracks, 1):
         out_name = _output_name(cue, track, template=filename_template)
         out_path = staging_dir / out_name
+        if progress is not None:
+            try:
+                progress(t_idx, n_tracks, out_name)
+            except Exception:  # noqa: BLE001 (display-only)
+                pass
 
         # Defensive: refuse to call ffmpeg with a non-progressing range.
         if (

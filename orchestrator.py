@@ -874,15 +874,23 @@ class Orchestrator:
         splits = None
         while True:
             try:
-                splits = split_cue(
-                    cue=cue,
-                    audio_path=audio_path,
-                    staging_dir=staging_dir,
-                    ffmpeg_binary=self.cfg.ffmpeg_binary,
-                    flac_compression_level=self.cfg.flac_compression_level,
-                    extra_args=self.cfg.ffmpeg_extra_args,
-                    filename_template=self.cfg.filename_template,
-                )
+                self._activity_start(cue_path.parent, "Splitting cue",
+                                     audio_path.name)
+                try:
+                    splits = split_cue(
+                        cue=cue,
+                        audio_path=audio_path,
+                        staging_dir=staging_dir,
+                        ffmpeg_binary=self.cfg.ffmpeg_binary,
+                        flac_compression_level=self.cfg.flac_compression_level,
+                        extra_args=self.cfg.ffmpeg_extra_args,
+                        filename_template=self.cfg.filename_template,
+                        progress=lambda i, n, name: self._activity_start(
+                            cue_path.parent, "Splitting cue",
+                            f"track {i}/{n} — {name}", pct=100.0 * (i - 1) / n),
+                    )
+                finally:
+                    self._activity_end(cue_path.parent)
                 break
             except subprocess.CalledProcessError as exc:
                 stderr = (exc.stderr or "").strip().splitlines()
@@ -8030,17 +8038,24 @@ class Orchestrator:
         }
 
     # ---- Conversion activity (WebUI "In progress" tab) ----------------
-    def _activity_start(self, folder: Path, stage: str, detail: str = "") -> None:
+    def _activity_start(self, folder: Path, stage: str, detail: str = "",
+                        pct: Optional[float] = None) -> None:
         """Mark a folder as undergoing a conversion (SACD/DVD-Audio/DTS/DSD/
-        archive). Shown live on the WebUI. Cleared by _activity_end."""
+        archive/cue split). Shown live on the WebUI; call again with new
+        detail/pct to update in place. Cleared by _activity_end."""
         act = getattr(self, "_activity", None)
         if act is None:
             return
         with self._activity_lock:
-            self._activity[str(folder)] = {
+            prev = self._activity.get(str(folder)) or {}
+            entry = {
                 "folder": str(folder), "stage": stage, "detail": detail,
-                "name": folder.name, "started": time.time(),
+                "name": folder.name,
+                "started": prev.get("started") or time.time(),
             }
+            if pct is not None:
+                entry["pct"] = round(max(0.0, min(100.0, pct)), 1)
+            self._activity[str(folder)] = entry
 
     def _activity_end(self, folder: Path) -> None:
         act = getattr(self, "_activity", None)
