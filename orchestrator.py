@@ -1621,6 +1621,36 @@ class Orchestrator:
             return ""
         return Counter(names).most_common(1)[0][0]
 
+    # "Track 01" / "Track 1" / "Audio Track 3" -- a ripper's placeholder name.
+    _PLACEHOLDER_TITLE_RE = re.compile(
+        r"(?i)^(?:audio\s*)?(?:track|title|untitled|unknown)\s*\d*$")
+
+    def _is_placeholder_identity(self, artist: str, album: str) -> bool:
+        """
+        Is this (artist, album) a ripper placeholder rather than a real identity?
+
+        An untagged rip named "01 - Track 01.flac" makes the filename fallback
+        report artist="01", album="Track 01" -- non-empty, so every "do we know
+        what this is?" test passes while the values are meaningless. Catching
+        that lets the AcoustID fingerprint fallback run instead.
+        """
+        a = (artist or "").strip()
+        b = (album or "").strip()
+        if not (a or b):
+            return False                    # genuinely empty: handled elsewhere
+        artist_junk = (
+            not a
+            or a.isdigit()                                  # "01"
+            or bool(re.fullmatch(r"(?:19|20)\d{2}", a))      # a bare year
+            or bool(self._PLACEHOLDER_TITLE_RE.match(a))
+        )
+        album_junk = (
+            not b
+            or b.isdigit()
+            or bool(self._PLACEHOLDER_TITLE_RE.match(b))     # "Track 01"
+        )
+        return artist_junk and album_junk
+
     def _same_album_title(self, lidarr_title: str, download_title: str) -> bool:
         """
         Are these the same album, allowing the download to be an EDITION of it?
@@ -3833,6 +3863,17 @@ class Orchestrator:
         # the audio actually is (content-based, so garbage/absent tags don't
         # matter). Best-effort: any failure falls through to the give-up below,
         # exactly as before. This is the "import music I don't have, by sound".
+        # A PLACEHOLDER identity is worse than none: a DVD-Audio/SACD rip lands as
+        # "01 - Track 01.flac" with no tags, and the filename fallback then reports
+        # artist='01' album='Track 01'. Both are non-empty, so the fingerprint
+        # fallback below used to be skipped and the folder chased a Lidarr artist
+        # called "01". Treat such junk as unidentified so AcoustID gets its turn.
+        if self._is_placeholder_identity(artist_name, album_name):
+            logger.info(
+                "Pre-split handoff: identity %r / %r is a placeholder (untagged "
+                "rip) -- treating as unidentified so fingerprinting can run.",
+                artist_name, album_name)
+            artist_name = album_name = ""
         if not (artist_name and album_name) and self.acoustid is not None:
             try:
                 ident = self.acoustid.identify_folder([str(a) for a in audios])
