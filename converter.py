@@ -31,7 +31,7 @@ import subprocess
 import threading
 import time
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("converter")
@@ -350,10 +350,15 @@ class LibraryTree:
 class ConvertManager:
     """Converts library files to MP3/AAC/Opus with live progress."""
 
-    def __init__(self, root: Path, ffmpeg: str = "ffmpeg", llm=None):
+    def __init__(self, root: Path, ffmpeg: str = "ffmpeg", llm=None,
+                 lidarr=None, lidarr_root: str = ""):
         self.root = Path(root)
         self.ffmpeg = ffmpeg
         self.llm = llm
+        # Optional Lidarr client + the path prefix Lidarr sees for `root`, used
+        # by OVERWRITE mode to tell Lidarr a library file was replaced.
+        self.lidarr = lidarr
+        self.lidarr_root = str(lidarr_root or "")
         self._lock = threading.Lock()
         self._jobs: Dict[str, Dict[str, Any]] = {}   # id -> job dict
         self._queue: List[str] = []
@@ -363,7 +368,19 @@ class ConvertManager:
     # ---------- public ----------
     def options(self) -> Dict[str, Any]:
         return {"codecs": CODEC_OPTIONS,
-                "concurrency": list(range(1, 11))}
+                "concurrency": list(range(1, 11)),
+                # Replace-in-place: delete the source (e.g. the FLAC) once the
+                # lossy encode is verified, repoint sidecar .xml files at the new
+                # filename, and have Lidarr rescan so it reflects the change.
+                "overwrite": {
+                    "label": "Overwrite existing (delete original)",
+                    "help": ("Replace the source file with the converted one: "
+                             "the original (e.g. FLAC) is DELETED after a "
+                             "verified encode, sidecar .xml files are repointed "
+                             "at the new filename, and Lidarr is asked to "
+                             "rescan the album folder."),
+                    "default": False,
+                }}
 
     def status(self) -> Dict[str, Any]:
         with self._lock:
@@ -537,6 +554,116 @@ class ConvertManager:
             args += ["-ar", sr]
         return args
 
+    def _commit_replace(
+        self, src: Path, tmp: Path, final: Path,
+    ) -> Tuple[bool, str]:
+        """
+        OVERWRITE mode commit, run only after a verified encode:
+          1. put the new lossy file at `final` (replacing it if it exists),
+          2. DELETE the original file,
+          3. repoint any sidecar .xml in the folder at the new filename,
+          4. tell Lidarr the library file changed so it re-reads the folder.
+        Returns (ok, note). On any failure before step 2 the original is left
+        untouched and the temp file is removed, so nothing is ever lost.
+        """
+        notes: List[str] = []
+        try:
+            if final.exists() and final != src:
+                final.unlink()
+            tmp.replace(final)
+        except OSError as exc:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return False, f"could not place {final.name}: {exc}"
+        # The original is gone only once the replacement is in place.
+        removed = False
+        try:
+            if src.exists() and src.resolve() != final.resolve():
+                src.unlink()
+                removed = True
+        except OSError as exc:
+            notes.append(f"kept original ({exc})")
+        try:
+            os.chmod(final, 0o666)
+        except OSError:
+            pass
+        notes.append(f"replaced {src.name} -> {final.name}"
+                     if removed else f"wrote {final.name}")
+        n_xml = self._repoint_sidecar_xml(src, final)
+        if n_xml:
+            notes.append(f"updated {n_xml} xml")
+        if self._notify_lidarr(final):
+            notes.append("Lidarr rescan queued")
+        return True, "; ".join(notes)
+
+    def _repoint_sidecar_xml(self, old: Path, new: Path) -> int:
+        """
+        Rewrite sidecar .xml files in the same folder that mention the old
+        filename so they refer to the replaced file. Handles the raw name, the
+        XML-escaped name, and a bare stem+extension reference. Returns the
+        number of files changed.
+        """
+        changed = 0
+        try:
+            xmls = [p for p in old.parent.iterdir()
+                    if p.is_file() and p.suffix.lower() == ".xml"]
+        except OSError:
+            return 0
+        subs = [(old.name, new.name)]
+        # XML-escaped variant (& -> &amp; etc.) in case the writer escaped it.
+        esc_old = (old.name.replace("&", "&amp;").replace("<", "&lt;")
+                   .replace(">", "&gt;"))
+        esc_new = (new.name.replace("&", "&amp;").replace("<", "&lt;")
+                   .replace(">", "&gt;"))
+        if esc_old != old.name:
+            subs.append((esc_old, esc_new))
+        for x in xmls:
+            try:
+                text = x.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            new_text = text
+            for a, b in subs:
+                if a in new_text:
+                    new_text = new_text.replace(a, b)
+            if new_text != text:
+                try:
+                    x.write_text(new_text, encoding="utf-8")
+                    changed += 1
+                    logger.info("converter: repointed %s -> %s in %s",
+                                old.name, new.name, x.name)
+                except OSError as exc:
+                    logger.warning("converter: could not update %s: %s",
+                                   x.name, exc)
+        return changed
+
+    def _notify_lidarr(self, changed_file: Path) -> bool:
+        """
+        Tell Lidarr a file in its library changed, by rescanning the containing
+        album folder (RescanFolders re-reads what's on disk, which is what makes
+        Lidarr drop the old trackfile and pick up the replacement). Translates
+        the local path to the path Lidarr sees via `lidarr_root`.
+        """
+        if self.lidarr is None:
+            return False
+        folder = changed_file.parent
+        try:
+            rel = folder.resolve().relative_to(self.root.resolve())
+        except Exception:  # noqa: BLE001
+            rel = None
+        if self.lidarr_root and rel is not None:
+            target = str(PurePosixPath(self.lidarr_root) / rel.as_posix())
+        else:
+            target = str(folder)
+        try:
+            return self.lidarr.rescan_folder(target) is not None
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("converter: Lidarr rescan of %s failed: %s",
+                           target, exc)
+            return False
+
     def _run_job(self, jid: str) -> None:
         job = self._jobs.get(jid)
         try:
@@ -544,13 +671,28 @@ class ConvertManager:
                 return
             src = (self.root / job["rel"].strip("/")).resolve()
             spec = CODEC_OPTIONS[job["codec"]]
+            overwrite = bool((job.get("opts") or {}).get("overwrite"))
             dst = src.with_suffix(spec["ext"])
-            if dst == src:
-                dst = src.with_name(src.stem + " (converted)" + spec["ext"])
-            n = 1
-            while dst.exists():
-                dst = src.with_name(f"{src.stem} ({n}){spec['ext']}")
-                n += 1
+            if overwrite:
+                # REPLACE MODE: the lossy file takes the source's place and the
+                # original is deleted after a VERIFIED encode. Encode to a temp
+                # name first so a failure can never destroy the original, and so
+                # we never feed ffmpeg the same path as input and output.
+                tmp = src.with_name(f".{src.stem}.converting{spec['ext']}")
+                job["_final"] = str(dst)
+                job["_replace"] = True
+                dst = tmp
+                try:
+                    dst.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            else:
+                if dst == src:
+                    dst = src.with_name(src.stem + " (converted)" + spec["ext"])
+                n = 1
+                while dst.exists():
+                    dst = src.with_name(f"{src.stem} ({n}){spec['ext']}")
+                    n += 1
             job["state"] = "running"
             job["out"] = dst.name
             dur = self._duration(src)
@@ -578,6 +720,17 @@ class ConvertManager:
             rc = proc.wait(timeout=1800)
             err = (proc.stderr.read() or "")[-400:] if proc.stderr else ""
             ok = (rc == 0 and dst.exists() and dst.stat().st_size > 0)
+            if ok and job.get("_replace"):
+                # Commit the replacement only now that the encode is verified.
+                ok, note = self._commit_replace(src, dst, Path(job["_final"]))
+                job["msg"] = note
+                if ok:
+                    job["state"] = "done"
+                    job["pct"] = 100.0
+                    job["out"] = Path(job["_final"]).name
+                else:
+                    job["state"] = "error"
+                return
             if ok:
                 job["state"] = "done"
                 job["pct"] = 100.0

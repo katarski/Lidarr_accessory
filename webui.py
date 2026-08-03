@@ -197,6 +197,7 @@ _PAGE = r"""<!doctype html>
       <label>Sample rate <select id="cv-sr"></select></label>
       <label>Channels <select id="cv-ch"></select></label>
       <label>Files at a time <select id="cv-conc"></select></label>
+      <label title="Replace each source file with the converted one: the original (e.g. FLAC) is DELETED after a verified encode, sidecar .xml files are repointed at the new filename, and Lidarr is asked to rescan the album folder."><input type="checkbox" id="cv-overwrite"> Overwrite existing (delete original)</label>
       <span class="muted" id="cv-codechelp"></span>
       <div class="grow"></div>
       <span id="cv-seln" class="muted">0 selected</span>
@@ -596,13 +597,19 @@ function cvSettingsSummary(){
 function cvConvertSel(){cvConvert(Array.from(CVSEL));}
 function cvConvert(rels){
   if(!rels.length){toast('Nothing selected');return;}
-  if(!confirm('Convert '+rels.length+' item(s) (folders expand to their audio files) to:\n'+cvSettingsSummary()+'\n\nConverted files are written NEXT TO the originals. Continue?'))return;
+  var ow=document.getElementById('cv-overwrite').checked;
+  var where=ow
+    ? 'OVERWRITE MODE: each ORIGINAL FILE WILL BE DELETED and replaced by the converted one.\nSidecar .xml files are repointed and Lidarr rescans the folder.\nThis cannot be undone.'
+    : 'Converted files are written NEXT TO the originals.';
+  if(!confirm('Convert '+rels.length+' item(s) (folders expand to their audio files) to:\n'+cvSettingsSummary()+'\n\n'+where+'\n\nContinue?'))return;
+  if(ow&&!confirm('Really DELETE '+rels.length+' original file(s) after converting?'))return;
   var body={files:rels,codec:document.getElementById('cv-codec').value,
     opts:{mode:document.getElementById('cv-mode').value,
       bitrate:document.getElementById('cv-bitrate').value,
       quality:document.getElementById('cv-quality').value,
       sample_rate:document.getElementById('cv-sr').value,
-      channels:document.getElementById('cv-ch').value},
+      channels:document.getElementById('cv-ch').value,
+      overwrite:ow},
     concurrency:parseInt(document.getElementById('cv-conc').value||'2',10)};
   fetch('/api/convert/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
    .then(function(r){return r.json();}).then(function(j){

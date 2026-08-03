@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from cue_parser import Cue, parse_cue
+from dedup_downloads import _EDITION_WORDS as _EDITION_NOISE_WORDS
 from held_store import HeldStore
 from lidarr import LidarrClient
 from ollama_client import OllamaClient
@@ -1586,6 +1587,40 @@ class Orchestrator:
             return ""
         return Counter(names).most_common(1)[0][0]
 
+    def _same_album_title(self, lidarr_title: str, download_title: str) -> bool:
+        """
+        Are these the same album, allowing the download to be an EDITION of it?
+
+        Exact (normalized) equality, or the Lidarr title's words are all present
+        in the download's AND every extra word is edition/format/year noise
+        ("deluxe", "expanded", "remastered", "2CD", "24bit", a bare year...).
+        So "Spirit (Deluxe Edition)" matches Lidarr's "Spirit", while "Blue
+        Train" never matches "Blue" -- "train" is a real word, not noise. That
+        asymmetry is the whole point: a naive subset test would happily import a
+        different album whose title merely contains the other one.
+        """
+        a = _match_key(lidarr_title or "")
+        b = _match_key(download_title or "")
+        if not a or not b:
+            return False
+        if a == b:
+            return True
+        aw, bw = set(a.split()), set(b.split())
+        if not aw or not aw <= bw:
+            return False
+        extra = bw - aw
+        if not extra:
+            return True
+        for w in extra:
+            if w in _EDITION_NOISE_WORDS:
+                continue
+            if re.fullmatch(r"(?:19|20)\d{2}", w):   # a bare year
+                continue
+            if re.fullmatch(r"\d+(?:cd|lp|disc)s?", w):  # "2cd", "3lp"
+                continue
+            return False
+        return True
+
     def _try_positional_force_import(
         self, cue_path, folder, key_path, artist_name, album_name, audios, reason,
     ) -> bool:
@@ -1626,9 +1661,12 @@ class Orchestrator:
             alb = self.lidarr.find_album(aid, album_name)
             if not alb:
                 return False
-            # Strict: matched album title must normalize-equal ours, so a
-            # fuzzy substring match can't force the WRONG album.
-            if _match_key(alb.get("title")) != _match_key(album_name):
+            # Matched album title must normalize-equal ours, so a fuzzy
+            # substring match can't force the WRONG album -- with ONE tolerated
+            # difference: the download may be an EDITION of the same record
+            # ("Spirit (Deluxe Edition)" vs Lidarr's "Spirit"), where the extra
+            # words are pure edition/format/year noise. See _is_edition_of.
+            if not self._same_album_title(alb.get("title"), album_name):
                 return False
             album_id = int(alb["id"])
 

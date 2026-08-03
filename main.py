@@ -1249,7 +1249,10 @@ def main() -> int:
         cache_path = (Path(args.config).parent / "library_tree.json")
         orch.library_tree = LibraryTree(lib_root, cache_path)
         orch.converter = ConvertManager(
-            lib_root, ffmpeg=orch_cfg.ffmpeg_binary, llm=ollama_client)
+            lib_root, ffmpeg=orch_cfg.ffmpeg_binary, llm=ollama_client,
+            # Overwrite mode needs Lidarr (to rescan a replaced file) and the
+            # path prefix Lidarr sees for the library root.
+            lidarr=lidarr, lidarr_root=lidarr_cfg["library_root_lidarr"])
         orch.work_queue = q   # cue-split queue, shown in the Converter tab
 
         def _lib_rescan_loop():
