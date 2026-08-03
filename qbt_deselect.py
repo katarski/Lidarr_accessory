@@ -27,7 +27,7 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import Callable, List, Dict, Any, Iterable, Optional
+from typing import Callable, List, Dict, Any, Iterable, Optional, Tuple
 
 import yaml
 
@@ -552,6 +552,108 @@ def dead_grab_reaper_pass(
     if removed:
         emit(f"dead-grab reaper: removed {removed} dead grab(s)")
     return removed
+
+
+def stalled_grab_reaper_pass(
+    qbt: QbtClient, lidarr: Optional[LidarrClient], category: str = "",
+    grace_seconds: int = 259200, blocklist: bool = True,
+    emit: Callable[[str], None] = logger.info, now: Optional[float] = None,
+    assembly_keep: Optional[set] = None, llm=None,
+) -> Tuple[int, int]:
+    """
+    Reap a torrent that IS partly downloaded but has not progressed in
+    `grace_seconds` (default 3 days, from qBittorrent's own `last_activity`).
+
+    SALVAGE FIRST -- never throw away usable music. A stalled torrent often has
+    whole songs finished (one real case here had 30 of 46 files complete), and
+    those may be exactly what a monitored album or an album assembly needs. So:
+
+      * something salvageable -> remove the TORRENT ONLY and KEEP the data on
+        disk, so the normal sweep/reconcile/assembly can import those songs. The
+        stalled download stops wasting slots, the music survives.
+      * nothing salvageable -> remove the torrent AND its data, and blocklist the
+        release so Lidarr looks for a different one.
+
+    A file counts as salvageable when it is COMPLETE (per-file progress 1.0),
+    is audio, and either an assembly needs it or it belongs to an album Lidarr
+    still wants. Torrents at 0% are left to dead_grab_reaper_pass; paused /
+    stopped torrents are never touched (a deliberate "don't download").
+    Returns (salvaged, trashed).
+    """
+    if now is None:
+        now = time.time()
+    salvaged = trashed = 0
+    for t in qbt.torrents(category=category):
+        h = t.get("hash") or ""
+        state = (t.get("state") or "").lower()
+        prog = float(t.get("progress") or 0.0)
+        if not h or prog >= 1.0:
+            continue
+        if "paused" in state or "stopped" in state:
+            continue                       # deliberate: leave it alone
+        if prog < 0.01:
+            continue                       # 0% -> dead_grab_reaper's job
+        last = float(t.get("last_activity") or 0)
+        if not last or (now - last) < grace_seconds:
+            continue
+        name = t.get("name") or h[:12]
+        idle_days = (now - last) / 86400.0
+        try:
+            files = qbt.files(h)
+        except Exception as exc:  # noqa: BLE001
+            emit(f"stalled reaper: cannot read files of {name!r}: {exc}")
+            continue
+        done_audio = [
+            f for f in files
+            if float(f.get("progress") or 0) >= 1.0
+            and os.path.splitext(str(f.get("name") or ""))[1].lower() in AUDIO_EXTS
+        ]
+        # (a) does an album assembly need any finished song?
+        wanted = [f for f in done_audio
+                  if _needed_for_assembly(str(f.get("name") or ""), assembly_keep or set())]
+        why = "an album assembly needs them" if wanted else ""
+        # (b) otherwise, is any finished song part of an album Lidarr still wants?
+        if not wanted and lidarr is not None and done_audio:
+            try:
+                plan = plan_torrent(lidarr, name, files, llm=llm)
+            except Exception:  # noqa: BLE001
+                plan = []
+            keep_keys = set()
+            for a in plan:
+                total = int(a.get("total") or 0)
+                if total > 0 and not a.get("have"):
+                    for x in a.get("files") or []:
+                        keep_keys.add(str(x.get("name") or ""))
+            if keep_keys:
+                wanted = [f for f in done_audio
+                          if str(f.get("name") or "") in keep_keys]
+                if wanted:
+                    why = "Lidarr still wants their album"
+        if wanted:
+            # Keep the DATA, drop the stalled torrent. The pipeline imports from
+            # the download folder, so the finished songs stay usable.
+            if qbt.remove(h, delete_files=False):
+                salvaged += 1
+                emit(f"stalled reaper: SALVAGED {len(wanted)} finished song(s) "
+                     f"from {name!r} (idle {idle_days:.1f}d, {prog*100:.0f}%) -- "
+                     f"{why}; torrent removed, files LEFT on disk for import")
+            continue
+        for r in (lidarr.queue_list() if (lidarr and blocklist) else []):
+            if str(r.get("downloadId") or "").lower() == h.lower() \
+                    and r.get("id") is not None:
+                try:
+                    lidarr.queue_remove(int(r["id"]), remove_from_client=False,
+                                        blocklist=True)
+                except Exception:  # noqa: BLE001
+                    pass
+        if qbt.remove(h, delete_files=True):
+            trashed += 1
+            emit(f"stalled reaper: TRASHED {name!r} (idle {idle_days:.1f}d at "
+                 f"{prog*100:.0f}%, nothing salvageable"
+                 f"{'; blocklisted' if blocklist else ''})")
+    if salvaged or trashed:
+        emit(f"stalled reaper: {salvaged} salvaged, {trashed} trashed")
+    return salvaged, trashed
 
 
 def _map_to_download_root(content_path: str, save_path: str, download_root: str) -> str:

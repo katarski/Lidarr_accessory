@@ -618,7 +618,7 @@ function cvLoadDir(rel,elId){
       var id='cvk-'+btoa(unescape(encodeURIComponent(f.rel))).replace(/[^a-zA-Z0-9]/g,'');
       out+='<div class="cvrow" data-rel="'+h(f.rel)+'" data-dir="1">'
         +'<span class="cvcaret" onclick="cvToggleDir(this,\''+h(f.rel).replace(/'/g,"\\'")+'\',\''+id+'\')">▸</span>'
-        +'<input type="checkbox" '+(CVSEL.has(f.rel)?'checked':'')+' onclick="cvSel(\''+h(f.rel).replace(/'/g,"\\'")+'\',this.checked)">'
+        +'<input type="checkbox" '+(cvIsCovered(f.rel)?'checked':'')+' onclick="cvSel(\''+h(f.rel).replace(/'/g,"\\'")+'\',this.checked,true)">'
         +'<span class="nm">📁 '+h(f.name)+'</span><span class="grow"></span>'
         +'<span class="meta">'+f.files+' files · '+h(f.size_h)+'</span></div>'
         +'<div class="cvkids" id="'+id+'" style="display:none"></div>';
@@ -627,7 +627,7 @@ function cvLoadDir(rel,elId){
       var meta=[f.format,f.bitrate,chLabel(f.channels)||'',(f.sample_rate?(f.sample_rate/1000)+'k':'')+(f.bits?'/'+f.bits:''),h(f.size_h)].filter(function(x){return x;}).join(' · ');
       out+='<div class="cvrow" data-rel="'+h(f.rel)+'">'
         +'<span class="cvcaret"></span>'
-        +'<input type="checkbox" '+(CVSEL.has(f.rel)?'checked':'')+' onclick="cvSel(\''+h(f.rel).replace(/'/g,"\\'")+'\',this.checked)">'
+        +'<input type="checkbox" '+(cvIsCovered(f.rel)?'checked':'')+' onclick="cvSel(\''+h(f.rel).replace(/'/g,"\\'")+'\',this.checked)">'
         +'<span class="nm">'+h(f.name)+'</span><span class="grow"></span>'
         +'<span class="meta">'+meta+'</span></div>';
     });
@@ -665,18 +665,17 @@ function cvSel(rel,on,isDir){
 function cvSelCount(){
   document.getElementById('cv-seln').textContent=CVSEL.size+' selected';
 }
-// When a folder's children are lazily loaded AFTER it was ticked, inherit the
-// tick so the tree doesn't look inconsistent.
-function cvInheritChecks(kidsId){
-  var box=document.getElementById(kidsId); if(!box)return;
-  var parents=[];
-  CVSEL.forEach(function(r){parents.push(r.replace(/\/+$/,'')+'/');});
-  box.querySelectorAll('.cvrow').forEach(function(row){
-    var r=row.getAttribute('data-rel')||'';
-    if(parents.some(function(p){return r.indexOf(p)===0;})){
-      var cb=row.querySelector('input[type=checkbox]'); if(cb)cb.checked=true;
-    }
+// Is this row covered by the selection -- either ticked itself, or sitting
+// under a ticked ANCESTOR folder? Used when rendering (children are loaded
+// lazily, long after their parent folder was ticked) so the tree always shows
+// the truth: ticking a folder means everything inside it.
+function cvIsCovered(rel){
+  if(CVSEL.has(rel))return true;
+  var covered=false;
+  CVSEL.forEach(function(sel){
+    if(!covered&&rel.indexOf(sel.replace(/\/+$/,'')+'/')===0)covered=true;
   });
+  return covered;
 }
 function cvSettingsSummary(){
   var k=document.getElementById('cv-codec').value,o=CVOPT[k]||{};

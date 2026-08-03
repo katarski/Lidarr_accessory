@@ -169,6 +169,9 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     put("qbittorrent", "pause_during_scan", "QBIT_PAUSE_SCAN", _as_bool)
     put("qbittorrent", "deselect_video", "QBIT_DESELECT_VIDEO", _as_bool)
     put("qbittorrent", "redeselect_recheck_seconds", "QBIT_REDESELECT_RECHECK", int)
+    put("qbittorrent", "stalled_reaper", "QBIT_STALLED_REAPER", _as_bool)
+    put("qbittorrent", "stalled_grace_days", "QBIT_STALLED_GRACE_DAYS", int)
+    put("qbittorrent", "stalled_blocklist", "QBIT_STALLED_BLOCKLIST", _as_bool)
     put("qbittorrent", "lifecycle_recheck_seconds", "QBIT_LIFECYCLE_RECHECK", int)
     put("qbittorrent", "dead_grab_reaper", "QBIT_DEAD_GRAB_REAPER", _as_bool)
     put("qbittorrent", "dead_grab_grace_minutes", "QBIT_DEAD_GRAB_GRACE_MINUTES", int)
@@ -645,6 +648,7 @@ def qbt_auto_deselect_loop(
     from qbittorrent_client import QbtClient
     from qbt_deselect import (
         auto_deselect_pass, torrent_lifecycle_pass, dead_grab_reaper_pass,
+        stalled_grab_reaper_pass,
     )
 
     cadence = max(10, interval)
@@ -664,6 +668,11 @@ def qbt_auto_deselect_loop(
     else:
         dead_grab_grace_minutes = int(qcfg.get("dead_grab_grace_hours", 6) or 6) * 60
     dead_grab_blocklist = _as_bool(qcfg.get("dead_grab_blocklist", True))
+    # Stalled-but-partly-downloaded reaper: no progress for N days -> salvage
+    # anything usable, then drop the torrent (its data too when nothing is).
+    stalled_reaper = _as_bool(qcfg.get("stalled_reaper", True))
+    stalled_grace_days = int(qcfg.get("stalled_grace_days", 3) or 3)
+    stalled_blocklist = _as_bool(qcfg.get("stalled_blocklist", True))
     # AI fallback for library matching: only used when the deterministic
     # (Lidarr) match misses. Requires an enabled LLM client.
     ai_match = _as_bool(qcfg.get("ai_match", True))
@@ -705,6 +714,14 @@ def qbt_auto_deselect_loop(
                         logger.info("qbt complete -> queued %s", cue)
         except OSError as exc:
             logger.debug("qbt complete: cue scan of %s failed: %s", folder, exc)
+
+    def _asm_keep_now():
+        if assembly_keep_provider is None:
+            return None
+        try:
+            return assembly_keep_provider()
+        except Exception:  # noqa: BLE001
+            return None
 
     delay = min(cadence, 10)  # first pass right after startup
     while not stop.wait(delay):
@@ -761,6 +778,16 @@ def qbt_auto_deselect_loop(
                     )
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("dead-grab reaper: %s", exc)
+            if stalled_reaper:
+                try:
+                    stalled_grab_reaper_pass(
+                        qbt, lidarr, category=category,
+                        grace_seconds=max(3600, stalled_grace_days * 86400),
+                        blocklist=stalled_blocklist, emit=logger.info,
+                        assembly_keep=_asm_keep_now(), llm=match_llm,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("stalled reaper: %s", exc)
         except Exception as exc:  # noqa: BLE001
             logger.exception("qbt loop thread: %s", exc)
 
