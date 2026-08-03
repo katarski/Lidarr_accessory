@@ -665,6 +665,15 @@ class LidarrClient:
             logger.warning("queue_remove(%s) failed: %s", queue_id, exc)
             return False
 
+    def list_artists(self) -> List[Dict[str, Any]]:
+        """Every artist in Lidarr's library (each carries `foreignArtistId`, the
+        MusicBrainz artist id, used by the external album audit)."""
+        try:
+            return self._get("/api/v1/artist") or []
+        except Exception as exc:
+            logger.warning("list_artists failed: %s", exc)
+            return []
+
     def find_artist(self, name: str) -> Optional[Dict[str, Any]]:
         """Search Lidarr's local library for an artist by (fuzzy) name match."""
         if not name:

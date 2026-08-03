@@ -128,6 +128,13 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     put("lidarr", "interactive_search_min_seeders", "ISEARCH_MIN_SEEDERS", int)
     put("lidarr", "interactive_search_seeder_weight", "ISEARCH_SEEDER_WEIGHT", float)
     put("lidarr", "interactive_search_refuse_unofficial", "ISEARCH_REFUSE_UNOFFICIAL", _as_bool)
+    put("lidarr", "external_audit_enabled", "EXTERNAL_AUDIT_ENABLED", _as_bool)
+    put("lidarr", "external_audit_interval_seconds", "EXTERNAL_AUDIT_INTERVAL", int)
+    put("lidarr", "external_audit_artists_per_pass", "EXTERNAL_AUDIT_ARTISTS", int)
+    put("lidarr", "external_audit_include_eps", "EXTERNAL_AUDIT_EPS", _as_bool)
+    put("lidarr", "verify_track_titles", "VERIFY_TRACK_TITLES", _as_bool)
+    put("lidarr", "verify_track_titles_accept", "VERIFY_TITLES_ACCEPT", float)
+    put("lidarr", "verify_track_titles_reject", "VERIFY_TITLES_REJECT", float)
     # Reconcile pass -- import monitored gaps still sitting in downloads.
     put("lidarr", "reconcile_enabled", "RECONCILE_ENABLED", _as_bool)
     put("lidarr", "reconcile_interval_seconds", "RECONCILE_INTERVAL", int)
@@ -501,6 +508,29 @@ def interactive_search_loop(
             orch.interactive_search_pass(qbt)
         except Exception as exc:  # noqa: BLE001
             logger.exception("interactive search thread: %s", exc)
+        delay = cadence
+
+
+def external_audit_loop(
+    orch: Orchestrator,
+    stop: threading.Event,
+    interval: int,
+) -> None:
+    """
+    Requirement (c): periodically cross-check Lidarr's album list against
+    MusicBrainz and report albums Lidarr has no record of (see
+    Orchestrator.external_album_audit_pass). Read-only -- it writes a report,
+    it never adds albums to Lidarr. Slow by design: MusicBrainz asks for <=1
+    request/second, so each pass checks a handful of artists and the library
+    rotates through over days. Minimum cadence 1h; first pass one cadence out.
+    """
+    cadence = max(3600, interval)
+    delay = cadence
+    while not stop.wait(delay):
+        try:
+            orch.external_album_audit_pass()
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("external audit thread: %s", exc)
         delay = cadence
 
 
@@ -935,6 +965,15 @@ def main() -> int:
         )
     else:
         isearch_state_path = None
+    # External album cross-check (requirement c): the MusicBrainz-vs-Lidarr gap
+    # report lives beside the other /config state files.
+    _ext_audit_cfg = lidarr_cfg.get("external_audit_file")
+    if _ext_audit_cfg:
+        external_audit_path = Path(_ext_audit_cfg)
+    elif isearch_state_path is not None:
+        external_audit_path = isearch_state_path.parent / "external_album_audit.json"
+    else:
+        external_audit_path = None
     # Manual-attention WebUI (#11): held-items state lives next to the other
     # /config state files (mirrors the reaper/isearch state path resolution).
     _held_state_cfg = lidarr_cfg.get("held_items_file") or staging_cfg.get("held_items_file")
@@ -1142,6 +1181,31 @@ def main() -> int:
         interactive_search_refuse_unofficial=bool(
             lidarr_cfg.get("interactive_search_refuse_unofficial", True)
         ),
+        verify_track_titles=bool(
+            lidarr_cfg.get("verify_track_titles", True)
+        ),
+        verify_track_titles_accept=float(
+            lidarr_cfg.get("verify_track_titles_accept", 0.60)
+        ),
+        verify_track_titles_reject=float(
+            lidarr_cfg.get("verify_track_titles_reject", 0.25)
+        ),
+        external_audit_enabled=bool(
+            lidarr_cfg.get("external_audit_enabled", True)
+        ),
+        external_audit_interval_seconds=int(
+            lidarr_cfg.get("external_audit_interval_seconds", 21600)
+        ),
+        external_audit_artists_per_pass=int(
+            lidarr_cfg.get("external_audit_artists_per_pass", 10)
+        ),
+        external_audit_recheck_seconds=int(
+            lidarr_cfg.get("external_audit_recheck_seconds", 604800)
+        ),
+        external_audit_include_eps=bool(
+            lidarr_cfg.get("external_audit_include_eps", False)
+        ),
+        external_audit_file=external_audit_path,
         interactive_search_cooldown_seconds=int(
             lidarr_cfg.get("interactive_search_cooldown_seconds", 43200)
         ),
@@ -1346,6 +1410,26 @@ def main() -> int:
         )
     else:
         logger.info("Reconcile: disabled")
+
+    # --- External album cross-check (requirement c) ---------------------
+    # Ask MusicBrainz which studio albums an artist has that Lidarr never
+    # listed, and report them. Read-only; nothing is added to Lidarr.
+    if getattr(orch_cfg, "external_audit_enabled", False):
+        threading.Thread(
+            target=external_audit_loop,
+            args=(orch, stop, orch_cfg.external_audit_interval_seconds),
+            daemon=True,
+            name="cue-external-audit",
+        ).start()
+        logger.info(
+            "External album audit: enabled (every %ds, %d artist(s)/pass, "
+            "re-check every %dd, report=%s)",
+            max(3600, orch_cfg.external_audit_interval_seconds),
+            orch_cfg.external_audit_artists_per_pass,
+            max(1, orch_cfg.external_audit_recheck_seconds // 86400),
+            external_audit_path)
+    else:
+        logger.info("External album audit: disabled")
 
     # --- Library audit: disk vs Lidarr (scheduled, change-gated) -------
     # Runs on a schedule only -- NOT at startup, not coupled to anything.

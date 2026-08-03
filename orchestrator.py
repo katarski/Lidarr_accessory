@@ -23,6 +23,7 @@ from __future__ import annotations
 import csv
 import difflib
 import hashlib
+import json
 import logging
 import os
 import re
@@ -562,6 +563,38 @@ class OrchestratorConfig:
     # albumType / secondaryTypes / own title) -- i.e. it's explicitly part of the
     # artist's work. Off = grab whatever ranks best.
     interactive_search_refuse_unofficial: bool = True
+    # (d) SONG-TITLE VERIFICATION: before committing a grab, compare Lidarr's
+    # track titles for the album against the songs actually in the torrent (its
+    # file names). A matching track COUNT proves nothing about which songs these
+    # are, so this is what stops the "right size, wrong record" grabs.
+    verify_track_titles: bool = True
+    # Coverage (0..1) of Lidarr titles found in the torrent at which the release
+    # is ACCEPTED even if the file count differs from Lidarr's expectation
+    # (bonus tracks, another pressing, an extra intro file).
+    verify_track_titles_accept: float = 0.60
+    # Coverage below which the release is REJECTED as a different record, even
+    # when the counts line up.
+    verify_track_titles_reject: float = 0.25
+
+    # --- (c) External album cross-check (MusicBrainz) ----------------------
+    # Lidarr's library only holds what it decided to add (its metadata profile
+    # excludes compilations/live/singles, and it may predate later releases), so
+    # an album can exist and simply not be listed. This asks MusicBrainz -- using
+    # the MB artist id Lidarr already stores -- for each artist's STUDIO
+    # release-groups and reports the ones Lidarr has no record of. Read-only:
+    # nothing is added to Lidarr automatically.
+    external_audit_enabled: bool = True
+    # How often the audit thread runs (seconds). Minimum 3600.
+    external_audit_interval_seconds: int = 21600
+    # Artists checked per pass. MusicBrainz asks for <=1 request/second, so this
+    # keeps each pass short and rotates through the library over time.
+    external_audit_artists_per_pass: int = 10
+    # Don't re-check the same artist more often than this (default 7 days).
+    external_audit_recheck_seconds: int = 604800
+    # Also treat EPs as expected releases (off = studio albums only).
+    external_audit_include_eps: bool = False
+    # JSON report of what MusicBrainz has that Lidarr lacks. Lives in /config.
+    external_audit_file: Optional[Path] = None
     # JSON state file: {albumId: {first_missing, last_attempt, blocklisted[]}}.
     # Tracks how long each album has been missing (the >Ndays clock) and the
     # per-album grab cooldown, surviving restarts. Lives in /config.
@@ -649,6 +682,17 @@ class Orchestrator:
         # startup. In-memory only; a restart re-parses (cheap).
         self._skip_seen: set = set()
         self._ledger_lock = threading.Lock()
+        # MusicBrainz cross-check client (requirement c). None when disabled --
+        # built lazily-but-once so the audit pass can be a no-op without it.
+        self._mb = None
+        if getattr(cfg, "external_audit_enabled", False):
+            try:
+                from musicbrainz import MusicBrainzClient
+                self._mb = MusicBrainzClient()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "external audit: MusicBrainz client unavailable (%s) -- "
+                    "album cross-check disabled", exc)
         # Manual-attention store for the WebUI (#11). None when disabled.
         self.held: Optional[HeldStore] = (
             HeldStore(cfg.held_items_file)
@@ -7162,12 +7206,262 @@ class Orchestrator:
             time.sleep(3)
         return None, None
 
-    def _verify_torrent(self, qbt, thash: str, expected: int, label: str):
+    def _album_track_titles(self, album_id: int) -> List[str]:
+        """
+        Every track title Lidarr knows for an album, across ALL its releases
+        (the plain /track call returns only the SELECTED release, which hides
+        other pressings). Deduped, normalized-nonempty.
+        """
+        titles: List[str] = []
+        seen: set = set()
+
+        def _add(rows):
+            for t in rows or []:
+                name = str(t.get("title") or "").strip()
+                key = self._norm_title(name)
+                if key and key not in seen:
+                    seen.add(key)
+                    titles.append(name)
+
+        try:
+            _add(self.lidarr.list_tracks_for_album(album_id))
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            full = self.lidarr.get_album(album_id) or {}
+            for rel in (full.get("releases") or []):
+                rid = rel.get("id")
+                if rid:
+                    _add(self.lidarr.list_tracks_for_release(album_id, rid))
+        except Exception:  # noqa: BLE001
+            pass
+        return titles
+
+    def _torrent_title_coverage(
+        self, files: List[Dict[str, Any]], track_titles: List[str],
+    ) -> Tuple[float, int, int]:
+        """
+        Requirement (d): compare Lidarr's SONG TITLES against the songs actually
+        inside a torrent (its audio file names -- nothing is downloaded yet, so
+        there are no tags to read).
+
+        A Lidarr title counts as present when its normalized form appears inside
+        a normalized audio file name, or fuzzy-matches one closely (>=0.82) --
+        so "05 - Bullet For Narcissus.flac" matches "Bullet for Narcissus" and
+        track-number/format noise is ignored.
+
+        Returns (coverage 0..1, matched, total). coverage is 0.0 with no titles
+        or no audio, so callers must treat "unknown" as not-a-verdict.
+        """
+        names = [
+            self._norm_title(os.path.splitext(os.path.basename(
+                str(f.get("name") or "")))[0])
+            for f in files or []
+            if os.path.splitext(str(f.get("name") or ""))[1].lower()
+            in _ALL_AUDIO_EXTS
+        ]
+        names = [n for n in names if n]
+        total = len(track_titles or [])
+        if not names or not total:
+            return 0.0, 0, total
+        matched = 0
+        for t in track_titles:
+            nt = self._norm_title(t)
+            if not nt:
+                continue
+            hit = any(nt in n or n in nt for n in names)
+            if not hit:
+                hit = any(
+                    difflib.SequenceMatcher(None, nt, n).ratio() >= 0.82
+                    for n in names)
+            if hit:
+                matched += 1
+        return (matched / float(total)), matched, total
+
+    def external_album_audit_pass(self, budget: int = 0) -> int:
+        """
+        Requirement (c): Lidarr may not have listed every album an artist made --
+        cross-check against MusicBrainz and report what's missing from Lidarr.
+
+        For each monitored Lidarr artist (least-recently-checked first, capped
+        per pass), ask MusicBrainz for the artist's STUDIO release-groups using
+        the MusicBrainz id Lidarr already stores (`foreignArtistId`, so there's
+        no fuzzy artist search), and list the ones Lidarr has no album record
+        for. Compilations / live / remix / soundtrack release-groups are excluded
+        so this agrees with the "official releases only" grab rule.
+
+        The result is written to `external_audit_file` (JSON) and logged. Nothing
+        is added to Lidarr automatically: adding an album changes what the whole
+        pipeline will then chase and download, so that stays a deliberate action
+        (add the album in Lidarr, and the normal search/import path takes over).
+
+        Returns the number of artists checked this pass.
+        """
+        if self._mb is None:
+            return 0
+        state_path = getattr(self.cfg, "external_audit_file", None)
+        budget = budget or max(1, int(getattr(
+            self.cfg, "external_audit_artists_per_pass", 10)))
+        recheck = max(3600, int(getattr(
+            self.cfg, "external_audit_recheck_seconds", 604800)))
+        include_eps = bool(getattr(self.cfg, "external_audit_include_eps", False))
+        now = time.time()
+
+        report: Dict[str, Any] = {"artists": {}}
+        if state_path:
+            try:
+                report = json.loads(Path(state_path).read_text(encoding="utf-8"))
+                if not isinstance(report, dict) or "artists" not in report:
+                    report = {"artists": {}}
+            except Exception:  # noqa: BLE001
+                report = {"artists": {}}
+        seen_state: Dict[str, Any] = report.setdefault("artists", {})
+
+        try:
+            artists = [a for a in (self.lidarr.list_artists() or [])
+                       if a.get("monitored")]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("external audit: Lidarr artist list failed: %s", exc)
+            return 0
+        # Least-recently-checked first, so every artist rotates through.
+        artists.sort(key=lambda a: float(
+            (seen_state.get(str(a.get("id"))) or {}).get("checked", 0)))
+
+        checked = 0
+        for art in artists:
+            if checked >= budget:
+                break
+            aid = str(art.get("id"))
+            mbid = str(art.get("foreignArtistId") or "").strip()
+            name = str(art.get("artistName") or "")
+            prev = seen_state.get(aid) or {}
+            if mbid and (now - float(prev.get("checked", 0))) < recheck:
+                continue
+            if not mbid:
+                continue
+            groups = self._mb.release_groups(
+                mbid, studio_only=True, include_eps=include_eps)
+            if not groups:
+                # Couldn't check (network/rate/unknown) -- do NOT record an empty
+                # result as truth, just move on and retry next pass.
+                continue
+            checked += 1
+            try:
+                have = self.lidarr.list_albums_for_artist(int(aid)) or []
+            except Exception:  # noqa: BLE001
+                have = []
+            have_keys = {_match_key(a.get("title")) for a in have}
+            missing = [
+                {"title": g["title"], "year": (g.get("first_release_date") or "")[:4],
+                 "mbid": g.get("mbid")}
+                for g in groups
+                if _match_key(g["title"]) not in have_keys
+            ]
+            seen_state[aid] = {
+                "artist": name, "mbid": mbid, "checked": now,
+                "mb_studio_albums": len(groups),
+                "lidarr_albums": len(have),
+                "missing_from_lidarr": missing,
+            }
+            if missing:
+                logger.info(
+                    "external audit: %s -- MusicBrainz lists %d studio album(s) "
+                    "that Lidarr has no record of: %s%s",
+                    name, len(missing),
+                    ", ".join(f"{m['title']}"
+                              + (f" ({m['year']})" if m["year"] else "")
+                              for m in missing[:5]),
+                    " ..." if len(missing) > 5 else "")
+            else:
+                logger.debug("external audit: %s -- Lidarr covers all %d MB "
+                             "studio album(s)", name, len(groups))
+        report["updated"] = now
+        report["totals"] = {
+            "artists_with_gaps": sum(
+                1 for v in seen_state.values() if v.get("missing_from_lidarr")),
+            "albums_missing_from_lidarr": sum(
+                len(v.get("missing_from_lidarr") or [])
+                for v in seen_state.values()),
+        }
+        if state_path:
+            try:
+                p = Path(state_path)
+                p.parent.mkdir(parents=True, exist_ok=True)
+                tmp = p.with_suffix(p.suffix + ".tmp")
+                tmp.write_text(json.dumps(report, indent=2), encoding="utf-8")
+                tmp.replace(p)
+            except OSError as exc:
+                logger.warning("external audit: could not write %s: %s",
+                               state_path, exc)
+        if checked:
+            logger.info(
+                "external audit: checked %d artist(s) against MusicBrainz; "
+                "running total %d album(s) missing from Lidarr across %d artist(s)"
+                " -- see %s",
+                checked, report["totals"]["albums_missing_from_lidarr"],
+                report["totals"]["artists_with_gaps"], state_path or "(no file)")
+        return checked
+
+    def _best_release_title_coverage(
+        self, files: List[Dict[str, Any]], album_id: int,
+    ) -> Tuple[float, int, int]:
+        """
+        Best song-title coverage over EACH of the album's releases separately,
+        returning (coverage, matched, total) for the winner.
+
+        Measuring against the pooled titles of every release badly understates a
+        correct grab: Eminem "Infinite" has 10 releases / 38 distinct titles, so
+        a perfectly correct 11-track release scored only 13/38 = 34%. Per
+        release, that same torrent matches its own 11-track pressing almost
+        fully. A torrent that matches NO release stays at ~0 and is rejected.
+        """
+        # NOTE: `best` starts as None, not (0,0,0). A genuine ZERO-coverage
+        # result is the strongest reject signal there is, and it must stay
+        # distinguishable from "no track data available" -- otherwise a wrong
+        # record reports total=0, the caller treats it as "unknown" and lets it
+        # through, which is exactly what happened in testing.
+        best: Optional[Tuple[float, int, int]] = None
+        try:
+            full = self.lidarr.get_album(int(album_id)) or {}
+            releases = full.get("releases") or []
+        except Exception:  # noqa: BLE001
+            releases = []
+        checked = 0
+        for rel in releases:
+            rid = rel.get("id")
+            if not rid:
+                continue
+            try:
+                rows = self.lidarr.list_tracks_for_release(int(album_id), int(rid))
+            except Exception:  # noqa: BLE001
+                continue
+            titles = [str(t.get("title") or "") for t in rows or []]
+            titles = [t for t in titles if t.strip()]
+            if not titles:
+                continue
+            checked += 1
+            cov, m, t = self._torrent_title_coverage(files, titles)
+            if best is None or cov > best[0]:
+                best = (cov, m, t)
+        if not checked or best is None:
+            # No per-release track lists available -- fall back to the pooled
+            # list so the check still works rather than silently passing.
+            return self._torrent_title_coverage(
+                files, self._album_track_titles(int(album_id)))
+        return best
+
+    def _verify_torrent(self, qbt, thash: str, expected: int, label: str,
+                        album_id: Optional[int] = None):
         """
         Pause the grabbed torrent, wait for its metadata/file list, classify it,
         and decide. Returns (verdict, info) where verdict is 'accept' or
         'reject:<reason>'. With no qBit client we can't inspect -- accept and let
         it download.
+
+        When `album_id` is given, Lidarr's SONG TITLES are compared against the
+        torrent's file names (requirement d) BEFORE the count rules, so a
+        release whose track count happens to match but whose songs are a
+        different record is rejected instead of imported.
         """
         if qbt is None:
             return "accept", {"note": "no qbit"}
@@ -7185,6 +7479,35 @@ class Orchestrator:
         ac = info["audio_count"]
         if info["is_dsd"] or info["is_iso"]:
             return "accept", info                      # pipeline handles these
+        # (d) SONG-TITLE COMPARISON, Lidarr <-> torrent. Runs before the count
+        # rules because a matching count proves nothing about WHICH songs these
+        # are; low overlap means we grabbed a different record.
+        if album_id and bool(getattr(self.cfg, "verify_track_titles", True)):
+            try:
+                cov, matched, total = self._best_release_title_coverage(
+                    files, int(album_id))
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("title verify failed for %s: %s", label, exc)
+                cov, matched, total = 0.0, 0, 0
+            if total and ac:
+                info.update(_title_coverage=round(cov, 3),
+                            _titles_matched=matched, _titles_total=total)
+                accept_at = float(getattr(
+                    self.cfg, "verify_track_titles_accept", 0.60))
+                reject_at = float(getattr(
+                    self.cfg, "verify_track_titles_reject", 0.25))
+                logger.info(
+                    "interactive search: %s -- song check: %d/%d Lidarr title(s) "
+                    "present in the torrent (%.0f%%, best-matching release)",
+                    label, matched, total, cov * 100)
+                if cov < reject_at:
+                    return (f"reject:songs-dont-match"
+                            f"({matched}/{total})"), info
+                if cov >= accept_at:
+                    # The songs ARE this album -- allow it even when the file
+                    # count differs from Lidarr's expectation (bonus tracks, a
+                    # different pressing, an extra intro/outro file).
+                    return "accept", info
         if expected > 0 and ac >= expected:
             return "accept", info                      # complete / superset
         if info["is_single_image"] and info["has_cue"]:
@@ -7270,7 +7593,8 @@ class Orchestrator:
                     "interactive search: %s -- grabbed but no queue hash "
                     "appeared; leaving it to download", label)
                 return True
-            verdict, info = self._verify_torrent(qbt, thash, expected, label)
+            verdict, info = self._verify_torrent(
+                qbt, thash, expected, label, album_id=aid)
             if verdict == "accept":
                 if qbt is not None:
                     # Force active: a confirmed interactive-search grab must
@@ -7529,9 +7853,13 @@ class Orchestrator:
                     qbt, thash, cand.get("title") or "")
                 detail = f"{detail} album folder(s)"
             else:
-                exp = (cand.get("_match") or ("", 0, 0))[1]
+                m = cand.get("_match") or ("", 0, 0)
+                exp = m[1]
+                # _match is (album_title, expected, album_id) -- give the verifier
+                # the album id so it can compare Lidarr's song titles (d).
                 verdict, info = self._verify_torrent(
-                    qbt, thash, int(exp or 0), artist_name)
+                    qbt, thash, int(exp or 0), artist_name,
+                    album_id=(m[2] if len(m) > 2 else None))
                 detail = f"{(info or {}).get('audio_count', '?')} audio"
             if verdict == "accept":
                 if qbt is not None:
@@ -8763,6 +9091,10 @@ class Orchestrator:
          "Prefer lossless; grab lossy only when no lossless release exists."),
         ("lidarr.interactive_search_refuse_unofficial", "lidarr", "interactive_search_refuse_unofficial", "Official releases only", "bool", True,
          "Refuse compilation / greatest-hits / live / remix / karaoke / bootleg releases, unless the album being filled is itself that kind of record."),
+        ("lidarr.external_audit_enabled", "lidarr", "external_audit_enabled", "Cross-check albums vs MusicBrainz", "bool", True,
+         "Ask MusicBrainz which studio albums an artist has that Lidarr never listed, and report them (read-only; nothing is added to Lidarr)."),
+        ("lidarr.verify_track_titles", "lidarr", "verify_track_titles", "Verify song titles before grab", "bool", True,
+         "Compare Lidarr's track titles against the songs inside the torrent; reject a release whose songs are a different record even if the track count matches."),
         ("lidarr.interactive_search_min_seeders", "lidarr", "interactive_search_min_seeders", "Min seeders", "int", 1,
          "Never grab a release with fewer seeders than this (0-seeder grabs are what produce torrents stuck at 0%)."),
         ("lidarr.interactive_search_seeder_weight", "lidarr", "interactive_search_seeder_weight", "Swarm-health weight", "int", 1,
