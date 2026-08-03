@@ -542,10 +542,12 @@ def assembly_loop(
     which of its songs are available inside the compilations/box sets stuck in
     needs-attention -- feeding the Assembly tab's % and missing-song list. Pure
     analysis: it reads tags and writes the plan store, it never moves files.
-    Minimum cadence 300s; first pass one cadence out so startup stays light.
+    Minimum cadence 300s. The FIRST pass runs shortly after startup (not a full
+    cadence later) -- otherwise the Assembly tab sits empty for half an hour on
+    a fresh start, which reads as "it never populates".
     """
     cadence = max(300, interval)
-    delay = cadence
+    delay = min(cadence, 45)
     while not stop.wait(delay):
         try:
             orch.assembly_plan_pass()
@@ -565,10 +567,11 @@ def external_audit_loop(
     Orchestrator.external_album_audit_pass). Read-only -- it writes a report,
     it never adds albums to Lidarr. Slow by design: MusicBrainz asks for <=1
     request/second, so each pass checks a handful of artists and the library
-    rotates through over days. Minimum cadence 1h; first pass one cadence out.
+    rotates through over days. Minimum cadence 1h; the first pass runs shortly
+    after startup so the report exists rather than appearing hours later.
     """
     cadence = max(3600, interval)
-    delay = cadence
+    delay = min(cadence, 120)
     while not stop.wait(delay):
         try:
             orch.external_album_audit_pass()
