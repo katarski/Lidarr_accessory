@@ -2519,11 +2519,16 @@ class Orchestrator:
         """
         Run dvda2wav, streaming its stdout so the WebUI gets a moving bar.
 
-        It reports no percentage, but it prints a line per finished track
-        ("* Wrote: <path>.wav"). We do not know the track count up front, so the
-        bar eases from 20% toward 55% as tracks land (asymptotic -- it never
-        pretends to be finished). Returns a CompletedProcess-like object with the
-        same .stdout/.stderr/.returncode the caller already parses.
+        It reports no percentage, and its stdout is BLOCK-BUFFERED -- reading it
+        live gave nothing until the process exited, so the bar sat frozen at the
+        phase start. Progress is therefore taken from the FILESYSTEM instead: a
+        watcher thread counts the .wav files appearing in `wav_dir`, which is
+        exactly "the WAV files being extracted" and is immune to buffering.
+
+        The track total isn't known until decoding ends, so the percentage eases
+        asymptotically toward 55% (it never claims to be finished) while the
+        label reports the real, growing WAV count. Returns a CompletedProcess-like
+        object with the .stdout/.stderr/.returncode the caller already parses.
         """
         import subprocess as _sp
 
@@ -2533,30 +2538,39 @@ class Orchestrator:
         proc = _sp.Popen(
             ["dvda2wav", "-A", str(audio_ts), "-d", str(wav_dir)],
             stdout=_sp.PIPE, stderr=_sp.PIPE, text=True)
-        out_lines: List[str] = []
-        done = 0
+
+        stop_watch = threading.Event()
+
+        def _watch() -> None:
+            last = -1
+            while not stop_watch.wait(2.0):
+                try:
+                    n = sum(1 for _ in wav_dir.glob("*.wav"))
+                except OSError:
+                    continue
+                if n == last:
+                    continue
+                last = n
+                # Each finished WAV closes a third of the gap to 55%.
+                pct = 55.0 - (35.0 * (0.67 ** max(0, n)))
+                self._activity_start(
+                    act_key, "DVD-Audio",
+                    f"{iso_name} — extracting WAV ({n} track(s) so far)", pct)
+
+        watcher = threading.Thread(target=_watch, daemon=True,
+                                   name="cue-dvda-progress")
+        watcher.start()
         try:
-            for line in proc.stdout:  # type: ignore[union-attr]
-                out_lines.append(line)
-                if re.search(r'Wrote:\s*"?.+?\.wav', line):
-                    done += 1
-                    # 20% + 35% spread over an unknown total: each track closes
-                    # a third of the remaining gap, so it approaches 55%.
-                    pct = 55.0 - (35.0 * (0.67 ** done))
-                    self._activity_start(
-                        act_key, "DVD-Audio",
-                        f"{iso_name} — decoded {done} track(s)", pct)
+            out, err = proc.communicate(timeout=7200)
         except Exception:  # noqa: BLE001
-            pass
-        try:
-            err = proc.stderr.read() if proc.stderr else ""
-        except Exception:  # noqa: BLE001
-            err = ""
-        rc = proc.wait(timeout=7200)
+            proc.kill()
+            out, err = "", "dvda2wav timed out"
+        finally:
+            stop_watch.set()
         res = _Res()
-        res.returncode = rc
-        res.stdout = "".join(out_lines)
-        res.stderr = err
+        res.returncode = proc.returncode
+        res.stdout = out or ""
+        res.stderr = err or ""
         return res
 
     def _extract_dvda_folder(
