@@ -86,14 +86,25 @@ def norm_title(s: str) -> str:
     # trailing disc token in filename-derived candidates ("Searchin-cd1").
     t = _LEAD_NUM_RE.sub("", t)
     t = _TRAIL_DISC_RE.sub("", t)
-    t = re.sub(r"[^a-z0-9]+", " ", t)
+    # Keep ALL word characters, not just a-z: a Latin-only class deletes every
+    # Cyrillic / Greek / CJK character, turning a non-Latin title into "" --
+    # which then compares as garbage instead of not matching.
+    t = re.sub(r"[\W_]+", " ", t, flags=re.UNICODE)
     return re.sub(r"\s{2,}", " ", t).strip()
 
 
 def norm_artist(s: str) -> str:
-    """Normalize an artist name: fold, &->and, drop a leading 'the'."""
+    """
+    Normalize an artist name: fold, &->and, drop a leading 'the'.
+
+    Unicode-safe on purpose. A Latin-only character class reduced "Белослава"
+    to an EMPTY string, and an empty target artist used to switch the artist
+    guard OFF -- so every non-Latin artist matched any song with a similar
+    title (a real false positive: Белослава / Красотата "matched" Quincy Jones'
+    "Walkin'").
+    """
     a = _fold(s).replace("&", " and ")
-    a = re.sub(r"[^a-z0-9]+", " ", a).strip()
+    a = re.sub(r"[\W_]+", " ", a, flags=re.UNICODE).strip()
     a = re.sub(r"^the\s+", "", a)
     return re.sub(r"\s{2,}", " ", a).strip()
 
@@ -309,8 +320,14 @@ class AssemblyPlanner:
         (ok, bonus). A compilation's per-track artist tag is the reliable
         signal; its ALBUM tag is not (it's the compilation's name).
         """
-        if not self.require_artist or album_is_various or not want_artist:
+        if not self.require_artist or album_is_various:
             return True, 0.0
+        if not want_artist:
+            # We cannot verify the artist at all, so we must NOT fall through to
+            # "title only" -- that is exactly how a Bulgarian album ended up
+            # claiming a Quincy Jones track. Refuse; the album shows 0% instead
+            # of a wrong match.
+            return False, 0.0
         strong = [a for a in (entry.get("n_artists") or []) if a]
         for a in strong:
             if similarity(a, want_artist) >= 0.90:
