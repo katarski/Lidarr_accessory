@@ -853,17 +853,20 @@ def make_handler(store, actions: HeldActions):
                 # just this in-memory list dump.
                 self._json(200, {"items": store.list()})
             elif path == "/api/assembly":
-                store = getattr(actions, "assembly", None)
-                if store is None:
+                # NOTE: must NOT be named `store` -- that name is the held-store
+                # CLOSURE variable used by /api/held above; assigning it here
+                # would make it a local for the whole method and break that
+                # handler with UnboundLocalError.
+                asm_store = getattr(actions, "assembly", None)
+                if asm_store is None:
                     self._json(200, {"items": [], "sources": 0,
                                      "note": "assembly disabled"})
                     return
                 # Served AS-IS from the plan store (same contract as /api/held):
                 # the background planner keeps it current, the page never
                 # recomputes.
-                items = store.list()
-                self._json(200, {"items": items,
-                                 "sources": len(store.needed_files())})
+                self._json(200, {"items": asm_store.list(),
+                                 "sources": len(asm_store.needed_files())})
 
             elif path == "/api/activity":
                 acts = actions.list_activity() if hasattr(actions, "list_activity") else []
