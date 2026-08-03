@@ -2484,11 +2484,37 @@ class Orchestrator:
             except OSError:
                 return True
 
+        # A LOOSE .iso dropped straight into the watch root has no album folder
+        # of its own. Give it one (named after the ISO) instead of extracting
+        # into the download root, where the tracks would be swept as a nameless
+        # root-level "album" and take their identity from the share name.
+        root = getattr(self, "_sweep_watch_root", None)
+        try:
+            at_root = bool(root) and folder.resolve() == Path(root).resolve()
+        except OSError:
+            at_root = False
+        if at_root:
+            dest = folder / isos[0].stem
+            try:
+                dest.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                logger.warning("DVD-Audio: cannot create %s: %s", dest, exc)
+                return True
+            logger.info(
+                "DVD-Audio: %s sits loose in the watch root -- extracting into "
+                "%r so it gets a proper album folder", isos[0].name, dest.name)
+            folder = dest
+
         # Already extracted on a prior pass? Drop the stray .cue and fall
         # through so the pre-split path hands off the FLAC. The .iso stays until
         # the source folder is removed after a verified import.
+        # NOTE: non-recursive on purpose. rglob() here searched the WHOLE subtree,
+        # so an ISO sitting in a folder that merely CONTAINS other album folders
+        # (worst case: the download root) always looked "already extracted" and
+        # was silently never ripped -- that is exactly what happened to a loose
+        # LIFAD.iso in /downloads.
         already = any(
-            any(True for _ in folder.rglob(f"*{ext}"))
+            any(True for _ in folder.glob(f"*{ext}"))
             for ext in (".flac", ".wav")
         )
         if already:
@@ -4557,6 +4583,9 @@ class Orchestrator:
 
         min_stable = max(0, int(self.cfg.sweep_min_stable_seconds))
         now_ts = time.time()
+        # Remembered for the ISO branch: a loose .iso sitting in the watch ROOT
+        # needs its own album folder rather than extracting into the root.
+        self._sweep_watch_root = watch_root
         # Fresh per-pass cache of container-folder -> Lidarr artist (#15), so a
         # newly-added Lidarr artist is picked up on the next sweep.
         self._container_artist_cache = {}
