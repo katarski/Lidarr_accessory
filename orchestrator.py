@@ -2485,6 +2485,52 @@ class Orchestrator:
                 return found
         return None
 
+    def _run_dvda2wav_with_progress(
+        self, audio_ts: Path, wav_dir: Path, act_key: Path, iso_name: str,
+    ):
+        """
+        Run dvda2wav, streaming its stdout so the WebUI gets a moving bar.
+
+        It reports no percentage, but it prints a line per finished track
+        ("* Wrote: <path>.wav"). We do not know the track count up front, so the
+        bar eases from 20% toward 55% as tracks land (asymptotic -- it never
+        pretends to be finished). Returns a CompletedProcess-like object with the
+        same .stdout/.stderr/.returncode the caller already parses.
+        """
+        import subprocess as _sp
+
+        class _Res:
+            pass
+
+        proc = _sp.Popen(
+            ["dvda2wav", "-A", str(audio_ts), "-d", str(wav_dir)],
+            stdout=_sp.PIPE, stderr=_sp.PIPE, text=True)
+        out_lines: List[str] = []
+        done = 0
+        try:
+            for line in proc.stdout:  # type: ignore[union-attr]
+                out_lines.append(line)
+                if re.search(r'Wrote:\s*"?.+?\.wav', line):
+                    done += 1
+                    # 20% + 35% spread over an unknown total: each track closes
+                    # a third of the remaining gap, so it approaches 55%.
+                    pct = 55.0 - (35.0 * (0.67 ** done))
+                    self._activity_start(
+                        act_key, "DVD-Audio",
+                        f"{iso_name} — decoded {done} track(s)", pct)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            err = proc.stderr.read() if proc.stderr else ""
+        except Exception:  # noqa: BLE001
+            err = ""
+        rc = proc.wait(timeout=7200)
+        res = _Res()
+        res.returncode = rc
+        res.stdout = "".join(out_lines)
+        res.stderr = err
+        return res
+
     def _extract_dvda_folder(
         self, folder: Path, isos: List[Path], now_ts: float, min_stable: int,
     ) -> bool:
@@ -2514,6 +2560,10 @@ class Orchestrator:
             except OSError:
                 return True
 
+        # The activity row the SWEEP opened is keyed on the folder it passed in,
+        # so remember it before `folder` may be re-pointed below -- progress
+        # updates must land on that row, and its _activity_end must still clear.
+        act_key = folder
         # A LOOSE .iso dropped straight into the watch root has no album folder
         # of its own. Give it one (named after the ISO) instead of extracting
         # into the download root, where the tracks would be swept as a nameless
@@ -2580,6 +2630,12 @@ class Orchestrator:
             return True
 
         logger.info("DVD-Audio: unpacking AUDIO_TS from %s ...", iso.name)
+        # Live progress for the WebUI. `act_key` is the folder the SWEEP opened
+        # the activity entry against -- NOT the (possibly re-pointed) extraction
+        # folder -- so updates land on that same row and its _activity_end still
+        # clears it. Phases: unpack 0-20%, decode 20-55%, encode 55-100%.
+        self._activity_start(act_key, "DVD-Audio",
+                             f"{iso.name} — unpacking AUDIO_TS", 2.0)
         audio_ts = self._unpack_audio_ts(iso, tmp)
         if audio_ts is None:
             logger.warning(
@@ -2598,11 +2654,14 @@ class Orchestrator:
             return True
 
         logger.info("DVD-Audio: decoding tracks from %s ...", iso.name)
+        # dvda2wav gives no machine-readable progress, but it announces each
+        # track it writes ("* Wrote: ..."), so tail its output on a helper thread
+        # and count those to drive the bar through the decode phase.
+        self._activity_start(act_key, "DVD-Audio",
+                             f"{iso.name} — decoding audio", 20.0)
         try:
-            proc = subprocess.run(
-                ["dvda2wav", "-A", str(audio_ts), "-d", str(wav_dir)],
-                capture_output=True, text=True, timeout=7200,
-            )
+            proc = self._run_dvda2wav_with_progress(
+                audio_ts, wav_dir, act_key, iso.name)
         except Exception as exc:  # noqa: BLE001
             logger.warning("DVD-Audio: dvda2wav failed for %s: %s", iso.name, exc)
             shutil.rmtree(tmp, ignore_errors=True)
@@ -2661,9 +2720,16 @@ class Orchestrator:
         artist, album = self._dvda_identity(folder)
         total = str(len(wavs))
         made = 0
+        n_wavs = len(wavs)
         for idx, w in enumerate(wavs, start=1):
             title = f"Track {idx:02d}"
             out = folder / f"{idx:02d} - {title}.flac"
+            # Encode phase 55-100%: now the total IS known, so report real
+            # "track i/n" progress (matching how the cue splitter reports).
+            self._activity_start(
+                act_key, "DVD-Audio",
+                f"{iso.name} — encoding FLAC track {idx}/{n_wavs}",
+                55.0 + 45.0 * ((idx - 1) / float(max(1, n_wavs))))
             cmd = [
                 self.cfg.ffmpeg_binary, "-hide_banner", "-loglevel", "warning",
                 "-y", "-i", str(w),
