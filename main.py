@@ -181,6 +181,8 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     put("qbittorrent", "remove_when_library_complete", "QBIT_REMOVE_WHEN_LIBRARY_COMPLETE", _as_bool)
     # #9 recurring .cue re-scan
     put("watch", "cue_rescan_interval_seconds", "CUE_RESCAN_INTERVAL", int)
+    put("watch", "sweep_ledger_enabled", "SWEEP_LEDGER_ENABLED", _as_bool)
+    put("watch", "sweep_ledger_ttl_seconds", "SWEEP_LEDGER_TTL", int)
     put("qbittorrent", "ai_match", "QBIT_AI_MATCH", _as_bool)
     # AcoustID fingerprint identification (import fallback)
     put("acoustid", "enabled", "ACOUSTID_ENABLED", _as_bool)
@@ -1054,6 +1056,14 @@ def main() -> int:
         external_audit_path = isearch_state_path.parent / "external_album_audit.json"
     else:
         external_audit_path = None
+    # Persistent cueless-sweep ledger -- beside the other /config state files.
+    _led_cfg = lidarr_cfg.get("sweep_ledger_file") or watch_cfg.get("sweep_ledger_file")
+    if _led_cfg:
+        sweep_ledger_path = Path(_led_cfg)
+    elif isearch_state_path is not None:
+        sweep_ledger_path = isearch_state_path.parent / "sweep_seen.json"
+    else:
+        sweep_ledger_path = None
     # Album-assembly store (requirement e) -- beside the other /config state.
     _asm_cfg = lidarr_cfg.get("assembly_file")
     if _asm_cfg:
@@ -1308,6 +1318,13 @@ def main() -> int:
         assembly_extra_source_dirs=list(
             lidarr_cfg.get("assembly_extra_source_dirs") or []),
         assembly_file=assembly_path,
+        sweep_ledger_enabled=bool(
+            watch_cfg.get("sweep_ledger_enabled",
+                          lidarr_cfg.get("sweep_ledger_enabled", True))),
+        sweep_ledger_file=sweep_ledger_path,
+        sweep_ledger_ttl_seconds=int(
+            watch_cfg.get("sweep_ledger_ttl_seconds",
+                          lidarr_cfg.get("sweep_ledger_ttl_seconds", 86400))),
         interactive_search_cooldown_seconds=int(
             lidarr_cfg.get("interactive_search_cooldown_seconds", 43200)
         ),

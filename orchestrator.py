@@ -622,6 +622,21 @@ class OrchestratorConfig:
     assembly_max_albums_per_pass: int = 150
     # Extra folders to draw songs from, beyond the needs-attention sources.
     assembly_extra_source_dirs: Optional[List[str]] = None
+
+    # --- Persistent sweep ledger -----------------------------------------
+    # `_skip_seen` lives in memory, so every restart made the cueless sweep
+    # replay its whole queue from the top -- and a full pass over a big download
+    # share takes close to an hour, so folders late in the walk could go
+    # unprocessed indefinitely. This ledger remembers which folders were already
+    # handed off, keyed by a cheap CONTENT SIGNATURE (audio count + newest
+    # mtime), so it survives restarts while still retrying a folder whose files
+    # changed. Entries also expire, so a transient failure is retried later
+    # instead of being written off forever.
+    sweep_ledger_enabled: bool = True
+    sweep_ledger_file: Optional[Path] = None
+    # Re-examine an unchanged, already-handled folder after this long (default
+    # 24h). Lower = more retries, higher = less repeated work.
+    sweep_ledger_ttl_seconds: int = 86400
     # JSON store backing the Assembly tab. Lives in /config.
     assembly_file: Optional[Path] = None
     # JSON state file: {albumId: {first_missing, last_attempt, blocklisted[]}}.
@@ -2487,6 +2502,91 @@ class Orchestrator:
             if found is not None:
                 return found
         return None
+
+    # ---- persistent sweep ledger ---------------------------------------
+    def _sweep_ledger(self) -> Dict[str, Any]:
+        """Lazily load the on-disk sweep ledger ({folder: [sig, ts]})."""
+        led = getattr(self, "_sweep_led", None)
+        if led is not None:
+            return led
+        led = {}
+        path = getattr(self.cfg, "sweep_ledger_file", None)
+        if path:
+            try:
+                data = json.loads(Path(path).read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    led = data.get("folders") or {}
+            except Exception:  # noqa: BLE001 (missing/corrupt -> start fresh)
+                led = {}
+        self._sweep_led = led
+        self._sweep_led_dirty = False
+        return led
+
+    def _sweep_ledger_save(self) -> None:
+        """Persist the ledger if it changed. Never fatal."""
+        if not getattr(self, "_sweep_led_dirty", False):
+            return
+        path = getattr(self.cfg, "sweep_ledger_file", None)
+        if not path:
+            return
+        led = getattr(self, "_sweep_led", None) or {}
+        # Keep the file bounded: drop the oldest entries past a generous cap.
+        try:
+            if len(led) > 20000:
+                for k in sorted(led, key=lambda k: led[k][1])[:len(led) - 20000]:
+                    led.pop(k, None)
+            pth = Path(path)
+            pth.parent.mkdir(parents=True, exist_ok=True)
+            tmp = pth.with_suffix(pth.suffix + ".tmp")
+            tmp.write_text(json.dumps({"folders": led}), encoding="utf-8")
+            tmp.replace(pth)
+            self._sweep_led_dirty = False
+        except OSError as exc:
+            logger.debug("sweep ledger save failed: %s", exc)
+
+    @staticmethod
+    def _folder_signature(audios: List[Path]) -> str:
+        """Cheap content signature of a folder: audio count + newest mtime."""
+        newest = 0
+        for a in audios:
+            try:
+                m = int(a.stat().st_mtime)
+            except OSError:
+                continue
+            if m > newest:
+                newest = m
+        return "%d:%d" % (len(audios), newest)
+
+    def _sweep_ledger_skip(self, folder: Path, audios: List[Path],
+                           now_ts: float) -> bool:
+        """
+        Has this folder already been handed off, unchanged, recently enough to
+        skip? False whenever the ledger is off, the folder is unknown, its audio
+        changed, or the entry has expired -- so a changed or long-untouched
+        folder always gets another look.
+        """
+        if not getattr(self.cfg, "sweep_ledger_enabled", True):
+            return False
+        rec = self._sweep_ledger().get(str(folder))
+        if not rec:
+            return False
+        try:
+            sig, ts = rec[0], float(rec[1])
+        except Exception:  # noqa: BLE001
+            return False
+        ttl = max(300, int(getattr(self.cfg, "sweep_ledger_ttl_seconds", 86400)))
+        if (now_ts - ts) >= ttl:
+            return False
+        return sig == self._folder_signature(audios)
+
+    def _sweep_ledger_mark(self, folder: Path, audios: List[Path],
+                           now_ts: float) -> None:
+        """Record that this folder was handed off at its current content."""
+        if not getattr(self.cfg, "sweep_ledger_enabled", True):
+            return
+        led = self._sweep_ledger()
+        led[str(folder)] = [self._folder_signature(audios), now_ts]
+        self._sweep_led_dirty = True
 
     def _dvda_rip_in_progress(
         self, folder: Path, isos: List[Path], now_ts: float,
@@ -4757,6 +4857,7 @@ class Orchestrator:
         self._container_artist_cache = {}
 
         handed_off = 0
+        led_skipped = 0
         # Folders that pass every guard, collected first so duplicate editions
         # can be de-duplicated before any handoff (see _drop_duplicate_editions).
         eligible: List[Tuple[Path, List[Path]]] = []
@@ -5013,6 +5114,11 @@ class Orchestrator:
                 )
                 continue
 
+            # Already handed off, unchanged, and not yet stale -> skip. This is
+            # what stops a restart from replaying an hour-long queue.
+            if self._sweep_ledger_skip(folder, audios, now_ts):
+                led_skipped += 1
+                continue
             logger.info(
                 "cueless sweep: found pre-split folder with no .cue: %s (%d audio files)",
                 folder, len(audios),
@@ -5088,6 +5194,9 @@ class Orchestrator:
                     artist_override=artist_ov, album_override=album_ov,
                 )
                 handed_off += 1
+                # Remember it at its CURRENT content, so a restart doesn't redo
+                # it but a later change (more files arriving) still will.
+                self._sweep_ledger_mark(folder, audios, now_ts)
             except Exception as exc:  # noqa: BLE001
                 logger.exception(
                     "cueless sweep: handoff failed for %s: %s", folder, exc,
@@ -5095,6 +5204,11 @@ class Orchestrator:
                 # Mark as seen so we don't retry in a tight loop.
                 self._skip_seen.add(folder)
 
+        self._sweep_ledger_save()
+        if led_skipped:
+            logger.info(
+                "cueless sweep: skipped %d folder(s) already handled and "
+                "unchanged (persistent ledger)", led_skipped)
         logger.info(
             "cueless sweep: finished; handed off %d folder(s)", handed_off,
         )
