@@ -548,6 +548,20 @@ class OrchestratorConfig:
     # album. Ranked by fill value first, then seeders/peers, then lossless, then
     # title. Falls back to per-album search when nothing of value is found.
     interactive_search_artist_level: bool = True
+    # SWARM HEALTH: refuse a release with fewer than this many seeders (0 = grab
+    # anything). A 0-seeder grab isn't a download -- it's what produced the flood
+    # of torrents stuck at 0%.
+    interactive_search_min_seeders: int = 1
+    # How strongly swarm health (seeders, plus leechers at 0.3x) weighs in the
+    # rank. 1.0 makes it comparable to title relation, so among releases of the
+    # RIGHT album the healthiest swarm wins. 0 = ignore health.
+    interactive_search_seeder_weight: float = 1.0
+    # OFFICIAL RELEASES ONLY: refuse releases whose title advertises a
+    # compilation / greatest-hits / live / remix / karaoke / bootleg product,
+    # UNLESS the Lidarr album being filled is itself that kind of record (by its
+    # albumType / secondaryTypes / own title) -- i.e. it's explicitly part of the
+    # artist's work. Off = grab whatever ranks best.
+    interactive_search_refuse_unofficial: bool = True
     # JSON state file: {albumId: {first_missing, last_attempt, blocklisted[]}}.
     # Tracks how long each album has been missing (the >Ndays clock) and the
     # per-album grab cooldown, surviving restarts. Lives in /config.
@@ -6981,8 +6995,69 @@ class Orchestrator:
             "is_lossless": audio_count > 0 and lossless_hits == audio_count,
         }
 
+    # Release-title markers of material that is NOT an official studio release:
+    # compilations, hits packages, live recordings, remix/DJ-mix products,
+    # karaoke/tribute/bootleg filler. Matched on the RELEASE TITLE and only used
+    # to refuse a grab when the Lidarr album we're filling isn't itself that
+    # kind of record (see _album_allows_unofficial) -- so a genuine live or
+    # compilation album in the artist's discography still downloads normally.
+    _UNOFFICIAL_RE = re.compile(
+        r"(?i)(?:^|[\s\-_.\(\[])("
+        r"greatest\s+hits|best\s+of|the\s+very\s+best|essential|definitive|"
+        r"anthology|compilation|collection|box\s*set|sampler|"
+        r"live(?:\s+(?:at|in|from|aid))?|unplugged|in\s+concert|"
+        r"remix(?:es|ed)?|megamix|dj[\s\-_.]*mix|continuous\s+mix|mixtape|"
+        r"karaoke|tribute|bootleg|soundboard|rehearsal|acapella|a\s*cappella|"
+        r"instrumentals?|b[\s\-_.]*sides|rarities|unreleased|outtakes|"
+        r"radio\s+show|broadcast|medley"
+        r")(?:$|[\s\-_.\)\]])")
+    # Lidarr secondary types that mean "this album IS that kind of record", so a
+    # matching release is exactly what we want rather than junk.
+    _UNOFFICIAL_SECONDARY = frozenset({
+        "live", "compilation", "remix", "mixtape/street", "dj-mix", "demo",
+        "interview", "spokenword",
+    })
+
+    def _release_unofficial_markers(self, title: str) -> List[str]:
+        """Unofficial-material markers found in a release title (lowercased)."""
+        return sorted({m.group(1).lower().strip()
+                       for m in self._UNOFFICIAL_RE.finditer(title or "")})
+
+    def _album_allows_unofficial(self, album_rec: Optional[Dict[str, Any]],
+                                 album_title: str = "") -> bool:
+        """
+        True when the Lidarr album we're filling is ITSELF a live / compilation /
+        remix / demo record (by its albumType, secondaryTypes, or its own title),
+        so an "unofficial-looking" release is legitimately part of the artist's
+        work rather than mumbo-jumbo filler.
+        """
+        rec = album_rec or {}
+        atype = str(rec.get("albumType") or "").strip().lower()
+        if atype in {"broadcast", "other"}:
+            return True
+        for st in (rec.get("secondaryTypes") or []):
+            name = st.get("name") if isinstance(st, dict) else st
+            if str(name or "").strip().lower() in self._UNOFFICIAL_SECONDARY:
+                return True
+        # The album's own title advertises it (e.g. "Live Rust", "Unplugged",
+        # "Greatest Hits") -> a matching release is the real thing.
+        title = album_title or str(rec.get("title") or "")
+        return bool(self._release_unofficial_markers(title))
+
+    def _release_health(self, seeders: int, leechers: int) -> float:
+        """
+        Swarm-health contribution to a release's rank: seeders dominate,
+        leechers count a little (they still prove the swarm is alive and will
+        become seeders). Both are capped so one hugely-seeded release can't
+        outweigh every other signal outright.
+        """
+        w = float(getattr(self.cfg, "interactive_search_seeder_weight", 1.0))
+        return (min(max(0, seeders), 100) * w
+                + min(max(0, leechers), 50) * 0.3 * w)
+
     def _rank_releases(
         self, releases, artist: str, album: str, blocklisted,
+        album_rec: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Rank torrent releases (not blocklisted) for an album. Considers
@@ -6998,6 +7073,13 @@ class Orchestrator:
         blocked = set(blocklisted or [])
         prefer_lossless = bool(self.cfg.interactive_search_require_lossless)
         floor = float(self.cfg.interactive_search_min_title_ratio)
+        min_seeders = max(0, int(getattr(
+            self.cfg, "interactive_search_min_seeders", 1)))
+        refuse_unofficial = bool(getattr(
+            self.cfg, "interactive_search_refuse_unofficial", True))
+        allows_unofficial = self._album_allows_unofficial(album_rec, album)
+        dropped_junk: List[str] = []
+        dropped_dead = 0
         scored: List[Dict[str, Any]] = []
         for raw in releases or []:
             if (raw.get("protocol") or "").lower() != "torrent":
@@ -7013,16 +7095,46 @@ class Orchestrator:
                 r"(?i)flac|alac|\bape\b|wavpack|\bwv\b|dsd|lossless|24 ?bit|hi-?res",
                 f"{qname} {title}"))
             seeders = int(raw.get("seeders") or 0)
+            leechers = int(raw.get("leechers") or 0)
+            # (b) Refuse non-official material -- compilations / hits packages /
+            # live / remix / karaoke / bootleg -- UNLESS this Lidarr album is
+            # itself that kind of record (then it IS part of the artist's work).
+            if refuse_unofficial and not allows_unofficial:
+                marks = self._release_unofficial_markers(title)
+                if marks:
+                    dropped_junk.append(f"{title} [{', '.join(marks)}]")
+                    continue
+            # (a) Skip dead swarms outright -- a 0-seeder grab is the flood of
+            # stuck 0% torrents, not a download.
+            if seeders < min_seeders:
+                dropped_dead += 1
+                continue
             ratio = difflib.SequenceMatcher(
                 None, want, self._norm_title(title)).ratio()
-            score = ratio * 100.0 + min(seeders, 200) / 10.0
+            # (a) Swarm health is a first-class ranking signal now (was a token
+            # seeders/10 nudge), so among releases of the right album the
+            # healthiest wins.
+            score = ratio * 100.0 + self._release_health(seeders, leechers)
             r = dict(raw)
             r["_score"] = score
             r["_seeders"] = seeders
+            r["_leechers"] = leechers
             r["_lossless"] = lossless
             r["_quality"] = qname or ("lossless" if lossless else "lossy")
             r["_title_ratio"] = round(ratio, 3)
             scored.append(r)
+        if dropped_junk:
+            logger.info(
+                "interactive search: %s / %s -- refused %d non-official "
+                "release(s) (album is not a live/compilation record): %s",
+                artist, album, len(dropped_junk),
+                "; ".join(dropped_junk[:3])
+                + (" ..." if len(dropped_junk) > 3 else ""))
+        if dropped_dead:
+            logger.info(
+                "interactive search: %s / %s -- skipped %d release(s) with "
+                "< %d seeder(s) (dead swarm)",
+                artist, album, dropped_dead, min_seeders)
         # Relevant (title >= floor) first; then lossless precedence (when
         # preferring); then title/seeder score. So a lossless of the right album
         # wins, but an irrelevant lossless never beats a relevant lossy.
@@ -7112,7 +7224,8 @@ class Orchestrator:
 
         releases = self.lidarr.release_search(aid)
         cands = self._rank_releases(
-            releases, artist, album, st.get("blocklisted") or [])
+            releases, artist, album, st.get("blocklisted") or [],
+            album_rec=alb)
         if not cands:
             logger.info(
                 "interactive search: %s -- no torrent candidates", label)
@@ -7264,7 +7377,30 @@ class Orchestrator:
                 f"{qname} {title}"))
             seeders = int(raw.get("seeders") or 0)
             leechers = int(raw.get("leechers") or 0)
-            score = (fill * 50.0 + seeders * 1.0 + leechers * 0.2
+            # (a) dead swarm -> not a download. Skip before scoring.
+            if seeders < max(0, int(getattr(
+                    self.cfg, "interactive_search_min_seeders", 1))):
+                continue
+            # (b) A SINGLE-album match that advertises non-official material is
+            # refused unless the missing album it claims to fill is itself that
+            # kind of record. A discography/box (is_disco) is the mechanism for
+            # filling many albums at once, so it is judged by fill value only --
+            # the per-album deselect then drops any junk folders inside it.
+            if (single_match and not is_disco
+                    and bool(getattr(self.cfg,
+                                     "interactive_search_refuse_unofficial", True))
+                    and self._release_unofficial_markers(title)
+                    # best_match is (album_title, expected, album_id) -- judge by
+                    # the TARGET album's own title (a missing "Live Rust" or
+                    # "Greatest Hits" legitimately wants such a release).
+                    and not self._album_allows_unofficial(
+                        None, best_match[0] if best_match else "")):
+                logger.info(
+                    "interactive search: artist-fill refused non-official "
+                    "release %r (target album is not a live/compilation record)",
+                    title)
+                continue
+            score = (fill * 50.0 + self._release_health(seeders, leechers)
                      + (10.0 if lossless else 0.0) + best_ratio * 20.0)
             r = dict(raw)
             r.update(_score=score, _seeders=seeders, _leechers=leechers,
@@ -8625,6 +8761,12 @@ class Orchestrator:
          "Seconds between interactive-search passes (min 300)."),
         ("lidarr.interactive_search_require_lossless", "lidarr", "interactive_search_require_lossless", "Prefer lossless", "bool", True,
          "Prefer lossless; grab lossy only when no lossless release exists."),
+        ("lidarr.interactive_search_refuse_unofficial", "lidarr", "interactive_search_refuse_unofficial", "Official releases only", "bool", True,
+         "Refuse compilation / greatest-hits / live / remix / karaoke / bootleg releases, unless the album being filled is itself that kind of record."),
+        ("lidarr.interactive_search_min_seeders", "lidarr", "interactive_search_min_seeders", "Min seeders", "int", 1,
+         "Never grab a release with fewer seeders than this (0-seeder grabs are what produce torrents stuck at 0%)."),
+        ("lidarr.interactive_search_seeder_weight", "lidarr", "interactive_search_seeder_weight", "Swarm-health weight", "int", 1,
+         "How strongly seeders/leechers weigh in ranking. 1 = comparable to title relation (healthiest swarm wins among correct matches); 0 = ignore."),
         ("lidarr.reconcile_enabled", "lidarr", "reconcile_enabled", "Reconcile monitored gaps", "bool", True,
          "Catch-all: import any downloaded album Lidarr still shows missing, using Lidarr's own matcher. Prevents albums stranding on disk."),
         ("lidarr.reconcile_interval_seconds", "lidarr", "reconcile_interval_seconds", "Reconcile interval (s)", "int", 1800,

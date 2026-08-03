@@ -125,6 +125,9 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     put("lidarr", "interactive_search_min_title_ratio", "ISEARCH_MIN_TITLE_RATIO", float)
     put("lidarr", "interactive_search_max_albums_per_pass", "ISEARCH_MAX_ALBUMS", int)
     put("lidarr", "interactive_search_artist_level", "ISEARCH_ARTIST_LEVEL", _as_bool)
+    put("lidarr", "interactive_search_min_seeders", "ISEARCH_MIN_SEEDERS", int)
+    put("lidarr", "interactive_search_seeder_weight", "ISEARCH_SEEDER_WEIGHT", float)
+    put("lidarr", "interactive_search_refuse_unofficial", "ISEARCH_REFUSE_UNOFFICIAL", _as_bool)
     # Reconcile pass -- import monitored gaps still sitting in downloads.
     put("lidarr", "reconcile_enabled", "RECONCILE_ENABLED", _as_bool)
     put("lidarr", "reconcile_interval_seconds", "RECONCILE_INTERVAL", int)
@@ -1129,6 +1132,15 @@ def main() -> int:
         ),
         interactive_search_artist_level=bool(
             lidarr_cfg.get("interactive_search_artist_level", True)
+        ),
+        interactive_search_min_seeders=int(
+            lidarr_cfg.get("interactive_search_min_seeders", 1)
+        ),
+        interactive_search_seeder_weight=float(
+            lidarr_cfg.get("interactive_search_seeder_weight", 1.0)
+        ),
+        interactive_search_refuse_unofficial=bool(
+            lidarr_cfg.get("interactive_search_refuse_unofficial", True)
         ),
         interactive_search_cooldown_seconds=int(
             lidarr_cfg.get("interactive_search_cooldown_seconds", 43200)
