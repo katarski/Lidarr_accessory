@@ -2485,6 +2485,34 @@ class Orchestrator:
                 return found
         return None
 
+    def _dvda_rip_in_progress(
+        self, folder: Path, isos: List[Path], now_ts: float,
+    ) -> bool:
+        """
+        Is a DVD-Audio rip of this ISO already running (started by an earlier
+        sweep pass)? Checked by the sweep BEFORE it opens an activity row, so a
+        re-entering pass neither duplicates the rip nor clears the working pass's
+        progress. Mirrors how _extract_dvda_folder resolves its staging dir: a
+        loose ISO in the watch root rips into `folder/<iso stem>/`.
+        """
+        if not isos:
+            return False
+        candidates = [folder]
+        root = getattr(self, "_sweep_watch_root", None)
+        try:
+            if root and folder.resolve() == Path(root).resolve():
+                candidates = [folder / isos[0].stem]
+        except OSError:
+            pass
+        for dest in candidates:
+            tmp = dest / ".dvda_extract_tmp"
+            try:
+                if tmp.is_dir() and (now_ts - tmp.stat().st_mtime) < 7200:
+                    return True
+            except OSError:
+                continue
+        return False
+
     def _run_dvda2wav_with_progress(
         self, audio_ts: Path, wav_dir: Path, act_key: Path, iso_name: str,
     ):
@@ -4767,7 +4795,14 @@ class Orchestrator:
             # returns False (fall through to the SACD branch) when the ISO is not
             # DVD-Audio, so the two coexist cleanly.
             if isos and getattr(self.cfg, "extract_dvda_iso", True):
-                self._activity_start(folder, "DVD-Audio", isos[0].name)
+                # A rip takes minutes while this sweep comes round every 60s. If
+                # another pass already owns this rip, skip WITHOUT touching the
+                # activity row -- otherwise this pass's `finally` would clear the
+                # working pass's progress and the WebUI would flip to "nothing
+                # running" for the whole decode phase.
+                if self._dvda_rip_in_progress(folder, isos, now_ts):
+                    continue
+                self._activity_start(folder, "DVD-Audio", isos[0].name, 1.0)
                 try:
                     did = self._extract_dvda_folder(folder, isos, now_ts, min_stable)
                 finally:
