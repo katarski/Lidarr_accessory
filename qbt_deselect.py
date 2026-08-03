@@ -27,7 +27,7 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import Callable, List, Dict, Any, Optional
+from typing import Callable, List, Dict, Any, Iterable, Optional
 
 import yaml
 
@@ -75,7 +75,13 @@ _ART_DIR = re.compile(
 _NOISE_DIR = re.compile(
     r"(?i)^-?(?:bootlegs?|live|lives|other|others|singles?|compilations?|"
     r"comps?|collaborations?|collabs?|remix(?:es)?|demos?|unofficial|misc|"
-    r"rarit(?:y|ies)|b-?sides?|extras?|mixes|promos?|eps?)$"
+    r"rarit(?:y|ies)|b-?sides?|extras?|mixes|promos?|eps?|"
+    # Not the artist's own studio work either -- same rule as the grab-time
+    # filter (_UNOFFICIAL_RE): skip these unless Lidarr actually wants a
+    # matching album, or an album assembly needs songs out of them (a needed
+    # song is rescued later by assembly_keep in process_torrent).
+    r"antholog(?:y|ies)|collections?|box\s*sets?|greatest\s*hits|best\s*of|"
+    r"essentials?|definitive)$"
 )
 
 
@@ -267,12 +273,42 @@ def plan_torrent(
     return plan
 
 
+def assembly_keep_tails(needed_paths: Iterable[str]) -> set:
+    """
+    Turn absolute source paths the assembly planner needs into match keys for a
+    qBittorrent file list. qBit reports names RELATIVE to the torrent root
+    ("Box Set/CD2/05 - Song.mp3") while the planner holds absolute paths, so we
+    compare the last two segments ("cd2/05 - song.mp3") -- specific enough to
+    avoid the basename collisions that plague compilations ("01 - Track.mp3"
+    exists in hundreds of folders).
+    """
+    out: set = set()
+    for p in needed_paths or []:
+        parts = [s for s in str(p).replace("\\", "/").split("/") if s]
+        if len(parts) >= 2:
+            out.add("/".join(parts[-2:]).lower())
+        elif parts:
+            out.add(parts[-1].lower())
+    return out
+
+
+def _needed_for_assembly(name: str, keep: set) -> bool:
+    """Is this torrent file one an album assembly needs?"""
+    if not keep:
+        return False
+    parts = [s for s in str(name or "").replace("\\", "/").split("/") if s]
+    if len(parts) >= 2 and "/".join(parts[-2:]).lower() in keep:
+        return True
+    return bool(parts) and parts[-1].lower() in keep
+
+
 def process_torrent(
     qbt: QbtClient, lidarr: LidarrClient, torrent: Dict[str, Any],
     forced_artist: str = "", apply: bool = False,
     emit: Callable[[str], None] = logger.info,
     files: Optional[List[Dict[str, Any]]] = None,
     llm=None, deselect_video: bool = True, reap_useless: bool = False,
+    assembly_keep: Optional[set] = None,
 ) -> tuple:
     """Plan + (optionally) deselect one torrent. Returns (deselected, kept)."""
     thash = torrent.get("hash")
@@ -318,6 +354,22 @@ def process_torrent(
     # this pass's picks) and drives the "nothing wanted left" reap decision.
     cur = {int(f["index"]): int(f.get("priority", 1))
            for f in files if "index" in f}
+    # ASSEMBLY PROTECTION (requirement e): this torrent may be a compilation
+    # whose albums are all "owned"/unknown -- so everything above wants to be
+    # deselected -- while individual SONGS in it are exactly what a missing
+    # album needs. Keep those files selected (and out of the reap decision).
+    # One compilation can feed several assemblies, so `assembly_keep` is the
+    # union across all plans.
+    if assembly_keep:
+        by_index = {int(f["index"]): str(f.get("name") or "")
+                    for f in files if "index" in f}
+        rescued = [i for i in to_deselect
+                   if _needed_for_assembly(by_index.get(i, ""), assembly_keep)]
+        if rescued:
+            keepset = set(rescued)
+            to_deselect = [i for i in to_deselect if i not in keepset]
+            emit(f"  ASSEMBLY -> keeping {len(rescued)} song(s) needed to "
+                 f"assemble a missing album")
     desel_all = {i for i, p in cur.items() if p == 0} | set(to_deselect)
     to_apply = sorted(i for i in to_deselect if cur.get(i, 1) != 0)
     if apply and to_apply:
@@ -349,7 +401,7 @@ def auto_deselect_pass(
     pause_during_scan: bool = True, llm=None, deselect_video: bool = True,
     reap_useless: bool = True,
     planned: Optional[Dict[str, float]] = None, recheck_seconds: int = 0,
-    now: Optional[float] = None,
+    now: Optional[float] = None, assembly_keep: Optional[set] = None,
 ) -> int:
     """
     One scheduled pass for the pipeline: for each INCOMPLETE music torrent,
@@ -419,6 +471,7 @@ def auto_deselect_pass(
             d, _k = process_torrent(
                 qbt, lidarr, t, apply=True, emit=emit, files=files, llm=llm,
                 deselect_video=deselect_video, reap_useless=reap_useless,
+                assembly_keep=assembly_keep,
             )
             seen.add(h)
             if planned is not None:

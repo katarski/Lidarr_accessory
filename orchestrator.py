@@ -596,6 +596,31 @@ class OrchestratorConfig:
     external_audit_include_eps: bool = False
     # JSON report of what MusicBrainz has that Lidarr lacks. Lives in /config.
     external_audit_file: Optional[Path] = None
+
+    # --- (e) Album assembly from compilations ------------------------------
+    # Work out which songs of a MISSING album are sitting in the compilations /
+    # box sets stuck in needs-attention, and show % assembled + what's still
+    # missing in the Assembly tab. One compilation can feed several assemblies.
+    assembly_enabled: bool = True
+    # How often the planner re-runs (seconds). Minimum 300.
+    assembly_interval_seconds: int = 1800
+    # Title-match score (0..1) a song must reach to count as found.
+    assembly_min_score: float = 0.87
+    # Require the source's own artist evidence to agree (a cover of the same
+    # song on a tribute compilation must not count). Folder names can only
+    # confirm, never reject; a file with no artist evidence is judged on title.
+    assembly_require_artist: bool = True
+    # Don't keep a plan below this % assembled (noise floor for the tab).
+    assembly_min_pct: float = 10.0
+    # Safety cap on how many source songs are indexed per pass.
+    assembly_max_source_files: int = 20000
+    # Albums planned per pass (each costs a Lidarr track-list request). The rest
+    # roll to the next pass, least-recently-planned first.
+    assembly_max_albums_per_pass: int = 150
+    # Extra folders to draw songs from, beyond the needs-attention sources.
+    assembly_extra_source_dirs: Optional[List[str]] = None
+    # JSON store backing the Assembly tab. Lives in /config.
+    assembly_file: Optional[Path] = None
     # JSON state file: {albumId: {first_missing, last_attempt, blocklisted[]}}.
     # Tracks how long each album has been missing (the >Ndays clock) and the
     # per-album grab cooldown, surviving restarts. Lives in /config.
@@ -694,6 +719,15 @@ class Orchestrator:
                 logger.warning(
                     "external audit: MusicBrainz client unavailable (%s) -- "
                     "album cross-check disabled", exc)
+        # Album-assembly store backing the Assembly tab (requirement e).
+        self.assembly = None
+        if getattr(cfg, "assembly_enabled", False):
+            try:
+                from assembly import AssemblyStore
+                self.assembly = AssemblyStore(
+                    getattr(cfg, "assembly_file", None))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("assembly: store unavailable (%s)", exc)
         # Manual-attention store for the WebUI (#11). None when disabled.
         self.held: Optional[HeldStore] = (
             HeldStore(cfg.held_items_file)
@@ -7316,6 +7350,215 @@ class Orchestrator:
                 matched += 1
         return (matched / float(total)), matched, total
 
+    def _read_song_tags(self, path: Path) -> Tuple[str, str, str]:
+        """(title, artist, album) from a file's ID tags; blanks on failure.
+        Cached per (path, size, mtime) because the assembly planner re-reads the
+        same compilation folders every pass."""
+        try:
+            st = path.stat()
+            key = (str(path), st.st_size, int(st.st_mtime))
+        except OSError:
+            return "", "", ""
+        cache = getattr(self, "_song_tag_cache", None)
+        if cache is None:
+            cache = {}
+            self._song_tag_cache = cache
+        hit = cache.get(key)
+        if hit is not None:
+            return hit
+        title = artist = album = ""
+        try:
+            from mutagen import File as MutagenFile  # lazy
+            mf = MutagenFile(str(path))
+            if mf is not None and mf.tags is not None:
+                def _first(keys: Tuple[str, ...]) -> str:
+                    for k in keys:
+                        try:
+                            v = mf.tags.get(k)
+                        except Exception:  # noqa: BLE001
+                            v = None
+                        if not v:
+                            continue
+                        if isinstance(v, (list, tuple)):
+                            v = v[0] if v else ""
+                        s = str(v).strip()
+                        if s:
+                            return s
+                    return ""
+                title = _first(("title", "TIT2", "\xa9nam", "Title"))
+                artist = _first(("artist", "TPE1", "\xa9ART", "Author",
+                                 "albumartist", "TPE2", "aART"))
+                album = _first(("album", "TALB", "\xa9alb", "WM/AlbumTitle"))
+        except Exception:  # noqa: BLE001
+            pass
+        if len(cache) > 20000:
+            cache.clear()
+        cache[key] = (title, artist, album)
+        return title, artist, album
+
+    def assembly_plan_pass(self) -> int:
+        """
+        Album assembly (requirement e): work out, for every album Lidarr wants
+        but is missing, which of its SONGS are sitting in the compilations /
+        box sets / best-ofs that are stuck in the needs-attention list.
+
+        Those sources can never import as albums (Lidarr has no record of them),
+        but their individual tracks are frequently exactly what's missing. Each
+        album gets a plan -- % assembled, which songs matched which file, and
+        which songs are still missing -- written to the assembly store so the
+        WebUI tab serves it instantly.
+
+        A source file is never claimed exclusively: one compilation can feed
+        several assemblies, and the "keep this file" set used by the torrent
+        deselect is the UNION over all plans.
+
+        Returns the number of albums planned.
+        """
+        store = getattr(self, "assembly", None)
+        if store is None:
+            return 0
+        try:
+            from assembly import AssemblyPlanner, SourceIndex
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("assembly: module unavailable (%s)", exc)
+            return 0
+        # ---- 1) the songs we could draw from: the held (needs-attention)
+        # folders, which is exactly the "these compilations may be of use" pool.
+        folders: List[Path] = []
+        seen_f: set = set()
+        if self.held is not None:
+            for it in self.held.list():
+                sp = it.get("source_path") or ""
+                if not sp or sp in seen_f:
+                    continue
+                p = Path(sp)
+                try:
+                    if p.is_dir():
+                        seen_f.add(sp)
+                        folders.append(p)
+                except OSError:
+                    continue
+        extra = getattr(self.cfg, "assembly_extra_source_dirs", None) or []
+        for d in extra:
+            p = Path(d)
+            if p.is_dir() and str(p) not in seen_f:
+                seen_f.add(str(p))
+                folders.append(p)
+        if not folders:
+            logger.debug("assembly: no candidate source folders")
+            return 0
+        index = SourceIndex(tag_reader=self._read_song_tags)
+        cap = max(100, int(getattr(self.cfg, "assembly_max_source_files", 20000)))
+        for f in folders:
+            if len(index) >= cap:
+                logger.info("assembly: source cap (%d files) reached", cap)
+                break
+            index.add_folder(f, max_files=cap - len(index))
+        logger.info(
+            "assembly: indexed %d song(s) from %d needs-attention source(s)",
+            len(index), len(folders))
+
+        # ---- 2) every album Lidarr wants and is missing tracks for.
+        try:
+            albums = self.lidarr.list_all_albums()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("assembly: Lidarr album list failed: %s", exc)
+            return 0
+        # PERFORMANCE: fetching a track list costs one Lidarr request per album,
+        # and a real library has thousands of gaps (2700 here) -- planning them
+        # all made the pass take longer than its own interval. The sources can
+        # only ever supply songs by artists they actually contain, so restrict
+        # to gap albums whose artist appears in the index. That is a pure
+        # narrowing: an artist absent from every tag, file name and folder cannot
+        # have contributed a song.
+        try:
+            from assembly import norm_artist as _na
+            src_artists = index.artists()
+        except Exception:  # noqa: BLE001
+            src_artists = set()
+        gaps = []
+        skipped_artist = 0
+        for a in albums:
+            if not a.get("monitored"):
+                continue
+            st = a.get("statistics") or {}
+            total = int(st.get("totalTrackCount") or 0)
+            have = int(st.get("trackFileCount") or 0)
+            if not (total > 0 and have < total):
+                continue
+            if src_artists:
+                an = _na(((a.get("artist") or {}).get("artistName")) or "")
+                if an and an not in src_artists:
+                    skipped_artist += 1
+                    continue
+            gaps.append(a)
+        logger.info(
+            "assembly: %d gap album(s) share an artist with the sources "
+            "(%d skipped -- their artist appears in no source song)",
+            len(gaps), skipped_artist)
+        planner = AssemblyPlanner(
+            min_score=float(getattr(self.cfg, "assembly_min_score", 0.87)),
+            require_artist=bool(getattr(self.cfg, "assembly_require_artist", True)))
+        # Each album still costs one Lidarr track-list request, so bound the pass
+        # and rotate: least-recently-planned albums first, existing plans kept.
+        # The library works through itself over successive passes instead of one
+        # pass outliving its own interval.
+        cap_albums = max(1, int(getattr(
+            self.cfg, "assembly_max_albums_per_pass", 150)))
+        prev_ts: Dict[str, float] = {}
+        for e in store.list():
+            prev_ts[str(e.get("id"))] = float(e.get("updated") or 0)
+        gaps.sort(key=lambda a: prev_ts.get(str(a.get("id")), 0.0))
+        rotated = len(gaps) > cap_albums
+        if rotated:
+            logger.info("assembly: planning %d of %d album(s) this pass "
+                        "(rotating; least-recently-planned first)",
+                        cap_albums, len(gaps))
+        gaps = gaps[:cap_albums]
+        planned = 0
+        keep_ids: List[Any] = []
+        min_pct = float(getattr(self.cfg, "assembly_min_pct", 10.0))
+        for a in gaps:
+            aid = a.get("id")
+            artist = ((a.get("artist") or {}).get("artistName")) or ""
+            title = a.get("title") or ""
+            if not (aid and artist and title):
+                continue
+            try:
+                tracks = self._album_track_titles_rows(int(aid))
+            except Exception:  # noqa: BLE001
+                continue
+            if not tracks:
+                continue
+            plan = planner.plan_album(artist, title, tracks, index)
+            if plan["n_matched"] <= 0 or plan["pct"] < min_pct:
+                store.remove(aid)      # nothing useful (any more) for this album
+                continue
+            plan["album_id"] = aid
+            plan["lidarr_have"] = int((a.get("statistics") or {}).get(
+                "trackFileCount") or 0)
+            store.upsert(aid, plan)
+            keep_ids.append(aid)
+            planned += 1
+        # Only prune plans when this pass covered EVERY candidate album -- during
+        # a rotated pass the albums we didn't revisit must keep their plans.
+        if not rotated:
+            store.keep_only(keep_ids)
+        if planned:
+            logger.info(
+                "assembly: %d album(s) can be (partly) assembled from the "
+                "needs-attention sources", planned)
+        return planned
+
+    def _album_track_titles_rows(self, album_id: int) -> List[Dict[str, Any]]:
+        """Track ROWS for an album's selected release (id/title/number), which
+        is what an assembly needs -- unlike _album_track_titles, which pools
+        titles across every release for coverage scoring."""
+        try:
+            return self.lidarr.list_tracks_for_album(int(album_id)) or []
+        except Exception:  # noqa: BLE001
+            return []
+
     def external_album_audit_pass(self, budget: int = 0) -> int:
         """
         Requirement (c): Lidarr may not have listed every album an artist made --
@@ -9129,6 +9372,8 @@ class Orchestrator:
          "Prefer lossless; grab lossy only when no lossless release exists."),
         ("lidarr.interactive_search_refuse_unofficial", "lidarr", "interactive_search_refuse_unofficial", "Official releases only", "bool", True,
          "Refuse compilation / greatest-hits / live / remix / karaoke / bootleg releases, unless the album being filled is itself that kind of record."),
+        ("lidarr.assembly_enabled", "lidarr", "assembly_enabled", "Album assembly", "bool", True,
+         "Work out which songs of a missing album sit in the compilations stuck in needs-attention, and show % assembled in the Assembly tab. Songs an assembly needs are kept when a torrent is deselected."),
         ("lidarr.external_audit_enabled", "lidarr", "external_audit_enabled", "Cross-check albums vs MusicBrainz", "bool", True,
          "Ask MusicBrainz which studio albums an artist has that Lidarr never listed, and report them (read-only; nothing is added to Lidarr)."),
         ("lidarr.verify_track_titles", "lidarr", "verify_track_titles", "Verify song titles before grab", "bool", True,

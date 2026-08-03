@@ -150,6 +150,7 @@ _PAGE = r"""<!doctype html>
   <h1>cue_pipeline</h1>
   <div class="tabs">
     <div class="tab on" data-tab="attention" onclick="setTab('attention')">Needs attention <span class="n" id="n-att">0</span></div>
+    <div class="tab" data-tab="assembly" onclick="setTab('assembly')">Assembly <span class="n" id="n-asm">0</span></div>
     <div class="tab" data-tab="progress" onclick="setTab('progress')">Converter <span class="n" id="n-prog">0</span></div>
     <div class="tab" data-tab="log" onclick="setTab('log')">Log</div>
     <div class="tab" data-tab="settings" onclick="setTab('settings')">Settings</div>
@@ -185,6 +186,16 @@ _PAGE = r"""<!doctype html>
 </div>
 <main>
   <div id="attention"></div>
+  <div id="assembly" style="display:none">
+    <div class="procard" style="justify-content:flex-start;gap:1rem;flex-wrap:wrap">
+      <input type="search" id="asm-q" placeholder="filter by artist / album / song…" oninput="asmRender()" style="min-width:18rem">
+      <label><input type="checkbox" id="asm-complete" onchange="asmRender()"> only 100% assembled</label>
+      <span class="grow"></span>
+      <span class="muted" id="asm-sum"></span>
+      <button class="b-copy" onclick="asmLoad()">Reload</button>
+    </div>
+    <div id="asm-list"></div>
+  </div>
   <div id="progress" style="display:none">
     <details id="cv-sec-prog" class="cvsec" open><summary>Progress</summary><div id="cv-prog" class="cvbody"><span class="muted">nothing running</span></div></details>
     <details id="cv-sec-conv" class="cvsec"><summary>Conversions <span class="n" id="cv-nconv">0</span></summary><div id="cv-convlist" class="cvbody"></div></details>
@@ -263,6 +274,7 @@ function ago(t){if(!t)return'';var s=Math.max(0,Date.now()/1000-t);if(s<90)retur
 function toast(m){var t=document.getElementById('toast');t.textContent=m;t.classList.add('show');setTimeout(function(){t.classList.remove('show');},3200);}
 function setTab(t){TAB=t;document.querySelectorAll('.tab').forEach(function(e){e.classList.toggle('on',e.dataset.tab===t);});
   document.getElementById('attention').style.display=t==='attention'?'':'none';
+  document.getElementById('assembly').style.display=t==='assembly'?'':'none';
   document.getElementById('progress').style.display=t==='progress'?'':'none';
   document.getElementById('log').style.display=t==='log'?'':'none';
   document.getElementById('settings').style.display=t==='settings'?'':'none';
@@ -270,7 +282,54 @@ function setTab(t){TAB=t;document.querySelectorAll('.tab').forEach(function(e){e
   updateBulkBar();
   if(t==='log')loadLog();
   if(t==='settings')loadSettings();
+  if(t==='assembly')asmLoad();
   if(t==='progress')cvEnter();}
+
+// ---- Assembly tab: % assembled per missing album + the songs still missing.
+var ASM=[];
+function asmLoad(){
+  fetch('/api/assembly').then(function(r){return r.json();}).then(function(j){
+    ASM=j.items||[];
+    document.getElementById('n-asm').textContent=ASM.length;
+    var don=ASM.filter(function(a){return (a.pct||0)>=100;}).length;
+    document.getElementById('asm-sum').textContent=
+      ASM.length+' album(s) partly available · '+don+' fully assembled'
+      +(j.sources?(' · '+j.sources+' source song(s) shared across assemblies'):'');
+    asmRender();
+  }).catch(function(){document.getElementById('asm-list').innerHTML='<p class="muted">assembly unavailable</p>';});
+}
+function asmRender(){
+  var q=(document.getElementById('asm-q').value||'').toLowerCase();
+  var onlyC=document.getElementById('asm-complete').checked;
+  var rows=ASM.filter(function(a){
+    if(onlyC&&(a.pct||0)<100)return false;
+    if(!q)return true;
+    var hay=((a.artist||'')+' '+(a.album||'')).toLowerCase();
+    if(hay.indexOf(q)>=0)return true;
+    var inSong=(a.matched||[]).concat(a.missing||[]).some(function(m){
+      return String(m.track||'').toLowerCase().indexOf(q)>=0;});
+    return inSong;
+  });
+  if(!rows.length){document.getElementById('asm-list').innerHTML=
+    '<p class="muted">No album can be assembled from the current needs-attention sources.</p>';return;}
+  document.getElementById('asm-list').innerHTML=rows.map(function(a){
+    var pct=a.pct||0;
+    var col=pct>=100?'#3fb950':(pct>=50?'#d29922':'#8b949e');
+    var bar='<div style="background:#30363d;border-radius:4px;height:10px;width:12rem;overflow:hidden">'
+      +'<div style="width:'+Math.min(100,pct)+'%;height:100%;background:'+col+'"></div></div>';
+    var miss=(a.missing||[]).map(function(m){return '<li>'+h(m.track)+'</li>';}).join('');
+    var got=(a.matched||[]).map(function(m){
+      return '<li>'+h(m.track)+' <span class="muted">← '+h((m.source||'').split('/').pop())
+        +' ('+(m.score||0)+' via '+h(m.via||'?')+')</span></li>';}).join('');
+    return '<details class="cvsec"><summary><b>'+h(a.artist)+' / '+h(a.album)+'</b> '
+      +'<span style="color:'+col+'">'+pct.toFixed(0)+'%</span> '
+      +'<span class="muted">'+(a.n_matched||0)+'/'+(a.total||0)+' songs</span> '
+      +bar+'</summary><div class="cvbody" style="display:flex;gap:2rem;flex-wrap:wrap">'
+      +'<div><b>Assembled ('+(a.n_matched||0)+')</b><ul>'+(got||'<li class="muted">none</li>')+'</ul></div>'
+      +'<div><b>Still missing ('+(a.n_missing||0)+')</b><ul>'+(miss||'<li class="muted">none — complete</li>')+'</ul></div>'
+      +'</div></details>';
+  }).join('');
+}
 function loadSettings(){fetch('/api/settings').then(function(r){return r.json();}).then(function(j){
   var s=j.settings||[];SETTINGS=s;
   document.getElementById('setform').innerHTML=s.map(function(o){
@@ -582,8 +641,43 @@ function cvToggleDir(caret,rel,kidsId){
   caret.textContent=open?'▾':'▸';
   if(open&&!kids.dataset.loaded){kids.dataset.loaded='1';kids.innerHTML='<span class="muted">loading…</span>';cvLoadDir(rel,kidsId);}
 }
-function cvSel(rel,on){if(on)CVSEL.add(rel);else CVSEL.delete(rel);
-  document.getElementById('cv-seln').textContent=CVSEL.size+' selected';}
+function cvSel(rel,on,isDir){
+  if(on)CVSEL.add(rel);else CVSEL.delete(rel);
+  // Ticking a FOLDER means "everything under it", so cascade to every
+  // descendant that is currently rendered: tick their boxes and drop them from
+  // the selection (the folder already covers them, so counting both would
+  // double up). Individual FILES are unaffected -- tick them one by one as
+  // before. The server expands a selected folder recursively anyway
+  // (_expand_audio), so this keeps the UI honest about what will be converted.
+  if(isDir){
+    var pref=rel.replace(/\/+$/,'')+'/';
+    document.querySelectorAll('.cvrow').forEach(function(row){
+      var r=row.getAttribute('data-rel')||'';
+      if(r!==rel&&r.indexOf(pref)===0){
+        var cb=row.querySelector('input[type=checkbox]');
+        if(cb)cb.checked=on;
+        CVSEL.delete(r);
+      }
+    });
+  }
+  cvSelCount();
+}
+function cvSelCount(){
+  document.getElementById('cv-seln').textContent=CVSEL.size+' selected';
+}
+// When a folder's children are lazily loaded AFTER it was ticked, inherit the
+// tick so the tree doesn't look inconsistent.
+function cvInheritChecks(kidsId){
+  var box=document.getElementById(kidsId); if(!box)return;
+  var parents=[];
+  CVSEL.forEach(function(r){parents.push(r.replace(/\/+$/,'')+'/');});
+  box.querySelectorAll('.cvrow').forEach(function(row){
+    var r=row.getAttribute('data-rel')||'';
+    if(parents.some(function(p){return r.indexOf(p)===0;})){
+      var cb=row.querySelector('input[type=checkbox]'); if(cb)cb.checked=true;
+    }
+  });
+}
 function cvSettingsSummary(){
   var k=document.getElementById('cv-codec').value,o=CVOPT[k]||{};
   var m=document.getElementById('cv-mode').value;
@@ -759,6 +853,19 @@ def make_handler(store, actions: HeldActions):
                 # which keeps the store file itself fresh. The page load is
                 # just this in-memory list dump.
                 self._json(200, {"items": store.list()})
+            elif path == "/api/assembly":
+                store = getattr(actions, "assembly", None)
+                if store is None:
+                    self._json(200, {"items": [], "sources": 0,
+                                     "note": "assembly disabled"})
+                    return
+                # Served AS-IS from the plan store (same contract as /api/held):
+                # the background planner keeps it current, the page never
+                # recomputes.
+                items = store.list()
+                self._json(200, {"items": items,
+                                 "sources": len(store.needed_files())})
+
             elif path == "/api/activity":
                 acts = actions.list_activity() if hasattr(actions, "list_activity") else []
                 self._json(200, {"items": acts})

@@ -128,6 +128,11 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     put("lidarr", "interactive_search_min_seeders", "ISEARCH_MIN_SEEDERS", int)
     put("lidarr", "interactive_search_seeder_weight", "ISEARCH_SEEDER_WEIGHT", float)
     put("lidarr", "interactive_search_refuse_unofficial", "ISEARCH_REFUSE_UNOFFICIAL", _as_bool)
+    put("lidarr", "assembly_enabled", "ASSEMBLY_ENABLED", _as_bool)
+    put("lidarr", "assembly_interval_seconds", "ASSEMBLY_INTERVAL", int)
+    put("lidarr", "assembly_min_score", "ASSEMBLY_MIN_SCORE", float)
+    put("lidarr", "assembly_min_pct", "ASSEMBLY_MIN_PCT", float)
+    put("lidarr", "assembly_max_albums_per_pass", "ASSEMBLY_MAX_ALBUMS", int)
     put("lidarr", "external_audit_enabled", "EXTERNAL_AUDIT_ENABLED", _as_bool)
     put("lidarr", "external_audit_interval_seconds", "EXTERNAL_AUDIT_INTERVAL", int)
     put("lidarr", "external_audit_artists_per_pass", "EXTERNAL_AUDIT_ARTISTS", int)
@@ -511,6 +516,41 @@ def interactive_search_loop(
         delay = cadence
 
 
+def _assembly_keep(orch: Orchestrator) -> Optional[set]:
+    """Match keys for every source song the album assemblies need (union across
+    plans), for the qBittorrent deselect. None when assembly is off."""
+    store = getattr(orch, "assembly", None)
+    if store is None:
+        return None
+    try:
+        from qbt_deselect import assembly_keep_tails
+        return assembly_keep_tails(store.needed_files().keys())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def assembly_loop(
+    orch: Orchestrator,
+    stop: threading.Event,
+    interval: int,
+) -> None:
+    """
+    Album assembly planner (requirement e): recompute, for each missing album,
+    which of its songs are available inside the compilations/box sets stuck in
+    needs-attention -- feeding the Assembly tab's % and missing-song list. Pure
+    analysis: it reads tags and writes the plan store, it never moves files.
+    Minimum cadence 300s; first pass one cadence out so startup stays light.
+    """
+    cadence = max(300, interval)
+    delay = cadence
+    while not stop.wait(delay):
+        try:
+            orch.assembly_plan_pass()
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("assembly thread: %s", exc)
+        delay = cadence
+
+
 def external_audit_loop(
     orch: Orchestrator,
     stop: threading.Event,
@@ -585,6 +625,7 @@ def held_curator_loop(
 def qbt_auto_deselect_loop(
     qcfg: Dict[str, Any], lidarr, stop: threading.Event, interval: int,
     download_root: str = "", llm=None, q: "Optional[queue.Queue[Path]]" = None,
+    assembly_keep_provider=None,
 ) -> None:
     """
     Poll qBittorrent on a schedule. Two jobs per pass:
@@ -675,6 +716,14 @@ def qbt_auto_deselect_loop(
                 logger.warning("qbt loop: login failed; will retry next pass")
                 continue
             if do_deselect:
+                # Songs an album assembly needs must stay selected even when
+                # their compilation looks fully "owned"/unwanted (requirement e).
+                asm_keep = None
+                if assembly_keep_provider is not None:
+                    try:
+                        asm_keep = assembly_keep_provider()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("assembly keep-set unavailable: %s", exc)
                 acted = auto_deselect_pass(qbt, lidarr, seen, category=category,
                                            emit=logger.info,
                                            pause_during_scan=pause_scan,
@@ -682,7 +731,8 @@ def qbt_auto_deselect_loop(
                                            deselect_video=deselect_video,
                                            reap_useless=reap_useless,
                                            planned=planned_deselect,
-                                           recheck_seconds=redeselect_recheck)
+                                           recheck_seconds=redeselect_recheck,
+                                           assembly_keep=asm_keep)
                 if acted:
                     logger.info("qbt auto-deselect: acted on %d torrent(s)", acted)
             if manage_completed:
@@ -974,6 +1024,14 @@ def main() -> int:
         external_audit_path = isearch_state_path.parent / "external_album_audit.json"
     else:
         external_audit_path = None
+    # Album-assembly store (requirement e) -- beside the other /config state.
+    _asm_cfg = lidarr_cfg.get("assembly_file")
+    if _asm_cfg:
+        assembly_path = Path(_asm_cfg)
+    elif isearch_state_path is not None:
+        assembly_path = isearch_state_path.parent / "assembly.json"
+    else:
+        assembly_path = None
     # Manual-attention WebUI (#11): held-items state lives next to the other
     # /config state files (mirrors the reaper/isearch state path resolution).
     _held_state_cfg = lidarr_cfg.get("held_items_file") or staging_cfg.get("held_items_file")
@@ -1206,6 +1264,20 @@ def main() -> int:
             lidarr_cfg.get("external_audit_include_eps", False)
         ),
         external_audit_file=external_audit_path,
+        assembly_enabled=bool(lidarr_cfg.get("assembly_enabled", True)),
+        assembly_interval_seconds=int(
+            lidarr_cfg.get("assembly_interval_seconds", 1800)),
+        assembly_min_score=float(lidarr_cfg.get("assembly_min_score", 0.87)),
+        assembly_require_artist=bool(
+            lidarr_cfg.get("assembly_require_artist", True)),
+        assembly_min_pct=float(lidarr_cfg.get("assembly_min_pct", 10.0)),
+        assembly_max_source_files=int(
+            lidarr_cfg.get("assembly_max_source_files", 20000)),
+        assembly_max_albums_per_pass=int(
+            lidarr_cfg.get("assembly_max_albums_per_pass", 150)),
+        assembly_extra_source_dirs=list(
+            lidarr_cfg.get("assembly_extra_source_dirs") or []),
+        assembly_file=assembly_path,
         interactive_search_cooldown_seconds=int(
             lidarr_cfg.get("interactive_search_cooldown_seconds", 43200)
         ),
@@ -1414,6 +1486,23 @@ def main() -> int:
     else:
         logger.info("Reconcile: disabled")
 
+    # --- Album assembly planner (requirement e) -------------------------
+    if getattr(orch_cfg, "assembly_enabled", False) and orch.assembly is not None:
+        threading.Thread(
+            target=assembly_loop,
+            args=(orch, stop, orch_cfg.assembly_interval_seconds),
+            daemon=True,
+            name="cue-assembly",
+        ).start()
+        logger.info(
+            "Album assembly: enabled (every %ds, min_score=%.2f, min_pct=%.0f%%, "
+            "store=%s)",
+            max(300, orch_cfg.assembly_interval_seconds),
+            orch_cfg.assembly_min_score, orch_cfg.assembly_min_pct,
+            assembly_path)
+    else:
+        logger.info("Album assembly: disabled")
+
     # --- External album cross-check (requirement c) ---------------------
     # Ask MusicBrainz which studio albums an artist has that Lidarr never
     # listed, and report them. Read-only; nothing is added to Lidarr.
@@ -1484,7 +1573,10 @@ def main() -> int:
             qbt_thread = threading.Thread(
                 target=qbt_auto_deselect_loop,
                 args=(qbt_cfg, lidarr, stop, interval, str(watch_root),
-                      ollama_client, q),
+                      ollama_client, q,
+                      # Fresh each pass: the union of source songs every album
+                      # assembly needs, so the deselect keeps them.
+                      (lambda: _assembly_keep(orch))),
                 daemon=True,
                 name="cue-qbt",
             )
