@@ -5197,6 +5197,12 @@ class Orchestrator:
                 # Remember it at its CURRENT content, so a restart doesn't redo
                 # it but a later change (more files arriving) still will.
                 self._sweep_ledger_mark(folder, audios, now_ts)
+                # Flush as we go. Saving only at the end of the pass was useless:
+                # a full pass takes the better part of an hour and rarely survives
+                # to completion, so nothing would ever reach disk -- exactly the
+                # problem the ledger exists to solve.
+                if handed_off % 5 == 0:
+                    self._sweep_ledger_save()
             except Exception as exc:  # noqa: BLE001
                 logger.exception(
                     "cueless sweep: handoff failed for %s: %s", folder, exc,
