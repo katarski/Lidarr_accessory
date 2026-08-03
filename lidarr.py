@@ -556,6 +556,40 @@ class LidarrClient:
             )
             return None
 
+    def manual_import_apply_files(
+        self, files: List[Dict[str, Any]], import_mode: str = "move",
+    ) -> Optional[int]:
+        """
+        Commit a ManualImport from ALREADY-BUILT file entries (path, artistId,
+        albumId, albumReleaseId, trackIds, quality...). Used by album assembly,
+        which knows the exact track id for every file it gathered, so Lidarr must
+        not be left to guess the mapping. Returns the command id or None.
+        """
+        payload = [f for f in (files or [])
+                   if f.get("path") and f.get("albumId") and f.get("trackIds")]
+        if not payload:
+            logger.warning("manual_import_apply_files: nothing importable")
+            return None
+        try:
+            resp = self._post("/api/v1/command", {
+                "name": "ManualImport", "files": payload,
+                "importMode": import_mode, "replaceExistingFiles": False,
+            })
+            cmd_id = resp.get("id") if isinstance(resp, dict) else None
+            logger.info("assembly ManualImport id=%s with %d file(s) (mode=%s)",
+                        cmd_id, len(payload), import_mode)
+            return cmd_id
+        except Exception as exc:
+            body = ""
+            r = getattr(exc, "response", None)
+            if r is not None:
+                try:
+                    body = r.text[:400]
+                except Exception:
+                    body = "(unreadable)"
+            logger.error("assembly ManualImport failed: %s | body=%s", exc, body)
+            return None
+
     def manual_import_apply(self, items: List[Dict[str, Any]]) -> Optional[int]:
         """
         Commit a ManualImport command. `items` is what you got back from

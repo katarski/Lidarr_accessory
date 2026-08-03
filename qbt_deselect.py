@@ -370,6 +370,37 @@ def process_torrent(
             to_deselect = [i for i in to_deselect if i not in keepset]
             emit(f"  ASSEMBLY -> keeping {len(rescued)} song(s) needed to "
                  f"assemble a missing album")
+    # ASSEMBLY-ONLY NARROWING: when a torrent is here to supply songs for an
+    # album assembly, download ONLY what is actually needed. Everything else in
+    # it (the rest of a 3-CD compilation) is dropped -- unless it belongs to an
+    # album Lidarr genuinely still wants, which is never sacrificed. Applies only
+    # when the torrent really does hold assembly-needed songs, so ordinary
+    # torrents behave exactly as before.
+    if assembly_keep:
+        by_index2 = {int(f["index"]): str(f.get("name") or "")
+                     for f in files if "index" in f}
+        needed_idx = {i for i, nm in by_index2.items()
+                      if _needed_for_assembly(nm, assembly_keep)}
+        if needed_idx:
+            wanted_idx = set()
+            for a in plan:
+                total = int(a.get("total") or 0)
+                if total > 0 and not a.get("have"):
+                    for x in (a.get("files") or []):
+                        if "index" in x:
+                            wanted_idx.add(int(x["index"]))
+            drop = [i for i, nm in by_index2.items()
+                    if i not in needed_idx and i not in wanted_idx
+                    and os.path.splitext(nm)[1].lower() in AUDIO_EXTS
+                    and cur.get(i, 1) != 0]
+            if drop:
+                already_d = set(to_deselect)
+                fresh = [i for i in drop if i not in already_d]
+                if fresh:
+                    to_deselect.extend(fresh)
+                    emit(f"  ASSEMBLY-ONLY -> keeping {len(needed_idx)} needed "
+                         f"song(s) (+{len(wanted_idx)} for wanted albums), "
+                         f"deselecting {len(fresh)} other track(s)")
     desel_all = {i for i, p in cur.items() if p == 0} | set(to_deselect)
     to_apply = sorted(i for i in to_deselect if cur.get(i, 1) != 0)
     if apply and to_apply:

@@ -214,6 +214,15 @@ _PAGE = r"""<!doctype html>
       <label><input type="checkbox" id="asm-complete" onchange="asmRender()"> only 100% assembled</label>
       <span class="grow"></span>
       <span class="muted" id="asm-sum"></span>
+      <span class="muted" id="asm-seln">0 selected</span>
+      <button class="b-copy" onclick="asmAll(true)">Select all</button>
+      <button class="b-copy" onclick="asmAll(false)">Clear</button>
+      <button class="b-copy" title="Search for the songs still missing"
+              onclick="asmAct('find')">Find missing</button>
+      <button class="b-copy" title="Assemble the matched songs into the Lidarr album"
+              onclick="asmAct('add')">Add to library</button>
+      <button class="b-copy" title="Dismiss these rows (no files touched)"
+              onclick="asmAct('remove')">Remove</button>
       <button class="b-copy" onclick="asmLoad()">Reload</button>
     </div>
     <div id="asm-list"></div>
@@ -407,11 +416,50 @@ function setTab(t){TAB=t;document.querySelectorAll('.tab').forEach(function(e){e
   if(t==='progress')cvEnter();}
 
 // ---- Assembly tab: % assembled per missing album + the songs still missing.
-var ASM=[];
+var ASM=[], ASMSEL=new Set();
+function asmSel(ev,id,on){
+  if(ev)ev.stopPropagation();          // don't toggle the <details> open/closed
+  if(on)ASMSEL.add(id);else ASMSEL.delete(id);
+  asmSelCount();
+}
+function asmSelCount(){
+  document.getElementById('asm-seln').textContent=ASMSEL.size+' selected';
+}
+function asmAll(on){
+  ASMSEL.clear();
+  if(on)(ASM||[]).forEach(function(a){ASMSEL.add(String(a.id));});
+  document.querySelectorAll('.asmsel').forEach(function(cb){cb.checked=on;});
+  asmSelCount();
+}
+function asmAct(kind){
+  var ids=Array.from(ASMSEL);
+  if(!ids.length){toast('Tick one or more albums first');return;}
+  var what={find:'Search for the missing songs of',
+            add:'Assemble and import into the library',
+            remove:'Dismiss (files untouched)'}[kind];
+  var extra=kind==='add'
+    ? '\n\nMatched songs are COPIED and retagged to the target album. A source '
+      +'file is deleted afterwards only if no other assembly still needs it.'
+    : '';
+  if(!confirm(what+' '+ids.length+' album(s)?'+extra))return;
+  toast('working…');
+  fetch('/api/assembly/'+kind,{method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({ids:ids})})
+   .then(function(r){return r.json();}).then(function(j){
+      var res=j.results||[];
+      var bad=res.filter(function(r){return !r.ok;});
+      toast('Done: '+(j.done||0)+' ok'+(bad.length?(', '+bad.length+' failed: '
+            +h(bad[0].message||'')):''));
+      ASMSEL.clear();asmLoad();
+   }).catch(function(e){toast('failed: '+e);});
+}
 function asmLoad(){
   fetch('/api/assembly').then(function(r){return r.json();}).then(function(j){
     ASM=j.items||[];
     document.getElementById('n-asm').textContent=ASM.length;
+    ASMSEL.forEach(function(id){if(!ASM.some(function(a){return String(a.id)===id;}))ASMSEL.delete(id);});
+    asmSelCount();
     var don=ASM.filter(function(a){return (a.pct||0)>=100;}).length;
     document.getElementById('asm-sum').textContent=
       ASM.length+' album(s) partly available · '+don+' fully assembled'
@@ -445,7 +493,11 @@ function asmRender(){
         +'<span class="playable" data-audio="'+h(src)+'" data-label="'+h(src.split('/').pop())
         +'" title="Click to play">'+h(src.split('/').pop())+'</span>'
         +' <span class="muted">('+(m.score||0)+' via '+h(m.via||'?')+')</span></li>';}).join('');
-    return '<details class="cvsec"><summary><b>'+h(a.artist)+' / '+h(a.album)+'</b> '
+    return '<details class="cvsec"><summary>'
+      +'<input type="checkbox" class="asmsel" data-id="'+h(String(a.id))+'" '
+      +(ASMSEL.has(String(a.id))?'checked':'')
+      +' onclick="asmSel(event,\''+h(String(a.id))+'\',this.checked)"> '
+      +'<b>'+h(a.artist)+' / '+h(a.album)+'</b> '
       +'<span style="color:'+col+'">'+pct.toFixed(0)+'%</span> '
       +'<span class="muted">'+(a.n_matched||0)+'/'+(a.total||0)+' songs</span> '
       +bar+'</summary><div class="cvbody" style="display:flex;gap:2rem;flex-wrap:wrap">'
@@ -1229,6 +1281,35 @@ def make_handler(store, actions: HeldActions):
                 ok, msg = actions.save_settings(changes)
                 self._json(200 if ok else 500, {"ok": ok, "message": msg})
                 return
+            if path in ("/api/assembly/remove", "/api/assembly/find",
+                        "/api/assembly/add"):
+                length = int(self.headers.get("Content-Length") or 0)
+                try:
+                    body = json.loads(self.rfile.read(length) or b"{}") or {}
+                except Exception:  # noqa: BLE001
+                    body = {}
+                ids = body.get("ids") or ([body["id"]] if body.get("id") else [])
+                fn = {
+                    "/api/assembly/remove": "assembly_remove",
+                    "/api/assembly/find": "assembly_find_missing",
+                    "/api/assembly/add": "assembly_add_to_library",
+                }[path]
+                act = getattr(actions, fn, None)
+                if act is None:
+                    self._json(503, {"ok": False, "message": "assembly disabled"})
+                    return
+                results = []
+                for aid in ids:
+                    try:
+                        ok, msg = act(aid)
+                    except Exception as exc:  # noqa: BLE001
+                        ok, msg = False, str(exc)[:200]
+                    results.append({"id": aid, "ok": bool(ok), "message": msg})
+                good = sum(1 for r in results if r["ok"])
+                self._json(200, {"ok": good > 0, "done": good,
+                                 "results": results})
+                return
+
             if path == "/api/convert/start":
                 conv = getattr(actions, "converter", None)
                 lt = getattr(actions, "library_tree", None)

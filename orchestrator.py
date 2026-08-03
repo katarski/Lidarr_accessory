@@ -47,6 +47,9 @@ from tagger import TagPlan, album_folder_name, tag_splits
 
 logger = logging.getLogger(__name__)
 
+# Characters a filesystem will not take in a file name.
+_SAFE_NAME_RE = re.compile(r'[\\/:*?"<>|]+')
+
 
 _FS_INVALID = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
@@ -7781,6 +7784,187 @@ class Orchestrator:
                 "assembly: %d album(s) can be (partly) assembled from the "
                 "needs-attention sources", planned)
         return planned
+
+    # ---- Assembly tab actions (requirement e, stage 2) ------------------
+    def assembly_remove(self, album_id):
+        """Dismiss an assembly plan. Drops the ROW only -- never touches audio."""
+        store = getattr(self, "assembly", None)
+        if store is None:
+            return False, "assembly disabled"
+        return (True, "removed") if store.remove(album_id) else (False, "not found")
+
+    def assembly_find_missing(self, album_id):
+        """
+        Go looking for the songs this assembly still lacks: run the normal
+        interactive search for the album. Anything grabbed is content-verified as
+        usual, and songs an assembly needs are protected from the deselect
+        (assembly_keep) -- so a compilation grabbed for one missing track keeps
+        that track even though its other albums are already owned.
+        """
+        store = getattr(self, "assembly", None)
+        if store is None:
+            return False, "assembly disabled"
+        plan = store.get(album_id)
+        if not plan:
+            return False, "no plan for that album"
+        try:
+            alb = self.lidarr.get_album(int(album_id)) or {}
+        except Exception as exc:  # noqa: BLE001
+            return False, "Lidarr lookup failed: %s" % exc
+        if not alb:
+            return False, "album not in Lidarr"
+        try:
+            qbt = self._get_qbt()
+        except Exception:  # noqa: BLE001
+            qbt = None
+        try:
+            ok = self._isearch_one_album(alb, {}, qbt)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("assembly find-missing failed: %s", exc)
+            return False, "search failed: %s" % exc
+        n = len(plan.get("missing") or [])
+        if ok:
+            return True, "search started for %d missing song(s)" % n
+        return False, "no acceptable release found (see log)"
+
+    @staticmethod
+    def _write_basic_tags(path, artist, album, title, track, total):
+        """Stamp the target album's identity onto an assembled file. Uses
+        mutagen's `easy` interface so it works for FLAC/MP3/M4A/Ogg alike."""
+        try:
+            from mutagen import File as MutagenFile
+            mf = MutagenFile(str(path), easy=True)
+            if mf is None:
+                return
+            if mf.tags is None:
+                try:
+                    mf.add_tags()
+                except Exception:  # noqa: BLE001
+                    return
+            mf["artist"] = [artist]
+            mf["albumartist"] = [artist]
+            mf["album"] = [album]
+            if title:
+                mf["title"] = [title]
+            if track:
+                mf["tracknumber"] = ["%s/%s" % (track, total) if total else str(track)]
+            mf.save()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("assembly: tag write failed for %s: %s", path, exc)
+
+    def assembly_add_to_library(self, album_id):
+        """
+        Assemble the album: copy every matched song into a staging folder, retag
+        it to the TARGET Lidarr album (artist/album/track/title), then hand the
+        files to Lidarr with the exact track ids the planner matched -- so Lidarr
+        files them as that album instead of guessing.
+
+        Sources are COPIED, never moved, because one compilation can feed several
+        assemblies. Afterwards a source is deleted only when no OTHER remaining
+        plan still needs it (the shared-file guard).
+        """
+        store = getattr(self, "assembly", None)
+        if store is None:
+            return False, "assembly disabled"
+        plan = store.get(album_id)
+        if not plan:
+            return False, "no plan for that album"
+        matched = [m for m in (plan.get("matched") or []) if m.get("source")]
+        if not matched:
+            return False, "nothing matched to assemble"
+        artist = str(plan.get("artist") or "")
+        album = str(plan.get("album") or "")
+        try:
+            full = self.lidarr.get_album(int(album_id)) or {}
+        except Exception as exc:  # noqa: BLE001
+            return False, "Lidarr lookup failed: %s" % exc
+        rels = [r for r in (full.get("releases") or []) if r.get("monitored")]
+        if not rels:
+            return False, "album has no monitored release in Lidarr"
+        release_id = int(rels[0]["id"])
+        artist_id = int((full.get("artist") or {}).get("id")
+                        or full.get("artistId") or 0)
+        if not artist_id:
+            return False, "could not resolve the Lidarr artist id"
+        total = int(plan.get("total") or len(matched))
+
+        staging = Path(self.cfg.staging_root) / ("assembly-%s" % album_id)
+        try:
+            shutil.rmtree(staging, ignore_errors=True)
+            staging.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return False, "cannot create staging folder: %s" % exc
+
+        items = []
+        for m in matched:
+            src = Path(str(m["source"]))
+            if not src.is_file():
+                continue
+            num = m.get("number") or (len(items) + 1)
+            safe = _SAFE_NAME_RE.sub("_", str(m.get("track") or src.stem))
+            dst = staging / ("%02d - %s%s" % (int(num), safe, src.suffix.lower()))
+            try:
+                shutil.copy2(src, dst)
+            except OSError as exc:
+                logger.warning("assembly: copy failed %s: %s", src, exc)
+                continue
+            self._write_basic_tags(dst, artist, album,
+                                   str(m.get("track") or ""), num, total)
+            tid = m.get("track_id")
+            if tid:
+                items.append({
+                    "path": str(dst), "artistId": artist_id,
+                    "albumId": int(album_id), "albumReleaseId": release_id,
+                    "trackIds": [int(tid)], "quality": None,
+                    "disableReleaseSwitching": True,
+                    "additionalFile": False, "replaceExistingFiles": False,
+                })
+        if not items:
+            shutil.rmtree(staging, ignore_errors=True)
+            return False, "no file could be prepared (copy failed or no track id)"
+        # Quality has to come from Lidarr's own parse, so ask it about the staged
+        # folder and borrow the quality it reports per file.
+        try:
+            cands = self.lidarr.manual_import_candidates(
+                str(staging), artist_id=artist_id)
+            qmap = {str(c.get("path")): c.get("quality") for c in cands}
+            for it in items:
+                it["quality"] = qmap.get(it["path"]) or it["quality"]
+        except Exception:  # noqa: BLE001
+            pass
+        cmd = self.lidarr.manual_import_apply_files(items, import_mode="move")
+        if cmd is None:
+            return False, "Lidarr refused the import (see log)"
+        try:
+            ok = bool(self.lidarr.wait_for_command(cmd, timeout_seconds=300,
+                                                   poll_interval=3))
+        except Exception:  # noqa: BLE001
+            ok = False
+        self._trigger_artist_refresh(artist, artist_id=artist_id)
+        if not ok:
+            return False, ("import command %s did not confirm -- staged files "
+                           "left in %s" % (cmd, staging))
+        shutil.rmtree(staging, ignore_errors=True)
+        store.remove(album_id)
+        # SHARED-FILE GUARD: a source may still feed another assembly, so only
+        # remove one that nothing else needs.
+        still_needed = set(store.needed_files().keys())
+        freed = 0
+        for m in matched:
+            sp = str(m["source"])
+            if sp in still_needed:
+                continue
+            try:
+                q = Path(sp)
+                if q.is_file():
+                    q.unlink()
+                    freed += 1
+            except OSError:
+                continue
+        tail = ("; removed %d source file(s) no other assembly needs" % freed
+                if freed else "; sources kept (still needed elsewhere)")
+        return True, ("assembled %d song(s) into %s / %s%s"
+                      % (len(items), artist, album, tail))
 
     def _album_track_titles_rows(self, album_id: int) -> List[Dict[str, Any]]:
         """Track ROWS for an album's selected release (id/title/number), which
