@@ -9272,6 +9272,8 @@ class Orchestrator:
             is_dir = False
         if not is_dir:
             node["type"] = "file"
+            # Absolute path so the WebUI player can stream this file directly.
+            node["path"] = str(p)
             try:
                 node["size"] = p.stat().st_size
             except OSError:

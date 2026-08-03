@@ -33,7 +33,7 @@ import threading
 import time
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, Protocol
+from typing import Any, Dict, Optional, Protocol
 from urllib.parse import parse_qs, urlparse
 
 logger = logging.getLogger(__name__)
@@ -144,6 +144,28 @@ _PAGE = r"""<!doctype html>
   #cv-modal table{width:100%;font-size:.75rem}
   #cv-modal td{padding:.15rem .4rem;vertical-align:top}
   #cv-modal td:first-child{color:var(--mut);white-space:nowrap}
+  /* ---- web player ---------------------------------------------------- */
+  .playable{cursor:pointer}
+  .playable:hover{text-decoration:underline}
+  .playable.on{color:#58a6ff;font-weight:600}
+  #pl{position:fixed;right:1rem;bottom:1rem;width:26rem;max-width:94vw;z-index:60;
+      background:var(--pan,#161b22);border:1px solid var(--bd,#30363d);
+      border-radius:8px;box-shadow:0 8px 28px #000a;display:none}
+  #pl.on{display:block}
+  #pl .plhead{display:flex;align-items:center;gap:.5rem;padding:.5rem .6rem;
+      border-bottom:1px solid var(--bd,#30363d)}
+  #pl .plname{font-weight:600;overflow:hidden;text-overflow:ellipsis;
+      white-space:nowrap;flex:1}
+  #pl .plbody{padding:.5rem .6rem}
+  #pl .plbtns{display:flex;gap:.35rem;align-items:center;margin:.35rem 0}
+  #pl .plbtns button{min-width:2.4rem}
+  #pl audio{width:100%;margin-top:.25rem}
+  #pl details{margin-top:.4rem}
+  #pl details summary{cursor:pointer;color:var(--mut,#8b949e)}
+  #pl table{border-collapse:collapse;font-size:.82rem;width:100%;
+      max-height:11rem;display:block;overflow:auto}
+  #pl td{padding:.1rem .35rem;vertical-align:top;border-bottom:1px solid #21262d}
+  #pl td:first-child{color:var(--mut,#8b949e);white-space:nowrap}
 </style></head>
 <body>
 <header>
@@ -244,6 +266,24 @@ _PAGE = r"""<!doctype html>
     </div>
   </div>
 </main>
+<div id="pl">
+  <div class="plhead">
+    <span class="plname" id="pl-name">—</span>
+    <button class="b-copy" title="Close player" onclick="plClose()">✕</button>
+  </div>
+  <div class="plbody">
+    <div class="plbtns">
+      <button class="b-copy" title="Rewind 10s" onclick="plSeek(-10)">⏪</button>
+      <button class="b-copy" title="Play / pause" onclick="plToggle()" id="pl-play">▶</button>
+      <button class="b-copy" title="Stop" onclick="plStop()">⏹</button>
+      <button class="b-copy" title="Forward 10s" onclick="plSeek(10)">⏩</button>
+      <span class="muted" id="pl-time" style="margin-left:auto">0:00</span>
+    </div>
+    <audio id="pl-audio" preload="none" controls></audio>
+    <details id="pl-tags"><summary>ID tags</summary><div id="pl-tagbody" class="muted">—</div></details>
+    <details id="pl-specs"><summary>Specs</summary><div id="pl-specbody" class="muted">—</div></details>
+  </div>
+</div>
 <div id="toast" class="toast"></div>
 <div id="ctx"></div>
 
@@ -272,6 +312,72 @@ function h(s){return (s==null?'':''+s).replace(/[&<>"']/g,function(c){return{'&'
 function human(b){b=b||0;var u=['B','KB','MB','GB','TB'],i=0;while(b>=1024&&i<u.length-1){b/=1024;i++;}return b.toFixed(b<10&&i>0?1:0)+u[i];}
 function ago(t){if(!t)return'';var s=Math.max(0,Date.now()/1000-t);if(s<90)return Math.round(s)+'s';if(s<5400)return Math.round(s/60)+'m';if(s<172800)return Math.round(s/3600)+'h';return Math.round(s/86400)+'d';}
 function toast(m){var t=document.getElementById('toast');t.textContent=m;t.classList.add('show');setTimeout(function(){t.classList.remove('show');},3200);}
+// ---- Web player -----------------------------------------------------------
+// One shared <audio> + popup for every tab. Playback starts IMMEDIATELY on click
+// (the stream endpoint supports Range, so the browser buffers as it goes); the
+// ID-tag and Specs dropdowns are filled by a separate request that never blocks
+// the audio. Any element carrying data-audio="<abs path>" is clickable, so the
+// same handler serves Needs attention, Assembly and Converter.
+var PLCUR='';
+function plEl(){return document.getElementById('pl-audio');}
+function plOpen(path,label){
+  if(!path)return;
+  var a=plEl();
+  document.getElementById('pl').classList.add('on');
+  document.getElementById('pl-name').textContent=label||path.split('/').pop();
+  if(PLCUR!==path){
+    PLCUR=path;
+    a.src='/api/audio/stream?path='+encodeURIComponent(path);
+    document.getElementById('pl-tagbody').innerHTML='<span class="muted">loading…</span>';
+    document.getElementById('pl-specbody').innerHTML='<span class="muted">loading…</span>';
+    plInfo(path);
+  }
+  a.play().catch(function(){/* browser may need a second click; controls still work */});
+  document.querySelectorAll('.playable.on').forEach(function(e){e.classList.remove('on');});
+  var cur=document.querySelector('.playable[data-audio="'+path.replace(/"/g,'\\"')+'"]');
+  if(cur)cur.classList.add('on');
+  plSyncBtn();
+}
+function plInfo(path){
+  fetch('/api/audio/info?path='+encodeURIComponent(path))
+    .then(function(r){return r.json();}).then(function(j){
+      if(PLCUR!==path)return;                       // user moved on already
+      var t=j.tags||{},s=j.specs||{};
+      function tbl(o){
+        var ks=Object.keys(o);
+        if(!ks.length)return '<span class="muted">none</span>';
+        return '<table>'+ks.map(function(k){
+          return '<tr><td>'+h(k)+'</td><td>'+h(String(o[k]))+'</td></tr>';}).join('')+'</table>';
+      }
+      if(s.duration_s)s.duration=fmtTime(s.duration_s);
+      document.getElementById('pl-tagbody').innerHTML=tbl(t);
+      document.getElementById('pl-specbody').innerHTML=tbl(s);
+    }).catch(function(){
+      document.getElementById('pl-tagbody').innerHTML='<span class="muted">unavailable</span>';});
+}
+function fmtTime(s){s=Math.max(0,Math.floor(s||0));
+  return Math.floor(s/60)+':'+('0'+(s%60)).slice(-2);}
+function plToggle(){var a=plEl();if(a.paused)a.play().catch(function(){});else a.pause();plSyncBtn();}
+function plStop(){var a=plEl();a.pause();a.currentTime=0;plSyncBtn();}
+function plSeek(d){var a=plEl();a.currentTime=Math.max(0,(a.currentTime||0)+d);}
+function plClose(){plStop();document.getElementById('pl').classList.remove('on');
+  document.querySelectorAll('.playable.on').forEach(function(e){e.classList.remove('on');});}
+function plSyncBtn(){document.getElementById('pl-play').textContent=plEl().paused?'▶':'⏸';}
+document.addEventListener('DOMContentLoaded',function(){
+  var a=plEl();if(!a)return;
+  a.addEventListener('timeupdate',function(){
+    document.getElementById('pl-time').textContent=
+      fmtTime(a.currentTime)+(a.duration?(' / '+fmtTime(a.duration)):'');});
+  ['play','pause','ended'].forEach(function(e){a.addEventListener(e,plSyncBtn);});
+});
+// Single delegated listener: cheap, and works for rows rendered later.
+document.addEventListener('click',function(ev){
+  var el=ev.target.closest?ev.target.closest('.playable[data-audio]'):null;
+  if(!el)return;
+  ev.preventDefault();ev.stopPropagation();
+  plOpen(el.getAttribute('data-audio'),el.getAttribute('data-label')||el.textContent.trim());
+});
+
 function setTab(t){TAB=t;document.querySelectorAll('.tab').forEach(function(e){e.classList.toggle('on',e.dataset.tab===t);});
   document.getElementById('attention').style.display=t==='attention'?'':'none';
   document.getElementById('assembly').style.display=t==='assembly'?'':'none';
@@ -319,8 +425,11 @@ function asmRender(){
       +'<div style="width:'+Math.min(100,pct)+'%;height:100%;background:'+col+'"></div></div>';
     var miss=(a.missing||[]).map(function(m){return '<li>'+h(m.track)+'</li>';}).join('');
     var got=(a.matched||[]).map(function(m){
-      return '<li>'+h(m.track)+' <span class="muted">← '+h((m.source||'').split('/').pop())
-        +' ('+(m.score||0)+' via '+h(m.via||'?')+')</span></li>';}).join('');
+      var src=m.source||'';
+      return '<li>'+h(m.track)+' <span class="muted">← </span>'
+        +'<span class="playable" data-audio="'+h(src)+'" data-label="'+h(src.split('/').pop())
+        +'" title="Click to play">'+h(src.split('/').pop())+'</span>'
+        +' <span class="muted">('+(m.score||0)+' via '+h(m.via||'?')+')</span></li>';}).join('');
     return '<details class="cvsec"><summary><b>'+h(a.artist)+' / '+h(a.album)+'</b> '
       +'<span style="color:'+col+'">'+pct.toFixed(0)+'%</span> '
       +'<span class="muted">'+(a.n_matched||0)+'/'+(a.total||0)+' songs</span> '
@@ -497,7 +606,11 @@ function treeHtml(node){
   if(!node||!node.name&&!node.children)return '<span class="muted">empty / not available</span>';
   function rec(n){
     if(!n)return '';
-    if(n.type==='file')return '<div class="tf">📄 '+h(n.name)+' <span class="muted">('+human(n.size)+')</span></div>';
+    if(n.type==='file'){
+      var pth=n.path||'';
+      var nm=pth?('<span class="playable" data-audio="'+h(pth)+'" data-label="'+h(n.name)+'" title="Click to play">'+h(n.name)+'</span>'):h(n.name);
+      return '<div class="tf">📄 '+nm+' <span class="muted">('+human(n.size)+')</span></div>';
+    }
     var kids=(n.children||[]).map(rec).join('')+(n.truncated?'<div class="muted">… (truncated)</div>':'');
     return '<details class="td"><summary>📁 '+h(n.name)+' <span class="muted">('+(n.children||[]).length+')</span></summary><div class="tind">'+kids+'</div></details>';
   }
@@ -575,11 +688,11 @@ document.addEventListener('scroll',function(){ctx.classList.remove('on');},true)
 buildColMenu();setTab('attention');refresh();setInterval(refresh,15000);
 
 /* ===================== Converter tab ===================== */
-var CVOPT=null, CVSEL=new Set(), CVINIT=false, CVPOLL=null;
+var CVOPT=null, CVSEL=new Set(), CVINIT=false, CVPOLL=null, CVROOT='';
 function cvEnter(){
   if(!CVINIT){CVINIT=true;
     fetch('/api/convert/options').then(function(r){return r.json();}).then(function(j){
-      CVOPT=j.codecs||{};
+      CVOPT=j.codecs||{};CVROOT=(j.root||'').replace(/\/+$/,'');
       var cs=document.getElementById('cv-codec');
       cs.innerHTML=Object.keys(CVOPT).map(function(k){return '<option value="'+k+'">'+h(CVOPT[k].label)+'</option>';}).join('');
       var cc=document.getElementById('cv-conc');
@@ -628,7 +741,7 @@ function cvLoadDir(rel,elId){
       out+='<div class="cvrow" data-rel="'+h(f.rel)+'">'
         +'<span class="cvcaret"></span>'
         +'<input type="checkbox" '+(cvIsCovered(f.rel)?'checked':'')+' onclick="cvSel(\''+h(f.rel).replace(/'/g,"\\'")+'\',this.checked)">'
-        +'<span class="nm">'+h(f.name)+'</span><span class="grow"></span>'
+        +'<span class="nm playable" data-audio="'+h(CVROOT+'/'+f.rel)+'" data-label="'+h(f.name)+'" title="Click to play">'+h(f.name)+'</span><span class="grow"></span>'
         +'<span class="meta">'+meta+'</span></div>';
     });
     el.innerHTML=out||'<div class="empty">(no audio here)</div>';
@@ -819,6 +932,70 @@ def _expand_audio(lt, rels, cap: int = 1000):
     return out
 
 
+_PLAYER_MIME = {
+    ".mp3": "audio/mpeg", ".flac": "audio/flac", ".ogg": "audio/ogg",
+    ".opus": "audio/ogg", ".m4a": "audio/mp4", ".aac": "audio/aac",
+    ".wav": "audio/wav", ".aiff": "audio/aiff", ".aif": "audio/aiff",
+    ".wma": "audio/x-ms-wma", ".ape": "audio/x-ape", ".wv": "audio/x-wavpack",
+}
+# Roots the player may read from. Everything the WebUI can show lives under one
+# of these two mounts, and nothing outside them is ever served.
+_PLAYER_ROOTS = ("/music", "/downloads")
+
+
+def _player_path(raw: str) -> Optional[Path]:
+    """
+    Resolve a requested audio path, refusing anything outside the allowed mounts.
+    Guards against traversal ('..') because this endpoint streams raw bytes.
+    """
+    if not raw:
+        return None
+    try:
+        p = Path(raw).resolve(strict=False)
+    except OSError:
+        return None
+    for root in _PLAYER_ROOTS:
+        try:
+            rp = Path(root).resolve(strict=False)
+        except OSError:
+            continue
+        if p == rp or rp in p.parents:
+            return p if p.is_file() else None
+    return None
+
+
+def _player_info(p: Path) -> Dict[str, Any]:
+    """ID tags + codec specs for the player's two dropdowns."""
+    out: Dict[str, Any] = {"name": p.name, "path": str(p), "tags": {}, "specs": {}}
+    try:
+        out["specs"]["size"] = p.stat().st_size
+    except OSError:
+        pass
+    try:
+        from mutagen import File as MutagenFile
+        mf = MutagenFile(str(p))
+        if mf is not None:
+            info = getattr(mf, "info", None)
+            if info is not None:
+                for k, label in (("length", "duration_s"), ("bitrate", "bitrate"),
+                                 ("sample_rate", "sample_rate"),
+                                 ("channels", "channels"),
+                                 ("bits_per_sample", "bits")):
+                    v = getattr(info, k, None)
+                    if v:
+                        out["specs"][label] = (round(v, 1) if k == "length" else v)
+                out["specs"]["codec"] = type(info).__module__.split(".")[-1]
+            if mf.tags:
+                for k, v in list(mf.tags.items())[:60]:
+                    if isinstance(v, (list, tuple)):
+                        v = ", ".join(str(x) for x in v)
+                    s = str(v)
+                    out["tags"][str(k)] = s[:300]
+    except Exception as exc:  # noqa: BLE001
+        out["error"] = str(exc)[:200]
+    return out
+
+
 def make_handler(store, actions: HeldActions):
     class Handler(BaseHTTPRequestHandler):
         server_version = "cue_pipeline-webui"
@@ -852,6 +1029,69 @@ def make_handler(store, actions: HeldActions):
                 # which keeps the store file itself fresh. The page load is
                 # just this in-memory list dump.
                 self._json(200, {"items": store.list()})
+            elif path == "/api/audio/info":
+                qs = parse_qs(urlparse(self.path).query)
+                p = _player_path((qs.get("path", [""]) or [""])[0])
+                if p is None:
+                    self._json(404, {"error": "not found or not allowed"})
+                    return
+                self._json(200, _player_info(p))
+
+            elif path == "/api/audio/stream":
+                qs = parse_qs(urlparse(self.path).query)
+                p = _player_path((qs.get("path", [""]) or [""])[0])
+                if p is None:
+                    self._send(404, b"not found", "text/plain")
+                    return
+                ctype = _PLAYER_MIME.get(p.suffix.lower(), "application/octet-stream")
+                try:
+                    size = p.stat().st_size
+                except OSError:
+                    self._send(404, b"not found", "text/plain")
+                    return
+                # Honour Range: without it the browser can't seek, so fast-forward
+                # and rewind would be dead on a long lossless track.
+                rng = self.headers.get("Range") or ""
+                start, end = 0, size - 1
+                partial = False
+                m = re.match(r"bytes=(\d*)-(\d*)", rng.strip())
+                if m and (m.group(1) or m.group(2)):
+                    if m.group(1):
+                        start = int(m.group(1))
+                        if m.group(2):
+                            end = min(int(m.group(2)), size - 1)
+                    else:                       # suffix range: last N bytes
+                        start = max(0, size - int(m.group(2)))
+                    if start > end or start >= size:
+                        self.send_response(416)
+                        self.send_header("Content-Range", f"bytes */{size}")
+                        self.end_headers()
+                        return
+                    partial = True
+                length = end - start + 1
+                self.send_response(206 if partial else 200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Content-Length", str(length))
+                if partial:
+                    self.send_header("Content-Range",
+                                     f"bytes {start}-{end}/{size}")
+                self.end_headers()
+                try:
+                    with open(p, "rb") as fh:
+                        fh.seek(start)
+                        left = length
+                        while left > 0:
+                            chunk = fh.read(min(262144, left))
+                            if not chunk:
+                                break
+                            self.wfile.write(chunk)
+                            left -= len(chunk)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass                        # listener seeked away / closed
+                except OSError as exc:
+                    logger.debug("stream %s failed: %s", p, exc)
+
             elif path == "/api/assembly":
                 # NOTE: must NOT be named `store` -- that name is the held-store
                 # CLOSURE variable used by /api/held above; assigning it here

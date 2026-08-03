@@ -369,6 +369,9 @@ class ConvertManager:
     def options(self) -> Dict[str, Any]:
         return {"codecs": CODEC_OPTIONS,
                 "concurrency": list(range(1, 11)),
+                # Library root, so the WebUI can turn a tree-relative path into
+                # the absolute path the audio player streams from.
+                "root": str(self.root),
                 # Replace-in-place: delete the source (e.g. the FLAC) once the
                 # lossy encode is verified, repoint sidecar .xml files at the new
                 # filename, and have Lidarr rescan so it reflects the change.
