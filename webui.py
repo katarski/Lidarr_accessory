@@ -148,7 +148,7 @@ _PAGE = r"""<!doctype html>
   .playable{cursor:pointer}
   .playable:hover{text-decoration:underline}
   .playable.on{color:#58a6ff;font-weight:600}
-  #pl{position:fixed;right:1rem;bottom:1rem;width:26rem;max-width:94vw;z-index:60;
+  #pl{position:fixed;left:1rem;top:1rem;width:24rem;max-width:94vw;z-index:60;
       background:var(--pan,#161b22);border:1px solid var(--bd,#30363d);
       border-radius:8px;box-shadow:0 8px 28px #000a;display:none}
   #pl.on{display:block}
@@ -320,10 +320,21 @@ function toast(m){var t=document.getElementById('toast');t.textContent=m;t.class
 // same handler serves Needs attention, Assembly and Converter.
 var PLCUR='';
 function plEl(){return document.getElementById('pl-audio');}
-function plOpen(path,label){
+function plPlace(x,y){
+  // Put the popup right under the pointer so it can be confirmed and dismissed
+  // without travelling to a corner -- clamped so it never hangs off-screen.
+  var el=document.getElementById('pl');
+  el.classList.add('on');                       // must be visible to measure
+  var w=el.offsetWidth||384, h=el.offsetHeight||220, m=8;
+  var left=Math.min(Math.max(m,(x||0)+12), Math.max(m,window.innerWidth-w-m));
+  var top =Math.min(Math.max(m,(y||0)+12), Math.max(m,window.innerHeight-h-m));
+  el.style.left=left+'px'; el.style.top=top+'px';
+}
+function plOpen(path,label,x,y){
   if(!path)return;
   var a=plEl();
-  document.getElementById('pl').classList.add('on');
+  if(x!==undefined&&x!==null)plPlace(x,y);
+  else document.getElementById('pl').classList.add('on');
   document.getElementById('pl-name').textContent=label||path.split('/').pop();
   if(PLCUR!==path){
     PLCUR=path;
@@ -363,6 +374,9 @@ function plSeek(d){var a=plEl();a.currentTime=Math.max(0,(a.currentTime||0)+d);}
 function plClose(){plStop();document.getElementById('pl').classList.remove('on');
   document.querySelectorAll('.playable.on').forEach(function(e){e.classList.remove('on');});}
 function plSyncBtn(){document.getElementById('pl-play').textContent=plEl().paused?'▶':'⏸';}
+document.addEventListener('keydown',function(e){
+  if(e.key==='Escape'&&document.getElementById('pl').classList.contains('on'))plClose();
+});
 document.addEventListener('DOMContentLoaded',function(){
   var a=plEl();if(!a)return;
   a.addEventListener('timeupdate',function(){
@@ -375,7 +389,8 @@ document.addEventListener('click',function(ev){
   var el=ev.target.closest?ev.target.closest('.playable[data-audio]'):null;
   if(!el)return;
   ev.preventDefault();ev.stopPropagation();
-  plOpen(el.getAttribute('data-audio'),el.getAttribute('data-label')||el.textContent.trim());
+  plOpen(el.getAttribute('data-audio'),el.getAttribute('data-label')||el.textContent.trim(),
+         ev.clientX,ev.clientY);
 });
 
 function setTab(t){TAB=t;document.querySelectorAll('.tab').forEach(function(e){e.classList.toggle('on',e.dataset.tab===t);});
