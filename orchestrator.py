@@ -380,6 +380,15 @@ class OrchestratorConfig:
     # (prune / box-set expand / library compare / auto-dismiss). The page
     # itself always serves the store as-is -- see curate_held_pass.
     webui_held_refresh_seconds: int = 300
+    # Let the curator SETTLE what pure logic can, so the needs-attention list
+    # only ever asks about things that genuinely need a human: (a) drop rows an
+    # ancestor row already covers byte-for-byte (a box set recorded at several
+    # levels asked for the same disc twice), (b) auto-import rows whose album
+    # Lidarr monitors and is still missing tracks for, via the release-scrolling
+    # force-import. Never deletes un-imported audio.
+    held_auto_resolve: bool = True
+    # Cap auto-imports per curator pass (each one talks to Lidarr repeatedly).
+    held_auto_resolve_max_per_pass: int = 6
     held_items_file: Optional[Path] = None
     # When the user resolves a held item in the WebUI (keep-existing or
     # move-held), unmonitor the matching Lidarr album so neither Lidarr nor the
@@ -7884,6 +7893,164 @@ class Orchestrator:
                                album=self._strip_disc_prefix(sub.name))
         return True
 
+    def _drop_redundant_nested_held(self) -> int:
+        """
+        AUTO-RESOLVE (no user interaction): remove needs-attention rows that are
+        REDUNDANT because an ancestor row already covers exactly the same audio.
+
+        A box-set/multi-disc download gets recorded at more than one level -- e.g.
+        both `.../[5CD Box Set]/CD4` and its single leaf
+        `.../CD4/The Man In Black 1954-1958 - Disc 4` -- so the same disc asks
+        for a decision twice (the real store had 10 rows for a 5-CD box).
+        A child row is dropped ONLY when the ancestor's recursive audio count
+        equals the child's, i.e. the ancestor adds nothing beyond this child, so
+        no information is lost. A genuine box container holding SEVERAL distinct
+        album subfolders has a larger count than any one child, so deliberate
+        box-set expansion (expand_box_set) is never undone.
+        Returns the number of rows removed.
+        """
+        store = self.held
+        if store is None:
+            return 0
+        items = [i for i in store.list() if i.get("source_path")]
+        counts: Dict[str, int] = {}
+
+        def n_audio(path: str) -> int:
+            if path not in counts:
+                try:
+                    counts[path] = len(self._held_audio_files(Path(path)))
+                except Exception:  # noqa: BLE001
+                    counts[path] = -1
+            return counts[path]
+
+        removed = 0
+        for child in items:
+            cp = str(child["source_path"]).rstrip("/")
+            for parent in items:
+                if parent["id"] == child["id"]:
+                    continue
+                pp = str(parent["source_path"]).rstrip("/")
+                if not (pp and cp.startswith(pp + "/")):
+                    continue
+                nc, np_ = n_audio(cp), n_audio(pp)
+                if nc > 0 and nc == np_:
+                    if store.remove(child["id"]):
+                        removed += 1
+                        logger.info(
+                            "held auto-resolve: dropped redundant row %r -- the "
+                            "same %d track(s) are already covered by %r",
+                            os.path.basename(cp), nc, os.path.basename(pp),
+                        )
+                    break
+        return removed
+
+    def _auto_resolve_held_gaps(self, budget: int = 6) -> int:
+        """
+        AUTO-RESOLVE (no user interaction): a needs-attention row whose album
+        Lidarr KNOWS, MONITORS and is still MISSING tracks for is not really a
+        user decision -- it's a gap we already hold the files for. Import it
+        automatically via the release-scrolling force-import
+        (_try_positional_force_import: walks every release, flips the album to
+        the one whose track count matches, then pairs files to tracks by
+        position). Cleanup only happens on a VERIFIED import inside that helper,
+        so a refusal leaves the files exactly where they are.
+
+        Deliberately CONSERVATIVE -- it only fires when the held folder holds
+        EXACTLY the album's full track list (len(audio) == Lidarr's total). That
+        single rule rejects every dangerous case seen in the real store: a
+        60-track box claiming a 10-track album (Dean Martin "Dino"), an 18-track
+        best-of claiming a 12-track album (Peggy Lee), a 6-of-36 fragment (Julio
+        Iglesias), and four DIFFERENT discs of a 10-CD box all claiming Charlie
+        Parker's one 25-track "Now's The Time". Anything partial or oversized is
+        a real judgement call and stays for the user.
+
+        Rows whose album Lidarr does NOT have (compilations / box sets / live
+        excluded by the metadata profile) are left alone: no logic can import an
+        album Lidarr doesn't track, so those stay for the user.
+        Returns the number of rows imported.
+        """
+        store = self.held
+        if store is None or budget <= 0:
+            return 0
+        done = 0
+        for it in store.list():
+            if done >= budget:
+                break
+            ex = it.get("existing") or {}
+            lid = (ex.get("lidarr") or {}) if isinstance(ex, dict) else {}
+            if not (lid.get("present") and lid.get("monitored")):
+                continue
+            have, total = int(lid.get("have") or 0), int(lid.get("total") or 0)
+            if not (total > 0 and have < total):
+                continue          # complete -> the green auto-dismiss handles it
+            sp = it.get("source_path") or ""
+            if not sp:
+                continue
+            folder = Path(sp)
+            try:
+                audios = self._held_audio_files(folder)
+            except Exception:  # noqa: BLE001
+                continue
+            if not audios:
+                continue
+            # HARD GATE: we must hold exactly the album's whole track list.
+            if len(audios) != total:
+                logger.debug(
+                    "held auto-resolve: skipping %s (hold %d, album wants %d) "
+                    "-- not a whole-album fill; leaving for the user",
+                    sp, len(audios), total,
+                )
+                continue
+            artist = str(it.get("artist") or "").strip()
+            album = str(it.get("album") or "").strip()
+            # Strip a disc marker so a per-disc row ("X - Disc 2", "CD 04 - X")
+            # resolves to the real album title Lidarr holds.
+            album = self._strip_disc_marker(album) or album
+            if not (artist and album):
+                continue
+            logger.info(
+                "held auto-resolve: %s / %s is a monitored gap in Lidarr "
+                "(%d/%d) and we hold %d track(s) -- importing automatically.",
+                artist, album, have, total, len(audios),
+            )
+            try:
+                ok = self._try_positional_force_import(
+                    None, folder, folder, artist, album, audios,
+                    "held auto-resolve",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("held auto-resolve failed for %s: %s", folder, exc)
+                continue
+            if ok:
+                store.remove(it["id"])
+                done += 1
+                logger.info("held auto-resolve: imported %s / %s -- row cleared",
+                            artist, album)
+        return done
+
+    _DISC_MARKER_ANY = re.compile(
+        r"(?i)[\s\-_,\(\[]*\b(?:cd|disc|disk)\s*[.\-_]?\s*\d{1,2}\b[\s\-_,\)\]]*")
+
+    def _strip_disc_marker(self, title: str) -> str:
+        """
+        'CD 09 - Now's The Time' / 'X - Disc 2' / 'X CD2' -> the album title
+        without the disc marker (wherever it sits). Returns the title UNCHANGED
+        when it carries no disc marker, so a legitimate parenthetical edition
+        ('Spirit (Deluxe Edition)') is never mangled.
+        """
+        title = title or ""
+        if not self._DISC_MARKER_ANY.search(title):
+            return title
+        t = self._DISC_MARKER_ANY.sub(" ", title)
+        t = re.sub(r"\s{2,}", " ", t).strip(" -_,")
+        # Re-balance brackets the strip may have orphaned.
+        for op, cl in (("(", ")"), ("[", "]")):
+            if t.count(op) > t.count(cl):
+                t += cl
+            elif t.count(cl) > t.count(op) and t.endswith(cl):
+                t = t[:-1].strip()
+        return t.strip(" -_,")
+
     def curate_held_pass(self) -> int:
         """
         Background curator for the needs-attention store, so the WebUI never
@@ -7910,6 +8077,21 @@ class Orchestrator:
                 self.expand_box_set(it)
             except Exception:  # noqa: BLE001
                 pass
+        # AUTO-RESOLVE what pure logic can settle, so the dashboard only ever
+        # asks about things that genuinely need a human: redundant duplicate
+        # rows, and rows that are really just monitored Lidarr gaps we hold the
+        # files for. Both are best-effort and never delete un-imported audio.
+        if getattr(self.cfg, "held_auto_resolve", True):
+            try:
+                self._drop_redundant_nested_held()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("held curator: nested dedupe failed: %s", exc)
+            try:
+                self._auto_resolve_held_gaps(
+                    budget=max(0, int(getattr(
+                        self.cfg, "held_auto_resolve_max_per_pass", 6))))
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("held curator: gap auto-resolve failed: %s", exc)
         refreshed = 0
         now = time.time()
         ttl = max(60, int(getattr(self.cfg, "webui_held_refresh_seconds", 300)))
@@ -8469,6 +8651,8 @@ class Orchestrator:
          "How long (minutes) a torrent may sit at ~0% before it's reaped (from add time)."),
         ("lidarr.webui_unmonitor_on_resolve", "lidarr", "webui_unmonitor_on_resolve", "Unmonitor on resolve", "bool", True,
          "When you resolve an item here, unmonitor the album so it isn't re-downloaded."),
+        ("lidarr.held_auto_resolve", "lidarr", "held_auto_resolve", "Needs-attention: auto-resolve", "bool", True,
+         "Let logic settle what it can: drop duplicate rows an ancestor already covers, and auto-import rows that are just monitored Lidarr gaps. Never deletes un-imported audio."),
         ("lidarr.webui_held_refresh_seconds", "lidarr", "webui_held_refresh_seconds", "Needs-attention refresh (s)", "int", 300,
          "How often the background curator refreshes this list (library compare, auto-dismiss). The page itself always loads instantly from the stored file."),
         ("lidarr.extract_archives", "lidarr", "extract_archives", "Extract archives", "bool", True,
