@@ -2528,6 +2528,20 @@ class Orchestrator:
             return False
 
         tmp = folder / ".dvda_extract_tmp"
+        # IN-PROGRESS LOCK. Ripping a DVD-Audio disc takes minutes, but the
+        # cueless sweep comes round every 60s and the "already extracted" check
+        # can't yet see any FLAC -- so a second, concurrent rip of the SAME iso
+        # used to start (observed: LIFAD.iso unpacked twice, a minute apart).
+        # The staging dir doubles as the lock: if it's present and recently
+        # touched, another pass owns this rip -- defer.
+        try:
+            if tmp.is_dir() and (now_ts - tmp.stat().st_mtime) < 7200:
+                logger.info(
+                    "DVD-Audio: %s is already being extracted (staging dir "
+                    "present) -- leaving it to the pass that owns it", iso.name)
+                return True
+        except OSError:
+            pass
         shutil.rmtree(tmp, ignore_errors=True)
         try:
             tmp.mkdir(parents=True, exist_ok=True)
