@@ -5031,6 +5031,39 @@ class Orchestrator:
             self._skip_seen.add(folder)
 
         surviving = [(f, a) for (f, a) in eligible if f not in self._skip_seen]
+        # IDENTIFY-FIRST ORDERING. A pass can hold 80+ folders and each handoff
+        # costs Lidarr (and sometimes LLM) round trips, so a full pass takes the
+        # better part of an hour -- and `_skip_seen` is in-memory, so any restart
+        # starts the queue again from the top. An UNIDENTIFIED folder (an untagged
+        # DVD-Audio/SACD rip whose files are "01 - Track 01.flac") therefore sat
+        # at the back of the queue and its fingerprint lookup effectively never
+        # ran. Folders that still need identifying now go FIRST: they are the ones
+        # that cannot be recovered any other way, and they are cheap to spot
+        # (one tag read of the first file).
+        def _needs_ident(pair) -> bool:
+            _f, auds = pair
+            if not auds:
+                return False
+            try:
+                ar, al = self._read_audio_tags(auds[0])
+            except Exception:  # noqa: BLE001
+                return True
+            return (not (ar and al)) or self._is_placeholder_identity(ar, al)
+
+        try:
+            ranked = [(0 if _needs_ident(p) else 1, i, p)
+                      for i, p in enumerate(surviving)]
+            ranked.sort(key=lambda t: (t[0], t[1]))
+            n_first = sum(1 for r in ranked if r[0] == 0)
+            if n_first and len(surviving) > 1:
+                logger.info(
+                    "cueless sweep: %d folder(s) need identifying (untagged / "
+                    "placeholder names) -- handing those off FIRST so their "
+                    "fingerprint lookup isn't stuck behind %d other folder(s)",
+                    n_first, len(surviving) - n_first)
+            surviving = [r[2] for r in ranked]
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("identify-first ordering skipped: %s", exc)
         for folder, audios in surviving:
             try:
                 artist_ov = album_ov = ""
