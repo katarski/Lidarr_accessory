@@ -1002,6 +1002,8 @@ def main() -> int:
             library_root_windows=lidarr_cfg["library_root_windows"],
             path_mapping_from=lidarr_cfg["path_mapping"]["from"],
             path_mapping_to=lidarr_cfg["path_mapping"]["to"],
+            manualimport_timeout=int(
+                lidarr_cfg.get("manualimport_query_timeout_seconds", 180)),
         )
     )
 
@@ -1016,8 +1018,13 @@ def main() -> int:
                 api_key=str(ollama_cfg.get("api_key", "")),
                 timeout=int(ollama_cfg.get("timeout_seconds", 60)),
                 enabled=True,
+                rpm=int(ollama_cfg.get("rpm", 10)),
+                max_wait_seconds=float(ollama_cfg.get("max_wait_seconds", 30)),
+                max_retries=int(ollama_cfg.get("max_retries", 3)),
+                cooldown_seconds=float(ollama_cfg.get("cooldown_seconds", 900)),
             )
-            label = f"cloud LLM ({provider}, model={ollama_cfg['model']})"
+            label = (f"cloud LLM ({provider}, model={ollama_cfg['model']}, "
+                     f"{ollama_cfg.get('rpm', 10)} req/min)")
         else:
             ollama_client = OllamaClient(
                 base_url=ollama_cfg["base_url"],

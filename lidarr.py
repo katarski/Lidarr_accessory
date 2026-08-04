@@ -51,6 +51,11 @@ class LidarrConfig:
     library_root_windows: str
     path_mapping_from: str
     path_mapping_to: str
+    # Read budget for the /manualimport QUERY (distinct from
+    # `manual_import_timeout_seconds`, which bounds waiting on the import
+    # command to finish). Lidarr parses every file in the folder before it
+    # replies, so large box sets need minutes, not 30 seconds.
+    manualimport_timeout: int = 180
 
 
 class LidarrClient:
@@ -58,6 +63,8 @@ class LidarrClient:
         self.cfg = cfg
         self.session = session or requests.Session()
         self.session.headers.update({"X-Api-Key": cfg.api_key})
+        self.manualimport_timeout = int(
+            getattr(cfg, "manualimport_timeout", 180) or 180)
 
     # ---- Path translation ------------------------------------------------
 
@@ -436,10 +443,17 @@ class LidarrClient:
         if artist_id:
             params["artistId"] = int(artist_id)
         try:
+            # Lidarr scans and match-parses EVERY file in the folder before it
+            # answers, so a multi-disc box (Pet Shop Boys "SMASH", the Maria
+            # Callas 60-CD set) routinely blows past the shared 30s _get
+            # budget -- the read times out, we return [] and the album is
+            # wrongly treated as having no import candidates. Give it the same
+            # 120s+ headroom the interactive-search calls get, scaled up
+            # because a 200-file box is the worst case.
             r = self.session.get(
                 self._url("/api/v1/manualimport"),
                 params=params,
-                timeout=30,
+                timeout=self.manualimport_timeout,
             )
             r.raise_for_status()
             data = r.json() or []

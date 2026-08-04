@@ -15,6 +15,7 @@ import json
 import logging
 import re
 import threading
+import time
 from dataclasses import asdict, replace
 from typing import List, Optional, TYPE_CHECKING
 
@@ -157,6 +158,7 @@ class OllamaClient:
         format_json: bool = False,
         num_predict: Optional[int] = None,
         timeout: Optional[float] = None,
+        label: str = "generate",
     ) -> str:
         if not self.enabled:
             return ""
@@ -183,6 +185,11 @@ class OllamaClient:
         # warmup/cold-load budget). Tag normalization is best-effort: we
         # don't want the pipeline blocked for 5 minutes on it.
         http_timeout = timeout if timeout is not None else self.timeout
+        # Every LLM call gets ONE log line. Without this a successful call is
+        # completely invisible (only failures used to log), so there was no way
+        # to tell "the LLM answered" apart from "the LLM was never asked" --
+        # which made the fallback impossible to reason about in production.
+        started = time.monotonic()
         try:
             r = self.session.post(
                 f"{self.base_url}/api/generate",
@@ -191,7 +198,13 @@ class OllamaClient:
             )
             r.raise_for_status()
             data = r.json()
-            return (data.get("response") or "").strip()
+            out = (data.get("response") or "").strip()
+            logger.info(
+                "LLM %s: %s in %.1fs (%d chars out)",
+                label, "answered" if out else "EMPTY",
+                time.monotonic() - started, len(out),
+            )
+            return out
         except requests.exceptions.ReadTimeout as exc:
             # With keep_alive=2h and a warmup at startup, a ReadTimeout on
             # a warm model almost always means runaway generation rather
@@ -283,7 +296,7 @@ class OllamaClient:
             "the corrected .cue text:\n\n"
             f"----- BEGIN CUE -----\n{text}\n----- END CUE -----"
         )
-        out = self._generate(_CUE_REPAIR_SYSTEM, prompt)
+        out = self._generate(_CUE_REPAIR_SYSTEM, prompt, label="repair_cue")
         if not out:
             return ""
         # Some models wrap in code fences despite instructions; strip them.
@@ -316,7 +329,8 @@ class OllamaClient:
             "catalog numbers.\nReply as EXACTLY one line: ARTIST | ALBUM"
         )
         out = self._generate(_IDENTITY_SPLIT_SYSTEM, prompt,
-                             num_predict=64, timeout=60.0)
+                             num_predict=64, timeout=60.0,
+                             label="parse_artist_album")
         ans = (out or "").strip().strip("`").strip()
         if "|" not in ans:
             return "", ""
@@ -355,7 +369,8 @@ class OllamaClient:
             "Which one is the SAME album as the download? "
             "Reply with the exact owned title, or NONE."
         )
-        out = self._generate(_ALBUM_MATCH_SYSTEM, prompt, num_predict=64, timeout=60.0)
+        out = self._generate(_ALBUM_MATCH_SYSTEM, prompt, num_predict=64,
+                             timeout=60.0, label="pick_owned_album")
         ans = (out or "").strip().strip("`").strip().strip('"').strip("'").strip()
         if not ans or ans.upper() == "NONE":
             self._match_cache[cache_key] = None
@@ -436,7 +451,8 @@ class OllamaClient:
             "list, copied verbatim, or NONE if unsure."
         )
         out = self._generate(
-            _ALBUM_MATCH_SYSTEM, prompt, num_predict=64, timeout=60.0)
+            _ALBUM_MATCH_SYSTEM, prompt, num_predict=64, timeout=60.0,
+            label="confirm_album")
         ans = (out or "").strip().strip("`").strip().strip('"').strip("'").strip()
         result = None
         if ans and ans.upper() != "NONE":
@@ -489,6 +505,7 @@ class OllamaClient:
             format_json=True,
             num_predict=token_cap,
             timeout=90.0,
+            label="normalize_tags",
         )
         if not out:
             return None

@@ -1081,6 +1081,10 @@ def main() -> int:
                         api_key=oc.get("api_key", ""),
                         timeout=int(oc.get("timeout_seconds", 60)),
                         enabled=True,
+                        rpm=int(oc.get("rpm", 10)),
+                        max_wait_seconds=float(oc.get("max_wait_seconds", 30)),
+                        max_retries=int(oc.get("max_retries", 3)),
+                        cooldown_seconds=float(oc.get("cooldown_seconds", 900)),
                     )
                 else:
                     llm = OllamaClient(
