@@ -642,6 +642,11 @@ class OrchestratorConfig:
     # only duration tells the studio master from a live cut.
     harvest_duration_tolerance: float = 10.0
     harvest_max_files_per_pass: int = 4000
+    # MOVE, not copy: the user has cache-drive space constraints and does not
+    # care about seeding, so once a track is in the library its source file must
+    # go rather than being duplicated. This DOES break the seed for the torrent
+    # the file came from -- that is the accepted trade.
+    harvest_import_mode: str = "move"
 
     # --- Re-check gating --------------------------------------------------
     # Don't recompute a verdict for a folder/torrent whose files AND Lidarr's
@@ -10542,6 +10547,8 @@ class Orchestrator:
          "How far a file's length may differ from the wanted track's. This is the check that separates the studio master from a live or alternate take of the same title -- title alone is not enough."),
         ("lidarr.harvest_max_files_per_pass", "lidarr", "harvest_max_files_per_pass", "Harvest: max files / pass", "int", 4000,
          "Safety cap on how many audio files are tag-read per harvest pass."),
+        ("lidarr.harvest_import_mode", "lidarr", "harvest_import_mode", "Harvest: import mode (move/copy)", "str", "move",
+         "move = the source file leaves the download folder once it is in the library, freeing cache space (this breaks seeding for that torrent). copy = keep the original too."),
         ("lidarr.recheck_skip_unchanged", "lidarr", "recheck_skip_unchanged", "Skip re-checking unchanged items", "bool", True,
          "Do not re-evaluate a needs-attention folder or torrent whose files AND Lidarr's library are both unchanged since the last look. Stops the same verdict being recomputed every pass (entries here had been re-checked up to 20 times)."),
         ("lidarr.transcode_lossless_to_flac", "lidarr", "transcode_lossless_to_flac", "Transcode lossless to FLAC", "bool", True,
@@ -10694,6 +10701,7 @@ class Orchestrator:
             "lidarr.harvest_dry_run",
             "lidarr.harvest_duration_tolerance",
             "lidarr.harvest_max_files_per_pass",
+            "lidarr.harvest_import_mode",
             "lidarr.recheck_skip_unchanged",
         ]),
         ("Discs, archives & conversion", [
