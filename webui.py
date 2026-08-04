@@ -137,6 +137,8 @@ _PAGE = r"""<!doctype html>
   .setrow label{min-width:15rem;flex:0 0 auto}
   .setrow .muted{flex:1;font-size:.78rem}
   .setsec>summary{display:flex;align-items:center;gap:.6rem}
+  /* push the Recommended button to the right edge of the category header */
+  .setsec>summary .setrec{margin-left:auto}
   .setrec{font-size:.7rem;padding:.15rem .45rem;font-weight:600}
   .setrow .setrecv{flex:0 0 auto;font-size:.7rem;opacity:.65;min-width:5.5rem;
     text-align:right}
