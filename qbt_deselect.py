@@ -549,10 +549,16 @@ def auto_deselect_pass(
             # Restore the original intent -- only if WE paused it (a re-check
             # never pauses, so it never touches start-state).
             if paused_by_us:
+                # We paused it only to narrow the file selection -- verify it
+                # actually starts again, otherwise the torrent sits at 0% with
+                # nothing in the log to say why.
                 if was_forced:
-                    qbt.force_start(h)    # preserve Lidarr's force-start
+                    ok_start = qbt.ensure_started(h)   # preserve force-start
                 else:
-                    qbt.resume(h)         # normal start
+                    ok_start = qbt.ensure_resumed(h)   # normal start
+                if not ok_start:
+                    emit(f"  WARNING: narrowed {str(t.get('name'))[:60]!r} but "
+                         f"qBittorrent did not restart it -- it is still paused")
     return acted
 
 
@@ -755,22 +761,25 @@ def stalled_grab_reaper_pass(
                      f"from {name!r} (idle {idle_days:.1f}d, {prog*100:.0f}%) -- "
                      f"{why}; torrent removed, files LEFT on disk for import")
             continue
+        blocklisted_any = False
         for r in (lidarr.queue_list() if (lidarr and blocklist) else []):
             if str(r.get("downloadId") or "").lower() == h.lower() \
                     and r.get("id") is not None:
                 try:
-                    if not lidarr.queue_remove(int(r["id"]),
-                                               remove_from_client=False,
-                                               blocklist=True):
-                        emit(f"  WARNING: could not blocklist queue row "
-                             f"{r.get('id')} -- Lidarr may re-grab this release")
+                    if lidarr.queue_remove(int(r["id"]),
+                                           remove_from_client=False,
+                                           blocklist=True):
+                        blocklisted_any = True
                 except Exception as exc:  # noqa: BLE001
                     emit(f"  WARNING: blocklist failed for {r.get('id')}: {exc}")
         if qbt.remove(h, delete_files=True):
             trashed += 1
             emit(f"stalled reaper: TRASHED {name!r} (idle {idle_days:.1f}d at "
                  f"{prog*100:.0f}%, nothing salvageable"
-                 f"{'; blocklisted' if blocklist else ''})")
+                 f"{'; blocklisted' if blocklisted_any else ''})")
+            if blocklist and not blocklisted_any:
+                emit(f"  note: no Lidarr queue row accepted the blocklist for "
+                     f"{name[:60]!r} -- the same release could come back")
     if salvaged or trashed:
         emit(f"stalled reaper: {salvaged} salvaged, {trashed} trashed")
     return salvaged, trashed

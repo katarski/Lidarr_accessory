@@ -8194,7 +8194,7 @@ class Orchestrator:
                     logger.warning("assembly: could not narrow %r before "
                                    "starting it: %s", title[:60], exc)
                 try:
-                    if not qbt.force_start(thash, True):
+                    if not qbt.ensure_started(thash):
                         logger.warning(
                             "assembly: narrowed %r but could not start it -- it "
                             "is left PAUSED in qBittorrent", title[:60])
@@ -8660,10 +8660,16 @@ class Orchestrator:
         try:
             rec = self.lidarr.queue_find_for(artist, album)
             if rec and rec.get("id") is not None:
-                self.lidarr.queue_remove(
-                    int(rec["id"]), remove_from_client=True, blocklist=True)
+                if not self.lidarr.queue_remove(
+                        int(rec["id"]), remove_from_client=True, blocklist=True):
+                    # the release is NOT on Lidarr's blocklist, so the next
+                    # search can hand us the same bad release again
+                    logger.warning(
+                        "rejected %s / %s but Lidarr did not blocklist it -- "
+                        "it may be grabbed again", artist, album)
         except Exception as exc:  # noqa: BLE001
-            logger.debug("interactive search: queue_remove failed: %s", exc)
+            logger.warning("interactive search: queue_remove failed for "
+                           "%s / %s: %s", artist, album, exc)
         if qbt is not None and thash:
             try:
                 if not qbt.remove(thash, delete_files=True):
@@ -8735,14 +8741,17 @@ class Orchestrator:
             verdict, info = self._verify_torrent(
                 qbt, thash, expected, label, album_id=aid)
             if verdict == "accept":
+                started = True
                 if qbt is not None:
                     # Force active: a confirmed interactive-search grab must
                     # download regardless of qBit queue/seeding limits.
-                    qbt.force_start(thash, True)
+                    started = qbt.ensure_started(thash)
                 logger.info(
                     "interactive search: %s -- ACCEPTED %r (%s audio, "
-                    "expected %d); force-started download", label,
-                    cand.get("title"), info.get("audio_count", "?"), expected)
+                    "expected %d); %s", label,
+                    cand.get("title"), info.get("audio_count", "?"), expected,
+                    "force-started download" if started
+                    else "BUT IT IS NOT DOWNLOADING -- see the warning above")
                 return True
             logger.info(
                 "interactive search: %s -- rejected %r (%s); blocklist + next",
@@ -8926,15 +8935,26 @@ class Orchestrator:
     def _reject_by_hash(self, thash: str, qbt, blocklist: bool = True) -> None:
         """Remove every Lidarr queue row for this torrent (blocklisting) and
         delete it + its data from qBittorrent."""
+        rows = took = 0
         try:
             for rec in self.lidarr.queue_list():
                 if (str(rec.get("downloadId") or "").lower() == thash
                         and rec.get("id") is not None):
-                    self.lidarr.queue_remove(
-                        int(rec["id"]), remove_from_client=True,
-                        blocklist=blocklist)
+                    rows += 1
+                    if self.lidarr.queue_remove(
+                            int(rec["id"]), remove_from_client=True,
+                            blocklist=blocklist):
+                        took += 1
+            # a 404 on some rows is normal (removing one row of a grouped
+            # download collapses its siblings); none taking is not
+            if blocklist and rows and not took:
+                logger.warning(
+                    "reject-by-hash %s: none of the %d queue row(s) accepted "
+                    "the blocklist -- Lidarr may re-grab this release",
+                    thash[:12], rows)
         except Exception as exc:  # noqa: BLE001
-            logger.debug("interactive search: reject-by-hash failed: %s", exc)
+            logger.warning("interactive search: reject-by-hash failed for %s: %s",
+                           thash[:12], exc)
         if qbt is not None and thash:
             try:
                 if not qbt.remove(thash, delete_files=True):
@@ -9008,7 +9028,10 @@ class Orchestrator:
             if verdict == "accept":
                 if qbt is not None:
                     # Force active regardless of source (backlog #10 follow-up).
-                    qbt.force_start(thash, True)
+                    if not qbt.ensure_started(thash):
+                        logger.warning(
+                            "interactive search: %s -- accepted %r but it is "
+                            "NOT downloading", artist_name, cand.get("title"))
                 logger.info(
                     "interactive search: %s -- ACCEPTED %s %r (%s); force-started"
                     "%s", artist_name, kind, cand.get("title"), detail,
