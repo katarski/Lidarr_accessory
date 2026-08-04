@@ -657,6 +657,11 @@ class OrchestratorConfig:
     # Stage leftovers here before deleting, so a pass can be inspected. Empty
     # deletes in place.
     harvest_leftovers_dir: str = ""
+    # Where files that are STILL WANTED get consolidated when their box folder
+    # is dissolved. Without this, one wanted track pins an entire 10-CD box (and
+    # its torrent) on disk; with it, the box goes and the wanted songs live in
+    # one folder that is itself harvested on later passes.
+    harvest_keep_dir: str = "/downloads/_harvest_pending"
 
     # --- Re-check gating --------------------------------------------------
     # Don't recompute a verdict for a folder/torrent whose files AND Lidarr's
@@ -10559,6 +10564,8 @@ class Orchestrator:
          "Safety cap on how many audio files are tag-read per harvest pass."),
         ("lidarr.harvest_purge_leftovers", "lidarr", "harvest_purge_leftovers", "Harvest: delete what is not needed", "bool", False,
          "After harvesting, DELETE everything the source still holds that no album wants, and remove the torrent (with data) from qBittorrent. Files still wanted by Lidarr are re-checked and survive. IRREVERSIBLE -- and 'not wanted' means not wanted right now, so adding an artist later cannot bring a deleted file back."),
+        ("lidarr.harvest_keep_dir", "lidarr", "harvest_keep_dir", "Harvest: keep-folder for still-wanted songs", "str", "/downloads/_harvest_pending",
+         "Files still wanted by Lidarr are moved here when their box folder is dissolved, so one wanted track does not pin a whole 10-CD box (and its torrent) on disk. This folder is itself harvested on later passes. Empty leaves them in place."),
         ("lidarr.harvest_leftovers_dir", "lidarr", "harvest_leftovers_dir", "Harvest: leftovers staging folder", "str", "",
          "Move leftovers here before deleting, so a pass can be inspected first. Leave empty to delete in place."),
         ("lidarr.harvest_import_mode", "lidarr", "harvest_import_mode", "Harvest: import mode (move/copy)", "str", "move",
@@ -10717,6 +10724,7 @@ class Orchestrator:
             "lidarr.harvest_max_files_per_pass",
             "lidarr.harvest_import_mode",
             "lidarr.harvest_purge_leftovers",
+            "lidarr.harvest_keep_dir",
             "lidarr.harvest_leftovers_dir",
             "lidarr.recheck_skip_unchanged",
         ]),

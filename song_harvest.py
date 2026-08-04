@@ -546,6 +546,7 @@ def harvest_pass(
     purge_leftovers_enabled: bool = False,
     leftovers_dir: Optional[str] = None,
     qbt=None,
+    keep_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Walk each source folder, harvest whatever songs Lidarr is missing, and
@@ -556,6 +557,11 @@ def harvest_pass(
     """
     index = build_wanted_index(lidarr)
     wsig = wanted_signature(index)
+    # The consolidated keep-folder is a source in its own right: songs parked
+    # there are exactly the ones a later pass should be able to take.
+    sources = list(sources)
+    if keep_dir and os.path.isdir(keep_dir) and keep_dir not in sources:
+        sources.append(keep_dir)
     stats = {"sources": 0, "skipped_unchanged": 0, "scanned": 0,
              "matched": 0, "imported": 0, "albums": 0, "no_quality": 0}
     albums: set = set()
@@ -605,7 +611,8 @@ def harvest_pass(
                             tolerance_seconds=tolerance_seconds,
                             staging_dir=leftovers_dir,
                             delete=purge_leftovers_enabled,
-                            qbt=qbt if purge_leftovers_enabled else None)
+                            qbt=qbt if purge_leftovers_enabled else None,
+                            keep_dir=keep_dir)
                         for k in ("deleted", "bytes_freed", "torrent_removed",
                                   "kept_wanted"):
                             stats["purge_" + k] = (
@@ -646,6 +653,7 @@ def purge_leftovers(
     staging_dir: Optional[str] = None,
     delete: bool = False,
     qbt=None,
+    keep_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Deal with what a harvested source still holds once its wanted tracks are in
@@ -681,7 +689,29 @@ def purge_leftovers(
                 rep = match_files([sf], index,
                                   tolerance_seconds=tolerance_seconds)
                 if rep.matches:
+                    # Still wanted -- a later pass takes it. Consolidate it into
+                    # the harvest folder so the original box folder can be
+                    # dissolved entirely and its torrent dropped, instead of
+                    # leaving one wanted file behind pinning the whole thing.
                     stats["kept_wanted"] += 1
+                    if keep_dir:
+                        try:
+                            dest = os.path.join(keep_dir, os.path.basename(full))
+                            os.makedirs(keep_dir, exist_ok=True)
+                            # Never clobber a same-named song from another box.
+                            if os.path.exists(dest):
+                                stem, ext = os.path.splitext(dest)
+                                dest = "%s (%s)%s" % (
+                                    stem,
+                                    os.path.basename(dirpath.rstrip("/"))[:24],
+                                    ext)
+                            if not os.path.exists(dest):
+                                os.replace(full, dest)
+                                stats["kept_moved"] = stats.get(
+                                    "kept_moved", 0) + 1
+                        except OSError as exc:
+                            stats["errors"] += 1
+                            logger.warning("harvest keep: %s -- %s", full, exc)
                     continue
             leftovers.append(full)
     stats["leftover"] = len(leftovers)
