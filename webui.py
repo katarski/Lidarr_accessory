@@ -543,6 +543,8 @@ function plQueueFolder(rel,label){
                                                       secs:f.secs||null};});
       if(!files.length){toast('No audio in that folder');return;}
       PLQ=files; PLQI=0;
+      var box=document.getElementById('pl-plist');
+      if(box&&PLQ.length>1)box.open=true;      // only on a fresh queue
       plOpenQueued(label);
    }).catch(function(){toast('Could not read that folder');});
 }
@@ -579,6 +581,18 @@ function plRenderList(){
       +'<td class="t" onclick="plJump('+i+')">'+h(plNiceName(it.name))+'</td>'
       +'<td class="d">'+(it.secs?fmtTime(it.secs):'')+'</td></tr>';
   }).join('');
+  plScrollToCurrent();
+}
+// Keep the playing track in view as the queue advances. Scrolls the playlist
+// PANE only (not the page), and centres the row when there is room, so you can
+// see what is coming next as well as what is playing.
+function plScrollToCurrent(){
+  var tb=document.getElementById('pl-pltbl'); if(!tb)return;
+  var row=tb.querySelector('tr.on'); if(!row)return;
+  var pane=tb.closest?tb.closest('.pltbl'):null; if(!pane)return;
+  var target=row.offsetTop-Math.max(0,(pane.clientHeight-row.offsetHeight)/2);
+  var max=Math.max(0,pane.scrollHeight-pane.clientHeight);
+  pane.scrollTop=Math.min(Math.max(0,target),max);
 }
 function plJump(i){
   if(i<0||i>=PLQ.length)return;
