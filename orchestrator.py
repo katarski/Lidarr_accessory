@@ -617,6 +617,37 @@ class OrchestratorConfig:
     assembly_min_pct: float = 10.0
     # Safety cap on how many source songs are indexed per pass.
     assembly_max_source_files: int = 20000
+    # A MAGNET has no file list until metadata is fetched from peers; on a thin
+    # swarm that is minutes, and the old hard-coded 45s discarded good grabs.
+    # The torrent is paused while we wait, so this costs no bandwidth.
+    assembly_filelist_timeout: int = 180
+    # How long to wait for a grabbed torrent to show up in qBittorrent, matched
+    # by INFOHASH (exact) rather than by title (which needs metadata first).
+    assembly_verify_timeout: int = 180
+    # Format weighting for the song hunt. Health + compilation-bonus alone let a
+    # 1-seeder mp3 outrank a 5-seeder FLAC box.
+    assembly_lossless_bonus: float = 30.0
+    assembly_lossy_penalty: float = 15.0
+
+    # --- Song harvest (salvage tracks already on disk) ---------------------
+    # Lidarr imports album-at-a-time, so a compilation disc has no album target
+    # and parks in needs-attention forever even when the songs inside it are
+    # tracks Lidarr wants. This matches per SONG and imports just those.
+    harvest_enabled: bool = True
+    # Report only. Stays ON by default: a wrongly-imported track has to be
+    # found and removed by hand, so the report is reviewed first.
+    harvest_dry_run: bool = True
+    # How far a file's length may differ from the wanted track's. THE key
+    # check -- a box set repeats a title across discs as different takes, and
+    # only duration tells the studio master from a live cut.
+    harvest_duration_tolerance: float = 10.0
+    harvest_max_files_per_pass: int = 4000
+
+    # --- Re-check gating --------------------------------------------------
+    # Don't recompute a verdict for a folder/torrent whose files AND Lidarr's
+    # library are both unchanged. Entries had been re-checked up to 20 times,
+    # each time deriving the same "no monitored album target".
+    recheck_skip_unchanged: bool = True
     # Albums planned per pass (each costs a Lidarr track-list request). The rest
     # roll to the next pass, least-recently-planned first.
     assembly_max_albums_per_pass: int = 150
@@ -8206,12 +8237,19 @@ class Orchestrator:
             files = []
             try:
                 qbt.pause(thash)
-                deadline = time.time() + 45
+                # A MAGNET carries no file list until metadata is fetched from
+                # peers, and on a thin swarm that takes minutes -- 45s meant a
+                # perfectly good grab was declared "no file list" and thrown
+                # away ("Nat King Cole - The Extraordinary Deluxe ... [24-192 HD
+                # FLAC]"). The torrent stays PAUSED throughout, so waiting costs
+                # no bandwidth.
+                deadline = time.time() + int(getattr(
+                    self.cfg, "assembly_filelist_timeout", 180))
                 while time.time() < deadline:
                     files = qbt.files(thash)
                     if files:
                         break
-                    time.sleep(3)
+                    time.sleep(5)
             except Exception:  # noqa: BLE001
                 files = []
             if not files:
@@ -10488,6 +10526,24 @@ class Orchestrator:
          "Only match a song when its artist agrees with the album's artist. Off invites matches from unrelated records."),
         ("lidarr.assembly_min_pct", "lidarr", "assembly_min_pct", "Assembly: min assembled (%)", "float", 10.0,
          "Hide plans below this completeness so the tab is not full of 1-song matches."),
+        ("lidarr.assembly_filelist_timeout", "lidarr", "assembly_filelist_timeout", "Assembly: magnet file-list wait (s)", "int", 180,
+         "How long to wait for a magnet's file list before giving up on a grab. A magnet has no file list until metadata arrives from peers, and on a thin swarm that takes minutes -- the old 45s threw away good grabs. The torrent stays paused while waiting, so this costs no bandwidth."),
+        ("lidarr.assembly_verify_timeout", "lidarr", "assembly_verify_timeout", "Assembly: grab verify wait (s)", "int", 180,
+         "How long to wait for a grabbed torrent to appear in qBittorrent, matched by infohash."),
+        ("lidarr.assembly_lossless_bonus", "lidarr", "assembly_lossless_bonus", "Assembly: lossless bonus", "float", 30.0,
+         "Rank bonus for a FLAC/APE/lossless release. Without it a 1-seeder mp3 outranks a 5-seeder FLAC box."),
+        ("lidarr.assembly_lossy_penalty", "lidarr", "assembly_lossy_penalty", "Assembly: lossy penalty", "float", 15.0,
+         "Rank penalty for an mp3/AAC release. Not a hard refusal -- a live lossy swarm still beats a dead lossless one."),
+        ("lidarr.harvest_enabled", "lidarr", "harvest_enabled", "Harvest: salvage songs already on disk", "bool", True,
+         "Match individual songs sitting in needs-attention (compilations, box sets) against tracks Lidarr is missing, per SONG rather than per album, and import just those. This is how a 10-CD box parked as 'no monitored album target' finally gives up its wanted tracks."),
+        ("lidarr.harvest_dry_run", "lidarr", "harvest_dry_run", "Harvest: dry run (report only)", "bool", True,
+         "Report what would be imported without writing anything. Leave ON until the report looks right -- a wrong track file has to be found and deleted by hand."),
+        ("lidarr.harvest_duration_tolerance", "lidarr", "harvest_duration_tolerance", "Harvest: duration tolerance (s)", "float", 10.0,
+         "How far a file's length may differ from the wanted track's. This is the check that separates the studio master from a live or alternate take of the same title -- title alone is not enough."),
+        ("lidarr.harvest_max_files_per_pass", "lidarr", "harvest_max_files_per_pass", "Harvest: max files / pass", "int", 4000,
+         "Safety cap on how many audio files are tag-read per harvest pass."),
+        ("lidarr.recheck_skip_unchanged", "lidarr", "recheck_skip_unchanged", "Skip re-checking unchanged items", "bool", True,
+         "Do not re-evaluate a needs-attention folder or torrent whose files AND Lidarr's library are both unchanged since the last look. Stops the same verdict being recomputed every pass (entries here had been re-checked up to 20 times)."),
         ("lidarr.transcode_lossless_to_flac", "lidarr", "transcode_lossless_to_flac", "Transcode lossless to FLAC", "bool", True,
          "Convert APE/WavPack/ALAC/WAV and friends to FLAC so Lidarr imports them."),
         ("lidarr.transcode_dsd", "lidarr", "transcode_dsd", "Transcode DSD", "bool", True,
@@ -10630,6 +10686,15 @@ class Orchestrator:
             "lidarr.assembly_min_score",
             "lidarr.assembly_require_artist",
             "lidarr.assembly_min_pct",
+            "lidarr.assembly_filelist_timeout",
+            "lidarr.assembly_verify_timeout",
+            "lidarr.assembly_lossless_bonus",
+            "lidarr.assembly_lossy_penalty",
+            "lidarr.harvest_enabled",
+            "lidarr.harvest_dry_run",
+            "lidarr.harvest_duration_tolerance",
+            "lidarr.harvest_max_files_per_pass",
+            "lidarr.recheck_skip_unchanged",
         ]),
         ("Discs, archives & conversion", [
             "lidarr.extract_archives",

@@ -131,6 +131,15 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     put("lidarr", "assembly_enabled", "ASSEMBLY_ENABLED", _as_bool)
     put("lidarr", "assembly_interval_seconds", "ASSEMBLY_INTERVAL", int)
     put("lidarr", "assembly_min_score", "ASSEMBLY_MIN_SCORE", float)
+    put("lidarr", "assembly_filelist_timeout", "ASSEMBLY_FILELIST_TIMEOUT", int)
+    put("lidarr", "assembly_verify_timeout", "ASSEMBLY_VERIFY_TIMEOUT", int)
+    put("lidarr", "assembly_lossless_bonus", "ASSEMBLY_LOSSLESS_BONUS", float)
+    put("lidarr", "assembly_lossy_penalty", "ASSEMBLY_LOSSY_PENALTY", float)
+    put("lidarr", "harvest_enabled", "HARVEST_ENABLED", bool)
+    put("lidarr", "harvest_dry_run", "HARVEST_DRY_RUN", bool)
+    put("lidarr", "harvest_duration_tolerance", "HARVEST_DURATION_TOLERANCE", float)
+    put("lidarr", "harvest_max_files_per_pass", "HARVEST_MAX_FILES", int)
+    put("lidarr", "recheck_skip_unchanged", "RECHECK_SKIP_UNCHANGED", bool)
     put("lidarr", "assembly_min_pct", "ASSEMBLY_MIN_PCT", float)
     put("lidarr", "assembly_max_albums_per_pass", "ASSEMBLY_MAX_ALBUMS", int)
     put("lidarr", "external_audit_enabled", "EXTERNAL_AUDIT_ENABLED", _as_bool)
@@ -1365,6 +1374,22 @@ def main() -> int:
         assembly_min_pct=float(lidarr_cfg.get("assembly_min_pct", 10.0)),
         assembly_max_source_files=int(
             lidarr_cfg.get("assembly_max_source_files", 20000)),
+        assembly_filelist_timeout=int(
+            lidarr_cfg.get("assembly_filelist_timeout", 180)),
+        assembly_verify_timeout=int(
+            lidarr_cfg.get("assembly_verify_timeout", 180)),
+        assembly_lossless_bonus=float(
+            lidarr_cfg.get("assembly_lossless_bonus", 30.0)),
+        assembly_lossy_penalty=float(
+            lidarr_cfg.get("assembly_lossy_penalty", 15.0)),
+        harvest_enabled=bool(lidarr_cfg.get("harvest_enabled", True)),
+        harvest_dry_run=bool(lidarr_cfg.get("harvest_dry_run", True)),
+        harvest_duration_tolerance=float(
+            lidarr_cfg.get("harvest_duration_tolerance", 10.0)),
+        harvest_max_files_per_pass=int(
+            lidarr_cfg.get("harvest_max_files_per_pass", 4000)),
+        recheck_skip_unchanged=bool(
+            lidarr_cfg.get("recheck_skip_unchanged", True)),
         assembly_max_albums_per_pass=int(
             lidarr_cfg.get("assembly_max_albums_per_pass", 150)),
         assembly_hunt_per_pass=int(
