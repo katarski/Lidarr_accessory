@@ -125,6 +125,17 @@ _PAGE = r"""<!doctype html>
   .cvsec{background:var(--card);border:1px solid var(--bd);border-radius:10px;margin-bottom:.55rem;padding:.15rem .7rem}
   .cvsec>summary{cursor:pointer;font-weight:600;padding:.4rem 0;user-select:none}
   .cvbody{padding:.3rem 0 .55rem;display:flex;flex-direction:column;gap:.4rem}
+  /* Settings tab: one collapsible card per category */
+  .setsec{background:var(--card);border:1px solid var(--bd);border-radius:10px;
+    margin-bottom:.55rem;padding:.15rem .7rem}
+  .setsec>summary{cursor:pointer;font-weight:700;padding:.45rem 0;
+    user-select:none}
+  .setbody{padding:.1rem 0 .5rem}
+  .setrow{display:flex;align-items:center;gap:1rem;padding:.3rem 0;
+    border-top:1px solid var(--bd)}
+  .setrow:first-child{border-top:0}
+  .setrow label{min-width:15rem;flex:0 0 auto}
+  .setrow .muted{flex:1;font-size:.78rem}
   /* Assembly rows: same card + right-aligned action buttons as a Needs
      attention row, so the two tabs read the same way */
   .asmrow>summary{display:flex;align-items:center;gap:.5rem;flex-wrap:wrap}
@@ -961,12 +972,22 @@ function asmRender(){
 }
 function loadSettings(){fetch('/api/settings').then(function(r){return r.json();}).then(function(j){
   var s=j.settings||[];SETTINGS=s;
-  document.getElementById('setform').innerHTML=s.map(function(o){
+  var out='',group=null;
+  s.forEach(function(o){
+    var g=o.group||'Other';
+    if(g!==group){
+      if(group!==null)out+='</div></details>';
+      out+='<details class="setsec" open><summary>'+h(g)+'</summary><div class="setbody">';
+      group=g;
+    }
     var ctl=o.type==='bool'
       ? '<input type="checkbox" data-sid="'+h(o.id)+'" data-type="bool" '+(o.value?'checked':'')+'>'
       : '<input type="'+(o.type==='int'?'number':'text')+'" data-sid="'+h(o.id)+'" data-type="'+h(o.type)+'" value="'+h(o.value)+'" style="width:8rem">';
-    return '<div class="procard" style="justify-content:flex-start;gap:1rem"><label style="min-width:15rem"><b>'+h(o.label)+'</b></label>'+ctl+'<span class="muted" style="flex:1">'+h(o.help)+'</span></div>';
-  }).join('');});}
+    out+='<div class="setrow"><label><b>'+h(o.label)+'</b></label>'+ctl
+        +'<span class="muted">'+h(o.help)+'</span></div>';
+  });
+  if(group!==null)out+='</div></details>';
+  document.getElementById('setform').innerHTML=out;});}
 function saveSettings(restart){
   var changes={};
   document.querySelectorAll('#setform [data-sid]').forEach(function(el){

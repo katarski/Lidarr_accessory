@@ -10261,7 +10261,7 @@ class Orchestrator:
         ("lidarr.interactive_search_min_missing_days", "lidarr", "interactive_search_min_missing_days", "Min days missing", "int", 3,
          "Wait this many days before grabbing, so Lidarr's own search goes first. 0 = act immediately."),
         ("lidarr.interactive_search_max_albums_per_pass", "lidarr", "interactive_search_max_albums_per_pass", "Max albums / pass", "int", 15,
-         "Cap albums processed per pass so a big backlog doesn't flood the indexers."),
+         "How many albums get their own search each pass, stalest first, so a big backlog rotates instead of flooding the indexers. Each album that finds nothing may also cost one artist-scope (discography) search."),
         ("lidarr.interactive_search_interval_seconds", "lidarr", "interactive_search_interval_seconds", "Search interval (s)", "int", 3600,
          "Seconds between interactive-search passes (min 300)."),
         ("lidarr.interactive_search_require_lossless", "lidarr", "interactive_search_require_lossless", "Prefer lossless", "bool", True,
@@ -10322,14 +10322,79 @@ class Orchestrator:
          "After a verified import, delete the whole source download folder."),
     ]
 
+    # Settings tab layout: which category each setting appears under.
+    # The config section a value lives in says where it is stored, not
+    # what it affects, so the user-facing grouping is declared here.
+    _SETTINGS_GROUPS = [
+        ("Finding missing music", [
+            "lidarr.interactive_search_enabled",
+            "lidarr.interactive_search_dry_run",
+            "lidarr.interactive_search_min_missing_days",
+            "lidarr.interactive_search_max_albums_per_pass",
+            "lidarr.interactive_search_interval_seconds",
+            "lidarr.external_audit_enabled",
+        ]),
+        ("Which release to accept", [
+            "lidarr.interactive_search_require_lossless",
+            "lidarr.interactive_search_refuse_unofficial",
+            "lidarr.verify_track_titles",
+            "lidarr.interactive_search_min_seeders",
+            "lidarr.interactive_search_seeder_weight",
+        ]),
+        ("Importing", [
+            "lidarr.reconcile_enabled",
+            "lidarr.reconcile_interval_seconds",
+            "lidarr.reconcile_require_full_album",
+            "lidarr.content_identify",
+            "lidarr.content_identify_llm",
+            "staging.delete_source_folder_on_success",
+        ]),
+        ("Torrents", [
+            "qbittorrent.deselect_video",
+            "qbittorrent.redeselect_recheck_seconds",
+            "qbittorrent.reap_useless_torrents",
+            "qbittorrent.reap_completed_wanted_only",
+            "qbittorrent.stalled_reaper",
+            "qbittorrent.stalled_grace_days",
+            "qbittorrent.dead_grab_reaper",
+            "qbittorrent.dead_grab_grace_minutes",
+        ]),
+        ("Needs attention & Assembly", [
+            "lidarr.assembly_enabled",
+            "lidarr.held_auto_resolve",
+            "lidarr.webui_unmonitor_on_resolve",
+            "lidarr.webui_held_refresh_seconds",
+        ]),
+        ("Discs, archives & conversion", [
+            "lidarr.extract_archives",
+            "lidarr.extract_dvda_iso",
+            "lidarr.extract_sacd_iso",
+            "lidarr.prefer_multichannel",
+        ]),
+    ]
+
     def get_settings(self):
-        """Current values of the curated settings (for the WebUI Settings tab)."""
-        out = []
+        """Current values of the curated settings (for the WebUI Settings tab).
+
+        Returned in category order, each row tagged with its group, so the tab
+        can draw sections without knowing anything about the schema.
+        """
+        group_of = {}
+        order = {}
+        for gi, (gname, ids) in enumerate(self._SETTINGS_GROUPS):
+            for si, sid in enumerate(ids):
+                group_of[sid] = gname
+                order[sid] = (gi, si)
+        rows = []
         for sid, section, key, label, typ, default, help_ in self._SETTINGS_SCHEMA:
             val = (self._raw_cfg.get(section) or {}).get(key, default)
-            out.append({"id": sid, "label": label, "type": typ,
-                        "value": val, "help": help_})
-        return out
+            rows.append({"id": sid, "label": label, "type": typ,
+                         "value": val, "help": help_,
+                         # anything not listed above still shows up, last
+                         "group": group_of.get(sid, "Other")})
+        rows.sort(key=lambda r: order.get(r["id"], (len(self._SETTINGS_GROUPS),
+                                                    0)))
+        return rows
 
     def save_settings(self, changes: Dict[str, Any]) -> Tuple[bool, str]:
         """
