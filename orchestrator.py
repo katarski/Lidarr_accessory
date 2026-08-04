@@ -7944,8 +7944,23 @@ class Orchestrator:
             return False, "search failed: %s" % exc
         n = len(plan.get("missing") or [])
         if ok:
-            return True, "search started for %d missing song(s)" % n
-        return False, "no acceptable release found (see log)"
+            return True, "grabbed a release to fill %d missing song(s)" % n
+        # Be specific: "nothing found" and "found but refused" are very different
+        # answers for the user. The ranked list tells us which happened.
+        try:
+            rel = self.lidarr.release_search(int(album_id)) or []
+            n_tor = sum(1 for r in rel
+                        if str(r.get("protocol") or "").lower() == "torrent")
+        except Exception:  # noqa: BLE001
+            n_tor = -1
+        if n_tor == 0:
+            return False, ("your indexers returned NO torrent for this album -- "
+                           "nothing to grab (not a rejection)")
+        if n_tor > 0:
+            return False, ("%d torrent(s) offered but none passed the checks "
+                           "(non-official / too few seeders / songs did not "
+                           "match) -- see log" % n_tor)
+        return False, "search failed -- see log"
 
     @staticmethod
     def _write_basic_tags(path, artist, album, title, track, total):

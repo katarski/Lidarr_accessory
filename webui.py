@@ -217,12 +217,12 @@ _PAGE = r"""<!doctype html>
       <span class="muted" id="asm-seln">0 selected</span>
       <button class="b-copy" onclick="asmAll(true)">Select all</button>
       <button class="b-copy" onclick="asmAll(false)">Clear</button>
-      <button class="b-copy" title="Search for the songs still missing"
-              onclick="asmAct('find')">Find missing</button>
-      <button class="b-copy" title="Assemble the matched songs into the Lidarr album"
-              onclick="asmAct('add')">Add to library</button>
-      <button class="b-copy" title="Dismiss these rows (no files touched)"
-              onclick="asmAct('remove')">Remove</button>
+      <select id="asmact" onchange="if(this.value){asmAct(this.value);this.value='';}">
+        <option value="">Actions on selected albums…</option>
+        <option value="find">Find missing songs</option>
+        <option value="add">Add to library (assemble + import)</option>
+        <option value="remove">Remove (dismiss row, keep files)</option>
+      </select>
       <button class="b-copy" onclick="asmLoad()">Reload</button>
     </div>
     <div id="asm-list"></div>
