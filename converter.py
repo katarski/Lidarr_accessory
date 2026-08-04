@@ -246,6 +246,77 @@ class LibraryTree:
             self._details[rel] = det
         return det
 
+    def refresh_dir(self, rel: str) -> Dict[str, Any]:
+        """
+        Re-stat a SINGLE folder and update the cache in place, so a file that was
+        just written (or deleted) shows immediately instead of waiting for the
+        hourly background rescan. Rolled-up ancestor totals are adjusted by the
+        delta rather than re-walking the library.
+
+        Returns {"files": n, "size": bytes} for the folder after refreshing.
+        """
+        rel = (rel or "").strip("/")
+        p = self.root / rel if rel else self.root
+        size = 0
+        nfiles = 0
+        try:
+            for entry in os.scandir(p):
+                if not entry.is_file():
+                    continue
+                if os.path.splitext(entry.name)[1].lower() not in AUDIO_EXTS:
+                    continue
+                try:
+                    size += entry.stat().st_size
+                    nfiles += 1
+                except OSError:
+                    continue
+        except OSError:
+            # Folder is gone -- drop it and let the caller re-render.
+            with self._lock:
+                self._dirs.pop(rel, None)
+            self._save()
+            return {"files": 0, "size": 0, "gone": True}
+
+        with self._lock:
+            prev = self._dirs.get(rel) or {"size": 0, "files": 0}
+            # `prev` for a parent folder includes its children's rolled-up
+            # totals, so keep that part and swap only this folder's OWN files.
+            own_prev = prev.get("own_size", prev.get("size", 0))
+            own_prev_n = prev.get("own_files", prev.get("files", 0))
+            d_size = size - own_prev
+            d_files = nfiles - own_prev_n
+            self._dirs[rel] = {
+                "size": prev.get("size", 0) + d_size,
+                "files": prev.get("files", 0) + d_files,
+                "own_size": size, "own_files": nfiles,
+            }
+            # Push the delta up the tree so folder sizes stay believable.
+            parent = rel
+            while parent:
+                parent = parent.rsplit("/", 1)[0] if "/" in parent else ""
+                if parent in self._dirs:
+                    self._dirs[parent]["size"] = max(
+                        0, self._dirs[parent].get("size", 0) + d_size)
+                    self._dirs[parent]["files"] = max(
+                        0, self._dirs[parent].get("files", 0) + d_files)
+                if not parent:
+                    break
+            # Forget per-file details for anything no longer on disk.
+            pref = (rel + "/") if rel else ""
+            live = set()
+            try:
+                for entry in os.scandir(p):
+                    if entry.is_file():
+                        live.add(pref + entry.name)
+            except OSError:
+                pass
+            for k in [k for k in self._details
+                      if k.startswith(pref) and "/" not in k[len(pref):]
+                      and k not in live]:
+                self._details.pop(k, None)
+        self._save()
+        return {"files": nfiles, "size": size}
+
     def list_dir(self, rel: str) -> Optional[Dict[str, Any]]:
         """One level: subfolders (with rolled-up sizes from the cache) +
         audio files (with lazily-cached detail). None if path escapes root."""
@@ -351,7 +422,7 @@ class ConvertManager:
     """Converts library files to MP3/AAC/Opus with live progress."""
 
     def __init__(self, root: Path, ffmpeg: str = "ffmpeg", llm=None,
-                 lidarr=None, lidarr_root: str = ""):
+                 lidarr=None, lidarr_root: str = "", tree=None):
         self.root = Path(root)
         self.ffmpeg = ffmpeg
         self.llm = llm
@@ -359,6 +430,9 @@ class ConvertManager:
         # by OVERWRITE mode to tell Lidarr a library file was replaced.
         self.lidarr = lidarr
         self.lidarr_root = str(lidarr_root or "")
+        # LibraryTree, so a finished conversion updates just its folder in the
+        # cache and the new (or removed) file shows in the UI immediately.
+        self.tree = tree
         self._lock = threading.Lock()
         self._jobs: Dict[str, Dict[str, Any]] = {}   # id -> job dict
         self._queue: List[str] = []
@@ -751,6 +825,17 @@ class ConvertManager:
                 job["msg"] = str(exc)[:300]
             logger.exception("convert job %s failed", jid)
         finally:
+            # Whatever happened, this folder's contents may have changed (a new
+            # lossy file, a replaced original). Update just that folder so the
+            # tree is truthful without a full rescan.
+            try:
+                if self.tree is not None and job:
+                    rel = str(job.get("rel") or "").strip("/")
+                    parent = rel.rsplit("/", 1)[0] if "/" in rel else ""
+                    self.tree.refresh_dir(parent)
+                    job["refreshed"] = parent
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("post-convert tree refresh failed: %s", exc)
             with self._lock:
                 self._active -= 1
             self._pump()

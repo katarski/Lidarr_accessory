@@ -7915,11 +7915,19 @@ class Orchestrator:
 
     def assembly_find_missing(self, album_id):
         """
-        Go looking for the songs this assembly still lacks: run the normal
-        interactive search for the album. Anything grabbed is content-verified as
-        usual, and songs an assembly needs are protected from the deselect
-        (assembly_keep) -- so a compilation grabbed for one missing track keeps
-        that track even though its other albums are already owned.
+        Hunt for the songs this assembly still lacks -- in COLLECTIONS.
+
+        A missing song usually isn't available as its own album; it sits on a
+        compilation, a best-of, a box set. So this deliberately does the OPPOSITE
+        of a normal grab: it searches the ARTIST's whole release list (not just
+        this album), and it ALLOWS the non-official releases the ordinary grab
+        filter refuses, because here we only ever want to cherry-pick songs out
+        of them.
+
+        A candidate is accepted only if its file list actually contains one of the
+        missing song titles. Once accepted, the deselect narrows the download to
+        the songs some assembly needs (assembly_keep union) and drops the rest --
+        so a 3-CD best-of pulls the one track you're missing, not 60.
         """
         store = getattr(self, "assembly", None)
         if store is None:
@@ -7927,40 +7935,128 @@ class Orchestrator:
         plan = store.get(album_id)
         if not plan:
             return False, "no plan for that album"
+        missing = [str(m.get("track") or "") for m in (plan.get("missing") or [])]
+        missing = [m for m in missing if m.strip()]
+        if not missing:
+            return False, "nothing missing -- use Add to library"
+        artist = str(plan.get("artist") or "")
         try:
-            alb = self.lidarr.get_album(int(album_id)) or {}
+            full = self.lidarr.get_album(int(album_id)) or {}
+            artist_id = int((full.get("artist") or {}).get("id")
+                            or full.get("artistId") or 0)
         except Exception as exc:  # noqa: BLE001
             return False, "Lidarr lookup failed: %s" % exc
-        if not alb:
-            return False, "album not in Lidarr"
+        if not artist_id:
+            return False, "could not resolve the Lidarr artist id"
+
+        # Artist-scope search first (that is where collections show up), with the
+        # album's own search as a fallback.
+        rels = []
+        try:
+            rels = list(self.lidarr.release_search_artist(artist_id) or [])
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("assembly search (artist) failed: %s", exc)
+        try:
+            rels += list(self.lidarr.release_search(int(album_id)) or [])
+        except Exception:  # noqa: BLE001
+            pass
+        min_seed = max(0, int(getattr(
+            self.cfg, "interactive_search_min_seeders", 1)))
+        cands = []
+        seen_guid = set()
+        for r in rels:
+            if str(r.get("protocol") or "").lower() != "torrent":
+                continue
+            g = r.get("guid")
+            if not g or g in seen_guid:
+                continue
+            seen_guid.add(g)
+            seeders = int(r.get("seeders") or 0)
+            if seeders < min_seed:
+                continue
+            cands.append((self._release_health(seeders,
+                                              int(r.get("leechers") or 0)), r))
+        if not cands:
+            return False, ("your indexers offered no torrent with at least "
+                           "%d seeder(s) for %s" % (min_seed, artist))
+        cands.sort(key=lambda t: -t[0])
+        return self._assembly_grab_for_songs(
+            album_id, artist, missing, [c[1] for c in cands])
+
+    def _assembly_grab_for_songs(self, album_id, artist, missing, cands):
+        """
+        Grab candidates in turn until one actually contains a missing song.
+        Anything that doesn't is removed and blocklisted, so the next attempt
+        tries something else instead of the same dud.
+        """
+        from assembly import norm_title, similarity
+        want = [norm_title(t) for t in missing]
+        want = [w for w in want if w]
+        qbt = None
         try:
             qbt = self._get_qbt()
         except Exception:  # noqa: BLE001
             qbt = None
-        try:
-            ok = self._isearch_one_album(alb, {}, qbt)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("assembly find-missing failed: %s", exc)
-            return False, "search failed: %s" % exc
-        n = len(plan.get("missing") or [])
-        if ok:
-            return True, "grabbed a release to fill %d missing song(s)" % n
-        # Be specific: "nothing found" and "found but refused" are very different
-        # answers for the user. The ranked list tells us which happened.
-        try:
-            rel = self.lidarr.release_search(int(album_id)) or []
-            n_tor = sum(1 for r in rel
-                        if str(r.get("protocol") or "").lower() == "torrent")
-        except Exception:  # noqa: BLE001
-            n_tor = -1
-        if n_tor == 0:
-            return False, ("your indexers returned NO torrent for this album -- "
-                           "nothing to grab (not a rejection)")
-        if n_tor > 0:
-            return False, ("%d torrent(s) offered but none passed the checks "
-                           "(non-official / too few seeders / songs did not "
-                           "match) -- see log" % n_tor)
-        return False, "search failed -- see log"
+        tried = 0
+        cap = max(1, int(getattr(
+            self.cfg, "interactive_search_max_candidates", 5)))
+        for r in cands[:cap]:
+            guid, idx = r.get("guid"), r.get("indexerId")
+            if not guid or idx is None:
+                continue
+            tried += 1
+            title = str(r.get("title") or "?")
+            logger.info("assembly: grabbing %r to look for %d missing song(s) "
+                        "of %s", title[:80], len(missing), artist)
+            if not self.lidarr.release_grab(guid, idx):
+                continue
+            if qbt is None:
+                return True, ("grabbed %r -- no qBittorrent to inspect it, so it "
+                              "will download in full" % title[:60])
+            thash, _rec = self._await_queue_hash_by_title(title, timeout=90)
+            if not thash:
+                return True, ("grabbed %r but it never appeared in the queue; "
+                              "left to download" % title[:60])
+            files = []
+            try:
+                qbt.pause(thash)
+                deadline = time.time() + 45
+                while time.time() < deadline:
+                    files = qbt.files(thash)
+                    if files:
+                        break
+                    time.sleep(3)
+            except Exception:  # noqa: BLE001
+                files = []
+            hits = []
+            for f in files or []:
+                nm = str(f.get("name") or "")
+                if os.path.splitext(nm)[1].lower() not in _ALL_AUDIO_EXTS:
+                    continue
+                base = norm_title(os.path.splitext(os.path.basename(nm))[0])
+                if not base:
+                    continue
+                for w in want:
+                    if w and (w in base or similarity(w, base) >= 0.87):
+                        hits.append(nm)
+                        break
+            if hits:
+                try:
+                    qbt.force_start(thash, True)
+                except Exception:  # noqa: BLE001
+                    pass
+                logger.info("assembly: %r contains %d needed song(s) -- kept; "
+                            "the deselect will drop the rest", title[:70],
+                            len(hits))
+                return True, ("%r has %d of your missing song(s) -- downloading "
+                              "just those" % (title[:60], len(hits)))
+            logger.info("assembly: %r has none of the missing songs -- "
+                        "blocklisting and trying the next", title[:70])
+            self._reject_grab(artist, str(missing[0]), thash, qbt)
+        if tried:
+            return False, ("tried %d release(s); none contained the missing "
+                           "song(s)" % tried)
+        return False, "no usable candidate to grab"
 
     @staticmethod
     def _write_basic_tags(path, artist, album, title, track, total):

@@ -159,6 +159,7 @@ _PAGE = r"""<!doctype html>
   #pl .plbody{padding:.5rem .6rem}
   #pl .plbtns{display:flex;gap:.35rem;align-items:center;margin:.35rem 0}
   #pl .plbtns button{min-width:2.4rem}
+  #pl #pl-vol{width:5.5rem;flex:0 0 auto;accent-color:#58a6ff;cursor:pointer}
   #pl audio{width:100%;margin-top:.25rem}
   #pl details{margin-top:.4rem}
   #pl details summary{cursor:pointer;color:var(--mut,#8b949e)}
@@ -286,6 +287,8 @@ _PAGE = r"""<!doctype html>
       <button class="b-copy" title="Play / pause" onclick="plToggle()" id="pl-play">▶</button>
       <button class="b-copy" title="Stop" onclick="plStop()">⏹</button>
       <button class="b-copy" title="Forward 10s" onclick="plSeek(10)">⏩</button>
+      <input type="range" id="pl-vol" min="0" max="100" step="1" value="100"
+             title="Volume" oninput="plVol(this.value)">
       <span class="muted" id="pl-time" style="margin-left:auto">0:00</span>
     </div>
     <audio id="pl-audio" preload="none" controls></audio>
@@ -377,6 +380,17 @@ function plInfo(path){
 }
 function fmtTime(s){s=Math.max(0,Math.floor(s||0));
   return Math.floor(s/60)+':'+('0'+(s%60)).slice(-2);}
+function plVol(v){
+  var a=plEl(); a.volume=Math.max(0,Math.min(1,(parseFloat(v)||0)/100));
+  a.muted=(a.volume===0);
+  try{localStorage.setItem('plvol',String(a.volume));}catch(e){}
+}
+function plVolInit(){
+  var v=1; try{var st=localStorage.getItem('plvol'); if(st!==null)v=parseFloat(st);}catch(e){}
+  if(!(v>=0&&v<=1))v=1;
+  var sl=document.getElementById('pl-vol'); if(sl)sl.value=Math.round(v*100);
+  plEl().volume=v; plEl().muted=(v===0);
+}
 function plToggle(){var a=plEl();if(a.paused)a.play().catch(function(){});else a.pause();plSyncBtn();}
 function plStop(){var a=plEl();a.pause();a.currentTime=0;plSyncBtn();}
 function plSeek(d){var a=plEl();a.currentTime=Math.max(0,(a.currentTime||0)+d);}
@@ -388,6 +402,7 @@ document.addEventListener('keydown',function(e){
 });
 document.addEventListener('DOMContentLoaded',function(){
   var a=plEl();if(!a)return;
+  plVolInit();                                   // restore last-used level
   a.addEventListener('timeupdate',function(){
     document.getElementById('pl-time').textContent=
       fmtTime(a.currentTime)+(a.duration?(' / '+fmtTime(a.duration)):'');});
@@ -755,7 +770,7 @@ document.addEventListener('scroll',function(){ctx.classList.remove('on');},true)
 buildColMenu();setTab('attention');refresh();setInterval(refresh,15000);
 
 /* ===================== Converter tab ===================== */
-var CVOPT=null, CVSEL=new Set(), CVINIT=false, CVPOLL=null, CVROOT='';
+var CVOPT=null, CVSEL=new Set(), CVINIT=false, CVPOLL=null, CVROOT='', CVDONE=new Set();
 function cvEnter(){
   if(!CVINIT){CVINIT=true;
     fetch('/api/convert/options').then(function(r){return r.json();}).then(function(j){
@@ -842,6 +857,18 @@ function cvSel(rel,on,isDir){
   }
   cvSelCount();
 }
+// Re-read ONE folder from disk and re-render just that node -- never the whole
+// tree. Used after a conversion or a delete so the change shows at once.
+function cvRefreshDir(rel){
+  rel=(rel||'').replace(/^\/+|\/+$/g,'');
+  fetch('/api/library/refresh?path='+encodeURIComponent(rel)).catch(function(){})
+   .then(function(){
+     if(!rel){cvLoadDir('','cv-tree');return;}
+     var id='cvk-'+btoa(unescape(encodeURIComponent(rel))).replace(/[^a-zA-Z0-9]/g,'');
+     var box=document.getElementById(id);
+     if(box&&box.dataset.loaded){cvLoadDir(rel,id);}      // node is open -> redraw it
+   });
+}
 function cvSelCount(){
   document.getElementById('cv-seln').textContent=CVSEL.size+' selected';
 }
@@ -897,7 +924,10 @@ function cvDelete(rels){
   fetch('/api/library/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({paths:rels})})
    .then(function(r){return r.json();}).then(function(j){
      toast(j.ok?('Deleted '+j.deleted+' item(s)'):(j.errors||[]).join('; ')||'failed');
-     CVSEL.clear();cvSel('',false);cvLoadDir('','cv-tree');})
+     var dirs={};(rels||[]).forEach(function(r){
+       var d=r.indexOf('/')>=0?r.replace(/\/[^/]*$/,''):'';dirs[d]=1;});
+     CVSEL.clear();cvSelCount();
+     Object.keys(dirs).forEach(function(d){cvRefreshDir(d);});})
    .catch(function(e){toast('Error: '+e);});
 }
 function cvInfo(rel){
@@ -920,6 +950,16 @@ function cvInfo(rel){
 function cvPollOnce(){
   fetch('/api/progress').then(function(r){return r.json();}).then(function(j){
     var conv=j.conversions||{},act=j.activity||[],splitq=j.split_queue||[];
+    // A job that just finished changed its folder on disk -- refresh ONLY that
+    // folder so the new (or replaced) file appears at once. Each job is handled
+    // once, tracked by id.
+    (conv.done||[]).forEach(function(jb){
+      if(!jb||!jb.id||CVDONE.has(jb.id))return;
+      CVDONE.add(jb.id);
+      var d=(jb.refreshed!==undefined&&jb.refreshed!==null)?jb.refreshed
+            :String(jb.rel||'').replace(/\/[^/]*$/,'');
+      if(d!==undefined&&d!==null)cvRefreshDir(d);
+    });
     var running=(conv.active||[]);
     document.getElementById('n-prog').textContent=(running.length+act.length)||0;
     // Progress section: total bar + each running conversion + each activity.
@@ -1219,6 +1259,18 @@ def make_handler(store, actions: HeldActions):
                     self._json(400, {"ok": False, "message": "bad path"})
                 else:
                     self._json(200, out)
+            elif path == "/api/library/refresh":
+                lt = getattr(actions, "library_tree", None)
+                qs = parse_qs(urlparse(self.path).query)
+                rel = (qs.get("path", [""]) or [""])[0]
+                if lt is None or not hasattr(lt, "refresh_dir"):
+                    self._json(503, {"ok": False})
+                    return
+                try:
+                    self._json(200, {"ok": True, "info": lt.refresh_dir(rel)})
+                except Exception as exc:  # noqa: BLE001
+                    self._json(500, {"ok": False, "message": str(exc)[:200]})
+
             elif path == "/api/library/info":
                 lt = getattr(actions, "library_tree", None)
                 qs = parse_qs(urlparse(self.path).query)
