@@ -63,7 +63,9 @@ def main() -> int:
     args.append(shlex.quote(image))
     for p in problems:
         print("# WARNING: " + p, file=sys.stderr)
-    print(" \\n  ".join(args))
+    # a real line continuation: " \" + newline + indent, so the output is
+    # copy-pasteable as-is
+    print((" \\" "\n  ").join(args))
     return 1 if problems else 0
 
 
