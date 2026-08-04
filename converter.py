@@ -60,6 +60,8 @@ CODEC_OPTIONS: Dict[str, Dict[str, Any]] = {
         ],
         "sample_rates": ["keep", 48000, 44100, 32000, 24000, 22050],
         "channels": ["keep", "stereo", "mono"],
+        "default_mode": "VBR",
+        "default_quality": "V0 (~245 kbps)",
         "help": "CBR: fixed bitrate. VBR: LAME -V quality presets "
                 "(V0 best .. V9 smallest).",
     },
@@ -74,6 +76,8 @@ CODEC_OPTIONS: Dict[str, Dict[str, Any]] = {
         ],
         "sample_rates": ["keep", 48000, 44100, 32000, 24000],
         "channels": ["keep", "stereo", "mono", "5.1"],
+        "default_mode": "VBR",
+        "default_quality": "Q5 (highest)",
         "help": "CBR: fixed bitrate. VBR: ffmpeg AAC quality scale "
                 "(Q1 smallest .. Q5 best). AAC keeps multichannel if "
                 "you pick 'keep'.",
@@ -443,6 +447,11 @@ class ConvertManager:
     def options(self) -> Dict[str, Any]:
         return {"codecs": CODEC_OPTIONS,
                 "concurrency": list(range(1, 11)),
+                # What the Converter tab opens on. Per-codec mode/quality
+                # defaults live in CODEC_OPTIONS above.
+                "defaults": {"codec": "aac", "bitrate": 320,
+                             "sample_rate": "keep", "channels": "keep",
+                             "concurrency": 2},
                 # Library root, so the WebUI can turn a tree-relative path into
                 # the absolute path the audio player streams from.
                 "root": str(self.root),
@@ -450,7 +459,7 @@ class ConvertManager:
                 # lossy encode is verified, repoint sidecar .xml files at the new
                 # filename, and have Lidarr rescan so it reflects the change.
                 "overwrite": {
-                    "label": "Overwrite existing (delete original)",
+                    "label": "Delete original",
                     "help": ("Replace the source file with the converted one: "
                              "the original (e.g. FLAC) is DELETED after a "
                              "verified encode, sidecar .xml files are repointed "

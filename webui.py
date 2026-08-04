@@ -47,10 +47,12 @@ class HeldActions(Protocol):
 _PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>cue_pipeline</title>
+<title>Lidarr Accessory</title>
 <link rel="icon" type="image/png" href="https://raw.githubusercontent.com/lidarr/Lidarr/develop/Logo/256.png">
 <link rel="shortcut icon" href="https://raw.githubusercontent.com/lidarr/Lidarr/develop/Logo/256.png">
 <style>
+  h1 .brand{color:inherit;font-weight:800;text-decoration:none}
+  h1 .brand:hover{text-decoration:underline}
   :root{color-scheme:light dark;--bg:#0f1115;--fg:#e6e6e6;--card:#1a1d24;--bd:#2a2e37;--mut:#8a93a2;--acc:#7c3aed;--chip:#232733;--chipOn:#3b2d63;--ok:#2f9e57;--warn:#f0b45e;--danger:#c0453b}
   @media(prefers-color-scheme:light){:root{--bg:#f5f6f8;--fg:#1a1a1a;--card:#fff;--bd:#e2e4e8;--mut:#5a6270;--chip:#eceef2;--chipOn:#e0d6fb}}
   *{box-sizing:border-box}
@@ -127,11 +129,19 @@ _PAGE = r"""<!doctype html>
      attention row, so the two tabs read the same way */
   .asmrow>summary{display:flex;align-items:center;gap:.5rem;flex-wrap:wrap}
   .asmrow>summary::-webkit-details-marker{display:none}
-  .asmrow>summary:before{content:"B8";color:var(--mut);font-size:.8rem}
-  .asmrow[open]>summary:before{content:"BE"}
+  /* Drawn with borders, not a glyph: the previous version used a CSS
+     escape that a non-raw Python string turned into a control char. */
+  .asmrow>summary:before{content:"";flex:0 0 auto;width:0;height:0;
+    border-left:5px solid var(--mut);border-top:4px solid transparent;
+    border-bottom:4px solid transparent;transition:transform .12s}
+  .asmrow[open]>summary:before{transform:rotate(90deg)}
   .asmrow:hover{border-color:var(--acc)}
   .cvbar{display:flex;gap:.7rem;align-items:center;flex-wrap:wrap;background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:.5rem .7rem;margin-bottom:.55rem}
   .cvbar label{display:flex;flex-direction:column;font-size:.68rem;color:var(--mut);gap:.15rem}
+  .cvbar label.cvtoggle{flex-direction:row;align-items:center;gap:.35rem;
+    font-size:.78rem;color:var(--fg);white-space:nowrap;cursor:pointer}
+  #cv-codechelp{max-width:32rem;white-space:normal;line-height:1.35;
+    font-size:.72rem}
   .cvbar select{font:inherit;font-size:.78rem;background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:7px;padding:.28rem .45rem}
   .cvtree{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:.4rem .6rem;max-height:62vh;overflow:auto;font-size:.78rem}
   .cvrow{display:flex;align-items:center;gap:.45rem;padding:.12rem .25rem;border-radius:6px;white-space:nowrap}
@@ -168,10 +178,14 @@ _PAGE = r"""<!doctype html>
       white-space:nowrap;flex:1}
   #pl .plbody{padding:.5rem .6rem}
   #pl .plbtns{display:flex;gap:.35rem;align-items:center;margin:.35rem 0}
-  /* font-variant-emoji keeps any control glyph monochrome even where the font
-     would rather draw a colour emoji, so the whole row matches play/pause */
-  #pl .plbtns button{min-width:2.4rem;font-variant-emoji:text}
-  #pl .plmode{min-width:auto;font-size:.75rem;padding:.2rem .45rem;opacity:.65}
+  /* One fixed box per control, icon centred -- Winamp-style: every button the
+     same size regardless of which shape is inside it. */
+  #pl .plbtns button{width:2.1rem;height:1.85rem;min-width:0;padding:0;
+    display:inline-flex;align-items:center;justify-content:center}
+  #pl .plbtns svg{width:15px;height:15px;display:block;fill:currentColor}
+  #pl .plsep{width:1px;height:1.2rem;background:var(--bd);margin:0 .2rem}
+  #pl .plmode{opacity:.5}
+  #pl .plmode:hover{opacity:.8}
   #pl .plmode.on{opacity:1;background:var(--acc);color:#fff}
   /* Seek bar -- the native <audio> bar is hidden, so this IS the progress bar. */
   #pl #pl-seek{width:100%;margin:.15rem 0 .1rem;height:14px;cursor:pointer;
@@ -230,7 +244,7 @@ _PAGE = r"""<!doctype html>
 </style></head>
 <body>
 <header>
-  <h1>cue_pipeline</h1>
+  <h1><a class="brand" href="__LIDARR_URL__" target="_blank" rel="noopener" title="Open Lidarr">Lidarr Accessory</a></h1>
   <div class="tabs">
     <div class="tab on" data-tab="attention" onclick="setTab('attention')">Needs attention <span class="n" id="n-att">0</span></div>
     <div class="tab" data-tab="assembly" onclick="setTab('assembly')">Assembly <span class="n" id="n-asm">0</span></div>
@@ -302,7 +316,7 @@ _PAGE = r"""<!doctype html>
       <label>Sample rate <select id="cv-sr"></select></label>
       <label>Channels <select id="cv-ch"></select></label>
       <label>Files at a time <select id="cv-conc"></select></label>
-      <label title="Replace each source file with the converted one: the original (e.g. FLAC) is DELETED after a verified encode, sidecar .xml files are repointed at the new filename, and Lidarr is asked to rescan the album folder."><input type="checkbox" id="cv-overwrite"> Overwrite existing (delete original)</label>
+      <label class="cvtoggle" title="Replace each source file with the converted one: the original (e.g. FLAC) is DELETED after a verified encode, sidecar .xml files are repointed at the new filename, and Lidarr is asked to rescan the album folder."><span>Delete original</span><input type="checkbox" id="cv-overwrite"></label>
       <span class="muted" id="cv-codechelp"></span>
       <div class="grow"></div>
       <span id="cv-seln" class="muted">0 selected</span>
@@ -345,19 +359,22 @@ _PAGE = r"""<!doctype html>
   </div>
   <div class="plbody">
     <div class="plbtns">
-      <button class="b-copy" title="Previous track" onclick="plPrev()">⏮</button>
-      <!-- U+23EA/U+23E9 default to EMOJI presentation, so they render blue while
-           every other control stays monochrome. Plain geometric triangles match
-           the play/pause glyphs exactly. -->
-      <button class="b-copy" title="Rewind 10s" onclick="plSeek(-10)">◀◀</button>
-      <button class="b-copy" title="Play / pause" onclick="plToggle()" id="pl-play">▶</button>
-      <button class="b-copy" title="Stop" onclick="plStop()">⏹</button>
-      <button class="b-copy" title="Forward 10s" onclick="plSeek(10)">▶▶</button>
-      <button class="b-copy" title="Next track" onclick="plNext()">⏭</button>
-      <button class="b-copy plmode" id="pl-shuf" title="Shuffle the queue"
-              onclick="plShuffleToggle()">Shuffle</button>
+      <!-- Transport icons are inline SVG, not text glyphs: ⏮ ⏪ ▶ ⏹ ⏩ ⏭ come from
+           different Unicode blocks and every font draws them at a different
+           weight and size (and U+23EA/U+23E9 default to colour emoji). One
+           viewBox for all of them is the only way they match. Filled in by
+           plIcons() so the play button can swap to pause. -->
+      <button class="b-copy" title="Previous track" onclick="plPrev()" id="pl-prev"></button>
+      <button class="b-copy" title="Rewind 10s" onclick="plSeek(-10)" id="pl-rew"></button>
+      <button class="b-copy" title="Play / pause" onclick="plToggle()" id="pl-play"></button>
+      <button class="b-copy" title="Stop" onclick="plStop()" id="pl-stop"></button>
+      <button class="b-copy" title="Forward 10s" onclick="plSeek(10)" id="pl-fwd"></button>
+      <button class="b-copy" title="Next track" onclick="plNext()" id="pl-next"></button>
+      <span class="plsep"></span>
+      <button class="b-copy plmode" id="pl-shuf" title="Shuffle: off"
+              onclick="plShuffleToggle()"></button>
       <button class="b-copy plmode" id="pl-rep" title="Repeat: off"
-              onclick="plRepeatCycle()">Repeat</button>
+              onclick="plRepeatCycle()"></button>
       <span class="plvol" title="Volume">
         <span id="pl-volicon">🔊</span>
         <input type="range" id="pl-vol" min="0" max="100" step="1" value="100"
@@ -565,20 +582,61 @@ var PLQ=[], PLQI=-1, PLQLABEL='';
 // repeats songs and skips others); PLHIST lets Previous walk back through the
 // order you actually heard rather than the queue's order.
 var PLSHUF=false, PLREP='off', PLPLAYED={}, PLHIST=[];
+// One 24x24 viewBox for every control, so the shapes line up and scale together.
+var PLSVG={
+  prev:'M7 5h2.2v14H7zM20 5v14l-9.4-7z',
+  rew :'M11.6 5v14L3 12zM21 5v14l-8.6-7z',
+  play:'M8 5.2v13.6L19 12z',
+  pause:'M7.6 5h3.2v14H7.6zM13.2 5h3.2v14h-3.2z',
+  stop:'M6.4 6.4h11.2v11.2H6.4z',
+  fwd :'M3 5l8.6 7L3 19zM12.4 5l8.6 7-8.6 7z',
+  next:'M4 5l9.4 7L4 19zM14.8 5H17v14h-2.2z'};
+// Shuffle/repeat read better as outlines than as solid blobs at 15px.
+var PLSVGO={
+  shuf:'M14.5 4.5h5v5M19.5 4.5l-13 13M4.5 4.5l4.5 4.5M14.5 19.5h5v-5M19.5 19.5l-5-5',
+  rep :'M7.5 5.5h9a3 3 0 0 1 3 3v3M16.5 18.5h-9a3 3 0 0 1-3-3v-3'
+       +'M17.5 3.5l2 2-2 2M6.5 20.5l-2-2 2-2'};
+function plIcon(d){
+  return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="'+d+'"/></svg>';
+}
+function plIconO(d,extra){
+  return '<svg viewBox="0 0 24 24" aria-hidden="true" fill="none" '
+    +'stroke="currentColor" stroke-width="2" stroke-linecap="round" '
+    +'stroke-linejoin="round"><path d="'+d+'"/>'+(extra||'')+'</svg>';
+}
+function plIcons(){
+  var set={'pl-prev':PLSVG.prev,'pl-rew':PLSVG.rew,'pl-stop':PLSVG.stop,
+           'pl-fwd':PLSVG.fwd,'pl-next':PLSVG.next};
+  Object.keys(set).forEach(function(id){
+    var el=document.getElementById(id); if(el)el.innerHTML=plIcon(set[id]);
+  });
+  plSyncBtn(); plShufIcon(); plRepIcon();
+}
+function plShufIcon(){
+  var b=document.getElementById('pl-shuf'); if(!b)return;
+  b.innerHTML=plIconO(PLSVGO.shuf);
+  b.classList.toggle('on',PLSHUF);
+  b.title=PLSHUF?'Shuffle: on (next picks an unplayed track)':'Shuffle: off';
+}
+function plRepIcon(){
+  var b=document.getElementById('pl-rep'); if(!b)return;
+  // the "1" rides inside the same viewBox, so the button never changes size
+  var one=(PLREP==='one')
+    ? '<text x="12" y="15.5" text-anchor="middle" font-size="9" '
+      +'stroke="none" fill="currentColor" font-weight="700">1</text>' : '';
+  b.innerHTML=plIconO(PLSVGO.rep,one);
+  b.classList.toggle('on',PLREP!=='off');
+  b.title=(PLREP==='off')?'Repeat: off'
+         :((PLREP==='all')?'Repeat: whole folder':'Repeat: this track');
+}
 function plShuffleToggle(){
   PLSHUF=!PLSHUF; PLPLAYED={};
   if(PLQI>=0)PLPLAYED[PLQI]=1;
-  document.getElementById('pl-shuf').classList.toggle('on',PLSHUF);
-  document.getElementById('pl-shuf').title=
-    PLSHUF?'Shuffle on -- next picks an unplayed track':'Shuffle the queue';
+  plShufIcon();
 }
 function plRepeatCycle(){
   PLREP=(PLREP==='off')?'all':((PLREP==='all')?'one':'off');
-  var b=document.getElementById('pl-rep');
-  b.classList.toggle('on',PLREP!=='off');
-  b.textContent=(PLREP==='one')?'Repeat 1':'Repeat';
-  b.title=(PLREP==='off')?'Repeat: off'
-         :((PLREP==='all')?'Repeat: whole folder':'Repeat: this track');
+  plRepIcon();
 }
 // Playing one song leaves a queue of 1, so Next has nowhere to go. Pull in the
 // rest of that song's folder on demand -- works for /downloads too, which the
@@ -718,12 +776,16 @@ function plClose(){
   var q=document.getElementById('pl-queue');if(q)q.textContent='';
   plRenderList();
 }
-function plSyncBtn(){document.getElementById('pl-play').textContent=plEl().paused?'▶':'⏸';}
+function plSyncBtn(){
+  var b=document.getElementById('pl-play'); if(!b)return;
+  b.innerHTML=plIcon(plEl().paused?PLSVG.play:PLSVG.pause);
+}
 document.addEventListener('keydown',function(e){
   if(e.key==='Escape'&&document.getElementById('pl').classList.contains('on'))plClose();
 });
 document.addEventListener('DOMContentLoaded',function(){
   var a=plEl();if(!a)return;
+  plIcons();                                     // draw the control glyphs
   plVolInit();                                   // restore last-used level
   a.addEventListener('timeupdate',function(){
     document.getElementById('pl-time').textContent=
@@ -1147,15 +1209,18 @@ document.addEventListener('scroll',function(){ctx.classList.remove('on');},true)
 buildColMenu();setTab('attention');refresh();setInterval(refresh,15000);
 
 /* ===================== Converter tab ===================== */
-var CVOPT=null, CVSEL=new Set(), CVINIT=false, CVPOLL=null, CVROOT='', CVDONE=new Set();
+var CVDEF={}, CVOPT=null, CVSEL=new Set(), CVINIT=false, CVPOLL=null, CVROOT='', CVDONE=new Set();
 function cvEnter(){
   if(!CVINIT){CVINIT=true;
     fetch('/api/convert/options').then(function(r){return r.json();}).then(function(j){
       CVOPT=j.codecs||{};CVROOT=(j.root||'').replace(/\/+$/,'');
+      CVDEF=j.defaults||{};
       var cs=document.getElementById('cv-codec');
       cs.innerHTML=Object.keys(CVOPT).map(function(k){return '<option value="'+k+'">'+h(CVOPT[k].label)+'</option>';}).join('');
+      if(CVDEF.codec&&CVOPT[CVDEF.codec])cs.value=CVDEF.codec;
+      var dc=CVDEF.concurrency||2;
       var cc=document.getElementById('cv-conc');
-      cc.innerHTML=(j.concurrency||[1,2,3,4,5,6,7,8,9,10]).map(function(n){return '<option '+(n===2?'selected':'')+'>'+n+'</option>';}).join('');
+      cc.innerHTML=(j.concurrency||[1,2,3,4,5,6,7,8,9,10]).map(function(n){return '<option '+(n===dc?'selected':'')+'>'+n+'</option>';}).join('');
       cvCodecChanged();
     });
     cvLoadDir('', 'cv-tree');
@@ -1171,8 +1236,23 @@ function cvCodecChanged(){
   document.getElementById('cv-quality').innerHTML=o.quality.map(function(q2){return '<option>'+h(q2)+'</option>';}).join('');
   document.getElementById('cv-sr').innerHTML=o.sample_rates.map(function(s){return '<option value="'+s+'">'+(s==='keep'?'keep source':h(''+s))+'</option>';}).join('');
   document.getElementById('cv-ch').innerHTML=o.channels.map(function(c){return '<option>'+h(c)+'</option>';}).join('');
+  // Preselect the defaults where the codec actually offers them; anything it
+  // does not offer just keeps the first option.
+  cvPick('cv-mode',o.default_mode);
+  cvPick('cv-quality',o.default_quality);
+  cvPick('cv-bitrate',CVDEF.bitrate);
+  cvPick('cv-sr',CVDEF.sample_rate);
+  cvPick('cv-ch',CVDEF.channels);
   document.getElementById('cv-codechelp').textContent=o.help||'';
   cvModeChanged();
+}
+function cvPick(id,val){
+  if(val===undefined||val===null)return;
+  var el=document.getElementById(id); if(!el)return;
+  var want=String(val);
+  for(var i=0;i<el.options.length;i++){
+    if(el.options[i].value===want||el.options[i].text===want){el.selectedIndex=i;return;}
+  }
 }
 function cvModeChanged(){
   var k=document.getElementById('cv-codec').value,m=document.getElementById('cv-mode').value;
@@ -1526,6 +1606,17 @@ def _player_info(p: Path) -> Dict[str, Any]:
     return out
 
 
+def _lidarr_web_url(actions: Any) -> str:
+    """Lidarr's own web UI, for the header link. Falls back to '#' so a missing
+    or half-built client cannot produce an href that reloads this page."""
+    try:
+        url = str(getattr(getattr(actions, "lidarr", None).cfg,
+                          "base_url", "") or "").strip().rstrip("/")
+    except Exception:  # noqa: BLE001
+        return "#"
+    return url or "#"
+
+
 def make_handler(store, actions: HeldActions):
     class Handler(BaseHTTPRequestHandler):
         server_version = "cue_pipeline-webui"
@@ -1549,7 +1640,10 @@ def make_handler(store, actions: HeldActions):
         def do_GET(self):  # noqa: N802
             path = urlparse(self.path).path
             if path in ("/", "/index.html"):
-                self._send(200, _PAGE.encode("utf-8"), "text/html; charset=utf-8")
+                page = _PAGE.replace("__LIDARR_URL__",
+                                     _lidarr_web_url(actions))
+                self._send(200, page.encode("utf-8"),
+                           "text/html; charset=utf-8")
             elif path == "/api/held":
                 # FAST PATH: serve straight from the file-backed store. Every
                 # heavy step that used to run here per page load -- pruning

@@ -9078,6 +9078,7 @@ class Orchestrator:
         # clock and collect the ones eligible to act on now.
         missing_ids: set = set()
         missing_artist_ids: set = set()
+        all_missing_by_artist: Dict[int, List[Tuple[str, int, int]]] = {}
         eligible: List[Tuple[Dict[str, Any], Dict[str, Any], int]] = []
         for alb in missing:
             aid = alb.get("id")
@@ -9088,6 +9089,10 @@ class Orchestrator:
             art_all = alb.get("artistId") or (alb.get("artist") or {}).get("id")
             if art_all is not None:
                 missing_artist_ids.add(int(art_all))
+                all_missing_by_artist.setdefault(int(art_all), []).append(
+                    (alb.get("title", "") or "",
+                     int((alb.get("statistics") or {}).get("trackCount") or 0),
+                     aid))
             st = state.setdefault(str(aid), {})
             st.setdefault("first_missing", now)
             if now - float(st.get("first_missing") or now) < min_missing:
@@ -9098,11 +9103,21 @@ class Orchestrator:
                 continue        # per-album cooldown
             eligible.append((alb, st, aid))
 
-        # Group eligible albums by ARTIST so an artist-level discography grab can
-        # fill several at once, and cap ARTISTS per pass (least-recently-tried
-        # first) so a big backlog doesn't hammer the indexers.
+        # ALBUM-FIRST. A discography grab fills several gaps at once, but it
+        # arrives full of compilations, live sets and wrong editions that then
+        # need deselecting and hand-resolving -- so search for the exact album
+        # first and keep the artist scope for gaps a per-album search cannot
+        # fill (an album that was only ever released inside a box set).
+        # Least-recently-tried album first, capped per pass, so a big backlog
+        # rotates instead of hammering the indexers.
+        eligible.sort(key=lambda t: float(t[1].get("last_attempt") or 0))
+        cap = max(1, int(cfg.interactive_search_max_albums_per_pass))
+        picked_albums = eligible[:cap]
+
+        # Still grouped by artist: that is the unit the discography fallback
+        # works on, and it keeps one artist's albums together in the log.
         by_artist: Dict[int, Dict[str, Any]] = {}
-        for alb, st, aid in eligible:
+        for alb, st, aid in picked_albums:
             art = alb.get("artist") or {}
             art_id = alb.get("artistId") or art.get("id")
             if art_id is None:
@@ -9110,63 +9125,56 @@ class Orchestrator:
             g = by_artist.setdefault(int(art_id), {
                 "name": art.get("artistName", "") or "", "items": []})
             g["items"].append((alb, st, aid))
-
-        artists = sorted(
-            by_artist.items(),
-            key=lambda kv: min((float(s.get("last_attempt") or 0)
-                                for _a, s, _i in kv[1]["items"]), default=0.0))
-        cap = max(1, int(cfg.interactive_search_max_albums_per_pass))
-        picked = artists[:cap]
         if eligible:
             logger.info(
-                "interactive search: %d eligible album(s) across %d artist(s); "
-                "processing %d artist(s) this pass", len(eligible),
-                len(by_artist), len(picked))
+                "interactive search: %d eligible album(s); trying %d this pass "
+                "across %d artist(s) -- album search first, artist/discography "
+                "only where that finds nothing", len(eligible),
+                len(picked_albums), len(by_artist))
 
         grabbed = 0
         # Shared budget so one prolific artist's per-album fallback can't fire
         # a search for every one of its (often unavailable) missing albums; the
         # rest rotate in on later passes.
-        album_budget = cap
-        for art_id, g in picked:
+        for art_id, g in by_artist.items():
             name, items = g["name"], g["items"]
-            handled = False
-            if cfg.interactive_search_artist_level:
-                ast = state.setdefault(f"artist:{art_id}", {})
-                missing_info = [
-                    (a.get("title", "") or "",
-                     int((a.get("statistics") or {}).get("trackCount") or 0),
-                     _aid)
-                    for a, _s, _aid in items]
-                try:
-                    handled = self._try_artist_fill(
-                        art_id, name, missing_info,
-                        ast.setdefault("blocklisted", []), qbt)
-                except Exception as exc:  # noqa: BLE001
-                    logger.exception(
-                        "interactive search: artist %s fill failed: %s",
-                        art_id, exc)
-                ast["last_attempt"] = now
-            if handled:
-                if not cfg.interactive_search_dry_run:
-                    grabbed += 1
-                for _alb, st, _aid in items:
-                    st["last_attempt"] = now
-                continue
-            # Fallback: per-album search for this artist's missing albums,
-            # bounded by the shared album-search budget (deferred albums keep
-            # their old last_attempt so they sort to the front next pass).
+            filled = 0
             for alb, st, aid in items:
-                if album_budget <= 0:
-                    break
-                album_budget -= 1
                 try:
                     if self._isearch_one_album(alb, st, qbt):
                         grabbed += 1
+                        filled += 1
                 except Exception as exc:  # noqa: BLE001
                     logger.exception(
                         "interactive search: album %s failed: %s", aid, exc)
                 st["last_attempt"] = now
+            if filled or not cfg.interactive_search_artist_level:
+                continue
+            # Nothing could be found album by album. Some albums were only ever
+            # released inside a discography or box set, and the artist scope is
+            # what finds those; auto-deselect then drops everything already
+            # owned. Judge the candidate against ALL of this artist's gaps, not
+            # just the ones tried this pass, so its fill value is real.
+            ast = state.setdefault(f"artist:{art_id}", {})
+            if now - float(ast.get("last_attempt") or 0) < cooldown:
+                continue        # don't re-sweep the same artist scope every pass
+            missing_info = all_missing_by_artist.get(int(art_id)) or [
+                (a.get("title", "") or "",
+                 int((a.get("statistics") or {}).get("trackCount") or 0), _aid)
+                for a, _s, _aid in items]
+            logger.info(
+                "interactive search: %s -- no per-album result for %d album(s), "
+                "falling back to the artist scope (%d gap(s) it could fill)",
+                name, len(items), len(missing_info))
+            try:
+                if self._try_artist_fill(art_id, name, missing_info,
+                                         ast.setdefault("blocklisted", []), qbt):
+                    if not cfg.interactive_search_dry_run:
+                        grabbed += 1
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "interactive search: artist %s fill failed: %s", art_id, exc)
+            ast["last_attempt"] = now
 
         # Prune state for albums/artists that are no longer missing.
         for k in list(state.keys()):
