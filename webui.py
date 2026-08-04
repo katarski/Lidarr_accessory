@@ -123,6 +123,13 @@ _PAGE = r"""<!doctype html>
   .cvsec{background:var(--card);border:1px solid var(--bd);border-radius:10px;margin-bottom:.55rem;padding:.15rem .7rem}
   .cvsec>summary{cursor:pointer;font-weight:600;padding:.4rem 0;user-select:none}
   .cvbody{padding:.3rem 0 .55rem;display:flex;flex-direction:column;gap:.4rem}
+  /* Assembly rows: same card + right-aligned action buttons as a Needs
+     attention row, so the two tabs read the same way */
+  .asmrow>summary{display:flex;align-items:center;gap:.5rem;flex-wrap:wrap}
+  .asmrow>summary::-webkit-details-marker{display:none}
+  .asmrow>summary:before{content:"B8";color:var(--mut);font-size:.8rem}
+  .asmrow[open]>summary:before{content:"BE"}
+  .asmrow:hover{border-color:var(--acc)}
   .cvbar{display:flex;gap:.7rem;align-items:center;flex-wrap:wrap;background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:.5rem .7rem;margin-bottom:.55rem}
   .cvbar label{display:flex;flex-direction:column;font-size:.68rem;color:var(--mut);gap:.15rem}
   .cvbar select{font:inherit;font-size:.78rem;background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:7px;padding:.28rem .45rem}
@@ -161,7 +168,11 @@ _PAGE = r"""<!doctype html>
       white-space:nowrap;flex:1}
   #pl .plbody{padding:.5rem .6rem}
   #pl .plbtns{display:flex;gap:.35rem;align-items:center;margin:.35rem 0}
-  #pl .plbtns button{min-width:2.4rem}
+  /* font-variant-emoji keeps any control glyph monochrome even where the font
+     would rather draw a colour emoji, so the whole row matches play/pause */
+  #pl .plbtns button{min-width:2.4rem;font-variant-emoji:text}
+  #pl .plmode{min-width:auto;font-size:.75rem;padding:.2rem .45rem;opacity:.65}
+  #pl .plmode.on{opacity:1;background:var(--acc);color:#fff}
   /* Seek bar -- the native <audio> bar is hidden, so this IS the progress bar. */
   #pl #pl-seek{width:100%;margin:.15rem 0 .1rem;height:14px;cursor:pointer;
       background:transparent;-webkit-appearance:none;appearance:none}
@@ -259,21 +270,23 @@ _PAGE = r"""<!doctype html>
 <main>
   <div id="attention"></div>
   <div id="assembly" style="display:none">
-    <div class="procard" style="justify-content:flex-start;gap:1rem;flex-wrap:wrap">
+    <!-- Same toolbar as Needs attention: filter on the left, selection count and
+         the actions dropdown on the right. -->
+    <div class="toolbar" id="asm-toolbar">
       <input type="search" id="asm-q" placeholder="filter by artist / album / song…" oninput="asmRender()" style="min-width:18rem">
-      <label><input type="checkbox" id="asm-complete" onchange="asmRender()"> only 100% assembled</label>
-      <span class="grow"></span>
+      <span class="chip" id="asm-chip-complete" onclick="asmOnlyToggle(this)">100% assembled</span>
       <span class="muted" id="asm-sum"></span>
-      <span class="muted" id="asm-seln">0 selected</span>
-      <button class="b-copy" onclick="asmAll(true)">Select all</button>
-      <button class="b-copy" onclick="asmAll(false)">Clear</button>
+      <div class="grow"></div>
+      <span id="asm-seln" class="muted">0 selected</span>
       <select id="asmact" onchange="if(this.value){asmAct(this.value);this.value='';}">
         <option value="">Actions on selected albums…</option>
         <option value="find">Find missing songs</option>
         <option value="add">Add to library (assemble + import)</option>
         <option value="remove">Remove (dismiss row, keep files)</option>
       </select>
-      <button class="b-copy" onclick="asmLoad()">Reload</button>
+      <button class="b-copy" onclick="asmAll(true)" title="Select all rows">Select all</button>
+      <button class="b-copy" onclick="asmAll(false)" title="Clear selection">✕</button>
+      <button class="b-copy" onclick="asmLoad()" title="Reload assembly plans">⟳</button>
     </div>
     <div id="asm-list"></div>
   </div>
@@ -333,11 +346,18 @@ _PAGE = r"""<!doctype html>
   <div class="plbody">
     <div class="plbtns">
       <button class="b-copy" title="Previous track" onclick="plPrev()">⏮</button>
-      <button class="b-copy" title="Rewind 10s" onclick="plSeek(-10)">⏪</button>
+      <!-- U+23EA/U+23E9 default to EMOJI presentation, so they render blue while
+           every other control stays monochrome. Plain geometric triangles match
+           the play/pause glyphs exactly. -->
+      <button class="b-copy" title="Rewind 10s" onclick="plSeek(-10)">◀◀</button>
       <button class="b-copy" title="Play / pause" onclick="plToggle()" id="pl-play">▶</button>
       <button class="b-copy" title="Stop" onclick="plStop()">⏹</button>
-      <button class="b-copy" title="Forward 10s" onclick="plSeek(10)">⏩</button>
+      <button class="b-copy" title="Forward 10s" onclick="plSeek(10)">▶▶</button>
       <button class="b-copy" title="Next track" onclick="plNext()">⏭</button>
+      <button class="b-copy plmode" id="pl-shuf" title="Shuffle the queue"
+              onclick="plShuffleToggle()">Shuffle</button>
+      <button class="b-copy plmode" id="pl-rep" title="Repeat: off"
+              onclick="plRepeatCycle()">Repeat</button>
       <span class="plvol" title="Volume">
         <span id="pl-volicon">🔊</span>
         <input type="range" id="pl-vol" min="0" max="100" step="1" value="100"
@@ -399,7 +419,7 @@ function plResetForNew(){
   try{a.pause();}catch(e){}
   PLCUR='';
   try{a.removeAttribute('src');a.load();}catch(e){}
-  PLQ=[];PLQI=-1;PLQLABEL='';
+  PLQ=[];PLQI=-1;PLQLABEL='';PLPLAYED={};PLHIST=[];
   var q=document.getElementById('pl-queue');if(q)q.textContent='';
   var box=document.getElementById('pl-plist');if(box)box.style.display='none';
   document.querySelectorAll('.playable.on').forEach(function(e){e.classList.remove('on');});
@@ -541,6 +561,62 @@ function plSeekTo(v){
 }
 // ---- queue: a folder plays through, in the order the explorer shows --------
 var PLQ=[], PLQI=-1, PLQLABEL='';
+// Shuffle draws from the tracks not yet played this cycle (a plain random pick
+// repeats songs and skips others); PLHIST lets Previous walk back through the
+// order you actually heard rather than the queue's order.
+var PLSHUF=false, PLREP='off', PLPLAYED={}, PLHIST=[];
+function plShuffleToggle(){
+  PLSHUF=!PLSHUF; PLPLAYED={};
+  if(PLQI>=0)PLPLAYED[PLQI]=1;
+  document.getElementById('pl-shuf').classList.toggle('on',PLSHUF);
+  document.getElementById('pl-shuf').title=
+    PLSHUF?'Shuffle on -- next picks an unplayed track':'Shuffle the queue';
+}
+function plRepeatCycle(){
+  PLREP=(PLREP==='off')?'all':((PLREP==='all')?'one':'off');
+  var b=document.getElementById('pl-rep');
+  b.classList.toggle('on',PLREP!=='off');
+  b.textContent=(PLREP==='one')?'Repeat 1':'Repeat';
+  b.title=(PLREP==='off')?'Repeat: off'
+         :((PLREP==='all')?'Repeat: whole folder':'Repeat: this track');
+}
+// Playing one song leaves a queue of 1, so Next has nowhere to go. Pull in the
+// rest of that song's folder on demand -- works for /downloads too, which the
+// library-tree endpoint knows nothing about.
+function plExpandToFolder(then){
+  var cur=PLCUR;
+  if(!cur){if(then)then(false);return;}
+  fetch('/api/audio/siblings?path='+encodeURIComponent(cur))
+   .then(function(r){return r.json();}).then(function(j){
+      var tr=j.tracks||[];
+      if(tr.length<2){if(then)then(false);return;}
+      PLQ=tr;
+      PLQI=Math.max(0,tr.findIndex(function(t){return t.path===cur;}));
+      PLPLAYED={};PLPLAYED[PLQI]=1;PLHIST=[];
+      if(!PLQLABEL)PLQLABEL=(j.folder||'').split('/').pop();
+      var box=document.getElementById('pl-plist');
+      if(box)box.open=true;
+      plRenderList();
+      if(then)then(true);
+   }).catch(function(){if(then)then(false);});
+}
+// Which track plays next, or -1 for "stop here".
+function plPickNext(){
+  if(!PLQ.length)return -1;
+  if(PLSHUF){
+    var pool=[];
+    for(var i=0;i<PLQ.length;i++)if(!PLPLAYED[i]&&i!==PLQI)pool.push(i);
+    if(!pool.length){
+      if(PLREP!=='all')return -1;
+      PLPLAYED={};                       // new cycle through the same folder
+      for(var j=0;j<PLQ.length;j++)if(j!==PLQI)pool.push(j);
+      if(!pool.length)return PLQI;       // a one-track folder on repeat
+    }
+    return pool[Math.floor(Math.random()*pool.length)];
+  }
+  if(PLQI+1<PLQ.length)return PLQI+1;
+  return (PLREP==='all')?0:-1;
+}
 function plQueueFolder(rel,label){
   fetch('/api/library/tracks?path='+encodeURIComponent(rel))
    .then(function(r){return r.json();}).then(function(j){
@@ -549,7 +625,7 @@ function plQueueFolder(rel,label){
                                                       name:f.name,
                                                       secs:f.secs||null};});
       if(!files.length){toast('No audio in that folder');return;}
-      PLQ=files; PLQI=0;
+      PLQ=files; PLQI=0; PLPLAYED={0:1}; PLHIST=[];
       var box=document.getElementById('pl-plist');
       if(box&&PLQ.length>1)box.open=true;      // only on a fresh queue
       plOpenQueued(label);
@@ -603,14 +679,33 @@ function plScrollToCurrent(){
 }
 function plJump(i){
   if(i<0||i>=PLQ.length)return;
-  PLQI=i; plOpenQueued();
+  if(PLQI>=0&&PLQI!==i)PLHIST.push(PLQI);
+  PLQI=i; PLPLAYED[PLQI]=1; plOpenQueued();
 }
-function plNext(){
-  if(PLQ.length&&PLQI+1<PLQ.length){PLQI++;plOpenQueued();}
-  else plSyncBtn();
+// auto=true means the track ended by itself, which is the only case where
+// "Repeat 1" should replay it -- pressing Next explicitly means move on.
+function plNext(auto){
+  if(auto&&PLREP==='one'&&PLCUR){var a=plEl();a.currentTime=0;a.play().catch(function(){});return;}
+  if(PLQ.length<2){
+    plExpandToFolder(function(ok){if(ok)plNext(auto);else plSyncBtn();});
+    return;
+  }
+  var nxt=plPickNext();
+  if(nxt<0){plSyncBtn();return;}
+  PLHIST.push(PLQI);
+  PLQI=nxt; PLPLAYED[PLQI]=1;
+  plOpenQueued();
 }
 function plPrev(){
-  if(PLQ.length&&PLQI>0){PLQI--;plOpenQueued();}
+  if(PLQ.length<2){plExpandToFolder(function(ok){if(ok)plPrev();});return;}
+  if(PLSHUF){
+    // walk back through what actually played, not the queue order
+    var prev=PLHIST.pop();
+    if(prev===undefined)return;
+    PLQI=prev; plOpenQueued(); return;
+  }
+  if(PLQI>0){PLHIST.push(PLQI);PLQI--;plOpenQueued();}
+  else if(PLREP==='all'){PLHIST.push(PLQI);PLQI=PLQ.length-1;plOpenQueued();}
 }
 function plToggle(){var a=plEl();if(a.paused)a.play().catch(function(){});else a.pause();plSyncBtn();}
 function plStop(){var a=plEl();a.pause();a.currentTime=0;plSyncBtn();}
@@ -636,7 +731,7 @@ document.addEventListener('DOMContentLoaded',function(){
     var sk=document.getElementById('pl-seek');
     if(sk&&!PLSEEKING&&a.duration)sk.value=Math.round(1000*a.currentTime/a.duration);
   });
-  a.addEventListener('ended',plNext);          // roll on through a queued folder
+  a.addEventListener('ended',function(){plNext(true);});  // roll on through a folder
   ['mousedown','touchstart'].forEach(function(e){
     document.getElementById('pl-seek').addEventListener(e,function(){PLSEEKING=true;});});
   ['mouseup','touchend'].forEach(function(e){
@@ -688,7 +783,10 @@ function setTab(t){TAB=t;document.querySelectorAll('.tab').forEach(function(e){e
   if(t==='progress')cvEnter();}
 
 // ---- Assembly tab: % assembled per missing album + the songs still missing.
-var ASM=[], ASMSEL=new Set();
+var ASM=[], ASMSEL=new Set(), ASMONLY=false;
+function asmOnlyToggle(el){
+  ASMONLY=!ASMONLY; el.classList.toggle('on',ASMONLY); asmRender();
+}
 function asmSel(ev,id,on){
   if(ev)ev.stopPropagation();          // don't toggle the <details> open/closed
   if(on)ASMSEL.add(id);else ASMSEL.delete(id);
@@ -703,9 +801,18 @@ function asmAll(on){
   document.querySelectorAll('.asmsel').forEach(function(cb){cb.checked=on;});
   asmSelCount();
 }
+// A single row's actions, styled and worded like the Needs attention row so the
+// two tabs behave the same way.
+function asmActOne(ev,id,kind){
+  if(ev){ev.preventDefault();ev.stopPropagation();}   // don't toggle the <details>
+  asmRun([String(id)],kind);
+}
 function asmAct(kind){
   var ids=Array.from(ASMSEL);
   if(!ids.length){toast('Tick one or more albums first');return;}
+  asmRun(ids,kind);
+}
+function asmRun(ids,kind){
   var what={find:'Search for the missing songs of',
             add:'Assemble and import into the library',
             remove:'Dismiss (files untouched)'}[kind];
@@ -741,7 +848,7 @@ function asmLoad(){
 }
 function asmRender(){
   var q=(document.getElementById('asm-q').value||'').toLowerCase();
-  var onlyC=document.getElementById('asm-complete').checked;
+  var onlyC=ASMONLY;
   var rows=ASM.filter(function(a){
     if(onlyC&&(a.pct||0)<100)return false;
     if(!q)return true;
@@ -765,14 +872,26 @@ function asmRender(){
         +'<span class="playable" data-audio="'+h(src)+'" data-label="'+h(src.split('/').pop())
         +'" title="Click to play">'+h(src.split('/').pop())+'</span>'
         +' <span class="muted">('+(m.score||0)+' via '+h(m.via||'?')+')</span></li>';}).join('');
-    return '<details class="cvsec"><summary>'
+    return '<details class="cvsec asmrow"><summary>'
       +'<input type="checkbox" class="asmsel" data-id="'+h(String(a.id))+'" '
       +(ASMSEL.has(String(a.id))?'checked':'')
       +' onclick="asmSel(event,\''+h(String(a.id))+'\',this.checked)"> '
       +'<b>'+h(a.artist)+' / '+h(a.album)+'</b> '
       +'<span style="color:'+col+'">'+pct.toFixed(0)+'%</span> '
       +'<span class="muted">'+(a.n_matched||0)+'/'+(a.total||0)+' songs</span> '
-      +bar+'</summary><div class="cvbody" style="display:flex;gap:2rem;flex-wrap:wrap">'
+      +bar
+      +'<div class="acts" style="margin-left:auto">'
+      +'<button class="b-ll" title="Search torrents for the songs this album is '
+      +'still missing (only the missing files are downloaded)" '
+      +'onclick="asmActOne(event,\''+h(String(a.id))+'\',\'find\')">Find missing</button>'
+      +'<button class="b-keep" title="Copy the matched songs into the library as '
+      +'this album, retagged; a source file is deleted only if no other assembly '
+      +'still needs it" '
+      +'onclick="asmActOne(event,\''+h(String(a.id))+'\',\'add\')">Add to library</button>'
+      +'<button class="b-disc" title="Dismiss this row; files are left untouched" '
+      +'onclick="asmActOne(event,\''+h(String(a.id))+'\',\'remove\')">Remove</button>'
+      +'</div>'
+      +'</summary><div class="cvbody" style="display:flex;gap:2rem;flex-wrap:wrap">'
       +'<div><b>Assembled ('+(a.n_matched||0)+')</b><ul>'+(got||'<li class="muted">none</li>')+'</ul></div>'
       +'<div><b>Still missing ('+(a.n_missing||0)+')</b><ul>'+(miss||'<li class="muted">none — complete</li>')+'</ul></div>'
       +'</div></details>';
@@ -1330,6 +1449,29 @@ def _player_path(raw: str) -> Optional[Path]:
     return None
 
 
+def _player_siblings(p: Path) -> Dict[str, Any]:
+    """Every playable file in the same folder as `p`, in explorer order.
+
+    /api/library/tracks only knows the library tree, so it cannot help a song
+    played from Needs attention (those live under /downloads). This walks the
+    one folder directly, which is all "play the next song in this folder" needs.
+    """
+    try:
+        entries = sorted(
+            (e for e in p.parent.iterdir()
+             if e.is_file() and e.suffix.lower() in _PLAYER_MIME),
+            key=lambda e: e.name.lower(),
+        )
+    except OSError:
+        entries = [p]
+    return {
+        "folder": str(p.parent),
+        "current": str(p),
+        "tracks": [{"path": str(e), "name": e.name, "secs": None}
+                   for e in entries],
+    }
+
+
 def _player_info(p: Path) -> Dict[str, Any]:
     """ID tags + codec specs for the player's two dropdowns."""
     out: Dict[str, Any] = {"name": p.name, "path": str(p), "tags": {}, "specs": {}}
@@ -1424,6 +1566,14 @@ def make_handler(store, actions: HeldActions):
                     self._json(404, {"error": "not found or not allowed"})
                     return
                 self._json(200, _player_info(p))
+
+            elif path == "/api/audio/siblings":
+                qs = parse_qs(urlparse(self.path).query)
+                p = _player_path((qs.get("path", [""]) or [""])[0])
+                if p is None:
+                    self._json(404, {"error": "not found or not allowed"})
+                    return
+                self._json(200, _player_siblings(p))
 
             elif path == "/api/audio/stream":
                 qs = parse_qs(urlparse(self.path).query)
