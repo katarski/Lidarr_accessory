@@ -8194,9 +8194,13 @@ class Orchestrator:
                     logger.warning("assembly: could not narrow %r before "
                                    "starting it: %s", title[:60], exc)
                 try:
-                    qbt.force_start(thash, True)
-                except Exception:  # noqa: BLE001
-                    pass
+                    if not qbt.force_start(thash, True):
+                        logger.warning(
+                            "assembly: narrowed %r but could not start it -- it "
+                            "is left PAUSED in qBittorrent", title[:60])
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("assembly: force-start failed for %r: %s",
+                                   title[:60], exc)
                 logger.info("assembly: %r contains %d needed song(s) -- kept; "
                             "the deselect will drop the rest", title[:70],
                             len(hits))
@@ -8662,9 +8666,13 @@ class Orchestrator:
             logger.debug("interactive search: queue_remove failed: %s", exc)
         if qbt is not None and thash:
             try:
-                qbt.remove(thash, delete_files=True)
-            except Exception:  # noqa: BLE001
-                pass
+                if not qbt.remove(thash, delete_files=True):
+                    logger.warning(
+                        "rejected grab %s but qBittorrent did not remove it -- "
+                        "torrent and data are still there", thash[:12])
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("could not remove rejected grab %s: %s",
+                               thash[:12], exc)
 
     def _isearch_one_album(self, alb: Dict[str, Any], st: Dict[str, Any], qbt) -> bool:
         """Search, rank, then grab+verify candidates for one album. True if a
@@ -8929,9 +8937,14 @@ class Orchestrator:
             logger.debug("interactive search: reject-by-hash failed: %s", exc)
         if qbt is not None and thash:
             try:
-                qbt.remove(thash, delete_files=True)
-            except Exception:  # noqa: BLE001
-                pass
+                if not qbt.remove(thash, delete_files=True):
+                    logger.warning(
+                        "interactive search: rejected %s but qBittorrent did "
+                        "not remove it -- torrent and data are still there",
+                        thash[:12])
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("interactive search: could not remove %s: %s",
+                               thash[:12], exc)
 
     def _try_artist_fill(self, artist_id: int, artist_name: str,
                          missing: List[Tuple[str, int, int]],

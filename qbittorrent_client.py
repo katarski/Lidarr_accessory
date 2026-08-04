@@ -125,16 +125,18 @@ class QbtClient:
         # qBittorrent 5.x renamed 'resume' -> 'start'; older builds use 'resume'.
         self._post_first_ok(("start", "resume"), {"hashes": torrent_hash})
 
-    def force_start(self, torrent_hash: str, value: bool = True) -> None:
+    def force_start(self, torrent_hash: str, value: bool = True) -> bool:
         """Force-start a torrent so it ignores queue/ratio limits and connects
         immediately (this also un-pauses it). value=False clears the flag."""
         try:
-            self.s.post(f"{self.base}/api/v2/torrents/setForceStart",
+            r = self.s.post(f"{self.base}/api/v2/torrents/setForceStart",
                         data={"hashes": torrent_hash,
                               "value": "true" if value else "false"},
                         timeout=15)
-        except Exception:  # noqa: BLE001
-            pass
+            return r.status_code < 400
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("force_start(%s) failed: %s", torrent_hash[:12], exc)
+        return False
 
     def set_category(self, torrent_hash: str, category: str) -> bool:
         """Assign a category to a torrent (qBit `torrents/setCategory`)."""

@@ -759,10 +759,13 @@ def stalled_grab_reaper_pass(
             if str(r.get("downloadId") or "").lower() == h.lower() \
                     and r.get("id") is not None:
                 try:
-                    lidarr.queue_remove(int(r["id"]), remove_from_client=False,
-                                        blocklist=True)
-                except Exception:  # noqa: BLE001
-                    pass
+                    if not lidarr.queue_remove(int(r["id"]),
+                                               remove_from_client=False,
+                                               blocklist=True):
+                        emit(f"  WARNING: could not blocklist queue row "
+                             f"{r.get('id')} -- Lidarr may re-grab this release")
+                except Exception as exc:  # noqa: BLE001
+                    emit(f"  WARNING: blocklist failed for {r.get('id')}: {exc}")
         if qbt.remove(h, delete_files=True):
             trashed += 1
             emit(f"stalled reaper: TRASHED {name!r} (idle {idle_days:.1f}d at "
