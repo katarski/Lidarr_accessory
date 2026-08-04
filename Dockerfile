@@ -60,6 +60,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # App code only (no config -- that lives in the mounted /config volume)
 COPY *.py /app/
+COPY tools/ /app/tools/
 
 ENV PYTHONUNBUFFERED=1 \
     TZ=Europe/Copenhagen
