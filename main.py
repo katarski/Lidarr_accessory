@@ -135,6 +135,15 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     put("lidarr", "assembly_verify_timeout", "ASSEMBLY_VERIFY_TIMEOUT", int)
     put("lidarr", "assembly_lossless_bonus", "ASSEMBLY_LOSSLESS_BONUS", float)
     put("lidarr", "assembly_lossy_penalty", "ASSEMBLY_LOSSY_PENALTY", float)
+    put("lidarr", "comp_hunt_enabled", "COMP_HUNT_ENABLED", bool)
+    put("lidarr", "prowlarr_base_url", "PROWLARR_BASE_URL", str)
+    put("lidarr", "prowlarr_api_key", "PROWLARR_API_KEY", str)
+    put("lidarr", "comp_hunt_lidarr_indexers_only",
+        "COMP_HUNT_LIDARR_INDEXERS_ONLY", bool)
+    put("lidarr", "comp_hunt_max_tracks", "COMP_HUNT_MAX_TRACKS", int)
+    put("lidarr", "comp_hunt_titles_per_pass", "COMP_HUNT_TITLES_PER_PASS", int)
+    put("lidarr", "comp_hunt_grabs_per_pass", "COMP_HUNT_GRABS_PER_PASS", int)
+    put("lidarr", "comp_hunt_min_title_score", "COMP_HUNT_MIN_TITLE_SCORE", float)
     put("lidarr", "harvest_enabled", "HARVEST_ENABLED", bool)
     put("lidarr", "harvest_dry_run", "HARVEST_DRY_RUN", bool)
     put("lidarr", "harvest_duration_tolerance", "HARVEST_DURATION_TOLERANCE", float)
@@ -1382,6 +1391,26 @@ def main() -> int:
             lidarr_cfg.get("assembly_lossless_bonus", 30.0)),
         assembly_lossy_penalty=float(
             lidarr_cfg.get("assembly_lossy_penalty", 15.0)),
+        # Find-the-compilation. These MUST be listed here: OrchestratorConfig is
+        # built field-by-field, so a dataclass default is all the running
+        # pipeline ever sees for anything omitted -- the WebUI would show the
+        # saved value while the orchestrator ran on the default.
+        comp_hunt_enabled=bool(lidarr_cfg.get("comp_hunt_enabled", True)),
+        prowlarr_base_url=str(lidarr_cfg.get("prowlarr_base_url", "") or ""),
+        prowlarr_api_key=str(lidarr_cfg.get("prowlarr_api_key", "") or ""),
+        comp_hunt_lidarr_indexers_only=bool(
+            lidarr_cfg.get("comp_hunt_lidarr_indexers_only", True)),
+        comp_hunt_max_tracks=int(lidarr_cfg.get("comp_hunt_max_tracks", 40)),
+        comp_hunt_cache_seconds=int(
+            lidarr_cfg.get("comp_hunt_cache_seconds", 604800)),
+        comp_hunt_titles_per_pass=int(
+            lidarr_cfg.get("comp_hunt_titles_per_pass", 3)),
+        comp_hunt_grabs_per_pass=int(
+            lidarr_cfg.get("comp_hunt_grabs_per_pass", 1)),
+        comp_hunt_min_title_score=float(
+            lidarr_cfg.get("comp_hunt_min_title_score", 0.6)),
+        comp_hunt_collections_only=bool(
+            lidarr_cfg.get("comp_hunt_collections_only", True)),
         harvest_enabled=bool(lidarr_cfg.get("harvest_enabled", True)),
         harvest_dry_run=bool(lidarr_cfg.get("harvest_dry_run", True)),
         harvest_duration_tolerance=float(
