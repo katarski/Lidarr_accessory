@@ -138,8 +138,11 @@ class QbtClient:
 
     def set_category(self, torrent_hash: str, category: str) -> bool:
         """Assign a category to a torrent (qBit `torrents/setCategory`)."""
+        # NOTE: _post_first_ok already prepends /api/v2/torrents/, so the
+        # endpoint here is the bare ACTION name -- passing a full path produced
+        # ".../torrents//api/v2/torrents/setCategory" and a silent 404.
         return self._post_first_ok(
-            ["/api/v2/torrents/setCategory"],
+            ["setCategory"],
             {"hashes": torrent_hash, "category": category},
         )
 
