@@ -162,6 +162,20 @@ _PAGE = r"""<!doctype html>
   #pl .plbody{padding:.5rem .6rem}
   #pl .plbtns{display:flex;gap:.35rem;align-items:center;margin:.35rem 0}
   #pl .plbtns button{min-width:2.4rem}
+  /* Seek bar -- the native <audio> bar is hidden, so this IS the progress bar. */
+  #pl #pl-seek{width:100%;margin:.15rem 0 .1rem;height:14px;cursor:pointer;
+      background:transparent;-webkit-appearance:none;appearance:none}
+  #pl #pl-seek:focus{outline:none}
+  #pl #pl-seek::-webkit-slider-runnable-track{height:5px;border-radius:3px;
+      background:#30363d}
+  #pl #pl-seek::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;
+      width:13px;height:13px;border-radius:50%;background:#58a6ff;border:none;
+      margin-top:-4px}
+  #pl #pl-seek::-moz-range-track{height:5px;border-radius:3px;background:#30363d}
+  #pl #pl-seek::-moz-range-progress{height:5px;border-radius:3px;background:#58a6ff}
+  #pl #pl-seek::-moz-range-thumb{width:13px;height:13px;border:none;
+      border-radius:50%;background:#58a6ff}
+  #pl .plq{font-size:.78rem;margin-top:.1rem}
   #pl #pl-vol{width:6rem;flex:0 0 auto;cursor:pointer;height:14px;
       background:transparent;-webkit-appearance:none;appearance:none;margin:0}
   #pl #pl-vol:focus{outline:none}
@@ -321,6 +335,9 @@ _PAGE = r"""<!doctype html>
       </span>
       <span class="muted" id="pl-time" style="margin-left:auto">0:00</span>
     </div>
+    <input type="range" id="pl-seek" min="0" max="1000" step="1" value="0"
+           title="Seek" oninput="plSeekTo(this.value)">
+    <div class="plq muted" id="pl-queue"></div>
     <audio id="pl-audio" preload="none" controls></audio>
     <details id="pl-tags" open><summary>ID tags</summary><div id="pl-tagbody" class="muted">—</div></details>
     <details id="pl-specs"><summary>Specs</summary><div id="pl-specbody" class="muted">—</div></details>
@@ -497,6 +514,39 @@ function plVolInit(){
   var sl=document.getElementById('pl-vol'); if(sl)sl.value=Math.round(v*100);
   plVol(Math.round(v*100));
 }
+var PLSEEKING=false;
+function plSeekTo(v){
+  var a=plEl(); if(!a.duration)return;
+  a.currentTime=a.duration*(parseFloat(v)||0)/1000;
+}
+// ---- queue: a folder plays through, in the order the explorer shows --------
+var PLQ=[], PLQI=-1;
+function plQueueFolder(rel,label){
+  fetch('/api/library/tracks?path='+encodeURIComponent(rel))
+   .then(function(r){return r.json();}).then(function(j){
+      var base=(j.root||CVROOT||'').replace(/\/+$/,'');
+      var files=(j.tracks||[]).map(function(f){return {path:base+'/'+f.rel,
+                                                      name:f.name};});
+      if(!files.length){toast('No audio in that folder');return;}
+      PLQ=files; PLQI=0;
+      plOpenQueued(label);
+   }).catch(function(){toast('Could not read that folder');});
+}
+function plOpenQueued(label){
+  if(PLQI<0||PLQI>=PLQ.length)return;
+  var it=PLQ[PLQI];
+  plOpen(it.path,it.name);
+  var q=document.getElementById('pl-queue');
+  if(q)q.textContent='Track '+(PLQI+1)+' of '+PLQ.length
+        +(label?(' — '+label):'');
+}
+function plNext(){
+  if(PLQ.length&&PLQI+1<PLQ.length){PLQI++;plOpenQueued();}
+  else plSyncBtn();
+}
+function plPrev(){
+  if(PLQ.length&&PLQI>0){PLQI--;plOpenQueued();}
+}
 function plToggle(){var a=plEl();if(a.paused)a.play().catch(function(){});else a.pause();plSyncBtn();}
 function plStop(){var a=plEl();a.pause();a.currentTime=0;plSyncBtn();}
 function plSeek(d){var a=plEl();a.currentTime=Math.max(0,(a.currentTime||0)+d);}
@@ -511,13 +561,30 @@ document.addEventListener('DOMContentLoaded',function(){
   plVolInit();                                   // restore last-used level
   a.addEventListener('timeupdate',function(){
     document.getElementById('pl-time').textContent=
-      fmtTime(a.currentTime)+(a.duration?(' / '+fmtTime(a.duration)):'');});
+      fmtTime(a.currentTime)+(a.duration?(' / '+fmtTime(a.duration)):'');
+    var sk=document.getElementById('pl-seek');
+    if(sk&&!PLSEEKING&&a.duration)sk.value=Math.round(1000*a.currentTime/a.duration);
+  });
+  a.addEventListener('ended',plNext);          // roll on through a queued folder
+  ['mousedown','touchstart'].forEach(function(e){
+    document.getElementById('pl-seek').addEventListener(e,function(){PLSEEKING=true;});});
+  ['mouseup','touchend'].forEach(function(e){
+    document.getElementById('pl-seek').addEventListener(e,function(){PLSEEKING=false;});});
   ['play','pause','ended'].forEach(function(e){a.addEventListener(e,plSyncBtn);});
 });
 // Single delegated listener: cheap, and works for rows rendered later.
 document.addEventListener('click',function(ev){
+  var fol=ev.target.closest?ev.target.closest('[data-audio-folder]'):null;
+  if(fol){
+    ev.preventDefault();ev.stopPropagation();
+    plQueueFolder(fol.getAttribute('data-audio-folder'),
+                  fol.getAttribute('data-label')||'');
+    return;
+  }
   var el=ev.target.closest?ev.target.closest('.playable[data-audio]'):null;
   if(!el)return;
+  if(!el.hasAttribute('data-queued')){PLQ=[];PLQI=-1;
+    var q=document.getElementById('pl-queue');if(q)q.textContent='';}
   ev.preventDefault();ev.stopPropagation();
   plOpen(el.getAttribute('data-audio'),el.getAttribute('data-label')||el.textContent.trim(),
          ev.clientX,ev.clientY);
@@ -920,7 +987,7 @@ function cvLoadDir(rel,elId){
       out+='<div class="cvrow" data-rel="'+h(f.rel)+'" data-dir="1">'
         +'<span class="cvcaret" onclick="cvToggleDir(this,\''+h(f.rel).replace(/'/g,"\\'")+'\',\''+id+'\')">▸</span>'
         +'<input type="checkbox" '+(cvIsCovered(f.rel)?'checked':'')+' onclick="cvSel(\''+h(f.rel).replace(/'/g,"\\'")+'\',this.checked,true)">'
-        +'<span class="nm">📁 '+h(f.name)+'</span><span class="grow"></span>'
+        +'<span class="nm playable" data-audio-folder="'+h(f.rel)+'" data-label="'+h(f.name)+'" title="Click to queue every song in this folder">📁 '+h(f.name)+'</span><span class="grow"></span>'
         +'<span class="meta">'+f.files+' files · '+h(f.size_h)+'</span></div>'
         +'<div class="cvkids" id="'+id+'" style="display:none"></div>';
     });
@@ -1396,6 +1463,21 @@ def make_handler(store, actions: HeldActions):
                     self._json(400, {"ok": False, "message": "bad path"})
                 else:
                     self._json(200, out)
+            elif path == "/api/library/tracks":
+                # Every audio file under a folder, RECURSIVELY, in the same order
+                # the explorer shows (sorted walk) -- so queueing a folder that
+                # contains CD1/CD2 plays straight through.
+                lt = getattr(actions, "library_tree", None)
+                qs = parse_qs(urlparse(self.path).query)
+                rel = (qs.get("path", [""]) or [""])[0]
+                if lt is None:
+                    self._json(503, {"tracks": []})
+                    return
+                rels = _expand_audio(lt, [rel], cap=2000)
+                root = str(getattr(lt, "root", "")).rstrip("/")
+                self._json(200, {"root": root, "tracks": [
+                    {"rel": r, "name": r.split("/")[-1]} for r in rels]})
+
             elif path == "/api/library/refresh":
                 lt = getattr(actions, "library_tree", None)
                 qs = parse_qs(urlparse(self.path).query)
