@@ -176,6 +176,14 @@ _PAGE = r"""<!doctype html>
   #pl #pl-seek::-moz-range-thumb{width:13px;height:13px;border:none;
       border-radius:50%;background:#58a6ff}
   #pl .plq{font-size:.78rem;margin-top:.1rem}
+  /* Playlist: number, title, duration hard right. */
+  #pl #pl-pltbl td{border-bottom:1px solid #21262d;padding:.26rem .45rem}
+  #pl #pl-pltbl td.n{width:2.2rem;color:var(--mut,#8b949e);text-align:right}
+  #pl #pl-pltbl td.t{overflow-wrap:anywhere;cursor:pointer}
+  #pl #pl-pltbl td.d{width:4rem;text-align:right;color:var(--mut,#8b949e);
+      white-space:nowrap;font-variant-numeric:tabular-nums}
+  #pl #pl-pltbl tr.on td{color:#58a6ff;font-weight:600}
+  #pl #pl-pltbl tr:hover td.t{text-decoration:underline}
   #pl #pl-vol{width:6rem;flex:0 0 auto;cursor:pointer;height:14px;
       background:transparent;-webkit-appearance:none;appearance:none;margin:0}
   #pl #pl-vol:focus{outline:none}
@@ -324,10 +332,12 @@ _PAGE = r"""<!doctype html>
   </div>
   <div class="plbody">
     <div class="plbtns">
+      <button class="b-copy" title="Previous track" onclick="plPrev()">⏮</button>
       <button class="b-copy" title="Rewind 10s" onclick="plSeek(-10)">⏪</button>
       <button class="b-copy" title="Play / pause" onclick="plToggle()" id="pl-play">▶</button>
       <button class="b-copy" title="Stop" onclick="plStop()">⏹</button>
       <button class="b-copy" title="Forward 10s" onclick="plSeek(10)">⏩</button>
+      <button class="b-copy" title="Next track" onclick="plNext()">⏭</button>
       <span class="plvol" title="Volume">
         <span id="pl-volicon">🔊</span>
         <input type="range" id="pl-vol" min="0" max="100" step="1" value="100"
@@ -338,6 +348,9 @@ _PAGE = r"""<!doctype html>
     <input type="range" id="pl-seek" min="0" max="1000" step="1" value="0"
            title="Seek" oninput="plSeekTo(this.value)">
     <div class="plq muted" id="pl-queue"></div>
+    <details id="pl-plist" style="display:none"><summary id="pl-plsum">Playlist</summary>
+      <div class="pltbl"><table id="pl-pltbl"></table></div>
+    </details>
     <audio id="pl-audio" preload="none" controls></audio>
     <details id="pl-tags" open><summary>ID tags</summary><div id="pl-tagbody" class="muted">—</div></details>
     <details id="pl-specs"><summary>Specs</summary><div id="pl-specbody" class="muted">—</div></details>
@@ -520,13 +533,14 @@ function plSeekTo(v){
   a.currentTime=a.duration*(parseFloat(v)||0)/1000;
 }
 // ---- queue: a folder plays through, in the order the explorer shows --------
-var PLQ=[], PLQI=-1;
+var PLQ=[], PLQI=-1, PLQLABEL='';
 function plQueueFolder(rel,label){
   fetch('/api/library/tracks?path='+encodeURIComponent(rel))
    .then(function(r){return r.json();}).then(function(j){
       var base=(j.root||CVROOT||'').replace(/\/+$/,'');
       var files=(j.tracks||[]).map(function(f){return {path:base+'/'+f.rel,
-                                                      name:f.name};});
+                                                      name:f.name,
+                                                      secs:f.secs||null};});
       if(!files.length){toast('No audio in that folder');return;}
       PLQ=files; PLQI=0;
       plOpenQueued(label);
@@ -535,10 +549,40 @@ function plQueueFolder(rel,label){
 function plOpenQueued(label){
   if(PLQI<0||PLQI>=PLQ.length)return;
   var it=PLQ[PLQI];
+  if(label!==undefined)PLQLABEL=label||'';
   plOpen(it.path,it.name);
   var q=document.getElementById('pl-queue');
   if(q)q.textContent='Track '+(PLQI+1)+' of '+PLQ.length
-        +(label?(' — '+label):'');
+        +(PLQLABEL?(' — '+PLQLABEL):'');
+  plRenderList();
+}
+// Strip the noise a library filename carries so the row reads
+// "Artist - Song" rather than "Artist - Album - 07 - Song.flac".
+function plNiceName(n){
+  var t=String(n||'').replace(/\.[a-z0-9]{2,5}$/i,'');
+  var parts=t.split(' - ');
+  if(parts.length>=4)return parts[0]+' - '+parts.slice(3).join(' - ');
+  if(parts.length===3&&/^\d+$/.test(parts[1].trim()))
+    return parts[0]+' - '+parts[2];
+  return t;
+}
+function plRenderList(){
+  var box=document.getElementById('pl-plist');
+  var tb=document.getElementById('pl-pltbl');
+  if(!box||!tb)return;
+  if(PLQ.length<2){box.style.display='none';return;}   // a single song needs no list
+  box.style.display='';
+  document.getElementById('pl-plsum').textContent='Playlist ('+PLQ.length+')';
+  tb.innerHTML=PLQ.map(function(it,i){
+    return '<tr'+(i===PLQI?' class="on"':'')+'>'
+      +'<td class="n">'+(i+1)+'.</td>'
+      +'<td class="t" onclick="plJump('+i+')">'+h(plNiceName(it.name))+'</td>'
+      +'<td class="d">'+(it.secs?fmtTime(it.secs):'')+'</td></tr>';
+  }).join('');
+}
+function plJump(i){
+  if(i<0||i>=PLQ.length)return;
+  PLQI=i; plOpenQueued();
 }
 function plNext(){
   if(PLQ.length&&PLQI+1<PLQ.length){PLQI++;plOpenQueued();}
@@ -571,6 +615,11 @@ document.addEventListener('DOMContentLoaded',function(){
   ['mouseup','touchend'].forEach(function(e){
     document.getElementById('pl-seek').addEventListener(e,function(){PLSEEKING=false;});});
   ['play','pause','ended'].forEach(function(e){a.addEventListener(e,plSyncBtn);});
+  a.addEventListener('loadedmetadata',function(){
+    if(PLQI>=0&&PLQI<PLQ.length&&a.duration&&!PLQ[PLQI].secs){
+      PLQ[PLQI].secs=a.duration; plRenderList();       // fill the blank in place
+    }
+  });
 });
 // Single delegated listener: cheap, and works for rows rendered later.
 document.addEventListener('click',function(ev){
@@ -583,8 +632,9 @@ document.addEventListener('click',function(ev){
   }
   var el=ev.target.closest?ev.target.closest('.playable[data-audio]'):null;
   if(!el)return;
-  if(!el.hasAttribute('data-queued')){PLQ=[];PLQI=-1;
-    var q=document.getElementById('pl-queue');if(q)q.textContent='';}
+  if(!el.hasAttribute('data-queued')){PLQ=[];PLQI=-1;PLQLABEL='';
+    var q=document.getElementById('pl-queue');if(q)q.textContent='';
+    plRenderList();}
   ev.preventDefault();ev.stopPropagation();
   plOpen(el.getAttribute('data-audio'),el.getAttribute('data-label')||el.textContent.trim(),
          ev.clientX,ev.clientY);
@@ -1475,8 +1525,20 @@ def make_handler(store, actions: HeldActions):
                     return
                 rels = _expand_audio(lt, [rel], cap=2000)
                 root = str(getattr(lt, "root", "")).rstrip("/")
-                self._json(200, {"root": root, "tracks": [
-                    {"rel": r, "name": r.split("/")[-1]} for r in rels]})
+                # Duration comes from the library-tree cache ONLY -- probing
+                # 88 files with mutagen to draw a playlist would stall the UI.
+                # Unknown durations are filled in as each track plays.
+                det = getattr(lt, "_details", {}) or {}
+                out_tracks = []
+                for r in rels:
+                    d = det.get(r) or {}
+                    secs = d.get("length") or (d.get("detail") or {}).get("length")
+                    out_tracks.append({
+                        "rel": r,
+                        "name": r.split("/")[-1],
+                        "secs": round(float(secs), 1) if secs else None,
+                    })
+                self._json(200, {"root": root, "tracks": out_tracks})
 
             elif path == "/api/library/refresh":
                 lt = getattr(actions, "library_tree", None)
