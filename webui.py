@@ -185,7 +185,8 @@ _PAGE = r"""<!doctype html>
   #pl{position:fixed;left:1rem;top:1rem;width:29rem;max-width:94vw;z-index:60;
       background:var(--pan,#161b22);border:1px solid var(--bd,#30363d);
       border-radius:8px;box-shadow:0 8px 28px #000a;display:none}
-  #pl.on{display:block}
+  /* flex column so dragging the corner grows the body, not just the box */
+  #pl.on{display:flex;flex-direction:column}
   #pl .plhead{display:flex;align-items:center;gap:.5rem;padding:.5rem .6rem;
       border-bottom:1px solid var(--bd,#30363d);cursor:move;user-select:none}
   #pl .plhead button{cursor:pointer}
@@ -193,7 +194,7 @@ _PAGE = r"""<!doctype html>
   body.pl-dragging{user-select:none}
   #pl .plname{font-weight:600;overflow:hidden;text-overflow:ellipsis;
       white-space:nowrap;flex:1}
-  #pl .plbody{padding:.5rem .6rem}
+  #pl .plbody{padding:.5rem .6rem;flex:1 1 auto;min-height:0;overflow:auto}
   #pl .plbtns{display:flex;gap:.35rem;align-items:center;margin:.35rem 0}
   /* One fixed box per control, icon centred -- Winamp-style: every button the
      same size regardless of which shape is inside it. */
@@ -220,7 +221,8 @@ _PAGE = r"""<!doctype html>
   #pl .plq{font-size:.78rem;margin-top:.1rem}
   /* Playlist: number, title, duration hard right. */
   #pl #pl-pltbl td{border-bottom:1px solid #21262d;padding:.26rem .45rem}
-  #pl #pl-pltbl td.n{width:2.2rem;color:var(--mut,#8b949e);text-align:right}
+  #pl #pl-pltbl td.n{width:var(--plnw,2.2rem);color:var(--mut,#8b949e);
+      text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
   #pl #pl-pltbl td.t{overflow-wrap:anywhere;cursor:pointer}
   #pl #pl-pltbl td.d{width:4rem;text-align:right;color:var(--mut,#8b949e);
       white-space:nowrap;font-variant-numeric:tabular-nums}
@@ -249,6 +251,7 @@ _PAGE = r"""<!doctype html>
   /* Each pane scrolls on its own and can be dragged taller, like a sheet. */
   #pl .pltbl{max-height:13rem;overflow:auto;resize:vertical;
       border:1px solid #21262d;border-radius:4px}
+  #pl .plqtbl{max-height:none;height:13rem}
   #pl table{border-collapse:collapse;font-size:.84rem;width:100%;
       table-layout:fixed}
   #pl td{padding:.32rem .5rem;vertical-align:top;
@@ -403,7 +406,7 @@ _PAGE = r"""<!doctype html>
            title="Seek" oninput="plSeekTo(this.value)">
     <div class="plq muted" id="pl-queue"></div>
     <details id="pl-plist" style="display:none"><summary id="pl-plsum">Playlist</summary>
-      <div class="pltbl"><table id="pl-pltbl"></table></div>
+      <div class="pltbl plqtbl" id="pl-plpane"><table id="pl-pltbl"></table></div>
     </details>
     <audio id="pl-audio" preload="none" controls></audio>
     <details id="pl-tags" open><summary>ID tags</summary><div id="pl-tagbody" class="muted">—</div></details>
@@ -493,11 +496,44 @@ function plPlace(x,y){
   if(x===undefined||x===null){x=PLXY.x;y=PLXY.y;}
   return plPlaceAt(x,y);
 }
+// Size is remembered; POSITION deliberately is not -- the popup always opens
+// under the pointer so it can be dismissed without travelling to a corner.
+function plSizeSave(){
+  var el=document.getElementById('pl'); if(!el)return;
+  var pane=document.getElementById('pl-plpane');
+  try{localStorage.setItem('plsize',JSON.stringify({
+    w:el.offsetWidth, h:el.offsetHeight,
+    q:pane?pane.offsetHeight:0}));}catch(e){}
+}
+function plSizeRestore(){
+  var el=document.getElementById('pl'); if(!el)return;
+  var s=null;
+  try{s=JSON.parse(localStorage.getItem('plsize')||'null');}catch(e){}
+  if(!s)return;
+  // clamp to the window: a size saved on a bigger screen must not open a player
+  // that hangs off this one
+  if(s.w>200)el.style.width=Math.min(s.w,window.innerWidth-16)+'px';
+  if(s.h>120)el.style.height=Math.min(s.h,window.innerHeight-16)+'px';
+  var pane=document.getElementById('pl-plpane');
+  if(pane&&s.q>40)pane.style.height=Math.min(s.q,window.innerHeight-120)+'px';
+}
+function plSizeWatch(){
+  var el=document.getElementById('pl'); if(!el||!window.ResizeObserver)return;
+  var t=null;
+  var ro=new ResizeObserver(function(){
+    if(t)clearTimeout(t);
+    t=setTimeout(plSizeSave,300);         // debounced: a drag fires constantly
+  });
+  ro.observe(el);
+  var pane=document.getElementById('pl-plpane');
+  if(pane)ro.observe(pane);
+}
 function plPlaceAt(x,y){
   // Put the popup right under the pointer so it can be confirmed and dismissed
   // without travelling to a corner -- clamped so it never hangs off-screen.
   var el=document.getElementById('pl');
   el.classList.add('on');                       // must be visible to measure
+  plSizeRestore();                              // ...at the size you left it
   var w=el.offsetWidth||384, h=el.offsetHeight||220, m=8;
   var left=Math.min(Math.max(m,(x||0)+12), Math.max(m,window.innerWidth-w-m));
   var top =Math.min(Math.max(m,(y||0)+12), Math.max(m,window.innerHeight-h-m));
@@ -733,6 +769,10 @@ function plRenderList(){
   if(PLQ.length<2){box.style.display='none';return;}   // a single song needs no list
   box.style.display='';
   document.getElementById('pl-plsum').textContent='Playlist ('+PLQ.length+')';
+  // 1.1rem of padding plus ~.52rem per digit, so 1000+ tracks still fit on one
+  // line instead of wrapping the dot
+  tb.style.setProperty('--plnw',
+    (1.1+0.52*String(PLQ.length).length)+'rem');
   tb.innerHTML=PLQ.map(function(it,i){
     return '<tr'+(i===PLQI?' class="on"':'')+'>'
       +'<td class="n">'+(i+1)+'.</td>'
@@ -803,6 +843,7 @@ document.addEventListener('keydown',function(e){
 document.addEventListener('DOMContentLoaded',function(){
   var a=plEl();if(!a)return;
   plIcons();                                     // draw the control glyphs
+  plSizeWatch();                                 // remember size changes
   plVolInit();                                   // restore last-used level
   a.addEventListener('timeupdate',function(){
     document.getElementById('pl-time').textContent=
