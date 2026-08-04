@@ -144,7 +144,8 @@ class QbtClient:
         self._post_first_ok(("stop", "pause"), {"hashes": torrent_hash})
 
     def add_magnet(self, magnet: str, category: str = "",
-                   paused: bool = True) -> Optional[str]:
+                   paused: bool = True,
+                   stop_on_metadata: bool = True) -> Optional[str]:
         """
         Add a magnet directly and return its infohash (lowercase), or None.
 
@@ -155,9 +156,21 @@ class QbtClient:
         Christmas disc holding Billie Holiday sides). So for the harvest path
         we add the torrent ourselves.
 
-        Added PAUSED by default so the file-selection step can deselect the
-        tracks we don't want BEFORE anything downloads -- otherwise a 3-CD box
-        pulls in full just to take two songs.
+        The caller wants the torrent to sit still until the file-selection step
+        has dropped the tracks it does not want -- otherwise a 3-CD box pulls in
+        full to take two songs. But a magnet CARRIES NO FILE LIST: the file
+        names live in metadata that has to be fetched from peers, and a STOPPED
+        torrent connects to nobody, so a magnet added stopped can never populate
+        its files. The old code added it stopped and then waited up to 180s for
+        a file list that was never going to arrive, and discarded the release --
+        which is how "The Essential Billie Holiday 3 cd boxset[flac]", holding
+        27 of the wanted sides, got blocklisted for "no file list".
+
+        So `stop_on_metadata` uses qBittorrent's own `stopCondition`
+        (MetadataReceived, available since 4.5): the torrent starts, fetches
+        ONLY the metadata, and qBittorrent stops it the instant that lands --
+        before any content transfers. Measured on the release above: 65 files
+        known after 5 seconds, 0 bytes of content downloaded.
         """
         mag = magnet_from_guid(magnet) or str(magnet or "")
         ih = btih_from_magnet(mag)
@@ -167,7 +180,11 @@ class QbtClient:
         data: Dict[str, str] = {"urls": mag}
         if category:
             data["category"] = category
-        if paused:
+        if paused and stop_on_metadata:
+            data["stopCondition"] = "MetadataReceived"
+        elif paused:
+            # Hard stop -- no metadata will be fetched, so only use this when
+            # the file list genuinely is not needed.
             # qBittorrent 5.x renamed `paused` to `stopped`; sending both keeps
             # this working across versions (the unknown key is ignored).
             data["paused"] = "true"

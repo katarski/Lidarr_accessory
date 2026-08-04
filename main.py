@@ -144,6 +144,7 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     put("lidarr", "comp_hunt_titles_per_pass", "COMP_HUNT_TITLES_PER_PASS", int)
     put("lidarr", "comp_hunt_grabs_per_pass", "COMP_HUNT_GRABS_PER_PASS", int)
     put("lidarr", "comp_hunt_min_title_score", "COMP_HUNT_MIN_TITLE_SCORE", float)
+    put("lidarr", "comp_hunt_healthy_seeders", "COMP_HUNT_HEALTHY_SEEDERS", int)
     put("lidarr", "harvest_enabled", "HARVEST_ENABLED", bool)
     put("lidarr", "harvest_dry_run", "HARVEST_DRY_RUN", bool)
     put("lidarr", "harvest_duration_tolerance", "HARVEST_DURATION_TOLERANCE", float)
@@ -1409,6 +1410,8 @@ def main() -> int:
             lidarr_cfg.get("comp_hunt_grabs_per_pass", 1)),
         comp_hunt_min_title_score=float(
             lidarr_cfg.get("comp_hunt_min_title_score", 0.6)),
+        comp_hunt_healthy_seeders=int(
+            lidarr_cfg.get("comp_hunt_healthy_seeders", 5)),
         comp_hunt_collections_only=bool(
             lidarr_cfg.get("comp_hunt_collections_only", True)),
         harvest_enabled=bool(lidarr_cfg.get("harvest_enabled", True)),

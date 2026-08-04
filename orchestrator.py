@@ -664,6 +664,11 @@ class OrchestratorConfig:
     # Holiday The Lady", which matches the already-owned "Lady Sings The Blues".
     # 0.6 accepted every true match and rejected every false one in testing.
     comp_hunt_min_title_score: float = 0.6
+    # Seeder count at or above which a candidate counts as healthy. Healthy ones
+    # are tried FIRST as a band, not as a rank bonus -- coverage*20 swamps any
+    # seeder weight, so a 25-seeder release could otherwise lose to a dead one
+    # holding two more songs. Thin releases are still tried, just afterwards.
+    comp_hunt_healthy_seeders: int = 5
     # Only consider releases MusicBrainz marks as a compilation / soundtrack /
     # live record. A plain studio album cannot be the home of another artist's
     # stray side, so it is no use here.
@@ -8550,8 +8555,27 @@ class Orchestrator:
                                                int(rel.get("leechers") or 0))
                         + self._release_format_bonus(str(rel.get("title") or "")))
                 cands.append((rank, rel))
-        cands.sort(key=lambda t: -t[0])
+        # SEEDERS FIRST, in bands rather than as a weight. Coverage times 20
+        # swamps any seeder term (a 27-track compilation scores 540, where a
+        # 25-seeder swarm adds 25), so a well-seeded release could lose to a
+        # dead one carrying two more songs -- and a dead torrent carries no
+        # songs at all. Banding says "prefer seeded" without ever refusing a
+        # thin release when it is the only thing on offer: everything above the
+        # threshold is tried first, everything below still gets its turn after.
+        healthy = max(1, int(getattr(self.cfg, "comp_hunt_healthy_seeders", 5)))
+        cands.sort(key=lambda t: (
+            0 if int(t[1].get("seeders") or 0) >= healthy else 1, -t[0]))
         ranked = [c[1] for c in cands]
+        n_healthy = sum(1 for c in cands
+                        if int(c[1].get("seeders") or 0) >= healthy)
+        if ranked and n_healthy:
+            logger.info("compilation hunt: %d of %d candidate(s) have >=%d "
+                        "seeder(s) and are tried first", n_healthy, len(ranked),
+                        healthy)
+        elif ranked:
+            logger.info("compilation hunt: no candidate has >=%d seeder(s) -- "
+                        "trying the %d thin one(s) anyway, best first",
+                        healthy, len(ranked))
         if ranked:
             note = "%d candidate(s) from %d compilation(s)" % (len(ranked), done)
         elif done:
@@ -8670,13 +8694,14 @@ class Orchestrator:
                 continue
             files = []
             try:
-                qbt.pause(thash)
-                # A MAGNET carries no file list until metadata is fetched from
-                # peers, and on a thin swarm that takes minutes -- 45s meant a
-                # perfectly good grab was declared "no file list" and thrown
-                # away ("Nat King Cole - The Extraordinary Deluxe ... [24-192 HD
-                # FLAC]"). The torrent stays PAUSED throughout, so waiting costs
-                # no bandwidth.
+                # DO NOT pause here. A magnet's file list lives in metadata that
+                # must be fetched from peers, and a stopped torrent talks to
+                # nobody -- pausing first meant the wait below could only ever
+                # time out, and the release was then discarded as "no file list"
+                # however good it was. The torrent was added with
+                # stopCondition=MetadataReceived, so qBittorrent stops it itself
+                # the moment metadata lands and no content is transferred; a
+                # Lidarr-grabbed one is paused as soon as its files are known.
                 deadline = time.time() + int(getattr(
                     self.cfg, "assembly_filelist_timeout", 180))
                 while time.time() < deadline:
@@ -8684,6 +8709,11 @@ class Orchestrator:
                     if files:
                         break
                     time.sleep(5)
+                if files:
+                    # Metadata is in. Stop it NOW, before the deselect decides
+                    # what to keep -- for anything Lidarr added started, this is
+                    # the only thing standing between us and a full 3-CD pull.
+                    qbt.pause(thash)
             except Exception:  # noqa: BLE001
                 files = []
             if not files:
@@ -10996,6 +11026,8 @@ class Orchestrator:
          "How many candidates are grabbed and verified per pass. Each costs a paused metadata wait, so 1 is usually right."),
         ("lidarr.comp_hunt_min_title_score", "lidarr", "comp_hunt_min_title_score", "Compilation hunt: min title match (0-1)", "float", 0.6,
          "How closely an indexer result must resemble the compilation searched for. The shortened queries that make these searches land also make them lie: 'The Lady: Complete Collection' has to be queried as 'Billie Holiday The Lady', which matches the already-owned 'Lady Sings The Blues'. Lower this and wrong releases get grabbed; raise it and obtainable compilations are missed."),
+        ("lidarr.comp_hunt_healthy_seeders", "lidarr", "comp_hunt_healthy_seeders", "Compilation hunt: healthy seeders", "int", 5,
+         "Seeder count at or above which a candidate is tried FIRST. This is a band, not a rank bonus: coverage counts for so much that a 25-seeder release would otherwise lose to a dead one holding two more songs, and a dead torrent yields no songs at all. Thin releases are still tried -- just after the healthy ones -- so nothing is refused when there is nothing better."),
         ("lidarr.comp_hunt_collections_only", "lidarr", "comp_hunt_collections_only", "Compilation hunt: collections only", "bool", True,
          "Only consider releases MusicBrainz marks as a compilation, soundtrack or live record. A plain studio album cannot be the home of a stray side, so it is no use here."),
         ("lidarr.harvest_enabled", "lidarr", "harvest_enabled", "Harvest: salvage songs already on disk", "bool", True,
@@ -11177,6 +11209,7 @@ class Orchestrator:
             "lidarr.comp_hunt_titles_per_pass",
             "lidarr.comp_hunt_grabs_per_pass",
             "lidarr.comp_hunt_min_title_score",
+            "lidarr.comp_hunt_healthy_seeders",
             "lidarr.comp_hunt_collections_only",
             "lidarr.harvest_enabled",
             "lidarr.harvest_dry_run",
