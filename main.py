@@ -1613,6 +1613,54 @@ def main() -> int:
     else:
         logger.info("Reconcile: disabled")
 
+    # --- Song harvest: salvage tracks already sitting in needs-attention ---
+    if getattr(orch_cfg, "harvest_enabled", True):
+        def harvest_loop(stop_evt, interval: int) -> None:
+            import song_harvest as SH
+            led = SH.HarvestLedger(str(
+                Path(args.config).parent / "harvest_ledger.json"))
+            # Offset the first run so it doesn't pile onto the startup scan.
+            if stop_evt.wait(120):
+                return
+            while not stop_evt.is_set():
+                try:
+                    # Sources are the folders already parked in
+                    # needs-attention -- compilations and box sets Lidarr had
+                    # no album target for.
+                    if orch.held is None:
+                        return
+                    srcs = [i.get("source_path") for i in orch.held.list()
+                            if i.get("source_path")]
+                    SH.harvest_pass(
+                        lidarr, srcs, ledger=led,
+                        tolerance_seconds=orch_cfg.harvest_duration_tolerance,
+                        dry_run=orch_cfg.harvest_dry_run,
+                        max_files=orch_cfg.harvest_max_files_per_pass,
+                        skip_unchanged=orch_cfg.recheck_skip_unchanged,
+                        import_mode="copy")
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("harvest pass failed: %s", exc)
+                if stop_evt.wait(max(600, interval)):
+                    return
+
+        threading.Thread(
+            target=harvest_loop,
+            args=(stop, max(600, int(orch_cfg.assembly_interval_seconds))),
+            daemon=True,
+            name="cue-harvest",
+        ).start()
+        logger.info(
+            "Song harvest: enabled (every %ds, tolerance=%.0fs, %s, "
+            "skip-unchanged=%s) -- imports single tracks Lidarr is missing out "
+            "of compilations already on disk",
+            max(600, int(orch_cfg.assembly_interval_seconds)),
+            orch_cfg.harvest_duration_tolerance,
+            "DRY RUN" if orch_cfg.harvest_dry_run else "IMPORTING (copy)",
+            orch_cfg.recheck_skip_unchanged,
+        )
+    else:
+        logger.info("Song harvest: disabled")
+
     # --- Album assembly planner (requirement e) -------------------------
     if getattr(orch_cfg, "assembly_enabled", False) and orch.assembly is not None:
         threading.Thread(
