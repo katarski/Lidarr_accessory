@@ -44,7 +44,7 @@ import threading
 import time
 from typing import Optional
 
-from ollama_client import OllamaClient
+from ollama_client import OllamaClient, _clip
 
 logger = logging.getLogger("cloud_llm")
 
@@ -155,7 +155,7 @@ class CloudLLMClient(OllamaClient):
     def _generate(
         self, system: str, prompt: str, format_json: bool = False,
         num_predict: Optional[int] = None, timeout: Optional[float] = None,
-        label: str = "generate",
+        label: str = "generate", subject: str = "",
     ) -> str:
         if not self.enabled:
             return ""
@@ -219,9 +219,10 @@ class CloudLLMClient(OllamaClient):
                 CloudLLMClient._blocked_logged = False
                 out = (data["choices"][0]["message"]["content"] or "").strip()
                 logger.info(
-                    "LLM %s: %s in %.1fs (%d chars out)",
-                    label, "answered" if out else "EMPTY",
-                    time.monotonic() - started, len(out),
+                    "LLM %s: %s -> %s (%.1fs)", label,
+                    _clip(subject) if subject else "(no subject)",
+                    _clip(out) if out else "EMPTY",
+                    time.monotonic() - started,
                 )
                 return out
             except Exception as exc:  # noqa: BLE001

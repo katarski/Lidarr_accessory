@@ -110,6 +110,12 @@ _ALBUM_MATCH_SYSTEM = (
 )
 
 
+def _clip(s: str, limit: int = 70) -> str:
+    """One-line, length-capped rendering for log lines."""
+    s = " ".join(str(s).split())
+    return repr(s if len(s) <= limit else s[:limit] + "...")
+
+
 class OllamaClient:
     def __init__(
         self,
@@ -159,6 +165,7 @@ class OllamaClient:
         num_predict: Optional[int] = None,
         timeout: Optional[float] = None,
         label: str = "generate",
+        subject: str = "",
     ) -> str:
         if not self.enabled:
             return ""
@@ -200,9 +207,10 @@ class OllamaClient:
             data = r.json()
             out = (data.get("response") or "").strip()
             logger.info(
-                "LLM %s: %s in %.1fs (%d chars out)",
-                label, "answered" if out else "EMPTY",
-                time.monotonic() - started, len(out),
+                "LLM %s: %s -> %s (%.1fs)", label,
+                _clip(subject) if subject else "(no subject)",
+                _clip(out) if out else "EMPTY",
+                time.monotonic() - started,
             )
             return out
         except requests.exceptions.ReadTimeout as exc:
@@ -330,7 +338,7 @@ class OllamaClient:
         )
         out = self._generate(_IDENTITY_SPLIT_SYSTEM, prompt,
                              num_predict=64, timeout=60.0,
-                             label="parse_artist_album")
+                             label="parse_artist_album", subject=folder_name)
         ans = (out or "").strip().strip("`").strip()
         if "|" not in ans:
             return "", ""
@@ -370,7 +378,8 @@ class OllamaClient:
             "Reply with the exact owned title, or NONE."
         )
         out = self._generate(_ALBUM_MATCH_SYSTEM, prompt, num_predict=64,
-                             timeout=60.0, label="pick_owned_album")
+                             timeout=60.0, label="pick_owned_album",
+                             subject=f"{download_name} vs {len(owned_titles)} owned")
         ans = (out or "").strip().strip("`").strip().strip('"').strip("'").strip()
         if not ans or ans.upper() == "NONE":
             self._match_cache[cache_key] = None
@@ -392,6 +401,10 @@ class OllamaClient:
             except Exception:  # noqa: BLE001
                 pass
         if matched is None:
+            logger.info(
+                "AI album match rejected (answer not in owned list): %r -> %r",
+                download_name, ans,
+            )
             self._match_cache[cache_key] = None
             return None
         # SAFETY GUARD: reject a match with no meaningful word overlap. A weak
@@ -417,6 +430,7 @@ class OllamaClient:
             )
             self._match_cache[cache_key] = None
             return None
+        logger.info("AI album match ACCEPTED: %r -> %r", download_name, matched)
         self._match_cache[cache_key] = matched
         return matched
 
@@ -452,7 +466,9 @@ class OllamaClient:
         )
         out = self._generate(
             _ALBUM_MATCH_SYSTEM, prompt, num_predict=64, timeout=60.0,
-            label="confirm_album")
+            label="confirm_album",
+            subject=f"{context.splitlines()[0] if context else ''} "
+                    f"vs {len(candidate_titles)} candidates")
         ans = (out or "").strip().strip("`").strip().strip('"').strip("'").strip()
         result = None
         if ans and ans.upper() != "NONE":
@@ -506,6 +522,7 @@ class OllamaClient:
             num_predict=token_cap,
             timeout=90.0,
             label="normalize_tags",
+            subject=f"{len(plans)} track(s)",
         )
         if not out:
             return None
