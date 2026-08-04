@@ -647,6 +647,16 @@ class OrchestratorConfig:
     # go rather than being duplicated. This DOES break the seed for the torrent
     # the file came from -- that is the accepted trade.
     harvest_import_mode: str = "move"
+    # After a harvest, DELETE whatever the source still holds that no album
+    # wants -- other performances, non-wanted songs, artwork, logs -- and drop
+    # the torrent (with data) from qBittorrent. Files that ARE still wanted are
+    # re-checked and survive for the next pass.
+    # OFF by default: deletion is irreversible and "not wanted" means not
+    # wanted RIGHT NOW, so adding an artist later cannot bring a file back.
+    harvest_purge_leftovers: bool = False
+    # Stage leftovers here before deleting, so a pass can be inspected. Empty
+    # deletes in place.
+    harvest_leftovers_dir: str = ""
 
     # --- Re-check gating --------------------------------------------------
     # Don't recompute a verdict for a folder/torrent whose files AND Lidarr's
@@ -10547,6 +10557,10 @@ class Orchestrator:
          "How far a file's length may differ from the wanted track's. This is the check that separates the studio master from a live or alternate take of the same title -- title alone is not enough."),
         ("lidarr.harvest_max_files_per_pass", "lidarr", "harvest_max_files_per_pass", "Harvest: max files / pass", "int", 4000,
          "Safety cap on how many audio files are tag-read per harvest pass."),
+        ("lidarr.harvest_purge_leftovers", "lidarr", "harvest_purge_leftovers", "Harvest: delete what is not needed", "bool", False,
+         "After harvesting, DELETE everything the source still holds that no album wants, and remove the torrent (with data) from qBittorrent. Files still wanted by Lidarr are re-checked and survive. IRREVERSIBLE -- and 'not wanted' means not wanted right now, so adding an artist later cannot bring a deleted file back."),
+        ("lidarr.harvest_leftovers_dir", "lidarr", "harvest_leftovers_dir", "Harvest: leftovers staging folder", "str", "",
+         "Move leftovers here before deleting, so a pass can be inspected first. Leave empty to delete in place."),
         ("lidarr.harvest_import_mode", "lidarr", "harvest_import_mode", "Harvest: import mode (move/copy)", "str", "move",
          "move = the source file leaves the download folder once it is in the library, freeing cache space (this breaks seeding for that torrent). copy = keep the original too."),
         ("lidarr.recheck_skip_unchanged", "lidarr", "recheck_skip_unchanged", "Skip re-checking unchanged items", "bool", True,
@@ -10702,6 +10716,8 @@ class Orchestrator:
             "lidarr.harvest_duration_tolerance",
             "lidarr.harvest_max_files_per_pass",
             "lidarr.harvest_import_mode",
+            "lidarr.harvest_purge_leftovers",
+            "lidarr.harvest_leftovers_dir",
             "lidarr.recheck_skip_unchanged",
         ]),
         ("Discs, archives & conversion", [

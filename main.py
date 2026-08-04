@@ -1390,6 +1390,10 @@ def main() -> int:
             lidarr_cfg.get("harvest_max_files_per_pass", 4000)),
         harvest_import_mode=str(
             lidarr_cfg.get("harvest_import_mode", "move")).lower(),
+        harvest_purge_leftovers=bool(
+            lidarr_cfg.get("harvest_purge_leftovers", False)),
+        harvest_leftovers_dir=str(
+            lidarr_cfg.get("harvest_leftovers_dir", "") or ""),
         recheck_skip_unchanged=bool(
             lidarr_cfg.get("recheck_skip_unchanged", True)),
         assembly_max_albums_per_pass=int(
@@ -1639,7 +1643,12 @@ def main() -> int:
                         dry_run=orch_cfg.harvest_dry_run,
                         max_files=orch_cfg.harvest_max_files_per_pass,
                         skip_unchanged=orch_cfg.recheck_skip_unchanged,
-                        import_mode=orch_cfg.harvest_import_mode)
+                        import_mode=orch_cfg.harvest_import_mode,
+                        purge_leftovers_enabled=(
+                            orch_cfg.harvest_purge_leftovers
+                            and not orch_cfg.harvest_dry_run),
+                        leftovers_dir=(orch_cfg.harvest_leftovers_dir or None),
+                        qbt=orch._get_qbt() if hasattr(orch, "_get_qbt") else None)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("harvest pass failed: %s", exc)
                 if stop_evt.wait(max(600, interval)):

@@ -543,6 +543,9 @@ def harvest_pass(
     max_files: int = 4000,
     skip_unchanged: bool = True,
     import_mode: str = "copy",
+    purge_leftovers_enabled: bool = False,
+    leftovers_dir: Optional[str] = None,
+    qbt=None,
 ) -> Dict[str, Any]:
     """
     Walk each source folder, harvest whatever songs Lidarr is missing, and
@@ -591,6 +594,25 @@ def harvest_pass(
                     logger.info("harvest: submitted %d track(s) to Lidarr "
                                 "(command %s, mode=%s)",
                                 len(entries), cid, import_mode)
+                    # Everything the harvest did NOT need goes. A file that is
+                    # still wanted survives -- purge_leftovers re-checks each
+                    # one against the index rather than trusting this pass.
+                    try:
+                        pst = purge_leftovers(
+                            src_dir,
+                            imported_paths=[e["path"] for e in entries],
+                            index=index,
+                            tolerance_seconds=tolerance_seconds,
+                            staging_dir=leftovers_dir,
+                            delete=purge_leftovers_enabled,
+                            qbt=qbt if purge_leftovers_enabled else None)
+                        for k in ("deleted", "bytes_freed", "torrent_removed",
+                                  "kept_wanted"):
+                            stats["purge_" + k] = (
+                                stats.get("purge_" + k, 0) + pst.get(k, 0))
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("harvest: purge failed for %s: %s",
+                                       src_dir, exc)
                 else:
                     logger.warning("harvest: Lidarr refused the import of "
                                    "%d track(s) from %s", len(entries), src_dir)
@@ -611,4 +633,101 @@ def harvest_pass(
         stats["sources"], stats["skipped_unchanged"], stats["scanned"],
         stats["matched"], stats["imported"], stats["albums"],
         "  [DRY RUN -- nothing written]" if dry_run else "")
+    return stats
+
+
+# ---------------------------------------------------------------- leftovers
+
+def purge_leftovers(
+    src_dir: str,
+    imported_paths: Iterable[str],
+    index: Dict[str, List[WantedTrack]],
+    tolerance_seconds: float = 10.0,
+    staging_dir: Optional[str] = None,
+    delete: bool = False,
+    qbt=None,
+) -> Dict[str, Any]:
+    """
+    Deal with what a harvested source still holds once its wanted tracks are in
+    the library.
+
+    A file survives ONLY if it is still wanted -- i.e. it matches a track Lidarr
+    is missing. Everything else (other performances, non-wanted songs, artwork,
+    logs, cue sheets) is leftover.
+
+    `staging_dir`  move leftovers there first, so a pass can be inspected
+                   before anything is destroyed
+    `delete`       actually remove them (default OFF)
+    `qbt`          if given, the torrent covering this folder is removed from
+                   the client once its files are gone -- seeding is already
+                   broken by the move, and the registration is not wanted
+
+    IMPORTANT: "not wanted" means not wanted RIGHT NOW. Adding an artist later
+    cannot resurrect a deleted file, which is why `delete` defaults to False and
+    staging exists.
+    """
+    stats = {"kept_wanted": 0, "leftover": 0, "moved": 0, "deleted": 0,
+             "bytes_freed": 0, "torrent_removed": 0, "errors": 0}
+    done = {os.path.abspath(p) for p in imported_paths}
+    leftovers: List[str] = []
+    for dirpath, _dirs, names in os.walk(src_dir):
+        for name in sorted(names):
+            full = os.path.join(dirpath, name)
+            if os.path.abspath(full) in done:
+                continue                      # already moved into the library
+            if os.path.splitext(name)[1].lower() in AUDIO_EXTS:
+                # Still wanted? Then it is NOT leftover -- a later pass takes it.
+                sf = read_tags(full)
+                rep = match_files([sf], index,
+                                  tolerance_seconds=tolerance_seconds)
+                if rep.matches:
+                    stats["kept_wanted"] += 1
+                    continue
+            leftovers.append(full)
+    stats["leftover"] = len(leftovers)
+    for full in leftovers:
+        try:
+            size = os.path.getsize(full)
+        except OSError:
+            size = 0
+        try:
+            if staging_dir:
+                rel = os.path.relpath(full, src_dir)
+                dest = os.path.join(staging_dir,
+                                    os.path.basename(src_dir.rstrip("/")), rel)
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                os.replace(full, dest)
+                stats["moved"] += 1
+                full = dest
+            if delete:
+                os.remove(full)
+                stats["deleted"] += 1
+                stats["bytes_freed"] += size
+        except OSError as exc:
+            stats["errors"] += 1
+            logger.warning("harvest purge: %s -- %s", full, exc)
+    if qbt is not None and (stats["deleted"] or stats["moved"]):
+        # The files are gone from where the torrent expects them, so the
+        # torrent can only error from here on. Remove it WITH data so any
+        # remaining pieces go too.
+        try:
+            for t in (qbt.torrents() or []):
+                cp = str(t.get("content_path") or "")
+                nm = str(t.get("name") or "")
+                if not nm:
+                    continue
+                if nm in src_dir or os.path.basename(src_dir.rstrip("/")) in cp:
+                    if qbt.remove(str(t.get("hash")), delete_files=True):
+                        stats["torrent_removed"] += 1
+                        logger.info("harvest purge: removed torrent %r "
+                                    "(with data) -- it was harvested", nm[:60])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("harvest purge: torrent removal failed: %s", exc)
+    logger.info(
+        "harvest purge %s: %d still-wanted kept, %d leftover (%d staged, "
+        "%d deleted, %.2f GB freed), %d torrent(s) removed%s",
+        os.path.basename(src_dir.rstrip("/"))[:44], stats["kept_wanted"],
+        stats["leftover"], stats["moved"], stats["deleted"],
+        stats["bytes_freed"] / 1e9, stats["torrent_removed"],
+        "" if delete else "  [REPORT ONLY -- nothing deleted]")
     return stats
