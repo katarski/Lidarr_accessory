@@ -7555,6 +7555,29 @@ class Orchestrator:
         title = album_title or str(rec.get("title") or "")
         return bool(self._release_unofficial_markers(title))
 
+    _LOSSLESS_RE = re.compile(
+        r"(?i)(?:^|[\s\-_.\(\[])(flac|ape|wavpack|wv|alac|lossless|dsd|"
+        r"24[\s\-]?bit|24[\s\-]?96|24[\s\-]?192)(?:$|[\s\-_.\)\]])")
+    _LOSSY_RE = re.compile(
+        r"(?i)(?:^|[\s\-_.\(\[])(mp3|aac|m4a|ogg|opus|vbr|v0|v2|"
+        r"320|256|192\s?kbps|128)(?:$|[\s\-_.\)\]])")
+
+    def _release_format_bonus(self, title: str) -> float:
+        """
+        Format contribution to a release's rank. Without this the song hunt is
+        format-BLIND: ranking was health + compilation-bonus only, which let a
+        1-seeder mp3 ("Sam Cooke - Merry Christmas ... mp3") outrank a 5-seeder
+        FLAC box ("The Complete On Verve (1945-1959) FLAC") purely on the
+        compilation bonus. Weighted to beat a modest seeder edge but not an
+        overwhelming one -- a dead lossless torrent is worse than a live lossy.
+        """
+        t = str(title or "")
+        if self._LOSSLESS_RE.search(t):
+            return float(getattr(self.cfg, "assembly_lossless_bonus", 30.0))
+        if self._LOSSY_RE.search(t):
+            return -float(getattr(self.cfg, "assembly_lossy_penalty", 15.0))
+        return 0.0
+
     def _release_health(self, seeders: int, leechers: int) -> float:
         """
         Swarm-health contribution to a release's rank: seeders dominate,
@@ -8040,6 +8063,9 @@ class Orchestrator:
             # A compilation is the likeliest home for a stray song, so give those
             # titles a leg up rather than refusing them as the normal grab does.
             bonus = 40.0 if self._release_unofficial_markers(title) else 0.0
+            # ... and prefer lossless among them: the compilation bonus alone
+            # used to let a 1-seeder mp3 beat a 5-seeder FLAC box.
+            bonus += self._release_format_bonus(title)
             cands.append((self._release_health(seeders,
                                                int(r.get("leechers") or 0)) + bonus,
                           r))
@@ -8127,20 +8153,52 @@ class Orchestrator:
             title = str(r.get("title") or "?")
             logger.info("assembly: grabbing %r to look for %d missing song(s) "
                         "of %s", title[:80], len(missing), artist)
-            if not self.lidarr.release_grab(guid, idx):
-                continue
+            from qbittorrent_client import btih_from_magnet, magnet_from_guid
+            magnet = magnet_from_guid(guid)
+            ih = btih_from_magnet(magnet) if magnet else None
+            grabbed = self.lidarr.release_grab(guid, idx)
+            if not grabbed:
+                # Lidarr REFUSES any release it can't attribute to a library
+                # artist ("Unable to find matching artist and albums", 404) --
+                # i.e. every cross-artist compilation, which is precisely where
+                # stray songs live. Add it ourselves, PAUSED, so the selection
+                # step runs before anything downloads.
+                if qbt is None or not magnet:
+                    continue
+                logger.info(
+                    "assembly: Lidarr would not grab %r (cannot attribute it) "
+                    "-- adding the magnet directly, paused", title[:70])
+                if not qbt.add_magnet(
+                        magnet,
+                        category=str(getattr(
+                            self.cfg, "assembly_qbt_category", "") or ""),
+                        paused=True):
+                    continue
             if qbt is None:
                 return True, ("grabbed %r -- no qBittorrent to inspect it, so it "
                               "will download in full" % title[:60])
-            thash, _rec = self._await_queue_hash_by_title(title, timeout=90)
+            # Verify by INFOHASH, not by title. Lidarr's queue is keyed to an
+            # artist/album it may never have resolved, and a magnet carries no
+            # file list until metadata arrives -- so the old title poll timed
+            # out on grabs that had in fact succeeded and the pipeline threw
+            # away its own harvest ("Nat King Cole - 100 Unforgettable Hits"
+            # reached 100% after being written off). The infohash is in the
+            # guid, so this is exact and needs no metadata.
+            thash = None
+            if ih:
+                thash = self._await_torrent_by_hash(qbt, ih, timeout=int(
+                    getattr(self.cfg, "assembly_verify_timeout", 180)))
+            if not thash:
+                thash, _rec = self._await_queue_hash_by_title(title, timeout=90)
             if not thash:
                 # Do NOT leave it running. For a song hunt the whole point is to
                 # take a couple of tracks; an unverifiable grab means a full album
                 # (or a 3-CD box) downloads for nothing -- which is exactly what
                 # happened when a restart interrupted this step.
-                logger.warning("assembly: %r never appeared in the queue -- "
-                               "cannot verify, removing the grab", title[:70])
-                self._reject_grab(artist, str(missing[0]), "", qbt)
+                logger.warning("assembly: %r never appeared in qBittorrent or "
+                               "the queue -- cannot verify, removing the grab",
+                               title[:70])
+                self._reject_grab(artist, str(missing[0]), ih or "", qbt)
                 continue
             files = []
             try:
@@ -8882,6 +8940,27 @@ class Orchestrator:
             scored.append(r)
         scored.sort(key=lambda x: x["_score"], reverse=True)
         return scored
+
+    def _await_torrent_by_hash(self, qbt, infohash: str, timeout: int = 180):
+        """
+        Wait for qBittorrent to hold this infohash and return it (lowercased),
+        or None. Presence is enough -- deliberately NOT waiting for a name or a
+        file list, because a magnet has neither until metadata resolves (14 of
+        this library's torrents sit in `metaDL` at 0%), and that wait is what
+        made the old title-based check fail on successful grabs.
+        """
+        if qbt is None or not infohash:
+            return None
+        ih = str(infohash).lower()
+        deadline = time.time() + max(5, int(timeout))
+        while time.time() < deadline:
+            try:
+                if qbt.torrent_by_hash(ih):
+                    return ih
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(3)
+        return None
 
     def _await_queue_hash_by_title(self, release_title: str, timeout: int = 90):
         """Poll Lidarr's queue for the item whose title matches the grabbed

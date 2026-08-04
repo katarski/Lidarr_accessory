@@ -7,12 +7,33 @@ priority (0 = don't download).
 from __future__ import annotations
 
 import logging
+import re
 import time
 from typing import Any, Dict, List, Optional
 
 import requests
 
 logger = logging.getLogger("qbittorrent")
+
+# Lidarr hands out release guids shaped "<indexerId>_magnet:?xt=urn:btih:...".
+# The prefix has to come off before the magnet is usable, and the infohash is
+# the only identifier that survives the round trip -- qBittorrent renames a
+# torrent to its own `name` field, so verifying a grab by TITLE is unreliable.
+_BTIH_RE = re.compile(r"xt=urn:btih:([0-9a-fA-F]{40}|[A-Z2-7]{32})")
+
+
+def magnet_from_guid(guid: str) -> Optional[str]:
+    """The bare magnet URI out of a Lidarr guid (strips any '<id>_' prefix)."""
+    s = str(guid or "")
+    i = s.find("magnet:")
+    return s[i:] if i >= 0 else None
+
+
+def btih_from_magnet(magnet: str) -> Optional[str]:
+    """Infohash from a magnet, LOWERCASED -- magnets carry it uppercase while
+    qBittorrent reports lowercase, so every comparison must be normalized."""
+    m = _BTIH_RE.search(str(magnet or ""))
+    return m.group(1).lower() if m else None
 
 
 class QbtClient:
@@ -121,6 +142,58 @@ class QbtClient:
     def pause(self, torrent_hash: str) -> None:
         # qBittorrent 5.x renamed 'pause' -> 'stop'; older builds use 'pause'.
         self._post_first_ok(("stop", "pause"), {"hashes": torrent_hash})
+
+    def add_magnet(self, magnet: str, category: str = "",
+                   paused: bool = True) -> Optional[str]:
+        """
+        Add a magnet directly and return its infohash (lowercase), or None.
+
+        Needed because Lidarr's grab endpoint REFUSES any release it cannot
+        attribute to a library artist -- it answers 404 "Unable to find
+        matching artist and albums". That is every cross-artist compilation,
+        which is exactly where a song hunt finds stray tracks (a Sam Cooke
+        Christmas disc holding Billie Holiday sides). So for the harvest path
+        we add the torrent ourselves.
+
+        Added PAUSED by default so the file-selection step can deselect the
+        tracks we don't want BEFORE anything downloads -- otherwise a 3-CD box
+        pulls in full just to take two songs.
+        """
+        mag = magnet_from_guid(magnet) or str(magnet or "")
+        ih = btih_from_magnet(mag)
+        if not mag.startswith("magnet:"):
+            logger.warning("add_magnet: not a magnet URI, refusing")
+            return None
+        data: Dict[str, str] = {"urls": mag}
+        if category:
+            data["category"] = category
+        if paused:
+            # qBittorrent 5.x renamed `paused` to `stopped`; sending both keeps
+            # this working across versions (the unknown key is ignored).
+            data["paused"] = "true"
+            data["stopped"] = "true"
+        if not self._api_ok():
+            self.login()
+        try:
+            r = self.s.post(f"{self.base}/api/v2/torrents/add",
+                            data=data, timeout=30)
+            r.raise_for_status()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("add_magnet failed (%s): %s",
+                           (ih or "?")[:12], exc)
+            return None
+        # qBittorrent answers a bare "Ok." even when it silently ignores a
+        # duplicate, so confirm by hash rather than trusting the response.
+        if ih:
+            for _ in range(10):
+                if self.torrent_by_hash(ih):
+                    logger.info("add_magnet: qBittorrent accepted %s", ih[:12])
+                    return ih
+                time.sleep(2)
+            logger.warning("add_magnet: %s never appeared in qBittorrent",
+                           ih[:12])
+            return None
+        return ih
 
     def torrent_by_hash(self, torrent_hash: str) -> Optional[Dict[str, Any]]:
         """The one torrent, or None if qBittorrent does not have it (which is
