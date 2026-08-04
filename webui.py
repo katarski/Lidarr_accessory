@@ -159,7 +159,21 @@ _PAGE = r"""<!doctype html>
   #pl .plbody{padding:.5rem .6rem}
   #pl .plbtns{display:flex;gap:.35rem;align-items:center;margin:.35rem 0}
   #pl .plbtns button{min-width:2.4rem}
-  #pl #pl-vol{width:5.5rem;flex:0 0 auto;accent-color:#58a6ff;cursor:pointer}
+  #pl #pl-vol{width:6rem;flex:0 0 auto;cursor:pointer;height:14px;
+      background:transparent;-webkit-appearance:none;appearance:none;margin:0}
+  #pl #pl-vol:focus{outline:none}
+  #pl #pl-vol::-webkit-slider-runnable-track{height:4px;border-radius:2px;
+      background:#30363d}
+  #pl #pl-vol::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;
+      width:12px;height:12px;border-radius:50%;background:#c9d1d9;
+      border:none;margin-top:-4px;transition:background .12s}
+  #pl #pl-vol:hover::-webkit-slider-thumb{background:#58a6ff}
+  #pl #pl-vol::-moz-range-track{height:4px;border-radius:2px;background:#30363d}
+  #pl #pl-vol::-moz-range-thumb{width:12px;height:12px;border:none;
+      border-radius:50%;background:#c9d1d9}
+  #pl #pl-vol:hover::-moz-range-thumb{background:#58a6ff}
+  #pl .plvol{display:flex;align-items:center;gap:.3rem;flex:0 0 auto}
+  #pl .plvol span{color:var(--mut,#8b949e);font-size:.8rem;line-height:1}
   #pl audio{width:100%;margin-top:.25rem}
   #pl details{margin-top:.4rem}
   #pl details summary{cursor:pointer;color:var(--mut,#8b949e)}
@@ -287,8 +301,11 @@ _PAGE = r"""<!doctype html>
       <button class="b-copy" title="Play / pause" onclick="plToggle()" id="pl-play">▶</button>
       <button class="b-copy" title="Stop" onclick="plStop()">⏹</button>
       <button class="b-copy" title="Forward 10s" onclick="plSeek(10)">⏩</button>
-      <input type="range" id="pl-vol" min="0" max="100" step="1" value="100"
-             title="Volume" oninput="plVol(this.value)">
+      <span class="plvol" title="Volume">
+        <span id="pl-volicon">🔊</span>
+        <input type="range" id="pl-vol" min="0" max="100" step="1" value="100"
+               oninput="plVol(this.value)">
+      </span>
       <span class="muted" id="pl-time" style="margin-left:auto">0:00</span>
     </div>
     <audio id="pl-audio" preload="none" controls></audio>
@@ -383,13 +400,15 @@ function fmtTime(s){s=Math.max(0,Math.floor(s||0));
 function plVol(v){
   var a=plEl(); a.volume=Math.max(0,Math.min(1,(parseFloat(v)||0)/100));
   a.muted=(a.volume===0);
+  var ic=document.getElementById('pl-volicon');
+  if(ic)ic.textContent=a.volume===0?'🔇':(a.volume<0.5?'🔉':'🔊');
   try{localStorage.setItem('plvol',String(a.volume));}catch(e){}
 }
 function plVolInit(){
   var v=1; try{var st=localStorage.getItem('plvol'); if(st!==null)v=parseFloat(st);}catch(e){}
   if(!(v>=0&&v<=1))v=1;
   var sl=document.getElementById('pl-vol'); if(sl)sl.value=Math.round(v*100);
-  plEl().volume=v; plEl().muted=(v===0);
+  plVol(Math.round(v*100));
 }
 function plToggle(){var a=plEl();if(a.paused)a.play().catch(function(){});else a.pause();plSyncBtn();}
 function plStop(){var a=plEl();a.pause();a.currentTime=0;plSyncBtn();}
@@ -950,6 +969,7 @@ function cvInfo(rel){
 function cvPollOnce(){
   fetch('/api/progress').then(function(r){return r.json();}).then(function(j){
     var conv=j.conversions||{},act=j.activity||[],splitq=j.split_queue||[];
+    var splitqTotal=(j.split_queue_total!==undefined)?j.split_queue_total:splitq.length;
     // A job that just finished changed its folder on disk -- refresh ONLY that
     // folder so the new (or replaced) file appears at once. Each job is handled
     // once, tracked by id.
@@ -983,7 +1003,7 @@ function cvPollOnce(){
     (conv.done||[]).slice().reverse().forEach(function(jb){cl+='<div class="pline"><span class="plab">'+h(jb.rel)+'</span><span class="'+(jb.state==='done'?'muted':'badge b-lossy')+'">'+h(jb.state)+' '+h(jb.msg||'')+'</span></div>';});
     document.getElementById('cv-convlist').innerHTML=cl||'<span class="muted">no conversions yet</span>';
     // Cue splits section.
-    document.getElementById('cv-nsplit').textContent=splitq.length;
+    document.getElementById('cv-nsplit').textContent=splitqTotal;
     document.getElementById('cv-splitlist').innerHTML=splitq.length
       ? splitq.map(function(p){return '<div class="pline"><span class="plab">'+h(p)+'</span><span class="muted">queued</span></div>';}).join('')
       : '<span class="muted">no cue files queued</span>';
@@ -1232,13 +1252,21 @@ def make_handler(store, actions: HeldActions):
                 wq = getattr(actions, "work_queue", None)
                 if wq is not None:
                     try:
-                        split_q = [str(p) for p in list(wq.queue)[:50]]
+                        # Send the REAL length as well: the list is capped for
+                        # display, and reporting only the capped list made the UI
+                        # read "50" indefinitely while the backlog was larger --
+                        # it looked stuck when it was draining.
+                        _allq = list(wq.queue)
+                        split_q_total = len(_allq)
+                        split_q = [str(x) for x in _allq[:50]]
                     except Exception:  # noqa: BLE001
                         split_q = []
+                        split_q_total = 0
                 self._json(200, {
                     "conversions": conv.status() if conv else {},
                     "activity": acts,
                     "split_queue": split_q,
+                    "split_queue_total": split_q_total,
                 })
             elif path == "/api/library/ls":
                 lt = getattr(actions, "library_tree", None)
