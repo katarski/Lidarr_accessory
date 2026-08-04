@@ -608,8 +608,15 @@ function plPrev(){
 function plToggle(){var a=plEl();if(a.paused)a.play().catch(function(){});else a.pause();plSyncBtn();}
 function plStop(){var a=plEl();a.pause();a.currentTime=0;plSyncBtn();}
 function plSeek(d){var a=plEl();a.currentTime=Math.max(0,(a.currentTime||0)+d);}
-function plClose(){plStop();document.getElementById('pl').classList.remove('on');
-  document.querySelectorAll('.playable.on').forEach(function(e){e.classList.remove('on');});}
+function plClose(){
+  plStop();
+  document.getElementById('pl').classList.remove('on');
+  document.querySelectorAll('.playable.on').forEach(function(e){e.classList.remove('on');});
+  // Forget where it was dragged to. A position you chose should hold while the
+  // player stays open (so clicking through songs doesn't make it jump around),
+  // but once you close it the next open belongs under the pointer again.
+  try{localStorage.removeItem('plpos');}catch(e){}
+}
 function plSyncBtn(){document.getElementById('pl-play').textContent=plEl().paused?'▶':'⏸';}
 document.addEventListener('keydown',function(e){
   if(e.key==='Escape'&&document.getElementById('pl').classList.contains('on'))plClose();
