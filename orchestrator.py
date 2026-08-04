@@ -2747,6 +2747,19 @@ class Orchestrator:
             return False
 
         iso = max(isos, key=lambda p: p.stat().st_size if p.exists() else 0)
+        # ALREADY RIPPED THIS DISC? The .iso is deliberately kept after a rip, so
+        # nothing stopped the sweep ripping it again -- and when the extracted
+        # album turns out to be one Lidarr already owns, the redundancy branch
+        # DELETES the extracted folder, which handed the next sweep a pristine
+        # ISO and started the whole rip over. That loop ran all night on a
+        # LIFAD.iso whose album was already complete in the library. The ledger
+        # entry is keyed on the ISO itself (its own mtime/size), so a genuinely
+        # replaced disc image is still ripped again.
+        iso_key = Path(str(iso) + "#dvda")
+        if self._sweep_ledger_skip(iso_key, [iso], now_ts):
+            logger.debug("DVD-Audio: %s already extracted previously -- skipping",
+                         iso.name)
+            return False
         if not self._iso_is_dvd_audio(iso):
             # Not a DVD-Audio disc -- let the SACD branch (or the leave-alone
             # path) handle it. Do NOT mark seen: the SACD branch still needs it.
@@ -2918,6 +2931,10 @@ class Orchestrator:
             self._skip_seen.add(folder)
             return True
         self._remove_stray_cues(folder)
+        # Record the DISC as done so it is never re-ripped, even if the extracted
+        # folder is later removed (imported, or deleted as redundant).
+        self._sweep_ledger_mark(iso_key, [iso], now_ts)
+        self._sweep_ledger_save()
         logger.info(
             "DVD-Audio: %s -> %d FLAC in %s (artist=%r album=%r) -- pre-split "
             "path will import (ISO kept until verified import)%s",
