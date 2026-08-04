@@ -873,6 +873,21 @@ def torrent_lifecycle_pass(
     if not download_root or not os.path.isdir(download_root):
         emit(f"lifecycle: download root {download_root!r} not visible -- skipping")
         return 0, 0
+    # ...and isdir() is not enough: Docker CREATES a missing bind-mount source,
+    # so a mistyped host path arrives as an existing, empty directory. Every
+    # completed torrent then maps to a folder that does not exist, which reads
+    # as "already imported" and costs the user their torrents. An empty root
+    # has nothing to import either way, so refusing to act loses nothing.
+    try:
+        root_empty = not any(os.scandir(download_root))
+    except OSError as exc:
+        emit(f"lifecycle: cannot read download root {download_root!r}: {exc}"
+             f" -- skipping")
+        return 0, 0
+    if root_empty:
+        emit(f"lifecycle: download root {download_root!r} is EMPTY -- refusing "
+             f"to treat completed torrents as imported (is the mount correct?)")
+        return 0, 0
 
     removed = paused = 0
     for t in qbt.torrents(category=category):

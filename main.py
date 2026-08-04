@@ -925,6 +925,40 @@ def scan_existing(root: Path, excluded: list, q: "queue.Queue[Path]",
 # --- main --------------------------------------------------------------
 
 
+def _check_mounts(watch_root: Path, library_root: Path) -> None:
+    """Shout at startup if a mount is wrong, instead of letting the pipeline
+    infer the consequences.
+
+    Docker creates a bind-mount source that does not exist on the host, so a
+    mistyped path in the Unraid template arrives as an existing, EMPTY
+    directory -- indistinguishable from "you have nothing to do" until passes
+    start acting on that emptiness. Both roots being non-empty is the normal
+    state; either being empty is worth a banner.
+    """
+    for label, root, why in (
+        ("watch root (/downloads)", watch_root,
+         "completed torrents will look already-imported and nothing can import"),
+        ("library root (/music)", library_root,
+         "every album will look missing from the library"),
+    ):
+        if not str(root):
+            continue
+        try:
+            if not root.is_dir():
+                logger.error("MOUNT PROBLEM: %s %s does not exist -- %s",
+                             label, root, why)
+            elif not any(root.iterdir()):
+                logger.error(
+                    "MOUNT PROBLEM: %s %s is EMPTY. If that is unexpected the "
+                    "host path in the container template is wrong (Docker "
+                    "silently creates a missing bind-mount source) -- %s",
+                    label, root, why)
+            else:
+                logger.info("%s %s ok", label, root)
+        except OSError as exc:
+            logger.error("MOUNT PROBLEM: cannot read %s %s: %s", label, root, exc)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="config.yaml", type=Path)
@@ -958,6 +992,7 @@ def main() -> int:
     staging_root = Path(staging_cfg["root"])
     watch_root.mkdir(parents=True, exist_ok=True)
     staging_root.mkdir(parents=True, exist_ok=True)
+    _check_mounts(watch_root, Path(lidarr_cfg.get("library_root_windows") or ""))
 
     lidarr = LidarrClient(
         LidarrConfig(
