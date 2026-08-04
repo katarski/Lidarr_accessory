@@ -621,6 +621,56 @@ def dead_grab_reaper_pass(
     return removed
 
 
+def adopt_uncategorised(
+    qbt: QbtClient, category: str,
+    emit: Callable[[str], None] = logger.info, max_adopt: int = 50,
+) -> int:
+    """
+    Give the managed category to music torrents that have NO category.
+
+    Everything in this module filters by `category` (Lidarr sets it on its own
+    grabs), so a torrent added by hand -- or by anything that forgets the
+    category -- is invisible to the pipeline: no deselect, no lifecycle, no
+    reaping. It just downloads in full. A real case: "Beck - Odelay (2016)
+    [FLAC 24-88]" sitting at 27% with an empty category while 263 other torrents
+    were managed.
+
+    Only torrents whose file list is predominantly AUDIO are adopted, so a
+    tv-sonarr-style download (or anything else sharing the client) is never
+    hijacked. Returns the number adopted.
+    """
+    if not category:
+        return 0
+    adopted = 0
+    for t in qbt.torrents():                      # no filter: we want the gaps
+        if adopted >= max_adopt:
+            break
+        if (t.get("category") or "").strip():
+            continue
+        h = t.get("hash")
+        if not h:
+            continue
+        try:
+            files = qbt.files(h)
+        except Exception:  # noqa: BLE001
+            continue
+        if not files:
+            continue                              # metadata not in yet -- later
+        audio = sum(1 for f in files
+                    if os.path.splitext(str(f.get("name") or ""))[1].lower()
+                    in AUDIO_EXTS)
+        if audio == 0 or audio * 2 < len(files):
+            continue                              # not a music download
+        if qbt.set_category(h, category):
+            adopted += 1
+            emit(f"adopted uncategorised music torrent into '{category}': "
+                 f"{(t.get('name') or h[:12])!r} ({audio}/{len(files)} audio "
+                 f"files) -- it can now be deselected and managed")
+    if adopted:
+        emit(f"adopted {adopted} uncategorised music torrent(s)")
+    return adopted
+
+
 def stalled_grab_reaper_pass(
     qbt: QbtClient, lidarr: Optional[LidarrClient], category: str = "",
     grace_seconds: int = 259200, blocklist: bool = True,

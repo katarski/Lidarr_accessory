@@ -8188,8 +8188,16 @@ class Orchestrator:
                         "blocklisting and trying the next", title[:70])
             self._reject_grab(artist, str(missing[0]), thash, qbt)
         if tried:
-            return False, ("tried %d release(s); none contained the missing "
-                           "song(s)" % tried)
+            n_left = 0
+            if hunt is not None:
+                n_left = max(0, int(hunt.get("candidates") or 0)
+                             - len(hunt.get("tried") or []))
+            return False, ("that release did not contain the missing song(s) -- "
+                           "removed and blocklisted. %s"
+                           % ("Still hunting: %d untried release(s) left, the "
+                              "next is tried automatically." % n_left
+                              if n_left else
+                              "No untried release left, so the hunt stops here."))
         return False, "no usable candidate to grab"
 
     @staticmethod

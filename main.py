@@ -169,6 +169,7 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     put("qbittorrent", "pause_during_scan", "QBIT_PAUSE_SCAN", _as_bool)
     put("qbittorrent", "deselect_video", "QBIT_DESELECT_VIDEO", _as_bool)
     put("qbittorrent", "redeselect_recheck_seconds", "QBIT_REDESELECT_RECHECK", int)
+    put("qbittorrent", "adopt_uncategorised", "QBIT_ADOPT_UNCATEGORISED", _as_bool)
     put("qbittorrent", "stalled_reaper", "QBIT_STALLED_REAPER", _as_bool)
     put("qbittorrent", "stalled_grace_days", "QBIT_STALLED_GRACE_DAYS", int)
     put("qbittorrent", "stalled_blocklist", "QBIT_STALLED_BLOCKLIST", _as_bool)
@@ -653,7 +654,7 @@ def qbt_auto_deselect_loop(
     from qbittorrent_client import QbtClient
     from qbt_deselect import (
         auto_deselect_pass, torrent_lifecycle_pass, dead_grab_reaper_pass,
-        stalled_grab_reaper_pass,
+        stalled_grab_reaper_pass, adopt_uncategorised,
     )
 
     cadence = max(10, interval)
@@ -678,6 +679,8 @@ def qbt_auto_deselect_loop(
     stalled_reaper = _as_bool(qcfg.get("stalled_reaper", True))
     stalled_grace_days = int(qcfg.get("stalled_grace_days", 3) or 3)
     stalled_blocklist = _as_bool(qcfg.get("stalled_blocklist", True))
+    # Adopt uncategorised music torrents so they are managed like the rest.
+    adopt_uncategorised_on = _as_bool(qcfg.get("adopt_uncategorised", True))
     # AI fallback for library matching: only used when the deterministic
     # (Lidarr) match misses. Requires an enabled LLM client.
     ai_match = _as_bool(qcfg.get("ai_match", True))
@@ -737,6 +740,13 @@ def qbt_auto_deselect_loop(
             if not qbt.login():
                 logger.warning("qbt loop: login failed; will retry next pass")
                 continue
+            # Pull in music torrents that have no category at all -- otherwise
+            # every pass below skips them and they download in full.
+            if adopt_uncategorised_on and category:
+                try:
+                    adopt_uncategorised(qbt, category, emit=logger.info)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("adopt uncategorised: %s", exc)
             if do_deselect:
                 # Songs an album assembly needs must stay selected even when
                 # their compilation looks fully "owned"/unwanted (requirement e).

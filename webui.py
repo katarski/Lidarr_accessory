@@ -669,6 +669,11 @@ document.addEventListener('click',function(ev){
          ev.clientX,ev.clientY);
 });
 
+function asmBadge(){
+  fetch('/api/assembly/count').then(function(r){return r.json();}).then(function(j){
+    var el=document.getElementById('n-asm'); if(el)el.textContent=(j.n||0);
+  }).catch(function(){});
+}
 function setTab(t){TAB=t;document.querySelectorAll('.tab').forEach(function(e){e.classList.toggle('on',e.dataset.tab===t);});
   document.getElementById('attention').style.display=t==='attention'?'':'none';
   document.getElementById('assembly').style.display=t==='assembly'?'':'none';
@@ -995,6 +1000,7 @@ function act(id,kind){
    .catch(function(e){toast('Error: '+e);document.querySelectorAll('[data-id="'+id+'"] button').forEach(function(b){b.disabled=false;});});
 }
 function refresh(){
+  asmBadge();                        // keep the Assembly count live on every tab
   Promise.all([fetch('/api/held').then(function(r){return r.json();}),fetch('/api/activity').then(function(r){return r.json();}).catch(function(){return{items:[]};})])
    .then(function(res){HELD=res[0].items||[];ACT=(res[1]||{}).items||[];document.getElementById('updated').textContent='updated '+new Date().toLocaleTimeString();render();
      if(TAB==='log'&&document.getElementById('logtail').checked)loadLog();});
@@ -1473,6 +1479,22 @@ def make_handler(store, actions: HeldActions):
                     pass                        # listener seeked away / closed
                 except OSError as exc:
                     logger.debug("stream %s failed: %s", p, exc)
+
+            elif path == "/api/assembly/count":
+                # The badge needs a number, not the whole plan set (which is
+                # ~190KB) -- otherwise the tab shows 0 until you open it.
+                st = getattr(actions, "assembly", None)
+                if st is None:
+                    self._json(200, {"n": 0, "complete": 0})
+                    return
+                items = st.list()
+                self._json(200, {
+                    "n": len(items),
+                    "complete": sum(1 for x in items
+                                    if float(x.get("pct") or 0) >= 100),
+                    "hunting": sum(1 for x in items
+                                   if (x.get("hunt") or {}).get("active")),
+                })
 
             elif path == "/api/assembly":
                 # NOTE: must NOT be named `store` -- that name is the held-store

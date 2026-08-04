@@ -136,6 +136,13 @@ class QbtClient:
         except Exception:  # noqa: BLE001
             pass
 
+    def set_category(self, torrent_hash: str, category: str) -> bool:
+        """Assign a category to a torrent (qBit `torrents/setCategory`)."""
+        return self._post_first_ok(
+            ["/api/v2/torrents/setCategory"],
+            {"hashes": torrent_hash, "category": category},
+        )
+
     def remove(self, torrent_hash: str, delete_files: bool = True) -> bool:
         """Delete a torrent. delete_files=True also removes its data on disk."""
         try:
