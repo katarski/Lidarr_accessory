@@ -8150,6 +8150,28 @@ class Orchestrator:
                         hits.append(nm)
                         break
             if hits:
+                # The torrent is STILL PAUSED from the check above, so narrow it
+                # BEFORE resuming. Waiting for the periodic pass meant a fast
+                # torrent had already pulled the whole collection by then --
+                # which defeats the entire point of hunting one song.
+                kept_n = 0
+                try:
+                    from qbt_deselect import (assembly_keep_tails,
+                                              process_torrent)
+                    store = getattr(self, "assembly", None)
+                    needed = set(store.needed_files().keys()) if store else set()
+                    keep = assembly_keep_tails(needed)
+                    keep |= assembly_keep_tails(hits)   # the songs we just found
+                    tinfo = {"hash": thash, "name": title}
+                    _d, _k = process_torrent(
+                        qbt, self.lidarr, tinfo, apply=True,
+                        emit=lambda m: logger.info("assembly narrow:%s", m),
+                        files=files, llm=None, deselect_video=True,
+                        reap_useless=False, assembly_keep=keep)
+                    kept_n = len(hits)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("assembly: could not narrow %r before "
+                                   "starting it: %s", title[:60], exc)
                 try:
                     qbt.force_start(thash, True)
                 except Exception:  # noqa: BLE001

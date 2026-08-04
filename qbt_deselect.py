@@ -487,7 +487,17 @@ def auto_deselect_pass(
     if now is None:
         now = time.time()
     acted = 0
-    for t in qbt.torrents(category=category):
+    # NEWEST FIRST. One pass can walk hundreds of torrents, each costing Lidarr
+    # (and sometimes LLM) calls, so a torrent that has only just been grabbed
+    # could wait many minutes to be narrowed -- by which time a fast swarm has
+    # already pulled the whole thing. Handling the newest arrivals first keeps
+    # the deselect ahead of the download.
+    _tors = list(qbt.torrents(category=category))
+    try:
+        _tors.sort(key=lambda x: float(x.get("added_on") or 0), reverse=True)
+    except Exception:  # noqa: BLE001
+        pass
+    for t in _tors:
         h = t.get("hash")
         if not h:
             continue
