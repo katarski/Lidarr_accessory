@@ -390,7 +390,20 @@ function toast(m){var t=document.getElementById('toast');t.textContent=m;t.class
 // ID-tag and Specs dropdowns are filled by a separate request that never blocks
 // the audio. Any element carrying data-audio="<abs path>" is clickable, so the
 // same handler serves Needs attention, Assembly and Converter.
-var PLCUR='';
+var PLCUR='', PLXY={x:null,y:null};
+// Clicking a different song or folder should behave like closing the player and
+// opening a new one: stop what is playing, drop the old queue and highlight, and
+// forget the current source so the fresh one always loads.
+function plResetForNew(){
+  var a=plEl();
+  try{a.pause();}catch(e){}
+  PLCUR='';
+  try{a.removeAttribute('src');a.load();}catch(e){}
+  PLQ=[];PLQI=-1;PLQLABEL='';
+  var q=document.getElementById('pl-queue');if(q)q.textContent='';
+  var box=document.getElementById('pl-plist');if(box)box.style.display='none';
+  document.querySelectorAll('.playable.on').forEach(function(e){e.classList.remove('on');});
+}
 function plEl(){return document.getElementById('pl-audio');}
 var PLDRAG=null;
 function plDragStart(ev){
@@ -417,19 +430,13 @@ function plDragEnd(){
   el.classList.remove('dragging'); document.body.classList.remove('pl-dragging');
   document.removeEventListener('mousemove',plDragMove);
   document.removeEventListener('mouseup',plDragEnd);
-  // Remember it: once you have placed the player, later tracks open there
-  // instead of jumping back under the pointer.
-  try{localStorage.setItem('plpos',JSON.stringify({l:el.style.left,t:el.style.top}));}catch(e){}
+  // Not persisted on purpose -- the next click positions the player afresh.
 }
+// Every new click opens the player AT THE POINTER. A dragged position is
+// deliberately not remembered: the player is a "look at this one thing" popup,
+// so it belongs where you just clicked, not where you left it last time.
 function plPlace(x,y){
-  // A position you chose wins over the pointer.
-  try{
-    var st=JSON.parse(localStorage.getItem('plpos')||'null');
-    if(st&&st.l&&st.t){
-      var el=document.getElementById('pl');
-      el.classList.add('on'); el.style.left=st.l; el.style.top=st.t; return;
-    }
-  }catch(e){}
+  if(x===undefined||x===null){x=PLXY.x;y=PLXY.y;}
   return plPlaceAt(x,y);
 }
 function plPlaceAt(x,y){
@@ -612,10 +619,9 @@ function plClose(){
   plStop();
   document.getElementById('pl').classList.remove('on');
   document.querySelectorAll('.playable.on').forEach(function(e){e.classList.remove('on');});
-  // Forget where it was dragged to. A position you chose should hold while the
-  // player stays open (so clicking through songs doesn't make it jump around),
-  // but once you close it the next open belongs under the pointer again.
-  try{localStorage.removeItem('plpos');}catch(e){}
+  PLQ=[];PLQI=-1;PLQLABEL='';
+  var q=document.getElementById('pl-queue');if(q)q.textContent='';
+  plRenderList();
 }
 function plSyncBtn(){document.getElementById('pl-play').textContent=plEl().paused?'▶':'⏸';}
 document.addEventListener('keydown',function(e){
@@ -647,15 +653,17 @@ document.addEventListener('click',function(ev){
   var fol=ev.target.closest?ev.target.closest('[data-audio-folder]'):null;
   if(fol){
     ev.preventDefault();ev.stopPropagation();
+    PLXY={x:ev.clientX,y:ev.clientY};
+    plResetForNew();                       // close the old one, then open fresh
+    plPlace(ev.clientX,ev.clientY);
     plQueueFolder(fol.getAttribute('data-audio-folder'),
                   fol.getAttribute('data-label')||'');
     return;
   }
   var el=ev.target.closest?ev.target.closest('.playable[data-audio]'):null;
   if(!el)return;
-  if(!el.hasAttribute('data-queued')){PLQ=[];PLQI=-1;PLQLABEL='';
-    var q=document.getElementById('pl-queue');if(q)q.textContent='';
-    plRenderList();}
+  PLXY={x:ev.clientX,y:ev.clientY};
+  plResetForNew();
   ev.preventDefault();ev.stopPropagation();
   plOpen(el.getAttribute('data-audio'),el.getAttribute('data-label')||el.textContent.trim(),
          ev.clientX,ev.clientY);
