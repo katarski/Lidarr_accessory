@@ -85,6 +85,29 @@ _NOISE_DIR = re.compile(
 )
 
 
+# An ALBUM NAME that advertises a compilation / hits package / live or remix
+# product rather than a studio album. _NOISE_DIR above only inspects CONTAINER
+# segments (so a real album titled "Live at Leeds" is never caught by it), which
+# left a folder literally named "... All Their Greatest Hits 2001" downloading
+# happily inside a discography just because Lidarr had no record of it.
+# Used only to flip the DEFAULT to deselect: if Lidarr genuinely tracks a
+# matching album that is still missing, it is kept and downloaded as normal, and
+# an album assembly can still rescue individual songs from it later.
+_UNOFFICIAL_ALBUM = re.compile(
+    r"(?i)(?:^|[\s\-_.\(\[])("
+    r"greatest\s+hits|best\s+of|the\s+very\s+best|very\s+best\s+of|"
+    r"antholog(?:y|ies)|compilations?|collections?|box\s*sets?|sampler|"
+    r"essential|definitive|singles\s+collection|hits\s+collection|"
+    r"remix(?:es|ed)?|megamix|dj[\s\-_.]*mix|mixtape|karaoke|tribute|"
+    r"bootleg|rarities|b[\s\-_.]*sides|outtakes|unreleased"
+    r")(?:$|[\s\-_.\)\]0-9])")
+
+
+def _album_looks_unofficial(album: str) -> bool:
+    """True when the album TITLE itself advertises non-studio material."""
+    return bool(_UNOFFICIAL_ALBUM.search(album or ""))
+
+
 def _is_noise_category(key: str) -> bool:
     """True if the album-folder key sits under a discography 'noise' category
     subfolder (Bootlegs/Live/Singles/Compilations/Remixes/...). Checks only the
@@ -252,7 +275,7 @@ def plan_torrent(
         complete, have, total = album_complete_in_library(
             lidarr, artist, album, _cache=lib_cache, llm=llm
         )
-        if _is_noise_category(key):
+        if _is_noise_category(key) or _album_looks_unofficial(album):
             # Noise-category folder (bootlegs/live/singles/...): deselect by
             # default. Keep ONLY if Lidarr explicitly tracks a matching album
             # (total > 0) that is still missing (not complete) -- i.e. Lidarr
@@ -333,7 +356,10 @@ def process_torrent(
             n_all = len(folder_files)
             extra = f" (+{n_all - n_audio} sidecar)" if n_all > n_audio else ""
             emit(f"  HAVE  [{human(a['size']):>9}]  {a['artist']} / {a['album']} "
-                 f"(library {a['have_count']}/{a['total']}) -> deselect {n_all} file(s){extra} [whole folder]")
+                 f"(library {a['have_count']}/{a['total']}) -> deselect {n_all} file(s){extra} [whole folder]"
+                 + (" [not an official studio album]"
+                    if (a["total"] == 0 and _album_looks_unofficial(a["album"]))
+                    else ""))
         else:
             kept += 1
             why = "not in library" if a["total"] == 0 else f"library {a['have_count']}/{a['total']}"
