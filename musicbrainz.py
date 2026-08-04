@@ -24,13 +24,15 @@ business -- nothing is added to Lidarr automatically.
 
 from __future__ import annotations
 
+import collections
 import json
 import logging
+import re
 import threading
 import time
 import urllib.parse
 import urllib.request
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +48,29 @@ NON_STUDIO_SECONDARY = frozenset({
     "compilation", "live", "remix", "dj-mix", "mixtape/street", "demo",
     "interview", "spokenword", "audiobook", "audio drama", "soundtrack",
 })
+
+# Release-group secondary types that make a release a plausible home for a
+# stray song -- the INVERSE of the audit's filter above. A best-of, a box set
+# and a soundtrack all carry other artists' recordings; a plain studio album
+# does not, so it is no use to the compilation hunt.
+COLLECTION_SECONDARY = frozenset({"compilation", "soundtrack", "live"})
+
+# Lucene metacharacters that would change the meaning of a quoted phrase.
+_LUCENE_ESCAPE_RE = re.compile(r'(["\\])')
+_NORM_BRACKETS_RE = re.compile(r"\(.*?\)|\[.*?\]")
+_NORM_KEEP_RE = re.compile(r"[^a-z0-9]+")
+
+
+def norm_release_title(s: Any) -> str:
+    """
+    Comparison key for a release title: lowercased, bracketed asides dropped,
+    punctuation flattened. "Lady Day: The Best of Billie Holiday (Remastered)"
+    and "lady day - the best of billie holiday" collapse to the same key, so
+    the same compilation reached via twenty different recordings is counted
+    once.
+    """
+    s = _NORM_BRACKETS_RE.sub(" ", str(s or "").lower())
+    return " ".join(_NORM_KEEP_RE.sub(" ", s).split())
 
 
 class MusicBrainzClient:
@@ -142,4 +167,146 @@ class MusicBrainzClient:
             if not groups or offset >= total:
                 break
         out.sort(key=lambda r: r.get("first_release_date") or "")
+        return out
+
+    # ---- find-the-compilation -------------------------------------------
+
+    def recording_releases(
+        self, title: str, artist_mbid: str, duration: float = 0.0,
+        tolerance: float = 15.0, limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """
+        Every release MusicBrainz knows that carries this artist's recording of
+        this song title.
+
+        Deliberately a SEARCH, not a browse by recording id. Lidarr stores a
+        recording mbid per track (`foreignRecordingId`), which looks like the
+        exact answer -- but MusicBrainz holds a separate recording entry per
+        release for these old sides, so browsing `/release?recording=<mbid>`
+        returns only the one album Lidarr already got the id from. Verified on
+        `Gloomy Sunday`: the browse found 1 release, this search found 125.
+
+        `duration` (seconds) is the discriminator that keeps a 1930s studio side
+        apart from a later live take of the same standard; recordings whose
+        length differs by more than `tolerance` are dropped. MusicBrainz does
+        not know every length, and a recording with no length is KEPT -- these
+        rarities are exactly where the metadata is thinnest.
+
+        Returns [{title, norm, type, secondary_types, date, mbid}], one entry
+        per (release, recording) pair -- callers dedupe on `norm`. Empty on any
+        failure, which must be read as "couldn't check".
+        """
+        title = str(title or "").strip()
+        if not title or not artist_mbid:
+            return []
+        query = 'recording:"%s" AND arid:%s' % (
+            _LUCENE_ESCAPE_RE.sub(r"\\\1", title), artist_mbid)
+        data = self._get("/recording", query=query, limit=int(limit))
+        if not data:
+            return []
+        want = norm_release_title(title)
+        out: List[Dict[str, Any]] = []
+        for rec in (data.get("recordings") or []):
+            # The search is fuzzy and scores partial matches -- "Sugar" pulls in
+            # "Sugar Blues". Only an exact normalized title is this song.
+            if norm_release_title(rec.get("title")) != want:
+                continue
+            length = rec.get("length")
+            if length and duration and tolerance >= 0:
+                if abs(float(length) / 1000.0 - float(duration)) > tolerance:
+                    continue
+            for rel in (rec.get("releases") or []):
+                rg = rel.get("release-group") or {}
+                rtitle = str(rel.get("title") or "").strip()
+                key = norm_release_title(rtitle)
+                if not key:
+                    continue
+                out.append({
+                    "title": rtitle,
+                    "norm": key,
+                    "type": str(rg.get("primary-type") or "").lower(),
+                    "secondary_types": [str(s or "").lower()
+                                        for s in (rg.get("secondary-types") or [])],
+                    "date": str(rel.get("date") or "")[:10],
+                    "mbid": rel.get("id"),
+                })
+        return out
+
+    def compilations_for_tracks(
+        self, tracks: Iterable[Dict[str, Any]], artist_mbid: str,
+        artist_name: str = "", tolerance: float = 15.0,
+        collections_only: bool = True, exclude: Iterable[str] = (),
+        max_tracks: int = 40, on_progress=None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Which releases carry the most of a set of wanted tracks -- the heart of
+        the find-the-compilation workflow.
+
+        `tracks` is [{title, duration}] (duration in seconds; 0 to skip the
+        length check). Each is looked up separately and the releases are pooled,
+        so a release is ranked by HOW MANY of the wanted songs it holds. That
+        ordering is what makes the hunt worth running: for `Billie Holiday /
+        The Love Songs` the top result covers 30 of the 34 missing sides, so one
+        grab can finish most of the album instead of one song at a time.
+
+        `exclude` drops releases by title -- pass the album being filled, or the
+        hunt's best answer is the record we already know we can't get. Titles
+        matching the ARTIST NAME are dropped too: a self-titled compilation
+        ("Billie Holiday") makes a search term that degenerates into exactly the
+        blind artist-level search this workflow replaces.
+
+        `max_tracks` bounds the pass: MusicBrainz allows one request a second,
+        so this is also the pass length in seconds. `on_progress(done, total,
+        title)` is called per track if given.
+
+        Returns [{title, norm, coverage, tracks, type, secondary_types, date,
+        mbid}] sorted by coverage descending. Empty on total failure.
+        """
+        wanted = [t for t in tracks if str(t.get("title") or "").strip()]
+        wanted = wanted[:max(1, int(max_tracks))]
+        if not wanted or not artist_mbid:
+            return []
+        skip = {norm_release_title(x) for x in exclude}
+        skip.discard("")
+        artist_key = norm_release_title(artist_name)
+        if artist_key:
+            skip.add(artist_key)
+
+        cover: Dict[str, set] = collections.defaultdict(set)
+        meta: Dict[str, Dict[str, Any]] = {}
+        for i, trk in enumerate(wanted, 1):
+            title = str(trk.get("title") or "").strip()
+            rels = self.recording_releases(
+                title, artist_mbid, duration=float(trk.get("duration") or 0.0),
+                tolerance=tolerance)
+            for rel in rels:
+                key = rel["norm"]
+                if key in skip:
+                    continue
+                if collections_only and not (
+                        set(rel["secondary_types"]) & COLLECTION_SECONDARY):
+                    continue
+                cover[key].add(title)
+                prev = meta.get(key)
+                # Keep the SHORTEST spelling of a title seen across releases --
+                # the plainest form ("The Best of Billie Holiday" rather than
+                # "The Best of Billie Holiday [Columbia Legacy Remaster]") is
+                # the one an indexer search is most likely to match.
+                if prev is None or len(rel["title"]) < len(prev["title"]):
+                    meta[key] = rel
+            if on_progress:
+                try:
+                    on_progress(i, len(wanted), title)
+                except Exception:  # noqa: BLE001
+                    pass
+
+        out: List[Dict[str, Any]] = []
+        for key, titles in cover.items():
+            rel = dict(meta[key])
+            rel["coverage"] = len(titles)
+            rel["tracks"] = sorted(titles)
+            out.append(rel)
+        # Coverage first, then the older release -- an original-issue box set is
+        # a likelier torrent than a 2019 streaming-era repackage of it.
+        out.sort(key=lambda r: (-r["coverage"], r.get("date") or "9999"))
         return out

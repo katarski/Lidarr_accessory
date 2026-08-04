@@ -629,6 +629,46 @@ class OrchestratorConfig:
     assembly_lossless_bonus: float = 30.0
     assembly_lossy_penalty: float = 15.0
 
+    # --- Find-the-compilation ---------------------------------------------
+    # Work out WHICH compilation carries a missing song before searching for
+    # anything, instead of grabbing artist-level releases and reading their file
+    # lists afterwards. MusicBrainz answers "which releases contain this
+    # recording"; those titles are then searched for by name.
+    comp_hunt_enabled: bool = True
+    # Prowlarr, because Lidarr's search takes only an albumId/artistId and
+    # cannot be given a free-text title. Base URL is auto-detected from the
+    # Prowlarr-synced indexers in Lidarr; the api key cannot be (Lidarr masks
+    # it) and MUST be set for this feature to run.
+    prowlarr_base_url: str = ""
+    prowlarr_api_key: str = ""
+    # Restrict the search to the indexers LIDARR has enabled, rather than
+    # everything Prowlarr knows. Prowlarr here has 13 enabled against Lidarr's 3
+    # for music, and that difference is deliberate curation -- the extra
+    # trackers return noise (searching the compilation "The Lady" brought back a
+    # Lady GaGa album). Off would widen the net and the noise with it.
+    comp_hunt_lidarr_indexers_only: bool = True
+    # How many missing tracks get a MusicBrainz lookup. MusicBrainz allows one
+    # request a second, so this is also roughly the lookup time in seconds.
+    comp_hunt_max_tracks: int = 40
+    # Seconds a cached compilation list stays usable before it is looked up
+    # again. The answer is stable metadata, so this is deliberately long.
+    comp_hunt_cache_seconds: int = 604800
+    # Compilation titles searched per pass, and candidate grabs per pass. Each
+    # grab costs a metadata wait, so the hunt is spread over passes rather than
+    # run as one long loop -- and it survives a restart that way.
+    comp_hunt_titles_per_pass: int = 3
+    comp_hunt_grabs_per_pass: int = 1
+    # How closely an indexer result must resemble the compilation searched for
+    # (0..1). The shortened queries that make these searches land also make them
+    # lie -- "The Lady: Complete Collection" has to be queried as "Billie
+    # Holiday The Lady", which matches the already-owned "Lady Sings The Blues".
+    # 0.6 accepted every true match and rejected every false one in testing.
+    comp_hunt_min_title_score: float = 0.6
+    # Only consider releases MusicBrainz marks as a compilation / soundtrack /
+    # live record. A plain studio album cannot be the home of another artist's
+    # stray side, so it is no use here.
+    comp_hunt_collections_only: bool = True
+
     # --- Song harvest (salvage tracks already on disk) ---------------------
     # Lidarr imports album-at-a-time, so a compilation disc has no album target
     # and parks in needs-attention forever even when the songs inside it are
@@ -8019,11 +8059,15 @@ class Orchestrator:
             plan["album_id"] = aid
             plan["lidarr_have"] = int((a.get("statistics") or {}).get(
                 "trackFileCount") or 0)
-            # Carry the hunt across a re-plan, or the periodic planner would wipe
-            # the record of which releases were already tried.
+            # Carry the hunts across a re-plan, or the periodic planner would
+            # wipe the record of which releases were already tried -- and, for
+            # the compilation hunt, the cached MusicBrainz answer that costs a
+            # rate-limited request per missing track to rebuild.
             prev = store.get(aid) or {}
             if prev.get("hunt"):
                 plan["hunt"] = prev["hunt"]
+            if prev.get("comp"):
+                plan["comp"] = prev["comp"]
             store.upsert(aid, plan)
             keep_ids.append(aid)
             planned += 1
@@ -8164,6 +8208,362 @@ class Orchestrator:
         store.upsert(album_id, plan)
         return ok, msg
 
+    # ---- find-the-compilation -------------------------------------------
+
+    def _get_mb(self):
+        """
+        The MusicBrainz client, built on first use.
+
+        `self._mb` is only created up-front when the external ALBUM AUDIT is
+        enabled, but the compilation hunt needs MusicBrainz regardless of that
+        unrelated setting -- so this builds one on demand and caches it.
+        """
+        if getattr(self, "_mb", None) is None:
+            try:
+                from musicbrainz import MusicBrainzClient
+                self._mb = MusicBrainzClient()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("compilation hunt: no MusicBrainz client: %s", exc)
+                return None
+        return self._mb
+
+    def _get_prowlarr(self):
+        """
+        The Prowlarr client, built on first use, or None when it can't be.
+
+        The base URL is read off Lidarr's Prowlarr-synced indexer definitions
+        when not configured, so only the api key normally needs setting (Lidarr
+        masks the key when reading indexers back, so it cannot be recovered).
+        The indexer set is pinned to what Lidarr has enabled -- see
+        `comp_hunt_lidarr_indexers_only`.
+        """
+        if getattr(self, "_prowlarr", None) is not None:
+            return self._prowlarr
+        key = str(getattr(self.cfg, "prowlarr_api_key", "") or "").strip()
+        if not key:
+            logger.info("compilation hunt: no Prowlarr api key set -- free-text "
+                        "title search unavailable (Lidarr's own search accepts "
+                        "only an albumId/artistId)")
+            return None
+        try:
+            from prowlarr import ProwlarrClient
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("compilation hunt: prowlarr module unusable: %s", exc)
+            return None
+        base = str(getattr(self.cfg, "prowlarr_base_url", "") or "").strip()
+        if not base:
+            base = ProwlarrClient.base_url_from_lidarr(self.lidarr) or ""
+            if base:
+                logger.info("compilation hunt: found Prowlarr at %s via Lidarr's "
+                            "indexer definitions", base)
+        if not base:
+            logger.warning("compilation hunt: could not work out Prowlarr's "
+                           "address -- set it in Settings")
+            return None
+        ids = []
+        if getattr(self.cfg, "comp_hunt_lidarr_indexers_only", True):
+            ids = ProwlarrClient.indexer_ids_from_lidarr(self.lidarr)
+            if ids:
+                logger.info("compilation hunt: searching the %d indexer(s) "
+                            "Lidarr has enabled for music (%s)", len(ids),
+                            ", ".join(str(i) for i in ids))
+            else:
+                logger.warning("compilation hunt: could not read Lidarr's "
+                               "enabled indexers -- falling back to every "
+                               "indexer Prowlarr has enabled, which may be "
+                               "noisier than your Lidarr setup")
+        self._prowlarr = ProwlarrClient(base, key, indexer_ids=ids)
+        return self._prowlarr
+
+    def _comp_missing_tracks(self, album_id):
+        """
+        The album's missing tracks as [{title, duration}] (duration in seconds).
+
+        Read from LIDARR rather than the assembly plan, because the plan records
+        no durations and duration is the check that tells a 1930s studio side
+        from a later live take of the same standard.
+        """
+        out = []
+        try:
+            for t in (self.lidarr.list_tracks_for_album(int(album_id)) or []):
+                if t.get("hasFile"):
+                    continue
+                title = str(t.get("title") or "").strip()
+                if not title:
+                    continue
+                out.append({"title": title,
+                            "duration": float(t.get("duration") or 0) / 1000.0})
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("compilation hunt: track list failed for %s: %s",
+                           album_id, exc)
+        return out
+
+    def _comp_lookup(self, album_id, plan, comp):
+        """
+        Ask MusicBrainz which compilations carry this album's missing songs and
+        cache the ranked answer in the plan.
+
+        Cached because it costs one rate-limited request per missing track (~34
+        seconds for this album) and the answer is stable metadata. Returns the
+        ranked list, or [] when it could not be worked out.
+        """
+        mb = self._get_mb()
+        if mb is None:
+            return []
+        try:
+            full = self.lidarr.get_album(int(album_id)) or {}
+            artist_id = int((full.get("artist") or {}).get("id")
+                            or full.get("artistId") or 0)
+            art = ((full.get("artist") or None)
+                   or self.lidarr.get_artist(artist_id) or {})
+            arid = str(art.get("foreignArtistId") or "").strip()
+            artist_name = str(art.get("artistName") or plan.get("artist") or "")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("compilation hunt: Lidarr lookup failed: %s", exc)
+            return []
+        if not arid:
+            logger.warning("compilation hunt: no MusicBrainz artist id for %r",
+                           artist_name)
+            return []
+        tracks = self._comp_missing_tracks(album_id)
+        if not tracks:
+            return []
+        album_title = str(plan.get("album") or full.get("title") or "")
+        logger.info("compilation hunt: asking MusicBrainz which compilations "
+                    "carry %d missing song(s) of %s / %s (about %ds -- one "
+                    "request a second)", len(tracks), artist_name, album_title,
+                    min(len(tracks), int(getattr(
+                        self.cfg, "comp_hunt_max_tracks", 40))))
+        comps = mb.compilations_for_tracks(
+            tracks, arid, artist_name=artist_name,
+            tolerance=float(getattr(self.cfg, "harvest_duration_tolerance", 10.0)),
+            collections_only=bool(getattr(
+                self.cfg, "comp_hunt_collections_only", True)),
+            exclude=[album_title],
+            max_tracks=int(getattr(self.cfg, "comp_hunt_max_tracks", 40)))
+        if not comps:
+            logger.info("compilation hunt: MusicBrainz named no compilation for "
+                        "%s / %s", artist_name, album_title)
+            return []
+        # Only the head of the list is worth keeping: it is ordered by how many
+        # of the missing songs each release carries, and the tail is single-song
+        # repackages that are no better than the artist-level search.
+        keep = comps[:60]
+        comp["titles"] = [{"title": c["title"], "coverage": c["coverage"]}
+                          for c in keep]
+        comp["artist_name"] = artist_name
+        comp["looked_up"] = time.time()
+        logger.info("compilation hunt: %d compilation(s) carry missing songs; "
+                    "best is %r with %d of %d",
+                    len(comps), keep[0]["title"][:60], keep[0]["coverage"],
+                    len(tracks))
+        return comp["titles"]
+
+    def assembly_find_compilation(self, album_id):
+        """
+        Find the COMPILATION that carries this album's missing songs, then find
+        that compilation on the indexers.
+
+        The inverse of `assembly_find_missing`, which searches the artist, grabs
+        whatever ranks highest and only learns the track list after downloading
+        it. Here the track list is settled FIRST, from metadata:
+
+          1. take the missing tracks (title + duration) from Lidarr;
+          2. ask MusicBrainz which releases contain those recordings, ranked by
+             how many of them each release carries;
+          3. search the indexers for those compilations BY NAME;
+          4. hand the results to the existing rank -> grab -> verify -> harvest
+             path, which narrows the torrent to the needed files.
+
+        Step 3 goes through Prowlarr because Lidarr's search endpoint accepts
+        only an albumId or artistId and cannot be handed a title it has never
+        heard of -- which is every compilation worth finding here.
+
+        Runs a slice per invocation (a few titles, one grab) and persists its
+        state in the plan, so the periodic assembly pass carries it on and a
+        restart does not lose it.
+        """
+        store = getattr(self, "assembly", None)
+        if store is None:
+            return False, "assembly disabled"
+        if not getattr(self.cfg, "comp_hunt_enabled", True):
+            return False, "the compilation hunt is switched off in Settings"
+        plan = store.get(album_id)
+        if not plan:
+            return False, "no plan for that album"
+        missing = [str(m.get("track") or "") for m in (plan.get("missing") or [])]
+        missing = [m for m in missing if m.strip()]
+        if not missing:
+            return False, "nothing missing -- use Add to library"
+        pw = self._get_prowlarr()
+        if pw is None:
+            return False, ("Prowlarr is not configured -- set its api key in "
+                           "Settings. Lidarr cannot do this search itself: its "
+                           "release endpoint takes only an albumId/artistId, "
+                           "never a title.")
+
+        from musicbrainz import norm_release_title
+        comp = dict(plan.get("comp") or {})
+        # (1)+(2) MusicBrainz, once per cache window.
+        age = time.time() - float(comp.get("looked_up") or 0)
+        if not comp.get("titles") or age > float(getattr(
+                self.cfg, "comp_hunt_cache_seconds", 604800)):
+            self._comp_lookup(album_id, plan, comp)
+        titles = list(comp.get("titles") or [])
+        if not titles:
+            comp["active"] = False
+            comp["note"] = "MusicBrainz names no compilation for these songs"
+            plan["comp"] = comp
+            store.upsert(album_id, plan)
+            return False, ("MusicBrainz does not list a compilation carrying "
+                           "these songs, so there is nothing to search for")
+
+        artist = str(comp.get("artist_name") or plan.get("artist") or "")
+        searched = set(comp.get("searched") or [])
+        queue = list(comp.get("queue") or [])
+        comp["active"] = True
+
+        # (3) Search the next few compilation titles by name, adding whatever
+        # plausibly IS that compilation to the grab queue.
+        if not queue:
+            queue, note = self._comp_search_titles(
+                pw, titles, searched, artist, album_id)
+            comp["searched"] = sorted(searched)
+            if not queue:
+                left = [t for t in titles
+                        if norm_release_title(t["title"]) not in searched]
+                comp["queue"] = []
+                if not left:
+                    comp["active"] = False
+                    comp["note"] = "every compilation searched, none obtainable"
+                    plan["comp"] = comp
+                    store.upsert(album_id, plan)
+                    return False, ("searched all %d compilation(s) MusicBrainz "
+                                   "named; your indexers carry none of them"
+                                   % len(titles))
+                comp["note"] = note
+                plan["comp"] = comp
+                store.upsert(album_id, plan)
+                return False, ("%s -- %d compilation(s) still to search, the "
+                               "next are tried automatically" % (note, len(left)))
+
+        # (4) One grab, verified against the file list by the existing path.
+        cap = max(1, int(getattr(self.cfg, "comp_hunt_grabs_per_pass", 1)))
+        batch, queue = queue[:cap], queue[cap:]
+        comp["queue"] = queue
+        # `_assembly_grab_for_songs` reports what is left as
+        # candidates - len(tried); tried grows by len(batch) inside the call, so
+        # this makes that arithmetic come out as the queue we still hold.
+        comp["candidates"] = (len(comp.get("tried") or []) + len(batch)
+                              + len(queue))
+        plan["comp"] = comp
+        store.upsert(album_id, plan)
+        ok, msg = self._assembly_grab_for_songs(
+            album_id, artist, missing, batch, hunt=comp)
+        # `_assembly_grab_for_songs` clears `active` on success; a failure leaves
+        # the hunt live so the next pass tries the next candidate.
+        if not ok:
+            comp["active"] = True
+        comp.pop("candidates", None)
+        plan["comp"] = comp
+        store.upsert(album_id, plan)
+        if ok:
+            return True, msg
+        return False, ("%s %d candidate(s) queued, %d compilation(s) left to "
+                       "search." % (msg, len(queue),
+                                    len(titles) - len(comp.get("searched") or [])))
+
+    def _comp_search_titles(self, pw, titles, searched, artist, album_id):
+        """
+        Search the indexers for the next few compilation titles by name.
+
+        Returns (ranked candidates, note). A result is kept only if it plausibly
+        IS the compilation searched for -- the shortened queries that make these
+        searches land also make them lie -- and only if it isn't a release of an
+        album already complete in the library, which is how an earlier hunt kept
+        grabbing "Lady Sings The Blues".
+        """
+        from musicbrainz import norm_release_title
+        from prowlarr import search_terms, title_plausible
+        min_score = float(getattr(self.cfg, "comp_hunt_min_title_score", 0.6))
+        min_seed = max(0, int(getattr(
+            self.cfg, "interactive_search_min_seeders", 1)))
+        per_pass = max(1, int(getattr(self.cfg, "comp_hunt_titles_per_pass", 3)))
+        owned = set()
+        try:
+            full = self.lidarr.get_album(int(album_id)) or {}
+            aid = int((full.get("artist") or {}).get("id")
+                      or full.get("artistId") or 0)
+            if aid:
+                owned = self._assembly_owned_keys(aid)
+        except Exception:  # noqa: BLE001
+            owned = set()
+
+        cands, done, rejected, no_hit = [], 0, 0, 0
+        for entry in titles:
+            if done >= per_pass:
+                break
+            ctitle = str(entry.get("title") or "")
+            key = norm_release_title(ctitle)
+            if not key or key in searched:
+                continue
+            terms = search_terms(ctitle, artist)
+            if not terms:
+                searched.add(key)
+                continue
+            done += 1
+            searched.add(key)
+            coverage = int(entry.get("coverage") or 0)
+            hits = []
+            for term in terms:
+                for rel in pw.search(term, min_seeders=min_seed):
+                    title = str(rel.get("title") or "")
+                    score = title_plausible(title, ctitle, artist)
+                    if score < min_score:
+                        rejected += 1
+                        continue
+                    tkey = _match_key(title)
+                    if any(k and k in tkey for k in owned):
+                        logger.info("compilation hunt: ignoring %r -- it is a "
+                                    "release of an album already complete in "
+                                    "the library", title[:70])
+                        continue
+                    rel = dict(rel)
+                    rel["_comp_title"] = ctitle
+                    rel["_comp_coverage"] = coverage
+                    hits.append((score, rel))
+                if hits:
+                    break       # the most specific term that returns wins
+            if not hits:
+                no_hit += 1
+                logger.info("compilation hunt: %r (%d missing song(s)) -- "
+                            "nothing on your indexers", ctitle[:60], coverage)
+                continue
+            logger.info("compilation hunt: %r (%d missing song(s)) -- %d "
+                        "candidate(s)", ctitle[:60], coverage, len(hits))
+            for score, rel in hits:
+                # Rank on what matters here: how many missing songs the
+                # compilation holds dominates, then how sure we are the release
+                # IS it, then swarm health and format.
+                rank = (coverage * 20.0 + score * 40.0
+                        + self._release_health(int(rel.get("seeders") or 0),
+                                               int(rel.get("leechers") or 0))
+                        + self._release_format_bonus(str(rel.get("title") or "")))
+                cands.append((rank, rel))
+        cands.sort(key=lambda t: -t[0])
+        ranked = [c[1] for c in cands]
+        if ranked:
+            note = "%d candidate(s) from %d compilation(s)" % (len(ranked), done)
+        elif done:
+            note = ("searched %d compilation(s), no usable match (%d result(s) "
+                    "were not that compilation)" % (done, rejected)
+                    if rejected else
+                    "searched %d compilation(s), your indexers have none of them"
+                    % done)
+        else:
+            note = "no compilation left with a usable search term"
+        return ranked, note
+
     def _assembly_owned_keys(self, artist_id):
         """
         Normalized titles of this artist's albums that are ALREADY COMPLETE, so a
@@ -8218,9 +8618,13 @@ class Orchestrator:
             logger.info("assembly: grabbing %r to look for %d missing song(s) "
                         "of %s", title[:80], len(missing), artist)
             from qbittorrent_client import btih_from_magnet, magnet_from_guid
-            magnet = magnet_from_guid(guid)
+            magnet = str(r.get("magnet") or "") or magnet_from_guid(guid)
             ih = btih_from_magnet(magnet) if magnet else None
-            grabbed = self.lidarr.release_grab(guid, idx)
+            # A Prowlarr result has no Lidarr guid or indexer id, so pushing it
+            # to Lidarr can only 404. Skip straight to adding the magnet -- the
+            # same path a Lidarr-refused compilation ends up on anyway.
+            grabbed = (False if str(r.get("_source") or "") == "prowlarr"
+                       else self.lidarr.release_grab(guid, idx))
             if not grabbed:
                 # Lidarr REFUSES any release it can't attribute to a library
                 # artist ("Unable to find matching artist and albums", 404) --
@@ -8509,28 +8913,38 @@ class Orchestrator:
         for plan in store.list():
             if done >= budget:
                 break
-            hunt = plan.get("hunt") or {}
-            if not hunt.get("active"):
-                continue
-            if not (plan.get("missing") or []):
-                hunt["active"] = False
-                hunt["note"] = "nothing missing any more"
-                plan["hunt"] = hunt
-                store.upsert(plan.get("id"), plan)
-                continue
-            aid = plan.get("album_id") or plan.get("id")
-            logger.info("assembly hunt: continuing for %s / %s (%d song(s) still "
-                        "missing, %d release(s) tried so far)",
-                        plan.get("artist"), plan.get("album"),
-                        len(plan.get("missing") or []),
-                        len(hunt.get("tried") or []))
-            try:
-                ok, msg = self.assembly_find_missing(aid)
-                logger.info("assembly hunt: %s -- %s", "ok" if ok else "no luck",
-                            msg)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("assembly hunt failed for %s: %s", aid, exc)
-            done += 1
+            # Two kinds of hunt can be live on a plan: the artist-scope release
+            # hunt ("hunt") and the compilation hunt ("comp"). The compilation
+            # hunt goes FIRST -- it knows which release should hold the song
+            # before grabbing anything, so it wastes fewer grabs.
+            for key, method in (("comp", self.assembly_find_compilation),
+                                ("hunt", self.assembly_find_missing)):
+                if done >= budget:
+                    break
+                state = plan.get(key) or {}
+                if not state.get("active"):
+                    continue
+                if not (plan.get("missing") or []):
+                    state["active"] = False
+                    state["note"] = "nothing missing any more"
+                    plan[key] = state
+                    store.upsert(plan.get("id"), plan)
+                    continue
+                aid = plan.get("album_id") or plan.get("id")
+                logger.info("assembly %s: continuing for %s / %s (%d song(s) "
+                            "still missing, %d release(s) tried so far)",
+                            "compilation hunt" if key == "comp" else "hunt",
+                            plan.get("artist"), plan.get("album"),
+                            len(plan.get("missing") or []),
+                            len(state.get("tried") or []))
+                try:
+                    ok, msg = method(aid)
+                    logger.info("assembly %s: %s -- %s",
+                                "compilation hunt" if key == "comp" else "hunt",
+                                "ok" if ok else "no luck", msg)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("assembly %s failed for %s: %s", key, aid, exc)
+                done += 1
         return done
 
     def _album_track_titles_rows(self, album_id: int) -> List[Dict[str, Any]]:
@@ -10564,6 +10978,26 @@ class Orchestrator:
          "Rank bonus for a FLAC/APE/lossless release. Without it a 1-seeder mp3 outranks a 5-seeder FLAC box."),
         ("lidarr.assembly_lossy_penalty", "lidarr", "assembly_lossy_penalty", "Assembly: lossy penalty", "float", 15.0,
          "Rank penalty for an mp3/AAC release. Not a hard refusal -- a live lossy swarm still beats a dead lossless one."),
+        ("lidarr.comp_hunt_enabled", "lidarr", "comp_hunt_enabled", "Compilation hunt: enabled", "bool", True,
+         "Work out WHICH compilation carries a missing song before searching for anything. Asks MusicBrainz which releases contain the recording, ranks them by how many of the album's missing songs each one holds, then searches the indexers for those titles by name. The opposite order from 'Find missing', which grabs artist-level releases and only reads their file lists afterwards."),
+        ("lidarr.prowlarr_api_key", "lidarr", "prowlarr_api_key", "Compilation hunt: Prowlarr api key", "str", "",
+         "REQUIRED for the compilation hunt. Lidarr's own search cannot be used: its release endpoint accepts only an albumId or artistId, so there is no way to hand it a compilation title it has never heard of. Prowlarr's search does take free text. Find the key in Prowlarr under Settings -> General."),
+        ("lidarr.prowlarr_base_url", "lidarr", "prowlarr_base_url", "Compilation hunt: Prowlarr URL", "str", "",
+         "Leave EMPTY to detect it from Lidarr's Prowlarr-synced indexers (their base URLs point at Prowlarr). Set it only if that detection gets it wrong, e.g. http://192.168.1.200:9696"),
+        ("lidarr.comp_hunt_lidarr_indexers_only", "lidarr", "comp_hunt_lidarr_indexers_only", "Compilation hunt: only Lidarr's indexers", "bool", True,
+         "Search just the indexers Lidarr has enabled for music, not everything Prowlarr knows. Keep this ON: the extra indexers return noise (a search for the compilation 'The Lady' came back topped by a Lady GaGa album from a tracker Lidarr does not use)."),
+        ("lidarr.comp_hunt_max_tracks", "lidarr", "comp_hunt_max_tracks", "Compilation hunt: tracks looked up", "int", 40,
+         "How many of an album's missing tracks get a MusicBrainz lookup. MusicBrainz allows one request a second, so this is roughly the lookup time in seconds. The result is cached."),
+        ("lidarr.comp_hunt_cache_seconds", "lidarr", "comp_hunt_cache_seconds", "Compilation hunt: cache (s)", "int", 604800,
+         "How long a compilation list stays usable before MusicBrainz is asked again. Long by design -- which releases contain a 1930s recording does not change."),
+        ("lidarr.comp_hunt_titles_per_pass", "lidarr", "comp_hunt_titles_per_pass", "Compilation hunt: titles searched / pass", "int", 3,
+         "How many compilation titles are searched for per pass. The hunt is spread across passes so it survives a restart instead of blocking in one long loop."),
+        ("lidarr.comp_hunt_grabs_per_pass", "lidarr", "comp_hunt_grabs_per_pass", "Compilation hunt: grabs / pass", "int", 1,
+         "How many candidates are grabbed and verified per pass. Each costs a paused metadata wait, so 1 is usually right."),
+        ("lidarr.comp_hunt_min_title_score", "lidarr", "comp_hunt_min_title_score", "Compilation hunt: min title match (0-1)", "float", 0.6,
+         "How closely an indexer result must resemble the compilation searched for. The shortened queries that make these searches land also make them lie: 'The Lady: Complete Collection' has to be queried as 'Billie Holiday The Lady', which matches the already-owned 'Lady Sings The Blues'. Lower this and wrong releases get grabbed; raise it and obtainable compilations are missed."),
+        ("lidarr.comp_hunt_collections_only", "lidarr", "comp_hunt_collections_only", "Compilation hunt: collections only", "bool", True,
+         "Only consider releases MusicBrainz marks as a compilation, soundtrack or live record. A plain studio album cannot be the home of a stray side, so it is no use here."),
         ("lidarr.harvest_enabled", "lidarr", "harvest_enabled", "Harvest: salvage songs already on disk", "bool", True,
          "Match individual songs sitting in needs-attention (compilations, box sets) against tracks Lidarr is missing, per SONG rather than per album, and import just those. This is how a 10-CD box parked as 'no monitored album target' finally gives up its wanted tracks."),
         ("lidarr.harvest_dry_run", "lidarr", "harvest_dry_run", "Harvest: dry run (report only)", "bool", True,
@@ -10734,6 +11168,16 @@ class Orchestrator:
             "lidarr.assembly_verify_timeout",
             "lidarr.assembly_lossless_bonus",
             "lidarr.assembly_lossy_penalty",
+            "lidarr.comp_hunt_enabled",
+            "lidarr.prowlarr_api_key",
+            "lidarr.prowlarr_base_url",
+            "lidarr.comp_hunt_lidarr_indexers_only",
+            "lidarr.comp_hunt_max_tracks",
+            "lidarr.comp_hunt_cache_seconds",
+            "lidarr.comp_hunt_titles_per_pass",
+            "lidarr.comp_hunt_grabs_per_pass",
+            "lidarr.comp_hunt_min_title_score",
+            "lidarr.comp_hunt_collections_only",
             "lidarr.harvest_enabled",
             "lidarr.harvest_dry_run",
             "lidarr.harvest_duration_tolerance",

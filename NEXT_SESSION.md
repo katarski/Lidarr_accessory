@@ -1,38 +1,105 @@
 # cue_pipeline — handoff for the next session
 
-Written 2026-08-04. Everything below is DEPLOYED and running unless marked TODO.
+Written 2026-08-05. Everything below is DEPLOYED and running unless marked TODO.
 
-## The one job left: find-the-compilation workflow
+## What was built this session: find-the-compilation
 
-**Goal.** For a track Lidarr is missing that exists only on compilations, work out
-*which* compilation carries it, then find that compilation on the indexers.
+For a track that exists only on compilations, work out *which* compilation
+carries it BEFORE searching for anything, then find that compilation on the
+indexers. The old song hunt did the reverse — search by artist, grab whatever
+ranked highest, and only discover the track list after downloading it.
 
-Today the song hunt searches indexers by **artist**, ranks whatever comes back,
-grabs it, and inspects the file list — it discovers the track list only *after*
-downloading. The user wants the opposite order:
+The chain, as built:
 
-1. Take a wanted track (title + artist + duration).
-2. Search the web to find which compilations / box sets contain that recording.
-3. Take those compilation TITLES and search the indexers for them
-   (`lidarr.release_search_artist`, or a direct Prowlarr query).
-4. Feed the result into the existing rank → grab → harvest path.
+1. Missing tracks (title + duration) come from Lidarr — `hasFile == false`.
+2. **MusicBrainz** is asked which releases contain each recording, and the
+   answers are pooled so a release is ranked by HOW MANY of the missing songs
+   it carries. For `Billie Holiday / The Love Songs` the top answer covers 27
+   of 34; for `Janis Joplin / Pearl` the top answers cover all 9.
+3. Those compilation titles are searched for BY NAME on the indexers.
+4. Results go into the existing rank → grab → verify → harvest path, which
+   narrows the torrent to just the needed files.
 
-**Why it matters here.** `Billie Holiday / The Love Songs` is 16/50, and 29 of
-the 34 missing tracks are 1930s–40s sides absent from the library — e.g.
-`Gloomy Sunday`, `Ghost of Yesterday`, `Trav'lin' All Alone`, `Carelessly`.
-Those only ever appear on compilations, and blind artist-level searching keeps
-grabbing the wrong ones.
+Entry points: the **Find compilation** button per row in the Assembly tab, the
+"Find the compilation" bulk action, or `assembly_find_compilation(album_id)`.
+It runs a slice per invocation (3 titles, 1 grab) and persists state in the
+plan under `comp`, so the periodic assembly pass carries it on and a restart
+does not lose it. `_assembly_continue_hunts` runs `comp` BEFORE `hunt`.
 
-**Design notes / traps**
-- MusicBrainz already answers step 2 without a scraper: a recording's releases
-  are queryable, and `musicbrainz.py` exists in this repo. Try that BEFORE any
-  web search — it is structured, free and rate-limited politely.
-- Only 3 indexers are enabled and 100/100 Billie Holiday candidates came from
-  one (The Pirate Bay via Prowlarr), all magnets. Expect thin coverage.
-- Lidarr's `POST /api/v1/release` REFUSES any release it cannot attribute to a
-  library artist (404 `Unable to find matching artist and albums`) — every
-  cross-artist compilation. `qbt.add_magnet()` already exists for exactly this.
-- Verify a grab by INFOHASH (`btih_from_magnet`), never by queue title.
+### Why Prowlarr, and why that is not a wider net
+
+**Lidarr cannot do step 3.** `GET /api/v1/release` accepts only an `albumId` or
+`artistId` and builds the query from its own metadata — there is no free-text
+parameter, and every compilation worth finding here is a title Lidarr has never
+heard of. Prowlarr's `/api/v1/search` does take free text.
+
+Prowlarr is used strictly as the TRANSPORT. Prowlarr has 13 indexers enabled
+against Lidarr's 3 with music categories, and that gap is deliberate curation —
+the extra trackers return noise (a search for the compilation "The Lady" came
+back topped by a Lady GaGa album). So `indexer_ids_from_lidarr()` reads which
+Torznab indexers Lidarr actually has switched on and pins every search to that
+set: here `[1, 2, 12]` = RuTracker, The Pirate Bay, Xtreme Bytes. Same
+indexers Lidarr would have queried; only the query shape is new.
+`comp_hunt_lidarr_indexers_only=False` would widen it, and the noise with it.
+
+Prowlarr's base URL is auto-detected from Lidarr's own indexer definitions
+(their baseUrls point at Prowlarr). **The api key cannot be** — Lidarr masks it
+as `********` when reading indexers back — so `prowlarr_api_key` must be set in
+Settings or the feature refuses to run.
+
+### Traps found the hard way in this workflow
+
+- **Lidarr's `foreignRecordingId` is a dead end.** Every track carries one and
+  it looks like the exact answer, but MusicBrainz holds a SEPARATE recording
+  entry per release for these old sides. Browsing `/release?recording=<mbid>`
+  for `Gloomy Sunday` returned **1** release — the album we already knew. The
+  fuzzy `/recording?query=` search with `arid:` returned **125**. Use the
+  search; the exact id is worthless here.
+- **The recording search is fuzzy and scores partial matches** — "Sugar" pulls
+  in "Sugar Blues". Titles are compared normalized-exact, and duration (±10s)
+  is what separates a 1930s studio side from a later live take. A recording MB
+  has no length for is KEPT: these rarities are where metadata is thinnest.
+- **A self-titled compilation makes a poisonous search term.** "Billie Holiday"
+  is a real MB compilation title, and searching for it IS the blind artist-level
+  search this feature replaces. Titles matching the artist name are dropped.
+- **Shortening a title is required, and it lies.** Full MB titles mostly return
+  nothing ("The Quintessential Billie Holiday, Volume 9: 1940-1942" → 0 hits;
+  drop the year range → exact hit). But an unanchored short title is dangerous:
+  "The Lady" alone returned 72 results headed by Lady GaGa. So the ARTIST NAME
+  IS PREFIXED TO EVERY VARIANT, and results are then scored against the full
+  compilation title with `title_plausible()` — an F1 over identity tokens,
+  scored both ways because one direction alone is fooled ("The Great Billie
+  Holiday" reduces to {great}, which "The Great American Songbook" contains in
+  full). 0.6 accepted every true match and rejected every false one in testing.
+- **The owned-album filter is still load-bearing.** "The Lady Sings" (a real MB
+  compilation) vs the owned "Lady Sings The Blues" scores 0.80 — text cannot
+  separate them. `_assembly_owned_keys` catches it, and did so in the live test.
+  The two guards are complementary; keep both.
+- Prowlarr's `magnetUrl` is a **proxy redirect** through Prowlarr with the api
+  key in the query string, NOT a magnet URI. The bare magnet is in `guid` for
+  trackers that publish one; otherwise it is rebuilt from `infoHash`. Results
+  with neither (private trackers, ~12 of 158) are dropped — nothing to hand to
+  qBittorrent, and Lidarr will not take them.
+- A Prowlarr result has no Lidarr guid or indexer id, so `release_grab` can only
+  404. `_assembly_grab_for_songs` now skips straight to `add_magnet` when
+  `_source == "prowlarr"`.
+
+## Also fixed: 61% of the library was never searched
+
+`wanted_missing()` requested **page 1 only**, silently capping the caller at
+1000 records. With 2557 missing albums and the endpoint's fixed
+`albums.title ascending` order, `interactive_search_pass` only ever saw titles
+from `$` to **"Inside You"**. Everything from J to Z was invisible to it,
+deterministically — so those albums were never searched even once.
+`Janis Joplin / Pearl` (5/14, monitored, missing for months) had **no entry at
+all** in `interactive_search.json`, because the pass never reached it to start
+its clock. `wanted_missing()` now paginates; it returns 2557.
+
+No starvation follow-up is needed: `eligible.sort` is by `last_attempt`
+ascending and a never-tried album has none (→ 0), so the newly-visible J–Z
+albums sort to the FRONT. They become eligible one day after deploy, because
+`interactive_search_min_missing_days=1` and their `first_missing` clock starts
+on the first pass that sees them.
 
 ## What is already built and live
 
@@ -50,7 +117,8 @@ grabbing the wrong ones.
 | Magnet file-list wait 45s → 180s | live |
 | LLM per-call logging (subject → answer) | live |
 | Lidarr `/manualimport` query timeout 30s → 180s | live |
-| Search-engine → compilation → torrent | **TODO — this session's job** |
+| **Search-engine → compilation → torrent** | **live** (`prowlarr.py`, `assembly_find_compilation`) |
+| **`wanted_missing()` pagination** | **live** (was capped at 1000 of 2557) |
 
 ## Gotchas that cost real time — do not rediscover
 
@@ -74,6 +142,8 @@ grabbing the wrong ones.
   `generate_content_free_tier_requests limit: 0`. The 3090 (`qwen2.5:14b` at
   `192.168.1.32:11434`) is the LLM. `llama3.2:3b` is a safe 3.1 GB fallback
   (11/13 vs 13/13); avoid `gemma3:27b` — slower AND it produced a false positive.
+- Windows dev box: run python as `.venv\Scripts\python.exe`; the system python
+  has no `mutagen`/`requests`, so importing `orchestrator` fails outright.
 
 ## Deploy procedure (proven, use exactly this)
 
@@ -103,9 +173,20 @@ an empty bind mount once caused 85 torrents to be removed — plus
 ## Health check
 
 ```bash
-docker logs cue_pipeline 2>&1 | grep -E 'harvest (pass|purge)|AcoustID rejected|Traceback' | tail -30
+docker logs cue_pipeline 2>&1 | grep -E 'harvest (pass|purge)|compilation hunt|AcoustID rejected|Traceback' | tail -30
 ```
 
 Settings live in the WebUI Settings tab (`/config/webui_overrides.json`, HIGHEST
-precedence — it beats env/template). All harvest knobs are under
-"Needs attention & Assembly".
+precedence — it beats env/template). All harvest and compilation-hunt knobs are
+under "Needs attention & Assembly".
+
+## TODO / next
+
+- **Set `prowlarr_api_key` in Settings** — the compilation hunt is inert until
+  then, and says so in the log. Prowlarr → Settings → General.
+- The compilation hunt is wired to the periodic pass but shares
+  `assembly_hunt_per_pass` (2) as its budget with the older artist hunt. If both
+  are active on many plans, consider a separate budget.
+- Coverage is genuinely thin for 1930s–40s material: of the top 12 compilations
+  for `The Love Songs`, 2 were obtainable and both at 1 seeder. `Pearl` fared
+  much better (25 seeders on a 9/9 box). This is the indexers, not the logic.

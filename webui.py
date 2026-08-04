@@ -315,6 +315,7 @@ _PAGE = r"""<!doctype html>
       <select id="asmact" onchange="if(this.value){asmAct(this.value);this.value='';}">
         <option value="">Actions on selected albums…</option>
         <option value="find">Find missing songs</option>
+        <option value="comp">Find the compilation (MusicBrainz → indexers)</option>
         <option value="add">Add to library (assemble + import)</option>
         <option value="remove">Remove (dismiss row, keep files)</option>
       </select>
@@ -934,12 +935,18 @@ function asmAct(kind){
 }
 function asmRun(ids,kind){
   var what={find:'Search for the missing songs of',
+            comp:'Find the compilation carrying the missing songs of',
             add:'Assemble and import into the library',
             remove:'Dismiss (files untouched)'}[kind];
   var extra=kind==='add'
     ? '\n\nMatched songs are COPIED and retagged to the target album. A source '
       +'file is deleted afterwards only if no other assembly still needs it.'
-    : '';
+    : (kind==='comp'
+      ? '\n\nFirst run asks MusicBrainz which compilations contain these '
+        +'recordings — one request per missing track, about a second each, then '
+        +'cached. It then searches your indexers for those titles and continues '
+        +'on its own each pass until a compilation is found or the list runs out.'
+      : '');
   if(!confirm(what+' '+ids.length+' album(s)?'+extra))return;
   toast('working…');
   fetch('/api/assembly/'+kind,{method:'POST',
@@ -1004,6 +1011,11 @@ function asmRender(){
       +'<button class="b-ll" title="Search torrents for the songs this album is '
       +'still missing (only the missing files are downloaded)" '
       +'onclick="asmActOne(event,\''+h(String(a.id))+'\',\'find\')">Find missing</button>'
+      +'<button class="b-ll" title="Ask MusicBrainz WHICH compilations carry the '
+      +'missing songs (ranked by how many each one holds), then search the '
+      +'indexers for those compilations by name. The reverse of Find missing, '
+      +'which grabs artist releases first and reads their file lists after" '
+      +'onclick="asmActOne(event,\''+h(String(a.id))+'\',\'comp\')">Find compilation</button>'
       +'<button class="b-keep" title="Copy the matched songs into the library as '
       +'this album, retagged; a source file is deleted only if no other assembly '
       +'still needs it" '
@@ -2004,7 +2016,7 @@ def make_handler(store, actions: HeldActions):
                 self._json(200 if ok else 500, {"ok": ok, "message": msg})
                 return
             if path in ("/api/assembly/remove", "/api/assembly/find",
-                        "/api/assembly/add"):
+                        "/api/assembly/comp", "/api/assembly/add"):
                 length = int(self.headers.get("Content-Length") or 0)
                 try:
                     body = json.loads(self.rfile.read(length) or b"{}") or {}
@@ -2014,6 +2026,7 @@ def make_handler(store, actions: HeldActions):
                 fn = {
                     "/api/assembly/remove": "assembly_remove",
                     "/api/assembly/find": "assembly_find_missing",
+                    "/api/assembly/comp": "assembly_find_compilation",
                     "/api/assembly/add": "assembly_add_to_library",
                 }[path]
                 act = getattr(actions, fn, None)

@@ -207,29 +207,60 @@ class LidarrClient:
 
     # ---- Interactive search + grab (backlog #10) -------------------------
 
-    def wanted_missing(self, page_size: int = 1000) -> List[Dict[str, Any]]:
+    def wanted_missing(self, page_size: int = 1000,
+                       max_pages: int = 50) -> List[Dict[str, Any]]:
         """
-        Monitored albums that are missing tracks, via GET /api/v1/wanted/missing.
-        Each record carries id/title/artistId/artist and a `statistics` block
-        ({trackCount, trackFileCount, percentOfTracks}); an album is "missing"
-        when trackFileCount < trackCount. Returns [] on error.
+        EVERY monitored album that is missing tracks, via
+        GET /api/v1/wanted/missing. Each record carries id/title/artistId/artist
+        and a `statistics` block ({trackCount, trackFileCount,
+        percentOfTracks}); an album is "missing" when
+        trackFileCount < trackCount.
+
+        PAGINATED, and it must stay that way. This used to request page 1 only,
+        which silently capped the caller at `page_size` records -- with 2557
+        missing albums and the endpoint's fixed `albums.title ascending` order,
+        the interactive search pass only ever saw titles from "$" to "Inside
+        You". Everything from J to Z was invisible to it, deterministically, so
+        those albums were never searched even once: `Janis Joplin / Pearl` (5/14,
+        monitored, missing for months) had no entry in the search state file at
+        all, because the pass never reached it to start its clock.
+
+        `max_pages` is a runaway guard, not a limit anyone should hit; a short
+        page (or a failed request mid-walk) ends the walk. Returns [] on error.
         """
-        try:
-            data = self._get(
-                "/api/v1/wanted/missing",
-                pageSize=page_size,
-                page=1,
-                sortKey="albums.title",
-                sortDirection="ascending",
-                monitored="true",
-                includeArtist="true",
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("wanted/missing failed: %s", exc)
-            return []
-        if isinstance(data, dict):
-            return data.get("records") or []
-        return data if isinstance(data, list) else []
+        out: List[Dict[str, Any]] = []
+        page = 1
+        while page <= max(1, int(max_pages)):
+            try:
+                data = self._get(
+                    "/api/v1/wanted/missing",
+                    pageSize=page_size,
+                    page=page,
+                    sortKey="albums.title",
+                    sortDirection="ascending",
+                    monitored="true",
+                    includeArtist="true",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("wanted/missing page %d failed: %s", page, exc)
+                break
+            if isinstance(data, list):
+                # Older/odd responses come back unpaged -- take them as final.
+                return data
+            if not isinstance(data, dict):
+                break
+            records = data.get("records") or []
+            out.extend(records)
+            total = int(data.get("totalRecords") or 0)
+            if len(records) < page_size or (total and len(out) >= total):
+                break
+            page += 1
+        else:
+            logger.warning(
+                "wanted/missing: stopped at the %d-page guard with %d album(s) "
+                "collected -- some missing albums were not considered",
+                max_pages, len(out))
+        return out
 
     def release_search(self, album_id: int) -> List[Dict[str, Any]]:
         """
@@ -721,6 +752,16 @@ class LidarrClient:
         except Exception as exc:
             logger.warning("list_artists failed: %s", exc)
             return []
+
+    def get_artist(self, artist_id: int) -> Optional[Dict[str, Any]]:
+        """One artist record by Lidarr id. Wanted for `foreignArtistId` -- the
+        MusicBrainz artist id -- without pulling the whole library, which
+        `list_artists` would."""
+        try:
+            return self._get(f"/api/v1/artist/{int(artist_id)}")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("get_artist(%s) failed: %s", artist_id, exc)
+            return None
 
     def find_artist(self, name: str) -> Optional[Dict[str, Any]]:
         """Search Lidarr's local library for an artist by (fuzzy) name match."""
