@@ -1,53 +1,50 @@
-# cue_pipeline
+# Lidarr Accessory (`cue_pipeline`)
 
-A Lidarr companion that turns messy music downloads into a clean library, and
-gives you a WebUI to watch and steer it.
+A companion service for **Lidarr** that deals with everything Lidarr itself
+won't: disc images, exotic formats, discography torrents, albums whose folder
+name matches nothing, and gaps that sit missing forever. It runs as a container
+next to Lidarr (or as a Windows service) and has its own web UI on port 8830.
 
-It started as a `.cue` disc-image splitter (that still works, and is still the
-safest path for a single-file rip), but it now covers the whole awkward middle
-ground Lidarr leaves alone:
+What it does, in the order you notice it:
 
-* **Splits disc images** — FLAC/APE/WV/WAV + `.cue`, split with **ffmpeg** (no
-  shntool, so none of its artifacts), tagged, then handed to Lidarr.
-* **Imports folders Lidarr won't** — pre-split albums whose folder name doesn't
-  match anything, artist dumps, box sets, multi-disc sets (all discs imported as
-  ONE album), and albums identified from **track titles, tags, `.nfo`
-  tracklists** or an **AcoustID fingerprint** when the tags are useless.
-* **Rips optical images** — SACD ISO (`sacd_extract`), DVD-Audio ISO
-  (`dvda2wav`, multichannel preferred), DSD → FLAC, DTS-CD → 5.1 FLAC, and
-  unpacks `.rar/.zip/.7z` (with an `unrar` fallback, since p7zip silently writes
-  0-byte files for some RARs).
-* **Controls what actually downloads** — deselects albums you already own inside
-  a discography torrent, refuses non-official material (greatest-hits, live,
-  remix, karaoke…) unless Lidarr genuinely wants that record, prefers healthy
-  swarms, and verifies a release's **song titles** before committing so a
-  right-sized/wrong-album grab is rejected.
-* **Cleans up after itself** — removes torrents with nothing left to want,
-  reaps dead grabs and stalled downloads (salvaging any finished songs first),
-  and never deletes data it hasn't confirmed is in your library.
-* **Fills gaps** — a reconcile pass imports anything Lidarr still lists as
-  missing but that is sitting in your downloads, and an **Assembly** view works
-  out which songs of a missing album live inside the compilations you already
-  have, then assembles them.
-* **Cross-checks Lidarr** — asks MusicBrainz which studio albums an artist has
-  that Lidarr never listed (read-only report).
+- **Imports what Lidarr can't.** Splits `.cue` disc images with ffmpeg, decodes
+  DTS-CD and DSD, rips SACD and DVD-Audio ISOs to multichannel FLAC, unpacks
+  archives, transcodes APE/WavPack/ALAC/WAV to FLAC, and identifies an album by
+  its **track titles** when the folder and tags say nothing useful.
+- **Finds music Lidarr left missing.** Searches per **album** first; only when an
+  album cannot be found on its own does it fall back to the artist scope and
+  accept a discography or box set that contains it. Every candidate is verified
+  inside qBittorrent before it counts — track counts, song titles, seeders — and
+  a bad one is blocklisted rather than retried.
+- **Keeps discography torrents lean.** De-selects albums you already own (whole
+  folders, not just audio), refuses compilations / live / remix / bootleg
+  releases unless the album really is that kind of record, and removes a
+  completed torrent once every album it carried is in the library.
+- **Assembles albums that exist only in pieces.** Works out which songs of a
+  missing album are sitting inside compilations you already have, shows the
+  percentage assembled, and can hunt torrents for just the missing songs.
+- **Hands you the rest.** Anything it will not decide alone lands in
+  **Needs attention** with the evidence, for one click.
 
-Ollama is optional: it repairs CUE files the deterministic parser can't handle
-and helps with ambiguous album matching. If it's unreachable everything still
-works deterministically.
+Ollama (or any OpenAI-compatible endpoint) is optional. When enabled it repairs
+malformed CUE files the deterministic parser can't handle and helps choose
+between candidate albums; when it is off or unreachable every deterministic path
+still works.
 
-## WebUI (port 8830)
+## Web UI (port 8830)
 
 | Tab | What it's for |
 |---|---|
-| **Needs attention** | Everything the pipeline could not finish on its own, with the held copy vs your library side by side (quality, track count, folder trees) and per-row **Add to library / Overwrite / Discard**. Served from a file-backed store, so it loads instantly. |
-| **Assembly** | Per missing album: **% assembled**, which songs were found and in which file, and which are still missing. Actions: *Find missing* (hunts collections for the songs, repeating across releases until found), *Add to library* (copies, retags to the target album, imports), *Remove*. |
-| **Converter** | Browse the library, convert to MP3/AAC/Opus with dbpoweramp-style options, live per-file and total progress. Optional **Overwrite existing** replaces the source after a verified encode, repoints sidecar `.xml`, and tells Lidarr. |
-| **Log** | Tail `pipeline.log` or the Lidarr flac2mp3 downsampler log. |
-| **Settings** | The curated tunables, applied without editing YAML. |
+| **Needs attention** | Albums that need a decision, with track-level comparison against the library. Add to library / Overwrite / Discard, in bulk or per row. |
+| **Assembly** | Missing albums that can be built from songs you already have: percentage assembled, which songs are still missing, and Find missing / Add to library / Remove. |
+| **Progress / Converter** | Live conversion and cue-split progress, plus a library browser that transcodes to MP3/AAC/Opus — optionally replacing the original in place and repointing Lidarr at it. |
+| **Log** | The pipeline log and Lidarr's flac2mp3 downsampler log. |
+| **Settings** | Every tunable, grouped by category, each with a recommended value and a per-section **Recommended** button. Saved to `webui_overrides.json` (highest precedence) and applied on restart. |
 
-Any music file in those tabs is **clickable** — a small player opens at your
-pointer with ID tags, specs, transport controls and volume. `Esc` closes it.
+There's a built-in **audio player** throughout: click a song to play it, click a
+folder to queue it recursively in explorer order, with a numbered playlist,
+shuffle, repeat (folder or single track), ID3 tags and codec specs. Clicking a
+single song and pressing Next pulls in the rest of that folder.
 
 ## Install on Unraid (Docker) — recommended
 
@@ -82,35 +79,25 @@ fill in your Lidarr API key, and **Apply**. On Unraid the container also:
 
 | File | What it does |
 |---|---|
-| `main.py` | Entry point: loads YAML + env + WebUI overrides, starts every loop/thread. |
-| `orchestrator.py` | The brain — per-CUE state machine, cueless sweep, ISO/DSD/DTS/archive handling, Lidarr handoff, reconcile, assembly planning, held-item curation. |
+| `main.py` | Entry point. Loads YAML config, starts watchdog, runs worker. |
+| `orchestrator.py` | Per-CUE state machine. |
 | `cue_parser.py` | Deterministic CUE parser + Ollama repair fallback. |
-| `splitter.py` | ffmpeg invocation (lossless FLAC out) with per-track progress. |
+| `splitter.py` | ffmpeg invocation (lossless FLAC out). |
 | `tagger.py` | mutagen Vorbis-comment tagging. |
-| `lidarr.py` | Lidarr API client (search, grab, manual import, queue, rescan). |
-| `qbt_deselect.py` | qBittorrent selective download: deselect owned/non-official albums, video exclusion, dead-grab + stalled-download reapers, completed-torrent lifecycle. |
-| `qbittorrent_client.py` | qBittorrent Web API client. |
-| `dedup_downloads.py` | "Do we already own this album?" matching + duplicate-download purge. |
-| `assembly.py` | Album assembly: song-level matching of compilations against missing albums, and the plan store behind the Assembly tab. |
-| `musicbrainz.py` | Read-only MusicBrainz client for the "albums Lidarr never listed" audit. |
-| `acoustid_client.py` | fpcalc + AcoustID fingerprint identification (for untagged rips). |
-| `converter.py` | Library tree cache + the MP3/AAC/Opus conversion engine. |
-| `held_store.py` | File-backed store behind the Needs-attention tab. |
-| `webui.py` | The WebUI: pages, JSON API, audio streaming for the player. |
-| `ollama_client.py` | Ollama HTTP client. Named to avoid shadowing `ollama.exe` on Windows PATH. |
-| `cloud_llm.py` | Optional cloud LLM fallback. |
+| `lidarr.py` | Lidarr API client (scan, import, refresh). |
+| `ollama_client.py` | Ollama HTTP client (repair CUE, normalize tags). Named to avoid shadowing `ollama.exe` on Windows PATH. |
+| `qbt_deselect.py` | qBittorrent selective download: de-select owned albums, adopt uncategorised music torrents, reap stalled/dead grabs, completed-torrent lifecycle. |
+| `qbittorrent_client.py` | qBittorrent Web API client. Verifies the effect it asked for (qBit answers 200 for a hash it has never heard of). |
+| `webui.py` | The web UI on port 8830 and its JSON API (needs attention, assembly, converter, settings, audio streaming). |
+| `assembly.py` | Song-to-track matching for building an album out of compilations. |
+| `converter.py` | Library browser + MP3/AAC/Opus conversion, optional replace-in-place. |
+| `held_store.py` | File-backed needs-attention store, so the page loads instantly. |
+| `dedup_downloads.py` | Removes duplicate/redundant copies inside a download. |
+| `musicbrainz.py` | Read-only MusicBrainz client for cross-checking albums Lidarr never listed. |
+| `acoustid_client.py` | AcoustID fingerprinting for rips with no usable tags. |
+| `tools/tpl2run.py` | Prints the `docker run` the Unraid template describes — do not retype mounts by hand. |
 | `config.yaml` | All tunables — paths, URLs, API keys, model name. |
-| `TUNING.md` | What every knob does and when to change it. |
 | `requirements.txt` | Python deps. |
-
-### State files (in `/config`)
-
-`pipeline.log`, `held_items.json` (needs-attention), `assembly.json` (assembly
-plans), `sweep_seen.json` (persistent sweep ledger — stops a restart replaying
-the whole queue), `library_tree.json` (Converter cache),
-`interactive_search.json`, `external_album_audit.json` (MusicBrainz gaps),
-`webui_overrides.json` (Settings tab; **highest precedence**, so check here if a
-value looks stuck).
 
 ## Install (Windows) — easy path
 
@@ -217,18 +204,11 @@ and starts it. To tear it down later:
 uninstall_service.bat
 ```
 
-## Processing flow (what actually happens)
+## Processing flow (the cue-image path)
 
-There are several entry points; the `.cue` path below is the original one.
+This is the original path, kept because it is the fiddliest. Loose tracks, ISOs,
+archives and Lidarr gaps take shorter routes to the same import step.
 
-| Trigger | Path |
-|---|---|
-| A `.cue` appears (watcher, or the periodic re-scan that catches ones the watcher dropped on SMB) | split → tag → Lidarr, as diagrammed below |
-| A folder of already-split audio, no `.cue` | cueless sweep → identify (tags → folder → track titles → `.nfo` → AcoustID) → Lidarr ManualImport. Folders that still need identifying go **first**; multi-disc sets are imported as ONE album |
-| An ISO / archive | SACD or DVD-Audio rip, or 7z/unrar unpack, then re-enters the sweep as ordinary audio |
-| A torrent is added | deselect owned + non-official albums, drop video, keep songs an assembly needs |
-| A torrent completes | lifecycle: remove it once every album Lidarr *wants* from it is owned |
-| Periodically | reconcile (import gaps still in downloads), assembly planning, needs-attention curation, MusicBrainz audit, stalled/dead-grab reaping |
 
 ```
 new .cue appears
@@ -284,22 +264,10 @@ wait up to `lidarr_grace_seconds` for staging to clear
 
 - **No CUE Splitter v2.0.8 / shntool.** ffmpeg handles FLAC/APE/WV/WAV
   directly. shntool was explicitly rejected (artifacts).
-- **No aggressive LLM use.** Ollama only runs when the CUE is malformed, when
-  an album match is genuinely ambiguous, or when tag normalization is asked for.
-- **No writing to Lidarr's metadata.** The MusicBrainz cross-check is
-  **read-only** — it reports albums Lidarr never listed, it never adds them,
-  because adding an album changes what the whole pipeline then chases.
-- **No deleting data it hasn't confirmed.** A torrent's files are never removed
-  unless at least one of its albums is verified present in your library; a
-  stalled download is salvaged before anything is discarded.
+- **No MusicBrainz lookups.** Lidarr already does that; we stay out of it.
+- **No aggressive LLM use.** Ollama only runs when the CUE is malformed
+  or when tag normalization is explicitly requested.
 
-Two claims that used to be here are no longer true:
-
-- ~~No MusicBrainz lookups~~ — it *does* query MusicBrainz now (read-only,
-  ≤1 req/s, see `musicbrainz.py` and the audit knobs in
-  [TUNING.md](TUNING.md)), because Lidarr's library only holds what it decided
-  to add and can simply be missing an album.
-- ~~Windows-only~~ — the Unraid container is the primary target. It talks to
-  qBittorrent (selective download, reapers, lifecycle) and serves the WebUI; see
-  [UNRAID_SETUP.md](UNRAID_SETUP.md). The standalone Windows watcher still works
-  but only does the split-and-hand-to-Lidarr part.
+(On Unraid the container *does* talk to qBittorrent — selective-download and
+completed-torrent lifecycle — see [UNRAID_SETUP.md](UNRAID_SETUP.md). The
+standalone Windows watcher above does not.)

@@ -136,6 +136,10 @@ _PAGE = r"""<!doctype html>
   .setrow:first-child{border-top:0}
   .setrow label{min-width:15rem;flex:0 0 auto}
   .setrow .muted{flex:1;font-size:.78rem}
+  .setsec>summary{display:flex;align-items:center;gap:.6rem}
+  .setrec{font-size:.7rem;padding:.15rem .45rem;font-weight:600}
+  .setrow .setrecv{flex:0 0 auto;font-size:.7rem;opacity:.65;min-width:5.5rem;
+    text-align:right}
   /* Assembly rows: same card + right-aligned action buttons as a Needs
      attention row, so the two tabs read the same way */
   .asmrow>summary{display:flex;align-items:center;gap:.5rem;flex-wrap:wrap}
@@ -977,17 +981,43 @@ function loadSettings(){fetch('/api/settings').then(function(r){return r.json();
     var g=o.group||'Other';
     if(g!==group){
       if(group!==null)out+='</div></details>';
-      out+='<details class="setsec" open><summary>'+h(g)+'</summary><div class="setbody">';
+      out+='<details class="setsec" open><summary>'+h(g)
+          +'<button class="b-copy setrec" onclick="setRecommended(event,this)" '
+          +'title="Fill this section with the recommended values (nothing is '
+          +'saved until you press Save)">Recommended</button>'
+          +'</summary><div class="setbody">';
       group=g;
     }
+    var rec=(o.recommended===undefined?o.value:o.recommended);
     var ctl=o.type==='bool'
-      ? '<input type="checkbox" data-sid="'+h(o.id)+'" data-type="bool" '+(o.value?'checked':'')+'>'
-      : '<input type="'+(o.type==='int'?'number':'text')+'" data-sid="'+h(o.id)+'" data-type="'+h(o.type)+'" value="'+h(o.value)+'" style="width:8rem">';
+      ? '<input type="checkbox" data-sid="'+h(o.id)+'" data-type="bool" data-rec="'+(rec?'1':'')+'" '+(o.value?'checked':'')+'>'
+      : '<input type="'+((o.type==='int'||o.type==='float')?'number':'text')+'"'
+        +(o.type==='float'?' step="0.05" min="0" max="1"':'')
+        +' data-sid="'+h(o.id)+'" data-type="'+h(o.type)+'" data-rec="'+h(rec)+'" value="'+h(o.value)+'" style="width:8rem">';
     out+='<div class="setrow"><label><b>'+h(o.label)+'</b></label>'+ctl
-        +'<span class="muted">'+h(o.help)+'</span></div>';
+        +'<span class="muted">'+h(o.help)+'</span>'
+        +'<span class="muted setrecv" title="Recommended value">rec: '+h(String(rec))+'</span>'
+        +'</div>';
   });
   if(group!==null)out+='</div></details>';
   document.getElementById('setform').innerHTML=out;});}
+// Fill one section's controls with their recommended values. Form-only: the
+// values are not written until Save, so a reload undoes it.
+function setRecommended(ev,btn){
+  ev.preventDefault();ev.stopPropagation();      // don't collapse the section
+  var sec=btn.closest('details');
+  if(!sec)return;
+  var n=0;
+  sec.querySelectorAll('[data-sid]').forEach(function(el){
+    var rec=el.getAttribute('data-rec');
+    if(rec===null)return;
+    if(el.getAttribute('data-type')==='bool')el.checked=(rec==='1');
+    else el.value=rec;
+    n++;
+  });
+  document.getElementById('setmsg').textContent=
+    n+' field(s) set to recommended -- press Save to apply';
+}
 function saveSettings(restart){
   var changes={};
   document.querySelectorAll('#setform [data-sid]').forEach(function(el){

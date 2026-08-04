@@ -1360,6 +1360,8 @@ def main() -> int:
             lidarr_cfg.get("assembly_max_source_files", 20000)),
         assembly_max_albums_per_pass=int(
             lidarr_cfg.get("assembly_max_albums_per_pass", 150)),
+        assembly_hunt_per_pass=int(
+            lidarr_cfg.get("assembly_hunt_per_pass", 2)),
         assembly_extra_source_dirs=list(
             lidarr_cfg.get("assembly_extra_source_dirs") or []),
         assembly_file=assembly_path,
