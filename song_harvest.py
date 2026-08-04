@@ -348,32 +348,74 @@ def match_files(
 
 # ---------------------------------------------------------------- import plan
 
-def build_import_files(matches: Iterable[Match],
-                       quality: Optional[Dict[str, Any]] = None,
-                       ) -> List[Dict[str, Any]]:
+def quality_map(lidarr, folders: Iterable[str]) -> Dict[str, Dict[str, Any]]:
     """
-    ManualImport entries for `LidarrClient.manual_import_apply_files`.
+    {file path: Lidarr quality dict} by asking Lidarr's own /manualimport about
+    each source folder.
+
+    REQUIRED, not optional. An import entry without `quality` makes Lidarr
+    throw while building the destination filename and the file silently never
+    lands:
+
+        System.NullReferenceException
+          at NzbDrone.Core.Organizer.FileNameBuilder.BuildTrackFileName(...)
+          at TrackFileMovingService.CopyTrackFile(...)
+
+    Lidarr logs only "Couldn't import track" at Warn, so this failure is easy
+    to mistake for a permissions problem. Only Lidarr can name the quality it
+    will accept, so it is fetched rather than constructed.
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    for folder in sorted(set(folders)):
+        try:
+            cands = lidarr.manual_import_candidates(folder) or []
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("harvest: quality lookup failed for %s: %s",
+                           folder, exc)
+            continue
+        for c in cands:
+            p, q = c.get("path"), c.get("quality")
+            if p and q:
+                out[str(p)] = q
+    return out
+
+
+def build_import_files(matches: Iterable[Match],
+                       quality_by_path: Optional[Dict[str, Dict[str, Any]]] = None,
+                       quality: Optional[Dict[str, Any]] = None,
+                       ) -> Tuple[List[Dict[str, Any]], List[Tuple[Match, str]]]:
+    """
+    ManualImport entries for `LidarrClient.manual_import_apply_files`, plus the
+    matches that had to be skipped.
 
     One entry per file with an explicit trackId, so Lidarr never guesses the
     mapping -- guessing is what produced "Unable to find matching artist and
     albums" and the album-level dead end in the first place.
+
+    A match with no known quality is SKIPPED rather than sent, because sending
+    it makes Lidarr fail on the filename build and drop the file on the floor.
     """
     out: List[Dict[str, Any]] = []
+    skipped: List[Tuple[Match, str]] = []
+    qbp = quality_by_path or {}
     for m in matches:
+        q = qbp.get(m.src.path) or quality
+        if not q:
+            skipped.append((m, "no quality from Lidarr for this path"))
+            continue
         entry: Dict[str, Any] = {
             "path": m.src.path,
             "artistId": m.want.artist_id,
             "albumId": m.want.album_id,
             "trackIds": [m.want.track_id],
+            "quality": q,
             "disableReleaseSwitching": True,
             "additionalFile": False,
         }
         if m.want.release_id:
             entry["albumReleaseId"] = m.want.release_id
-        if quality:
-            entry["quality"] = quality
         out.append(entry)
-    return out
+    return out, skipped
 
 
 def format_report(rep: HarvestReport, source: str = "",
