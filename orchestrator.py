@@ -7979,8 +7979,15 @@ class Orchestrator:
             pass
         min_seed = max(0, int(getattr(
             self.cfg, "interactive_search_min_seeders", 1)))
+        # Releases for albums we ALREADY OWN are useless here and actively
+        # harmful: dropping the title floor and the non-official filter (both
+        # correct for song-hunting) left nothing stopping a healthy-seeded owned
+        # album from winning. That is how a hunt for one missing song grabbed
+        # "Lady Sings The Blues", an album already complete at 12/12.
+        owned = self._assembly_owned_keys(artist_id)
         cands = []
         seen_guid = set()
+        skipped_owned = 0
         for r in rels:
             if str(r.get("protocol") or "").lower() != "torrent":
                 continue
@@ -7991,14 +7998,47 @@ class Orchestrator:
             seeders = int(r.get("seeders") or 0)
             if seeders < min_seed:
                 continue
+            title = str(r.get("title") or "")
+            tkey = _match_key(title)
+            if any(k and k in tkey for k in owned):
+                skipped_owned += 1
+                continue
+            # A compilation is the likeliest home for a stray song, so give those
+            # titles a leg up rather than refusing them as the normal grab does.
+            bonus = 40.0 if self._release_unofficial_markers(title) else 0.0
             cands.append((self._release_health(seeders,
-                                              int(r.get("leechers") or 0)), r))
+                                               int(r.get("leechers") or 0)) + bonus,
+                          r))
+        if skipped_owned:
+            logger.info("assembly: ignored %d release(s) for albums already in "
+                        "the library", skipped_owned)
         if not cands:
             return False, ("your indexers offered no torrent with at least "
                            "%d seeder(s) for %s" % (min_seed, artist))
         cands.sort(key=lambda t: -t[0])
         return self._assembly_grab_for_songs(
             album_id, artist, missing, [c[1] for c in cands])
+
+    def _assembly_owned_keys(self, artist_id):
+        """
+        Normalized titles of this artist's albums that are ALREADY COMPLETE, so a
+        song hunt never grabs a release of something we own. Returns a set of
+        match keys; empty on any lookup failure (fail open -- the verification
+        step still guards the actual grab).
+        """
+        out = set()
+        try:
+            for al in (self.lidarr.list_albums_for_artist(int(artist_id)) or []):
+                st = al.get("statistics") or {}
+                total = int(st.get("totalTrackCount") or 0)
+                have = int(st.get("trackFileCount") or 0)
+                if total > 0 and have >= total:
+                    k = _match_key(al.get("title"))
+                    if k:
+                        out.add(k)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("assembly owned-albums lookup failed: %s", exc)
+        return out
 
     def _assembly_grab_for_songs(self, album_id, artist, missing, cands):
         """
@@ -8032,8 +8072,14 @@ class Orchestrator:
                               "will download in full" % title[:60])
             thash, _rec = self._await_queue_hash_by_title(title, timeout=90)
             if not thash:
-                return True, ("grabbed %r but it never appeared in the queue; "
-                              "left to download" % title[:60])
+                # Do NOT leave it running. For a song hunt the whole point is to
+                # take a couple of tracks; an unverifiable grab means a full album
+                # (or a 3-CD box) downloads for nothing -- which is exactly what
+                # happened when a restart interrupted this step.
+                logger.warning("assembly: %r never appeared in the queue -- "
+                               "cannot verify, removing the grab", title[:70])
+                self._reject_grab(artist, str(missing[0]), "", qbt)
+                continue
             files = []
             try:
                 qbt.pause(thash)
@@ -8045,6 +8091,11 @@ class Orchestrator:
                     time.sleep(3)
             except Exception:  # noqa: BLE001
                 files = []
+            if not files:
+                logger.warning("assembly: %r produced no file list -- cannot "
+                               "verify, removing the grab", title[:70])
+                self._reject_grab(artist, str(missing[0]), thash, qbt)
+                continue
             hits = []
             for f in files or []:
                 nm = str(f.get("name") or "")
