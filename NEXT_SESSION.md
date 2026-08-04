@@ -122,6 +122,29 @@ on the first pass that sees them.
 
 ## Gotchas that cost real time — do not rediscover
 
+- **A STOPPED MAGNET NEVER GETS A FILE LIST.** A magnet carries no file names;
+  they live in metadata fetched from peers, and a stopped torrent connects to
+  nobody. `add_magnet(paused=True)` plus the `qbt.pause()` before the file-list
+  wait therefore made every magnet candidate *structurally* unverifiable — the
+  wait could only time out, and the release was discarded as "no file list".
+  `The Essential Billie Holiday 3 cd boxset[flac]`, holding 27 of that album's
+  missing sides, was blocklisted this way. Raising the wait 45s → 180s in an
+  earlier session was treating a symptom that had nothing to do with time; it
+  only made the stall four times longer. The fix is qBittorrent's own
+  `stopCondition=MetadataReceived` (≥4.5): the torrent starts, fetches only
+  metadata, and qBittorrent stops it the instant that lands. Measured: 65 files
+  known after **5 seconds, 0 bytes of content**. Never pause before you have the
+  file list; pause the moment you do.
+- **"produced no file list" is now meaningful.** After the above, that message
+  means a genuinely dead swarm (0 seeders, so no peers to fetch metadata from),
+  not a bug. Those candidates are ranked last by the seeder band.
+- **A restart inside the metadata wait orphans the torrent.** Cleanup is purely
+  in-process, so killing the container mid-wait leaves a stopped, 0-byte torrent
+  that nothing ever reaps — and no warning is logged, because the removal code
+  never ran. 13 such orphans were cleared by hand on 2026-08-05. A startup
+  reaper (stopped + 0 bytes + no metadata + not in any plan's `tried`/`queue`)
+  is still TODO.
+
 - **A ManualImport entry without `quality` silently fails.** Lidarr accepts the
   command, approves the track, then throws
   `NullReferenceException at FileNameBuilder.BuildTrackFileName` and the file
@@ -182,11 +205,29 @@ under "Needs attention & Assembly".
 
 ## TODO / next
 
-- **Set `prowlarr_api_key` in Settings** — the compilation hunt is inert until
-  then, and says so in the log. Prowlarr → Settings → General.
-- The compilation hunt is wired to the periodic pass but shares
-  `assembly_hunt_per_pass` (2) as its budget with the older artist hunt. If both
-  are active on many plans, consider a separate budget.
-- Coverage is genuinely thin for 1930s–40s material: of the top 12 compilations
-  for `The Love Songs`, 2 were obtainable and both at 1 seeder. `Pearl` fared
-  much better (25 seeders on a 9/9 box). This is the indexers, not the logic.
+- **The unverified source-folder deletion is the top open bug.** Confirmed data
+  loss: `/downloads/Hans Zimmer/Crimson Tide/Expanded Score` (10 mp3s) went
+  `content-identify ... 10/10 (100%)` → `Removed source folder` in **7 seconds**
+  with no import in between; Lidarr threw `FileNotFoundException`, the album is
+  **0/10**, and no audio survives. A healthy import logs `handoff succeeded` and
+  `Post-import check: Lidarr reflects N/N` *before* deleting; 65 of 96
+  `Removed source folder` events had neither within 25 lines (heuristic — the log
+  is thread-interleaved, so a lead, not a count). Mitigation while it is open:
+  `staging.delete_source_folder_on_success = false`. Call sites: orchestrator.py
+  ~1048, 1459, 2087, 4353, 4545, 4582 — the one at 4545 is the *sound* one
+  (gated on `_wait_for_manual_import`, library-name check advisory by design,
+  see the comment at ~4518), so this needs targeted work, not a blanket guard.
+- **`song_harvest` counts `imported` on command ACCEPTANCE, not completion**, and
+  runs `purge_leftovers` on that same optimistic signal. Verified 14 of 16
+  ManualImport commands still `queued` while already logged as imported — so the
+  log's "imported" number is a submission count. Not lossy today (the purge
+  excludes the imported paths; 81/81 pending files were intact), but
+  `qbt.remove(..., delete_files=True)` at song_harvest.py:829 rides the same
+  signal. It has never fired only because its match test one line above
+  (`nm in src_dir`) is a reversed substring comparison.
+- A startup reaper for metadata-orphaned torrents (see the gotcha above).
+- The compilation hunt shares `assembly_hunt_per_pass` (2) with the older artist
+  hunt. If both are active on many plans, consider a separate budget.
+- Coverage is genuinely thin for 1930s–40s material and that is the indexers,
+  not the logic — but re-measure now that magnets can actually be verified,
+  because every previous "no file list" verdict was meaningless.
