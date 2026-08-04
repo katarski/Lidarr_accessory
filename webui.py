@@ -309,7 +309,7 @@ _PAGE = r"""<!doctype html>
       <span class="muted" id="pl-time" style="margin-left:auto">0:00</span>
     </div>
     <audio id="pl-audio" preload="none" controls></audio>
-    <details id="pl-tags"><summary>ID tags</summary><div id="pl-tagbody" class="muted">—</div></details>
+    <details id="pl-tags" open><summary>ID tags</summary><div id="pl-tagbody" class="muted">—</div></details>
     <details id="pl-specs"><summary>Specs</summary><div id="pl-specbody" class="muted">—</div></details>
   </div>
 </div>
@@ -382,16 +382,38 @@ function plInfo(path){
   fetch('/api/audio/info?path='+encodeURIComponent(path))
     .then(function(r){return r.json();}).then(function(j){
       if(PLCUR!==path)return;                       // user moved on already
-      var t=j.tags||{},s=j.specs||{};
-      function tbl(o){
-        var ks=Object.keys(o);
-        if(!ks.length)return '<span class="muted">none</span>';
-        return '<table>'+ks.map(function(k){
-          return '<tr><td>'+h(k)+'</td><td>'+h(String(o[k]))+'</td></tr>';}).join('')+'</table>';
+      var t=j.tags||{},s=j.specs||{},pri=j.primary||{};
+      function rows(pairs){
+        pairs=pairs.filter(function(r){return r[1]!==''&&r[1]!==undefined&&r[1]!==null;});
+        if(!pairs.length)return '<span class="muted">none</span>';
+        return '<table>'+pairs.map(function(r){
+          return '<tr><td>'+h(r[0])+'</td><td>'+h(String(r[1]))+'</td></tr>';}).join('')+'</table>';
       }
-      if(s.duration_s)s.duration=fmtTime(s.duration_s);
-      document.getElementById('pl-tagbody').innerHTML=tbl(t);
-      document.getElementById('pl-specbody').innerHTML=tbl(s);
+      // Specs in a sensible order, with human units: kbps and MB (2dp).
+      var specPairs=[
+        ['Codec', s.codec],
+        ['Duration', s.duration_s?fmtTime(s.duration_s):''],
+        ['Bitrate', s.bitrate?(Math.round(s.bitrate/1000)+' kbps'):''],
+        ['Sample rate', s.sample_rate?(s.sample_rate+' Hz'):''],
+        ['Channels', s.channels],
+        ['Bit depth', s.bits],
+        ['Size', s.size?((s.size/1048576).toFixed(2)+' MB'):'']
+      ];
+      document.getElementById('pl-specbody').innerHTML=rows(specPairs);
+      // Artist / song / album first, then everything else the file carries.
+      var shown={};
+      var tagPairs=[['Artist',pri.artist||''],['Song',pri.title||''],
+                    ['Album',pri.album||'']];
+      ['artist','title','album'].forEach(function(k){shown[k]=1;});
+      if(pri.albumartist&&pri.albumartist!==pri.artist)
+        tagPairs.push(['Album artist',pri.albumartist]);
+      if(pri.tracknumber)tagPairs.push(['Track',pri.tracknumber]);
+      if(pri.date)tagPairs.push(['Year',pri.date]);
+      Object.keys(t).forEach(function(k){
+        if(shown[String(k).toLowerCase()])return;
+        tagPairs.push([k,t[k]]);
+      });
+      document.getElementById('pl-tagbody').innerHTML=rows(tagPairs);
     }).catch(function(){
       document.getElementById('pl-tagbody').innerHTML='<span class="muted">unavailable</span>';});
 }
@@ -1097,6 +1119,28 @@ def _player_info(p: Path) -> Dict[str, Any]:
     try:
         out["specs"]["size"] = p.stat().st_size
     except OSError:
+        pass
+    # Artist / song / album via mutagen's `easy` map, so the player can show them
+    # first regardless of container: FLAC uses "artist", ID3 uses TPE1, MP4 uses
+    # \xa9ART. Reading raw tag keys alone would make that guesswork.
+    try:
+        from mutagen import File as _MF
+        emf = _MF(str(p), easy=True)
+        if emf is not None and emf.tags:
+            def _first(k):
+                v = emf.tags.get(k)
+                if isinstance(v, (list, tuple)):
+                    v = v[0] if v else ""
+                return str(v or "").strip()
+            out["primary"] = {k: v for k, v in (
+                ("artist", _first("artist")),
+                ("title", _first("title")),
+                ("album", _first("album")),
+                ("albumartist", _first("albumartist")),
+                ("tracknumber", _first("tracknumber")),
+                ("date", _first("date")),
+            ) if v}
+    except Exception:  # noqa: BLE001
         pass
     try:
         from mutagen import File as MutagenFile
