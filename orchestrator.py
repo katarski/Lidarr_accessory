@@ -620,6 +620,8 @@ class OrchestratorConfig:
     # Albums planned per pass (each costs a Lidarr track-list request). The rest
     # roll to the next pass, least-recently-planned first.
     assembly_max_albums_per_pass: int = 150
+    # How many active song hunts get one grab-and-verify attempt per pass.
+    assembly_hunt_per_pass: int = 2
     # Extra folders to draw songs from, beyond the needs-attention sources.
     assembly_extra_source_dirs: Optional[List[str]] = None
 
@@ -7909,6 +7911,11 @@ class Orchestrator:
             plan["album_id"] = aid
             plan["lidarr_have"] = int((a.get("statistics") or {}).get(
                 "trackFileCount") or 0)
+            # Carry the hunt across a re-plan, or the periodic planner would wipe
+            # the record of which releases were already tried.
+            prev = store.get(aid) or {}
+            if prev.get("hunt"):
+                plan["hunt"] = prev["hunt"]
             store.upsert(aid, plan)
             keep_ids.append(aid)
             planned += 1
@@ -7920,6 +7927,12 @@ class Orchestrator:
             logger.info(
                 "assembly: %d album(s) can be (partly) assembled from the "
                 "needs-attention sources", planned)
+        try:
+            self._assembly_continue_hunts(
+                budget=max(0, int(getattr(self.cfg,
+                                          "assembly_hunt_per_pass", 2))))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("assembly hunt continuation skipped: %s", exc)
         return planned
 
     # ---- Assembly tab actions (requirement e, stage 2) ------------------
@@ -8016,8 +8029,29 @@ class Orchestrator:
             return False, ("your indexers offered no torrent with at least "
                            "%d seeder(s) for %s" % (min_seed, artist))
         cands.sort(key=lambda t: -t[0])
-        return self._assembly_grab_for_songs(
-            album_id, artist, missing, [c[1] for c in cands])
+        ranked = [c[1] for c in cands]
+        # Persist the hunt so it CONTINUES on its own. One attempt per pass:
+        # grab a candidate, verify it really holds a missing song, and if it does
+        # not, drop it and let the next pass try the next release. That keeps
+        # going until the song is found or the candidates run out -- and it
+        # survives a restart, which an in-process loop did not.
+        hunt = dict(plan.get("hunt") or {})
+        hunt["active"] = True
+        tried = set(hunt.get("tried") or [])
+        nxt = [r for r in ranked if r.get("guid") not in tried]
+        hunt["candidates"] = len(ranked)
+        if not nxt:
+            hunt["active"] = False
+            hunt["note"] = "no untried release left"
+            plan["hunt"] = hunt
+            store.upsert(album_id, plan)
+            return False, ("tried every release your indexers offer (%d); none "
+                           "carried the missing song(s)" % len(ranked))
+        ok, msg = self._assembly_grab_for_songs(
+            album_id, artist, missing, nxt, hunt=hunt)
+        plan["hunt"] = hunt
+        store.upsert(album_id, plan)
+        return ok, msg
 
     def _assembly_owned_keys(self, artist_id):
         """
@@ -8040,7 +8074,7 @@ class Orchestrator:
             logger.debug("assembly owned-albums lookup failed: %s", exc)
         return out
 
-    def _assembly_grab_for_songs(self, album_id, artist, missing, cands):
+    def _assembly_grab_for_songs(self, album_id, artist, missing, cands, hunt=None):
         """
         Grab candidates in turn until one actually contains a missing song.
         Anything that doesn't is removed and blocklisted, so the next attempt
@@ -8055,9 +8089,16 @@ class Orchestrator:
         except Exception:  # noqa: BLE001
             qbt = None
         tried = 0
-        cap = max(1, int(getattr(
+        # ONE grab per invocation: each attempt costs a grab + a metadata wait, so
+        # a long in-process loop just blocks (and dies on restart). The hunt is
+        # resumed by the periodic assembly pass instead.
+        cap = 1 if hunt is not None else max(1, int(getattr(
             self.cfg, "interactive_search_max_candidates", 5)))
         for r in cands[:cap]:
+            if hunt is not None and r.get("guid"):
+                hunt.setdefault("tried", [])
+                if r["guid"] not in hunt["tried"]:
+                    hunt["tried"].append(r["guid"])
             guid, idx = r.get("guid"), r.get("indexerId")
             if not guid or idx is None:
                 continue
@@ -8116,6 +8157,9 @@ class Orchestrator:
                 logger.info("assembly: %r contains %d needed song(s) -- kept; "
                             "the deselect will drop the rest", title[:70],
                             len(hits))
+                if hunt is not None:
+                    hunt["active"] = False
+                    hunt["note"] = "found in %s" % title[:60]
                 return True, ("%r has %d of your missing song(s) -- downloading "
                               "just those" % (title[:60], len(hits)))
             logger.info("assembly: %r has none of the missing songs -- "
@@ -8264,6 +8308,46 @@ class Orchestrator:
                 if freed else "; sources kept (still needed elsewhere)")
         return True, ("assembled %d song(s) into %s / %s%s"
                       % (len(items), artist, album, tail))
+
+    def _assembly_continue_hunts(self, budget: int = 2) -> int:
+        """
+        Resume song hunts left running by the Assembly tab. One grab-and-verify
+        attempt per album per pass: a release that does not carry a missing song
+        is deselected, removed and blocklisted, and the NEXT release is tried on
+        the following pass -- repeating until the song is found or the candidate
+        list is exhausted. Persisted in the plan, so a restart does not lose it.
+        Returns the number of attempts made.
+        """
+        store = getattr(self, "assembly", None)
+        if store is None or budget <= 0:
+            return 0
+        done = 0
+        for plan in store.list():
+            if done >= budget:
+                break
+            hunt = plan.get("hunt") or {}
+            if not hunt.get("active"):
+                continue
+            if not (plan.get("missing") or []):
+                hunt["active"] = False
+                hunt["note"] = "nothing missing any more"
+                plan["hunt"] = hunt
+                store.upsert(plan.get("id"), plan)
+                continue
+            aid = plan.get("album_id") or plan.get("id")
+            logger.info("assembly hunt: continuing for %s / %s (%d song(s) still "
+                        "missing, %d release(s) tried so far)",
+                        plan.get("artist"), plan.get("album"),
+                        len(plan.get("missing") or []),
+                        len(hunt.get("tried") or []))
+            try:
+                ok, msg = self.assembly_find_missing(aid)
+                logger.info("assembly hunt: %s -- %s", "ok" if ok else "no luck",
+                            msg)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("assembly hunt failed for %s: %s", aid, exc)
+            done += 1
+        return done
 
     def _album_track_titles_rows(self, album_id: int) -> List[Dict[str, Any]]:
         """Track ROWS for an album's selected release (id/title/number), which

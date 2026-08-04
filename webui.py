@@ -148,7 +148,7 @@ _PAGE = r"""<!doctype html>
   .playable{cursor:pointer}
   .playable:hover{text-decoration:underline}
   .playable.on{color:#58a6ff;font-weight:600}
-  #pl{position:fixed;left:1rem;top:1rem;width:24rem;max-width:94vw;z-index:60;
+  #pl{position:fixed;left:1rem;top:1rem;width:29rem;max-width:94vw;z-index:60;
       background:var(--pan,#161b22);border:1px solid var(--bd,#30363d);
       border-radius:8px;box-shadow:0 8px 28px #000a;display:none}
   #pl.on{display:block}
@@ -177,10 +177,20 @@ _PAGE = r"""<!doctype html>
   #pl audio{width:100%;margin-top:.25rem}
   #pl details{margin-top:.4rem}
   #pl details summary{cursor:pointer;color:var(--mut,#8b949e)}
-  #pl table{border-collapse:collapse;font-size:.82rem;width:100%;
-      max-height:11rem;display:block;overflow:auto}
-  #pl td{padding:.1rem .35rem;vertical-align:top;border-bottom:1px solid #21262d}
-  #pl td:first-child{color:var(--mut,#8b949e);white-space:nowrap}
+  /* Drag the bottom-right corner to resize the whole player. */
+  #pl{resize:both;overflow:hidden;min-width:20rem;min-height:12rem}
+  /* Each pane scrolls on its own and can be dragged taller, like a sheet. */
+  #pl .pltbl{max-height:13rem;overflow:auto;resize:vertical;
+      border:1px solid #21262d;border-radius:4px}
+  #pl table{border-collapse:collapse;font-size:.84rem;width:100%;
+      table-layout:fixed}
+  #pl td{padding:.32rem .5rem;vertical-align:top;
+      border-bottom:1px solid #21262d;line-height:1.35;
+      overflow-wrap:anywhere}                 /* wrap instead of h-scrolling */
+  #pl td:first-child{color:var(--mut,#8b949e);width:8.5rem;font-weight:600}
+  #pl tr:nth-child(even) td{background:#0d1117}   /* zebra, easier to scan */
+  /* One set of transport controls: mine. The native bar duplicated it. */
+  #pl audio{width:100%;margin-top:.25rem;display:none}
 </style></head>
 <body>
 <header>
@@ -399,7 +409,8 @@ function plInfo(path){
         ['Bit depth', s.bits],
         ['Size', s.size?((s.size/1048576).toFixed(2)+' MB'):'']
       ];
-      document.getElementById('pl-specbody').innerHTML=rows(specPairs);
+      document.getElementById('pl-specbody').innerHTML=
+        '<div class="pltbl">'+rows(specPairs)+'</div>';
       // Artist / song / album first, then everything else the file carries.
       var shown={};
       var tagPairs=[['Artist',pri.artist||''],['Song',pri.title||''],
@@ -409,11 +420,22 @@ function plInfo(path){
         tagPairs.push(['Album artist',pri.albumartist]);
       if(pri.tracknumber)tagPairs.push(['Track',pri.tracknumber]);
       if(pri.date)tagPairs.push(['Year',pri.date]);
+      // Raw container keys duplicate the friendly rows above (ID3 TPE1 = Artist,
+      // TIT2 = Song, TALB = Album...). Showing both was noise.
+      var dupKeys={tpe1:1,tit2:1,talb:1,trck:1,tdrc:1,tyer:1,tpe2:1,tdrl:1,
+                   '\u00a9art':1,'\u00a9nam':1,'\u00a9alb':1,'\u00a9day':1,
+                   aart:1,trkn:1,albumartist:1,tracknumber:1,date:1,
+                   artist:1,title:1,album:1};
+      var dupVals={};
+      tagPairs.forEach(function(r){if(r[1])dupVals[String(r[1]).toLowerCase()]=1;});
       Object.keys(t).forEach(function(k){
-        if(shown[String(k).toLowerCase()])return;
+        var lk=String(k).toLowerCase();
+        if(shown[lk]||dupKeys[lk])return;
+        if(dupVals[String(t[k]).toLowerCase()])return;   // same value, other name
         tagPairs.push([k,t[k]]);
       });
-      document.getElementById('pl-tagbody').innerHTML=rows(tagPairs);
+      document.getElementById('pl-tagbody').innerHTML=
+        '<div class="pltbl">'+rows(tagPairs)+'</div>';
     }).catch(function(){
       document.getElementById('pl-tagbody').innerHTML='<span class="muted">unavailable</span>';});
 }
