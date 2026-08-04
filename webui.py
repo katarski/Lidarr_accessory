@@ -153,7 +153,10 @@ _PAGE = r"""<!doctype html>
       border-radius:8px;box-shadow:0 8px 28px #000a;display:none}
   #pl.on{display:block}
   #pl .plhead{display:flex;align-items:center;gap:.5rem;padding:.5rem .6rem;
-      border-bottom:1px solid var(--bd,#30363d)}
+      border-bottom:1px solid var(--bd,#30363d);cursor:move;user-select:none}
+  #pl .plhead button{cursor:pointer}
+  #pl.dragging{opacity:.92}
+  body.pl-dragging{user-select:none}
   #pl .plname{font-weight:600;overflow:hidden;text-overflow:ellipsis;
       white-space:nowrap;flex:1}
   #pl .plbody{padding:.5rem .6rem}
@@ -301,7 +304,7 @@ _PAGE = r"""<!doctype html>
   </div>
 </main>
 <div id="pl">
-  <div class="plhead">
+  <div class="plhead" id="pl-head" onmousedown="plDragStart(event)" title="Drag to move">
     <span class="plname" id="pl-name">—</span>
     <button class="b-copy" title="Close player" onclick="plClose()">✕</button>
   </div>
@@ -359,7 +362,47 @@ function toast(m){var t=document.getElementById('toast');t.textContent=m;t.class
 // same handler serves Needs attention, Assembly and Converter.
 var PLCUR='';
 function plEl(){return document.getElementById('pl-audio');}
+var PLDRAG=null;
+function plDragStart(ev){
+  // Drag by the header only, and never when the close button was hit.
+  if(ev.target&&ev.target.tagName==='BUTTON')return;
+  var el=document.getElementById('pl'), r=el.getBoundingClientRect();
+  PLDRAG={dx:ev.clientX-r.left, dy:ev.clientY-r.top};
+  el.classList.add('dragging'); document.body.classList.add('pl-dragging');
+  document.addEventListener('mousemove',plDragMove);
+  document.addEventListener('mouseup',plDragEnd);
+  ev.preventDefault();
+}
+function plDragMove(ev){
+  if(!PLDRAG)return;
+  var el=document.getElementById('pl'), m=4;
+  var w=el.offsetWidth, h=el.offsetHeight;
+  var left=Math.min(Math.max(m,ev.clientX-PLDRAG.dx), Math.max(m,window.innerWidth-w-m));
+  var top =Math.min(Math.max(m,ev.clientY-PLDRAG.dy), Math.max(m,window.innerHeight-h-m));
+  el.style.left=left+'px'; el.style.top=top+'px';
+}
+function plDragEnd(){
+  PLDRAG=null;
+  var el=document.getElementById('pl');
+  el.classList.remove('dragging'); document.body.classList.remove('pl-dragging');
+  document.removeEventListener('mousemove',plDragMove);
+  document.removeEventListener('mouseup',plDragEnd);
+  // Remember it: once you have placed the player, later tracks open there
+  // instead of jumping back under the pointer.
+  try{localStorage.setItem('plpos',JSON.stringify({l:el.style.left,t:el.style.top}));}catch(e){}
+}
 function plPlace(x,y){
+  // A position you chose wins over the pointer.
+  try{
+    var st=JSON.parse(localStorage.getItem('plpos')||'null');
+    if(st&&st.l&&st.t){
+      var el=document.getElementById('pl');
+      el.classList.add('on'); el.style.left=st.l; el.style.top=st.t; return;
+    }
+  }catch(e){}
+  return plPlaceAt(x,y);
+}
+function plPlaceAt(x,y){
   // Put the popup right under the pointer so it can be confirmed and dismissed
   // without travelling to a corner -- clamped so it never hangs off-screen.
   var el=document.getElementById('pl');
