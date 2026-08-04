@@ -321,6 +321,28 @@ def match_files(
             rep.rejected.append((sf, "; ".join(why[:3]) or "no acceptable track"))
         else:
             rep.matches.append(best)
+
+    # ONE file per wanted track. A box set legitimately carries the same song
+    # several times (different sessions/takes), and on real data three separate
+    # "He's Funny That Way" files all cleared the gates for one track slot
+    # (+1.3s, +18.7s, +26.9s). Importing all three would stack duplicates onto
+    # one track, so keep only the closest by duration and report the rest.
+    best_per_track: Dict[int, Match] = {}
+    for m in rep.matches:
+        cur = best_per_track.get(m.want.track_id)
+        if cur is None or abs(m.delta_ms) < abs(cur.delta_ms):
+            best_per_track[m.want.track_id] = m
+    if len(best_per_track) != len(rep.matches):
+        for m in rep.matches:
+            keep = best_per_track.get(m.want.track_id)
+            if keep is not m:
+                rep.rejected.append((
+                    m.src,
+                    "duplicate for %r -- kept %s (%+.1fs vs %+.1fs)"
+                    % (m.want.title[:30],
+                       os.path.basename(keep.src.path)[:28],
+                       keep.delta_ms / 1000.0, m.delta_ms / 1000.0)))
+        rep.matches = list(best_per_track.values())
     return rep
 
 
