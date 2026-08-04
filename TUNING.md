@@ -1,8 +1,19 @@
 # Tuning guide — grabbing, quality & cleanup
 
 How to control **what the pipeline grabs, how aggressively, and how it cleans up
-dead/lossy junk**. Every setting is available in the Unraid template (Edit the
-container) as an env var, or in `config.yaml`. Defaults shown in **bold**.
+dead/lossy junk**. Defaults shown in **bold**.
+
+Three places set these, in increasing precedence:
+
+1. `config.yaml`
+2. the Unraid template's env vars (Edit the container)
+3. the **Settings tab** of the web UI — every tunable, grouped by category, each
+   with a recommended value and a per-section **Recommended** button. It writes
+   `/config/webui_overrides.json`, which wins over both of the above and applies
+   on the next restart.
+
+So if a value looks stuck at something you didn't set, check the Settings tab
+(or that file) first.
 
 ---
 
@@ -27,6 +38,27 @@ lossless release exists**, so you still fill gaps that are lossy-only.
 The interactive search proactively grabs monitored albums Lidarr has left
 missing. **This is the knob that controls the firehose.** With a large missing
 backlog, aggressive settings flood qBittorrent with dead/lossy grabs.
+
+### Album first, discography only as a fallback
+
+Each pass takes the albums missing longest (least-recently-tried first) and
+searches for **that album**. Only when an album cannot be found on its own does
+it search the whole **artist** and consider a discography or box set that
+contains it — auto-deselect then drops everything in that torrent you already
+own.
+
+That order matters more than it sounds. A discography grab fills several gaps at
+once, which looks efficient, but it arrives full of compilations, live sets and
+wrong editions that then need deselecting and hand-resolving in Needs attention.
+Searching per album costs more indexer queries and produces far less cleanup.
+
+| Setting | Default | Effect |
+|---|---|---|
+| `Max albums / pass` (`ISEARCH_MAX_ALBUMS`) | **15** | How many albums get their own search each pass. Every album that finds nothing may also cost one artist-scope search, so this bounds the whole pass. A rotating 25 drains a big backlog steadily; several hundred fires a burst at your indexers. |
+| `Discography fallback` (`ISEARCH_ARTIST_LEVEL`) | **true** | Allow the artist-scope search. Turn it off to only ever search for the exact album — some albums only exist inside a box set, and those will then never be found. |
+| `Retry cooldown (s)` (`ISEARCH_COOLDOWN`) | **43200** | How long before the same album is searched again, and before the same artist's scope is swept again. Stops a pass re-running the searches that just failed. |
+| `Candidates to try` (`ISEARCH_MAX_CANDIDATES`) | **5** | Ranked releases to attempt per album/artist before giving up for this pass. Each is verified inside qBittorrent and rejected if its contents are wrong. |
+| `Min title match` (`ISEARCH_MIN_TITLE_RATIO`) | **0.55** | How closely a release title must resemble the album (0-1). Lower finds more, at the risk of a different record; the song-title check is the real safety net. |
 
 | Env var | Default | Aggressive (fast backfill) | Gentle (less junk) | Notes |
 |---|---|---|---|---|
