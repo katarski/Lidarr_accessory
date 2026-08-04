@@ -1662,11 +1662,16 @@ def main() -> int:
         ).start()
         logger.info(
             "Song harvest: enabled (every %ds, tolerance=%.0fs, %s, "
-            "skip-unchanged=%s) -- imports single tracks Lidarr is missing out "
-            "of compilations already on disk",
+            "leftovers=%s, skip-unchanged=%s) -- imports single tracks Lidarr "
+            "is missing out of compilations already on disk",
             max(600, int(orch_cfg.assembly_interval_seconds)),
             orch_cfg.harvest_duration_tolerance,
-            "DRY RUN" if orch_cfg.harvest_dry_run else "IMPORTING (copy)",
+            "DRY RUN" if orch_cfg.harvest_dry_run
+            else "IMPORTING (%s)" % orch_cfg.harvest_import_mode,
+            ("DELETING" if (orch_cfg.harvest_purge_leftovers
+                            and not orch_cfg.harvest_dry_run) else "kept")
+            + (" via %s" % orch_cfg.harvest_leftovers_dir
+               if orch_cfg.harvest_leftovers_dir else ""),
             orch_cfg.recheck_skip_unchanged,
         )
     else:
