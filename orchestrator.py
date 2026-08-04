@@ -1805,7 +1805,14 @@ class Orchestrator:
                 "(%d tracks); flipping release and importing.",
                 mode, artist_name, album_name, n, target_rid, T,
             )
-            self.lidarr.set_album_monitored_release(album_id, target_rid)
+            # If the flip fails we would positionally import against whatever
+            # release Lidarr still points at -- i.e. the wrong track list.
+            if not self.lidarr.set_album_monitored_release(album_id, target_rid):
+                logger.warning(
+                    "Force-import: could not switch %s / %s to release %s -- "
+                    "aborting rather than importing against the wrong release.",
+                    artist_name, album_name, target_rid)
+                return False
             rcmd = self.lidarr.refresh_artist(aid)
             if rcmd:
                 self.lidarr.wait_for_command(
@@ -5611,7 +5618,13 @@ class Orchestrator:
                     "id=%s (trackCount matches disk=%d)",
                     album_id, target_rid, disk_file_count,
                 )
-                self.lidarr.set_album_monitored_release(album_id, target_rid)
+                if not self.lidarr.set_album_monitored_release(
+                        album_id, target_rid):
+                    logger.warning(
+                        "could not switch album %s to release %s -- not "
+                        "importing against the wrong release.",
+                        album_id, target_rid)
+                    return False
                 rcmd = self.lidarr.refresh_artist(artist_id)
                 if rcmd:
                     self.lidarr.wait_for_command(
@@ -6452,9 +6465,17 @@ class Orchestrator:
                                             album_id, album_rec.get("title"),
                                             target_rid, len(audios),
                                         )
-                                        self.lidarr.set_album_monitored_release(
+                                        _flip_ok = self.lidarr.set_album_monitored_release(
                                             album_id, target_rid,
                                         )
+                                        if not _flip_ok:
+                                            logger.warning(
+                                                "release flip to %s failed for "
+                                                "album %s -- skipping this "
+                                                "candidate rather than reading "
+                                                "the wrong track list.",
+                                                target_rid, album_id)
+                                            continue
                                         # Wait for refresh so tracks for the
                                         # newly-monitored release are visible
                                         # to /api/v1/track before we query.
@@ -10440,7 +10461,15 @@ class Orchestrator:
                         return ""
                     # Keep the torrent; just stop this album from downloading.
                     if desel:
-                        q.set_file_priority(t.get("hash"), desel, 0)
+                        # Never claim a deselect that did not happen: qBit can
+                        # refuse (auth expired, hash gone) and the message below
+                        # would otherwise tell the user it worked.
+                        if not q.set_file_priority(t.get("hash"), desel, 0):
+                            logger.warning(
+                                "deselect of %d file(s) FAILED for torrent %s",
+                                len(desel), str(t.get("name"))[:60])
+                            return (" (tried to deselect this album in the "
+                                    "torrent but qBittorrent refused -- see log)")
                     return (f" (deselected this album in the torrent; "
                             f"{other_audio} other album track(s) kept)")
         except Exception as exc:  # noqa: BLE001
