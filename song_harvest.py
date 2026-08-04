@@ -380,6 +380,68 @@ def quality_map(lidarr, folders: Iterable[str]) -> Dict[str, Dict[str, Any]]:
     return out
 
 
+def acoustid_verify(
+    matches: Iterable[Match],
+    acoustid,
+    min_score: float = 0.5,
+    require: bool = False,
+) -> Tuple[List[Match], List[Tuple[Match, str]]]:
+    """
+    Final gate before anything moves: confirm the FINGERPRINT agrees.
+
+    Tags and duration can both be right and the recording still wrong -- two
+    different performances of a standard run to the same length, and a
+    compilation's tags are often copied from a tracklist rather than the audio.
+    AcoustID identifies the actual audio, so it is the only check that can catch
+    that. Duration stays the primary gate because fingerprinting needs fpcalc, a
+    network round trip and a rate limit (3 req/s here), so it runs LAST and only
+    on what already passed everything else.
+
+    `require=False` keeps a match whose fingerprint is simply unknown (no
+    fpcalc, no network, nothing in the database -- common for obscure 1930s
+    sides). `require=True` drops anything unproven.
+
+    Returns (verified, rejected_with_reason).
+    """
+    ok: List[Match] = []
+    bad: List[Tuple[Match, str]] = []
+    if acoustid is None or not getattr(acoustid, "enabled", False):
+        if require:
+            return [], [(m, "AcoustID required but unavailable") for m in matches]
+        return list(matches), []
+    for m in matches:
+        try:
+            res = acoustid.identify_file(m.src.path)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("harvest: acoustid failed for %s: %s", m.src.path, exc)
+            res = None
+        if not res:
+            if require:
+                bad.append((m, "no AcoustID match (unproven)"))
+            else:
+                ok.append(m)
+            continue
+        score = float(res.get("score") or 0.0)
+        got_t, got_a = res.get("title"), res.get("artist")
+        if score < min_score:
+            bad.append((m, "AcoustID score %.2f below %.2f" % (score, min_score)))
+            continue
+        # The fingerprint must name the SAME song. A mismatch here means the
+        # tags lied -- exactly the garbage this gate exists to stop.
+        if got_t and norm_title(got_t) != norm_title(m.want.title):
+            bad.append((m, "AcoustID says %r, not %r"
+                        % (str(got_t)[:34], m.want.title[:34])))
+            continue
+        if got_a and m.want.artist_name:
+            ak, wk = artist_key(got_a), artist_key(m.want.artist_name)
+            if wk and ak and wk not in ak and ak not in wk:
+                bad.append((m, "AcoustID artist %r != %r"
+                            % (str(got_a)[:26], m.want.artist_name[:26])))
+                continue
+        ok.append(m)
+    return ok, bad
+
+
 def build_import_files(matches: Iterable[Match],
                        quality_by_path: Optional[Dict[str, Dict[str, Any]]] = None,
                        quality: Optional[Dict[str, Any]] = None,
@@ -547,6 +609,9 @@ def harvest_pass(
     leftovers_dir: Optional[str] = None,
     qbt=None,
     keep_dir: Optional[str] = None,
+    acoustid=None,
+    acoustid_min_score: float = 0.5,
+    acoustid_required: bool = False,
 ) -> Dict[str, Any]:
     """
     Walk each source folder, harvest whatever songs Lidarr is missing, and
@@ -582,6 +647,17 @@ def harvest_pass(
         stats["matched"] += len(rep.matches)
         for line in format_report(rep, source=src_dir):
             logger.info("%s", line)
+        if rep.matches and acoustid is not None:
+            # LAST gate before anything moves: the fingerprint must agree.
+            verified, unproven = acoustid_verify(
+                rep.matches, acoustid, min_score=acoustid_min_score,
+                require=acoustid_required)
+            for m, why in unproven:
+                logger.warning("harvest: AcoustID rejected %s -- %s",
+                               os.path.basename(m.src.path)[:40], why)
+            stats["acoustid_rejected"] = (stats.get("acoustid_rejected", 0)
+                                          + len(unproven))
+            rep.matches = verified
         if rep.matches and not dry_run:
             qmap = quality_map(lidarr, {os.path.dirname(m.src.path)
                                         for m in rep.matches})
@@ -654,6 +730,9 @@ def purge_leftovers(
     delete: bool = False,
     qbt=None,
     keep_dir: Optional[str] = None,
+    acoustid=None,
+    acoustid_min_score: float = 0.5,
+    acoustid_required: bool = False,
 ) -> Dict[str, Any]:
     """
     Deal with what a harvested source still holds once its wanted tracks are in

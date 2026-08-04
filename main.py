@@ -1397,6 +1397,12 @@ def main() -> int:
         harvest_keep_dir=str(
             lidarr_cfg.get("harvest_keep_dir", "/downloads/_harvest_pending")
             or ""),
+        harvest_acoustid_verify=bool(
+            lidarr_cfg.get("harvest_acoustid_verify", True)),
+        harvest_acoustid_min_score=float(
+            lidarr_cfg.get("harvest_acoustid_min_score", 0.5)),
+        harvest_acoustid_required=bool(
+            lidarr_cfg.get("harvest_acoustid_required", False)),
         recheck_skip_unchanged=bool(
             lidarr_cfg.get("recheck_skip_unchanged", True)),
         assembly_max_albums_per_pass=int(
@@ -1652,6 +1658,10 @@ def main() -> int:
                             and not orch_cfg.harvest_dry_run),
                         leftovers_dir=(orch_cfg.harvest_leftovers_dir or None),
                         keep_dir=(orch_cfg.harvest_keep_dir or None),
+                        acoustid=(acoustid_client
+                                  if orch_cfg.harvest_acoustid_verify else None),
+                        acoustid_min_score=orch_cfg.harvest_acoustid_min_score,
+                        acoustid_required=orch_cfg.harvest_acoustid_required,
                         qbt=orch._get_qbt() if hasattr(orch, "_get_qbt") else None)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("harvest pass failed: %s", exc)

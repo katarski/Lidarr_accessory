@@ -662,6 +662,16 @@ class OrchestratorConfig:
     # its torrent) on disk; with it, the box goes and the wanted songs live in
     # one folder that is itself harvested on later passes.
     harvest_keep_dir: str = "/downloads/_harvest_pending"
+    # AcoustID fingerprint check as the LAST gate before a file moves. Tags and
+    # duration can both agree while the recording is still wrong -- two
+    # performances of a standard run to the same length, and compilation tags
+    # are often copied from a tracklist rather than the audio.
+    harvest_acoustid_verify: bool = True
+    harvest_acoustid_min_score: float = 0.5
+    # Require a positive fingerprint. OFF by default: obscure 1930s-40s sides
+    # are frequently absent from AcoustID, and requiring proof would refuse
+    # exactly the rarities this feature exists to recover.
+    harvest_acoustid_required: bool = False
 
     # --- Re-check gating --------------------------------------------------
     # Don't recompute a verdict for a folder/torrent whose files AND Lidarr's
@@ -10564,6 +10574,12 @@ class Orchestrator:
          "Safety cap on how many audio files are tag-read per harvest pass."),
         ("lidarr.harvest_purge_leftovers", "lidarr", "harvest_purge_leftovers", "Harvest: delete what is not needed", "bool", False,
          "After harvesting, DELETE everything the source still holds that no album wants, and remove the torrent (with data) from qBittorrent. Files still wanted by Lidarr are re-checked and survive. IRREVERSIBLE -- and 'not wanted' means not wanted right now, so adding an artist later cannot bring a deleted file back."),
+        ("lidarr.harvest_acoustid_verify", "lidarr", "harvest_acoustid_verify", "Harvest: verify by AcoustID fingerprint", "bool", True,
+         "Fingerprint each candidate before it moves and refuse it if the audio is a different recording than the tags claim. Tags plus duration can both agree while the recording is wrong -- this is the only check that reads the actual audio."),
+        ("lidarr.harvest_acoustid_min_score", "lidarr", "harvest_acoustid_min_score", "Harvest: AcoustID min score", "float", 0.5,
+         "Confidence floor for an AcoustID identification to count."),
+        ("lidarr.harvest_acoustid_required", "lidarr", "harvest_acoustid_required", "Harvest: REQUIRE an AcoustID match", "bool", False,
+         "Refuse any file AcoustID cannot identify. Off by default because obscure 1930s-40s sides are often missing from the database, and requiring proof would reject exactly the rarities worth recovering."),
         ("lidarr.harvest_keep_dir", "lidarr", "harvest_keep_dir", "Harvest: keep-folder for still-wanted songs", "str", "/downloads/_harvest_pending",
          "Files still wanted by Lidarr are moved here when their box folder is dissolved, so one wanted track does not pin a whole 10-CD box (and its torrent) on disk. This folder is itself harvested on later passes. Empty leaves them in place."),
         ("lidarr.harvest_leftovers_dir", "lidarr", "harvest_leftovers_dir", "Harvest: leftovers staging folder", "str", "",
@@ -10724,6 +10740,9 @@ class Orchestrator:
             "lidarr.harvest_max_files_per_pass",
             "lidarr.harvest_import_mode",
             "lidarr.harvest_purge_leftovers",
+            "lidarr.harvest_acoustid_verify",
+            "lidarr.harvest_acoustid_min_score",
+            "lidarr.harvest_acoustid_required",
             "lidarr.harvest_keep_dir",
             "lidarr.harvest_leftovers_dir",
             "lidarr.recheck_skip_unchanged",
