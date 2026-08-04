@@ -7555,12 +7555,15 @@ class Orchestrator:
         title = album_title or str(rec.get("title") or "")
         return bool(self._release_unofficial_markers(title))
 
+    # Boundary classes include '@' and '~' because release names tag bitrate as
+    # "@320" / "(mp3@320)" -- without them "Complete Decca Recordings 1944-50
+    # @320" scored as neutral rather than lossy.
     _LOSSLESS_RE = re.compile(
-        r"(?i)(?:^|[\s\-_.\(\[])(flac|ape|wavpack|wv|alac|lossless|dsd|"
-        r"24[\s\-]?bit|24[\s\-]?96|24[\s\-]?192)(?:$|[\s\-_.\)\]])")
+        r"(?i)(?:^|[\s\-_.\(\[@~])(flac|ape|wavpack|wv|alac|lossless|dsd|"
+        r"24[\s\-]?bit|24[\s\-]?96|24[\s\-]?192)(?:$|[\s\-_.\)\]@~])")
     _LOSSY_RE = re.compile(
-        r"(?i)(?:^|[\s\-_.\(\[])(mp3|aac|m4a|ogg|opus|vbr|v0|v2|"
-        r"320|256|192\s?kbps|128)(?:$|[\s\-_.\)\]])")
+        r"(?i)(?:^|[\s\-_.\(\[@~])(mp3|aac|m4a|ogg|opus|vbr|v0|v2|"
+        r"320|256|192\s?kbps|128)(?:$|[\s\-_.\)\]@~])")
 
     def _release_format_bonus(self, title: str) -> float:
         """
