@@ -154,3 +154,135 @@ creates is `0666`/`0777` — group- and other-writable, matching Unraid's
 For files created **before** this was in place, run Unraid **Tools → Docker
 Safe New Permissions** on the share (or `chmod -R 666 files / 777 dirs`). Do
 **not** remove `--user 99:100` to fix permissions — that breaks Lidarr imports.
+
+## Official releases only + swarm health (grabs)
+
+| Knob | Default | Effect |
+|---|---|---|
+| `lidarr.interactive_search_refuse_unofficial` | `true` | Refuse a release whose title advertises greatest-hits / best-of / anthology / collection / box set / live / unplugged / remix / DJ-mix / mixtape / karaoke / tribute / bootleg / b-sides / rarities material — **unless the Lidarr album being filled is itself that kind of record** (by its albumType, secondaryTypes or its own title). So a missing "Live Rust" still downloads; a studio album never gets a hits package instead. |
+| `lidarr.interactive_search_min_seeders` | `1` | Never grab a release with fewer seeders. A 0-seeder grab is not a download — it is what produces torrents stuck at 0%. |
+| `lidarr.interactive_search_seeder_weight` | `1.0` | How strongly seeders (+ leechers at 0.3×) weigh in ranking. `1.0` makes swarm health comparable to title relation, so among releases of the *right* album the healthiest wins. `0` ignores it. |
+
+The same "not an official studio album" test is applied to **folders inside a
+discography torrent** and to an **album folder's own name**, so a folder literally
+called `... All Their Greatest Hits 2001` is deselected by default instead of
+downloading just because Lidarr has no record of it.
+
+## Song-title verification before a grab
+
+| Knob | Default | Effect |
+|---|---|---|
+| `lidarr.verify_track_titles` | `true` | Compare Lidarr's track titles against the songs inside the torrent (its file names) before committing. |
+| `lidarr.verify_track_titles_accept` | `0.60` | Coverage at or above which the release is accepted **even if the file count differs** (bonus tracks, another pressing). |
+| `lidarr.verify_track_titles_reject` | `0.25` | Coverage below which it is rejected as a different record **even when the counts line up**. |
+
+Coverage is measured **per release** and the best one wins: pooling every
+release's titles badly understates a correct grab (an album with 10 releases and
+38 distinct titles scored 34% for a perfectly correct 11-track torrent).
+
+## Reconcile — import gaps still sitting in downloads
+
+| Knob | Default | Effect |
+|---|---|---|
+| `lidarr.reconcile_enabled` | `true` | Import anything Lidarr still lists as missing but which is present in your downloads, using Lidarr's own matcher rather than folder-name heuristics. |
+| `lidarr.reconcile_interval_seconds` | `1800` | How often it runs. |
+| `lidarr.reconcile_require_full_album` | `true` | Only import when the source supplies **every** track of the album (track-level source↔destination match). Off allows partial fills. |
+| `lidarr.reconcile_import_mode` | `copy` | `copy` leaves the download in place (safe while seeding); `move` consumes it. |
+
+## Needs attention — automatic resolution
+
+| Knob | Default | Effect |
+|---|---|---|
+| `lidarr.held_auto_resolve` | `true` | Let logic settle what it can: drop duplicate rows an ancestor row already covers (a box set recorded at several levels), and auto-import rows that are simply monitored Lidarr gaps. Only fires when the held folder holds **exactly** the album's whole track list, so partial/oversized matches stay for you. |
+| `lidarr.webui_held_refresh_seconds` | `300` | Background curator cadence (prune, box-set expand, library compare, auto-dismiss). The page itself always serves the store as-is. |
+
+## Album assembly (build a missing album from compilations)
+
+| Knob | Default | Effect |
+|---|---|---|
+| `lidarr.assembly_enabled` | `true` | Work out which songs of a missing album sit in the compilations stuck in needs-attention. |
+| `lidarr.assembly_interval_seconds` | `1800` | Planner cadence (first pass ~45s after start). |
+| `lidarr.assembly_min_score` | `0.87` | Title-match score a song must reach to count as found. |
+| `lidarr.assembly_require_artist` | `true` | The source's own artist evidence must agree, so a cover of the same song on a tribute compilation is not counted. Folder names may only *confirm*, never reject; a file with no artist evidence is judged on title alone. |
+| `lidarr.assembly_min_pct` | `10` | Don't keep a plan below this % assembled. |
+| `lidarr.assembly_max_albums_per_pass` | `150` | Albums planned per pass (each costs a Lidarr track-list request); the rest rotate in next pass. |
+| `lidarr.assembly_hunt_per_pass` | `2` | Active *Find missing* hunts given one grab-and-verify attempt per pass. |
+
+**Find missing** deliberately inverts the grab rules: it searches the artist's
+whole release list (where collections live), allows non-official releases, and
+skips releases for albums you already own. A candidate is accepted only if its
+file list really carries a missing song; if not it is removed and blocklisted and
+the next release is tried, repeating until the song is found. An accepted torrent
+is narrowed **while still paused**, so it downloads only the needed songs — the
+keep-set is the union across **all** assemblies, so a song another assembly wants
+is never dropped.
+
+## Stalled downloads (partly downloaded, no progress)
+
+| Knob | Default | Effect |
+|---|---|---|
+| `qbittorrent.stalled_reaper` | `true` | Deal with a torrent that has real progress but hasn't moved in N days (from qBittorrent's own `last_activity`). |
+| `qbittorrent.stalled_grace_days` | `3` | How long without progress before acting. |
+| `qbittorrent.stalled_blocklist` | `true` | Blocklist a trashed release so Lidarr grabs a different one. |
+
+**Salvage first:** any *complete* audio file that an assembly needs, or whose
+album Lidarr still wants, means the **torrent only** is removed and the data is
+KEPT for import. Only when nothing is salvageable are the torrent and its data
+deleted. Torrents at 0% are the dead-grab reaper's job; paused/stopped torrents
+are never touched.
+
+## Re-checking torrents already assessed
+
+| Knob | Default | Effect |
+|---|---|---|
+| `qbittorrent.redeselect_recheck_seconds` | `1800` | Re-plan a still-downloading torrent this often, so albums that become owned *after* it was first assessed get deselected too. `0` = plan once only. |
+
+Newly added torrents are always handled **first**, so a fresh grab is narrowed
+before a fast swarm can pull the whole thing.
+
+## Persistent sweep ledger
+
+| Knob | Default | Effect |
+|---|---|---|
+| `watch.sweep_ledger_enabled` | `true` | Remember which folders the cueless sweep already handed off, keyed on a content signature (audio count + newest mtime), so a restart doesn't replay an hour-long queue. |
+| `watch.sweep_ledger_ttl_seconds` | `86400` | Re-examine an unchanged, already-handled folder after this long, so a transient failure is retried rather than written off. |
+
+A folder is re-examined whenever its audio changes, the entry expires, or the
+ledger is disabled. Delete `/config/sweep_seen.json` to force a full pass.
+This also records ripped optical images, which is what stops a DVD-Audio ISO
+being re-ripped forever after its extracted folder is cleaned up.
+
+## Cross-check Lidarr against MusicBrainz
+
+| Knob | Default | Effect |
+|---|---|---|
+| `lidarr.external_audit_enabled` | `true` | Ask MusicBrainz which **studio** albums an artist has that Lidarr has no record of, and report them to `/config/external_album_audit.json`. |
+| `lidarr.external_audit_interval_seconds` | `21600` | Cadence (6h). |
+| `lidarr.external_audit_artists_per_pass` | `10` | Artists per pass — MusicBrainz asks for ≤1 request/second, so the library rotates through over days. |
+| `lidarr.external_audit_recheck_seconds` | `604800` | Don't re-check the same artist more often than this. |
+| `lidarr.external_audit_include_eps` | `false` | Also treat EPs as expected releases. |
+
+**Read-only on purpose** — nothing is added to Lidarr, because adding an album
+changes what the whole pipeline then chases and downloads. Note MusicBrainz's own
+typing is imperfect: a few flagged entries are bootlegs it typed as plain
+"Album", so treat the report as advisory.
+
+## Untagged rips (AcoustID)
+
+Set `acoustid.enabled: true` and your own free key from
+<https://acoustid.org/new-application> (the bundled public test key is dead and
+returns `invalid API key`). Fingerprinting recovers artist/album for a rip whose
+tags are useless — including one whose *filename* fallback produced a placeholder
+identity like `artist='01' album='Track 01'`, which previously counted as
+"identified" and skipped the lookup entirely. Folders that still need identifying
+are handed off **first** in each sweep, so their lookup isn't stuck behind a long
+queue.
+
+## Converter
+
+`Overwrite existing` replaces the source with the converted file: the encode goes
+to a hidden temp name, and only after it is verified (exit 0, non-empty) is the
+original **deleted**, sidecar `.xml` files repointed at the new name, and Lidarr
+asked to rescan the album folder. A failed encode leaves the original untouched.
+Folder ticks include everything beneath them; the affected folder is re-read
+immediately after a conversion or delete, so the tree never lies.
