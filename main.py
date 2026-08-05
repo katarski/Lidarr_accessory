@@ -856,12 +856,18 @@ def qbt_auto_deselect_loop(
                                            reap_useless=reap_useless,
                                            planned=planned_deselect,
                                            recheck_seconds=redeselect_recheck,
-                                           assembly_keep=asm_keep)
+                                           assembly_keep=asm_keep,
+                                           # Checkpoint mid-walk: a full pass
+                                           # takes the better part of an hour,
+                                           # so end-of-pass-only saving lost
+                                           # everything on a restart.
+                                           on_progress=lambda: (
+                                               _save_deselect_ledger(
+                                                   deselect_ledger_path,
+                                                   planned_deselect)))
                 if acted:
                     logger.info("qbt auto-deselect: acted on %d torrent(s)", acted)
-                # Persist the plan ledger every pass, pruned to torrents that
-                # still exist. Cheap (a few hundred hashes) and it is what stops
-                # a restart from re-planning -- and re-LLM-ing -- everything.
+                # Final save for the pass (it is also checkpointed mid-walk).
                 _save_deselect_ledger(deselect_ledger_path, planned_deselect)
             if manage_completed:
                 removed, paused = torrent_lifecycle_pass(

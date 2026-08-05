@@ -470,6 +470,8 @@ def auto_deselect_pass(
     reap_useless: bool = True,
     planned: Optional[Dict[str, float]] = None, recheck_seconds: int = 0,
     now: Optional[float] = None, assembly_keep: Optional[set] = None,
+    on_progress: Optional[Callable[[], None]] = None,
+    progress_every: int = 10,
 ) -> int:
     """
     One scheduled pass for the pipeline: for each INCOMPLETE music torrent,
@@ -498,6 +500,7 @@ def auto_deselect_pass(
     if now is None:
         now = time.time()
     acted = 0
+    progressed = 0
     # NEWEST FIRST. One pass can walk hundreds of torrents, each costing Lidarr
     # (and sometimes LLM) calls, so a torrent that has only just been grabbed
     # could wait many minutes to be narrowed -- by which time a fast swarm has
@@ -556,6 +559,19 @@ def auto_deselect_pass(
                 planned[h] = now
             if d:
                 acted += 1
+            # Checkpoint the caller's ledger DURING the walk. A full pass over a
+            # few hundred torrents takes the better part of an hour (each one
+            # costs Lidarr queries and sometimes an LLM call), so saving only at
+            # the end meant a restart anywhere in that hour threw away the whole
+            # pass's progress -- which is exactly the re-planning this ledger
+            # exists to prevent.
+            if on_progress is not None:
+                progressed = progressed + 1
+                if progressed % max(1, int(progress_every)) == 0:
+                    try:
+                        on_progress()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("deselect progress callback: %s", exc)
         finally:
             # Restore the original intent -- only if WE paused it (a re-check
             # never pauses, so it never touches start-state).
