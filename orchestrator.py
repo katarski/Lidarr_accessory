@@ -676,6 +676,15 @@ class OrchestratorConfig:
     # holding two more songs. Thin releases are still tried, just afterwards.
     comp_hunt_healthy_seeders: int = 5
 
+    # --- Torrent ownership boundary ---------------------------------------
+    # The ONLY qBittorrent category this pipeline may touch. The client is
+    # shared with other apps (Sonarr et al. sit in the same qBittorrent under
+    # the same /downloads root), and several code paths used to enumerate EVERY
+    # torrent and match on content path -- which can remove another app's
+    # download, with its data. Empty means "match nothing", i.e. fail CLOSED:
+    # better to skip a cleanup than to delete a stranger's torrent.
+    qbt_category: str = "lidarr"
+
     # Only consider releases MusicBrainz marks as a compilation / soundtrack /
     # live record. A plain studio album cannot be the home of another artist's
     # stray side, so it is no use here.
@@ -5267,6 +5276,18 @@ class Orchestrator:
                 "(%d audio files)", folder, len(audios),
             )
             eligible.append((folder, audios))
+            # Record it AS IT IS DISCOVERED, not at end of pass. A pass takes the
+            # better part of an hour and often does not survive to completion, so
+            # end-of-pass marking wrote nothing on most runs and the whole backlog
+            # was re-walked, re-tag-read and re-announced every 60 seconds. The
+            # ledger is keyed by content signature with a 24h TTL, so recording it
+            # now costs nothing correctness-wise: this pass already holds the
+            # folder in `eligible` and will still act on it, a folder whose audio
+            # changes gets a new signature and is reconsidered at once, and
+            # anything not reached is retried when the entry expires.
+            self._sweep_ledger_mark(folder, audios, now_ts)
+            if len(eligible) % 10 == 0:
+                self._sweep_ledger_save()
 
         # Multi-disc unification FIRST: fold CD1/CD2/... leaf folders of one
         # album into a single parent handoff, so a 2-CD album imports as one
@@ -5380,33 +5401,13 @@ class Orchestrator:
                 except Exception:  # noqa: BLE001
                     pass
 
-        # Record EVERY folder this pass considered, not just the ones handed off.
-        # The first pass after a start does the full walk (which is what we want)
-        # but afterwards an unchanged folder must cost nothing: previously only a
-        # handed-off folder was recorded, so anything deferred past this pass's
-        # work -- or dropped as a redundant edition -- was re-walked, re-tag-read,
-        # re-decided and re-logged every 60 seconds forever. 146 folders were
-        # being re-announced per sweep with only 1 ledger entry to show for it.
-        #
-        # Safe because the ledger is keyed by CONTENT SIGNATURE and expires
-        # (sweep_ledger_ttl_seconds, 24h): a folder whose audio changes is
-        # reconsidered immediately, and everything else gets a fresh look daily,
-        # so a deferred folder is retried rather than written off.
-        deferred = 0
-        for folder, audios in eligible:
-            if not self._sweep_ledger_skip(folder, audios, now_ts):
-                self._sweep_ledger_mark(folder, audios, now_ts)
-                deferred += 1
+        # Folders are recorded as they are DISCOVERED (see above) and handoffs
+        # re-record themselves as they go, so this is just the closing flush.
         self._sweep_ledger_save()
         if led_skipped:
             logger.info(
                 "cueless sweep: skipped %d folder(s) already handled and "
                 "unchanged (persistent ledger)", led_skipped)
-        if deferred:
-            logger.info(
-                "cueless sweep: recorded %d considered folder(s) so an unchanged "
-                "one is not re-examined next sweep (re-checked if its audio "
-                "changes, or after the ledger TTL)", deferred)
         logger.info(
             "cueless sweep: finished; handed off %d folder(s)", handed_off,
         )
@@ -8729,10 +8730,16 @@ class Orchestrator:
                 logger.info(
                     "assembly: Lidarr would not grab %r (cannot attribute it) "
                     "-- adding the magnet directly, paused", title[:70])
+                # Stamp OUR category on it. `assembly_qbt_category` was never a
+                # real config field, so this always sent "" -- the torrent landed
+                # uncategorised, outside every category-scoped guard, and the
+                # pipeline could then neither recognise nor safely clean up its
+                # own grab.
                 if not qbt.add_magnet(
                         magnet,
-                        category=str(getattr(
-                            self.cfg, "assembly_qbt_category", "") or ""),
+                        category=str(getattr(self.cfg, "assembly_qbt_category", "")
+                                     or getattr(self.cfg, "qbt_category", "")
+                                     or ""),
                         paused=True):
                     continue
             if qbt is None:
@@ -11392,6 +11399,35 @@ class Orchestrator:
         except Exception as exc:  # noqa: BLE001
             return (False, f"save failed: {exc}")
 
+    def _qbt_ours(self, t: Dict[str, Any]) -> bool:
+        """
+        Is this torrent ours to touch? True only when its category matches the
+        configured Lidarr category EXACTLY.
+
+        The qBittorrent instance is shared -- other apps' downloads live in it,
+        under the same /downloads root -- and several paths here find torrents by
+        matching content paths, then remove them WITH DATA. That is how a reap of
+        "empty" torrents took out six `How Its Made` episodes belonging to
+        another app. An uncategorised torrent is NOT ours either: no category
+        means no claim. Fails CLOSED (an unset category matches nothing), because
+        skipping a cleanup is always cheaper than deleting a stranger's download.
+        """
+        want = str(getattr(self.cfg, "qbt_category", "") or "").strip().lower()
+        if not want:
+            return False
+        return str(t.get("category") or "").strip().lower() == want
+
+    def _qbt_ours_by_hash(self, q, thash: str) -> bool:
+        """`_qbt_ours` for a bare infohash -- re-reads the torrent so a
+        hash-keyed destructive call is still category-checked."""
+        if not thash:
+            return False
+        try:
+            t = q.torrent_by_hash(str(thash))
+        except Exception:  # noqa: BLE001
+            return False
+        return bool(t) and self._qbt_ours(t)
+
     def _get_qbt(self):
         """Lazy, cached, logged-in QbtClient for WebUI torrent removal, or None
         if qBit isn't configured / unreachable."""
@@ -11433,6 +11469,10 @@ class Orchestrator:
             removed = 0
             container = False
             for t in q.torrents():
+                # NEVER another app's torrent: this removes WITH DATA and matches
+                # on content path, and the client is shared under one /downloads.
+                if not self._qbt_ours(t):
+                    continue
                 cp = str(t.get("content_path") or "").replace("\\", "/").rstrip("/")
                 sp = str(t.get("save_path") or "").replace("\\", "/").rstrip("/")
                 name = os.path.basename(cp) if cp else (t.get("name") or "")
@@ -11473,7 +11513,18 @@ class Orchestrator:
             except Exception:  # noqa: BLE001
                 pass
         q = self._get_qbt()
-        return bool(q and q.remove(thash, delete_files=True))
+        if q is None:
+            return False
+        # Category check even here, where we were handed a bare hash: a caller
+        # that resolved the hash by content-path match could hand us another
+        # app's torrent, and this deletes its DATA.
+        if not self._qbt_ours_by_hash(q, thash):
+            logger.info("refusing to remove torrent %s -- it is not in the %r "
+                        "category, so it is not ours to touch",
+                        str(thash)[:12],
+                        getattr(self.cfg, "qbt_category", "") or "(unset)")
+            return False
+        return bool(q.remove(thash, delete_files=True))
 
     def _discard_torrent_for_folder(self, folder: Path) -> str:
         """
@@ -11494,6 +11545,8 @@ class Orchestrator:
             wr = str((self.cfg.watch_root or Path("/")).resolve(strict=False)).replace("\\", "/").rstrip("/")
             seg = "/" + os.path.basename(fr).replace("\\", "/") + "/"  # this album's folder segment
             for t in q.torrents():
+                if not self._qbt_ours(t):
+                    continue            # shared client -- only ever our category
                 cp = str(t.get("content_path") or "").replace("\\", "/").rstrip("/")
                 sp = str(t.get("save_path") or "").replace("\\", "/").rstrip("/")
                 name = os.path.basename(cp) if cp else (t.get("name") or "")

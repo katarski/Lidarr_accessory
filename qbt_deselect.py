@@ -472,6 +472,7 @@ def auto_deselect_pass(
     now: Optional[float] = None, assembly_keep: Optional[set] = None,
     on_progress: Optional[Callable[[], None]] = None,
     progress_every: int = 10,
+    start_added_stopped: bool = True,
 ) -> int:
     """
     One scheduled pass for the pipeline: for each INCOMPLETE music torrent,
@@ -586,6 +587,26 @@ def auto_deselect_pass(
                 if not ok_start:
                     emit(f"  WARNING: narrowed {str(t.get('name'))[:60]!r} but "
                          f"qBittorrent did not restart it -- it is still paused")
+            elif (start_added_stopped and was_stopped and first_sight
+                  and float(t.get("progress") or 0) <= 0.0
+                  and not float(t.get("completion_on") or 0) > 0):
+                # A FRESH grab that arrived already stopped. This is what makes
+                # Lidarr's "Initial State = Stopped" usable: Lidarr adds the
+                # torrent stopped so NOTHING downloads before the file selection
+                # is applied, and we start it here now that it has been narrowed.
+                # Without this the torrent would sit at 0% forever, because the
+                # branch above only restarts what this pass paused itself.
+                #
+                # Deliberately narrow: only on first sight, only at 0% with no
+                # completion timestamp. A torrent YOU stopped by hand has either
+                # progress or a completion time (or has been seen before), so it
+                # is never resumed against your wishes.
+                if qbt.ensure_resumed(h):
+                    emit(f"  started {str(t.get('name'))[:60]!r} -- it was added "
+                         f"stopped and is now narrowed")
+                else:
+                    emit(f"  WARNING: narrowed {str(t.get('name'))[:60]!r} but "
+                         f"qBittorrent would not start it")
     return acted
 
 

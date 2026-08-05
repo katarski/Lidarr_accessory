@@ -612,6 +612,7 @@ def harvest_pass(
     acoustid=None,
     acoustid_min_score: float = 0.5,
     acoustid_required: bool = False,
+    category: str = "",
 ) -> Dict[str, Any]:
     """
     Walk each source folder, harvest whatever songs Lidarr is missing, and
@@ -688,7 +689,10 @@ def harvest_pass(
                             staging_dir=leftovers_dir,
                             delete=purge_leftovers_enabled,
                             qbt=qbt if purge_leftovers_enabled else None,
-                            keep_dir=keep_dir)
+                            keep_dir=keep_dir,
+                            # Shared qBittorrent: the purge may only ever remove
+                            # torrents in OUR category.
+                            category=category)
                         for k in ("deleted", "bytes_freed", "torrent_removed",
                                   "kept_wanted"):
                             stats["purge_" + k] = (
@@ -733,6 +737,7 @@ def purge_leftovers(
     acoustid=None,
     acoustid_min_score: float = 0.5,
     acoustid_required: bool = False,
+    category: str = "",
 ) -> Dict[str, Any]:
     """
     Deal with what a harvested source still holds once its wanted tracks are in
@@ -748,6 +753,9 @@ def purge_leftovers(
     `qbt`          if given, the torrent covering this folder is removed from
                    the client once its files are gone -- seeding is already
                    broken by the move, and the registration is not wanted
+    `category`     the ONLY qBittorrent category whose torrents may be removed.
+                   The client is shared with other apps, so an empty value here
+                   means "touch no torrent at all" rather than "touch any"
 
     IMPORTANT: "not wanted" means not wanted RIGHT NOW. Adding an artist later
     cannot resurrect a deleted file, which is why `delete` defaults to False and
@@ -819,19 +827,37 @@ def purge_leftovers(
         # The files are gone from where the torrent expects them, so the
         # torrent can only error from here on. Remove it WITH data so any
         # remaining pieces go too.
-        try:
-            for t in (qbt.torrents() or []):
-                cp = str(t.get("content_path") or "")
-                nm = str(t.get("name") or "")
-                if not nm:
-                    continue
-                if nm in src_dir or os.path.basename(src_dir.rstrip("/")) in cp:
-                    if qbt.remove(str(t.get("hash")), delete_files=True):
-                        stats["torrent_removed"] += 1
-                        logger.info("harvest purge: removed torrent %r "
-                                    "(with data) -- it was harvested", nm[:60])
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("harvest purge: torrent removal failed: %s", exc)
+        # ONLY our own category. This used to enumerate EVERY torrent in a shared
+        # client and then delete with data on a substring match -- one loose
+        # folder name away from destroying another app's download. An empty
+        # category matches nothing (fail closed): skipping a cleanup is always
+        # cheaper than removing a stranger's torrent.
+        want = str(category or "").strip().lower()
+        if not want:
+            logger.debug("harvest purge: no torrent category configured -- "
+                         "leaving every torrent alone")
+        else:
+            try:
+                base = os.path.basename(src_dir.rstrip("/"))
+                for t in (qbt.torrents(category=category) or []):
+                    if str(t.get("category") or "").strip().lower() != want:
+                        continue                  # belt and braces
+                    cp = str(t.get("content_path") or "")
+                    nm = str(t.get("name") or "")
+                    if not nm:
+                        continue
+                    # Match the torrent to THIS source folder. The old test read
+                    # `nm in src_dir` -- "is the torrent NAME a substring of the
+                    # folder PATH" -- which is backwards, and is why this cleanup
+                    # never once fired (0 torrents removed across 21 purges).
+                    if nm == base or (base and base in cp) or (cp and cp in src_dir):
+                        if qbt.remove(str(t.get("hash")), delete_files=True):
+                            stats["torrent_removed"] += 1
+                            logger.info("harvest purge: removed torrent %r "
+                                        "(with data) -- it was harvested",
+                                        nm[:60])
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("harvest purge: torrent removal failed: %s", exc)
     logger.info(
         "harvest purge %s: %d still-wanted kept, %d leftover (%d staged, "
         "%d deleted, %.2f GB freed), %d torrent(s) removed%s",

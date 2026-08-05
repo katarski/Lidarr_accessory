@@ -186,6 +186,7 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     put("qbittorrent", "auto_deselect", "QBIT_AUTO_DESELECT", _as_bool)
     put("qbittorrent", "interval_seconds", "QBIT_INTERVAL", int)
     put("qbittorrent", "pause_during_scan", "QBIT_PAUSE_SCAN", _as_bool)
+    put("qbittorrent", "start_added_stopped", "QBIT_START_ADDED_STOPPED", _as_bool)
     put("qbittorrent", "deselect_video", "QBIT_DESELECT_VIDEO", _as_bool)
     put("qbittorrent", "redeselect_recheck_seconds", "QBIT_REDESELECT_RECHECK", int)
     put("qbittorrent", "adopt_uncategorised", "QBIT_ADOPT_UNCATEGORISED", _as_bool)
@@ -741,6 +742,11 @@ def qbt_auto_deselect_loop(
     cadence = max(10, interval)
     category = qcfg.get("category", "") or ""
     pause_scan = _as_bool(qcfg.get("pause_during_scan", True))
+    # Start a torrent that ARRIVED stopped once we have narrowed it. This is
+    # what makes Lidarr's "Initial State = Stopped" safe: without it such a
+    # torrent would sit at 0% forever, because the pass only restarts what it
+    # paused itself.
+    start_added_stopped = _as_bool(qcfg.get("start_added_stopped", True))
     do_deselect = _as_bool(qcfg.get("auto_deselect", False))
     manage_completed = _as_bool(qcfg.get("manage_completed", True))
     deselect_video = _as_bool(qcfg.get("deselect_video", True))  # #4
@@ -864,7 +870,8 @@ def qbt_auto_deselect_loop(
                                            on_progress=lambda: (
                                                _save_deselect_ledger(
                                                    deselect_ledger_path,
-                                                   planned_deselect)))
+                                                   planned_deselect)),
+                                           start_added_stopped=start_added_stopped)
                 if acted:
                     logger.info("qbt auto-deselect: acted on %d torrent(s)", acted)
                 # Final save for the pass (it is also checkpointed mid-walk).
@@ -1342,6 +1349,13 @@ def main() -> int:
         qbt_url=str((cfg.get("qbittorrent") or {}).get("base_url", "") or ""),
         qbt_user=str((cfg.get("qbittorrent") or {}).get("username", "") or ""),
         qbt_pass=str((cfg.get("qbittorrent") or {}).get("password", "") or ""),
+        # The one category this pipeline may touch. Read from the qbittorrent
+        # section so it can never disagree with what the deselect/reaper passes
+        # use. NOTE the config default for `category` is an empty string, which
+        # would mean "touch nothing" -- so fall back to "lidarr", the category
+        # Lidarr itself is configured to write.
+        qbt_category=str((cfg.get("qbittorrent") or {}).get("category", "")
+                         or "lidarr"),
         log_file=(Path((cfg.get("logging") or {}).get("file"))
                   if (cfg.get("logging") or {}).get("file") else None),
         flac2mp3_log=str(
@@ -1777,7 +1791,10 @@ def main() -> int:
                                   if orch_cfg.harvest_acoustid_verify else None),
                         acoustid_min_score=orch_cfg.harvest_acoustid_min_score,
                         acoustid_required=orch_cfg.harvest_acoustid_required,
-                        qbt=orch._get_qbt() if hasattr(orch, "_get_qbt") else None)
+                        qbt=orch._get_qbt() if hasattr(orch, "_get_qbt") else None,
+                        # The ONLY category whose torrents the purge may remove.
+                        # The client is shared, so this is a hard boundary.
+                        category=getattr(orch_cfg, "qbt_category", "") or "")
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("harvest pass failed: %s", exc)
                 if stop_evt.wait(max(600, interval)):
