@@ -210,6 +210,66 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     return cfg
 
 
+def _load_deselect_ledger(path: Optional[Path]) -> Dict[str, float]:
+    """
+    {torrent_hash: last_plan_ts} remembered across restarts.
+
+    Without this the deselect pass re-planned every torrent on every start, and
+    a re-plan costs a Lidarr query per album folder plus (when the deterministic
+    match misses) an LLM call. Missing or malformed file is an empty ledger --
+    never an error, since the worst case is simply the old behaviour.
+    """
+    if not path:
+        return {}
+    import json
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {}
+        out: Dict[str, float] = {}
+        for h, ts in data.items():
+            try:
+                out[str(h)] = float(ts)
+            except (TypeError, ValueError):
+                continue
+        return out
+    except FileNotFoundError:
+        return {}
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger("cue_pipeline").debug(
+            "deselect ledger %s unreadable (%s) -- starting empty", path, exc)
+        return {}
+
+
+def _save_deselect_ledger(path: Optional[Path], planned: Dict[str, float],
+                          max_age_days: float = 30.0) -> None:
+    """
+    Persist the plan ledger, dropping entries untouched for `max_age_days` so it
+    cannot grow without bound. Pruned by AGE rather than against the live torrent
+    list, because that list is fetched inside the pass and asking qBittorrent for
+    it again every cycle just to tidy a few hundred hashes is not worth the call;
+    a stale hash costs one dict entry and is re-planned on sight anyway.
+
+    Written via temp file + replace, so a crash mid-write cannot leave a
+    truncated ledger that loses every torrent's state.
+    """
+    if not path:
+        return
+    import json
+    try:
+        data = dict(planned)
+        if max_age_days > 0:
+            cutoff = time.time() - max_age_days * 86400.0
+            data = {h: ts for h, ts in data.items() if ts >= cutoff}
+        p = Path(path)
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        tmp.write_text(json.dumps(data), encoding="utf-8")
+        os.replace(tmp, p)
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger("cue_pipeline").debug(
+            "could not save deselect ledger %s: %s", path, exc)
+
+
 def apply_webui_overrides(cfg: Dict[str, Any], path: Path) -> Dict[str, Any]:
     """
     Overlay {section: {key: value}} from the WebUI's Settings tab (written to
@@ -655,7 +715,7 @@ def held_curator_loop(
 def qbt_auto_deselect_loop(
     qcfg: Dict[str, Any], lidarr, stop: threading.Event, interval: int,
     download_root: str = "", llm=None, q: "Optional[queue.Queue[Path]]" = None,
-    assembly_keep_provider=None,
+    assembly_keep_provider=None, deselect_ledger_path: Optional[Path] = None,
 ) -> None:
     """
     Poll qBittorrent on a schedule. Two jobs per pass:
@@ -715,12 +775,23 @@ def qbt_auto_deselect_loop(
     reap_completed_wanted_only = _as_bool(
         qcfg.get("reap_completed_wanted_only", True))
     remove_min_stable = int(qcfg.get("remove_min_stable_seconds", 300) or 300)
-    seen: set = set()
     # {hash: last_plan_ts} so an INCOMPLETE torrent is re-planned every
     # `redeselect_recheck` seconds -- catches albums that become owned AFTER the
     # torrent was first planned (Lidarr import, reconcile fill, another torrent
     # completing) instead of downloading them forever. 0 disables re-checks.
-    planned_deselect: dict = {}
+    #
+    # PERSISTED, keyed by torrent hash. It used to be an in-memory dict, so every
+    # restart re-planned every torrent from scratch -- and a re-plan is not cheap:
+    # it re-queries Lidarr per album folder and can call the LLM. Measured over
+    # one day's log: 971 distinct albums produced 1787 evaluations, and 91
+    # distinct LLM questions became 166 calls, purely because the container had
+    # been restarted. `seen` is derived from the keys, so one file covers both.
+    planned_deselect: dict = _load_deselect_ledger(deselect_ledger_path)
+    seen: set = set(planned_deselect)
+    if planned_deselect:
+        logger.info("qbt auto-deselect: resumed the plan ledger -- %d torrent(s) "
+                    "already planned, so they are not re-planned on this start",
+                    len(planned_deselect))
     redeselect_recheck = int(qcfg.get("redeselect_recheck_seconds", 1800) or 0)
     completed_seen: set = set()   # #8a: torrents we've already kicked to process
     # {hash: (disk_signature, ts)}: a completed torrent whose disk state hasn't
@@ -788,6 +859,10 @@ def qbt_auto_deselect_loop(
                                            assembly_keep=asm_keep)
                 if acted:
                     logger.info("qbt auto-deselect: acted on %d torrent(s)", acted)
+                # Persist the plan ledger every pass, pruned to torrents that
+                # still exist. Cheap (a few hundred hashes) and it is what stops
+                # a restart from re-planning -- and re-LLM-ing -- everything.
+                _save_deselect_ledger(deselect_ledger_path, planned_deselect)
             if manage_completed:
                 removed, paused = torrent_lifecycle_pass(
                     qbt, download_root, category=category, emit=logger.info,
@@ -1815,7 +1890,11 @@ def main() -> int:
                       ollama_client, q,
                       # Fresh each pass: the union of source songs every album
                       # assembly needs, so the deselect keeps them.
-                      (lambda: _assembly_keep(orch))),
+                      (lambda: _assembly_keep(orch)),
+                      # Persisted plan ledger: without it every restart
+                      # re-plans (and re-LLMs) every torrent from scratch.
+                      (isearch_state_path.parent / "deselect_planned.json"
+                       if isearch_state_path else None)),
                 daemon=True,
                 name="cue-qbt",
             )
