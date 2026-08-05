@@ -5366,8 +5366,19 @@ class Orchestrator:
                 logger.exception(
                     "cueless sweep: handoff failed for %s: %s", folder, exc,
                 )
-                # Mark as seen so we don't retry in a tight loop.
+                # Mark as seen so we don't retry in a tight loop -- in the
+                # PERSISTENT ledger too, not just the in-memory set, and flushed
+                # now. Otherwise a folder that throws is re-walked, re-logged and
+                # re-attempted every 60 seconds forever after any restart. The
+                # signature key means a changed folder is retried immediately and
+                # the TTL retries the rest daily, so a transient failure is not
+                # written off.
                 self._skip_seen.add(folder)
+                try:
+                    self._sweep_ledger_mark(folder, audios, now_ts)
+                    self._sweep_ledger_save()
+                except Exception:  # noqa: BLE001
+                    pass
 
         # Record EVERY folder this pass considered, not just the ones handed off.
         # The first pass after a start does the full walk (which is what we want)
