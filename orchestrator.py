@@ -5276,18 +5276,15 @@ class Orchestrator:
                 "(%d audio files)", folder, len(audios),
             )
             eligible.append((folder, audios))
-            # Record it AS IT IS DISCOVERED, not at end of pass. A pass takes the
-            # better part of an hour and often does not survive to completion, so
-            # end-of-pass marking wrote nothing on most runs and the whole backlog
-            # was re-walked, re-tag-read and re-announced every 60 seconds. The
-            # ledger is keyed by content signature with a 24h TTL, so recording it
-            # now costs nothing correctness-wise: this pass already holds the
-            # folder in `eligible` and will still act on it, a folder whose audio
-            # changes gets a new signature and is reconsidered at once, and
-            # anything not reached is retried when the entry expires.
-            self._sweep_ledger_mark(folder, audios, now_ts)
-            if len(eligible) % 10 == 0:
-                self._sweep_ledger_save()
+            # DO NOT mark it here. Marking at DISCOVERY strands folders: the entry
+            # says "handled" while the pass may still be killed before reaching
+            # it, and the matching content signature then hides it for the full
+            # 24h TTL. That is exactly what happened to eleven Weezer discography
+            # folders -- all marked in the same instant, none ever handed off,
+            # then invisible. A folder is marked only once it has actually been
+            # DEALT WITH: handed off, failed, or dropped as a redundant edition.
+            # Each of those marks and flushes on the spot, so this stays fully
+            # incremental without lying about work that has not happened.
 
         # Multi-disc unification FIRST: fold CD1/CD2/... leaf folders of one
         # album into a single parent handoff, so a 2-CD album imports as one
