@@ -5258,10 +5258,23 @@ class Orchestrator:
             if self._sweep_ledger_skip(folder, audios, now_ts):
                 led_skipped += 1
                 continue
-            logger.info(
-                "cueless sweep: found pre-split folder with no .cue: %s (%d audio files)",
-                folder, len(audios),
-            )
+            # Announce a folder ONCE per content signature. This line used to be
+            # re-emitted for every eligible folder on every sweep (60s), because
+            # only a folder that actually got handed off was recorded -- one
+            # skipped as a redundant edition, or left over past the pass's
+            # handoff budget, was re-discovered and re-logged forever. The
+            # in-process guard keeps the log honest without hiding a folder whose
+            # content really did change (that changes the signature, so the
+            # ledger check above lets it through and it is announced again).
+            if folder not in self._skip_seen:
+                logger.info(
+                    "cueless sweep: found pre-split folder with no .cue: %s "
+                    "(%d audio files)", folder, len(audios),
+                )
+            else:
+                logger.debug(
+                    "cueless sweep: %s still eligible (already considered this "
+                    "pass-cycle)", folder)
             eligible.append((folder, audios))
 
         # Multi-disc unification FIRST: fold CD1/CD2/... leaf folders of one
@@ -5275,8 +5288,24 @@ class Orchestrator:
         # editions of a discography grab), only hand off the one whose track
         # count is closest to Lidarr's release; skip the rest as redundant.
         # Done before handoff so we never import two editions into one album.
+        _by_folder = {f: a for (f, a) in eligible}
         for folder in self._drop_duplicate_editions(eligible):
             self._skip_seen.add(folder)
+            # PERSIST the decision. "Redundant edition" is a verdict about this
+            # folder's CURRENT content, not a transient failure, so recording it
+            # against the content signature stops the sweep re-walking, re-tag-
+            # reading and re-deciding it every 60 seconds -- and stops a restart
+            # (which clears the in-memory `_skip_seen`) from replaying all of it.
+            # A genuine change alters the signature and it is reconsidered, and
+            # ledger entries expire anyway, so nothing is written off forever.
+            try:
+                self._sweep_ledger_mark(folder, _by_folder.get(folder) or [],
+                                        now_ts)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("cueless sweep: could not record the redundant-"
+                             "edition verdict for %s: %s", folder, exc)
+        if self._skip_seen:
+            self._sweep_ledger_save()
 
         surviving = [(f, a) for (f, a) in eligible if f not in self._skip_seen]
         # IDENTIFY-FIRST ORDERING. A pass can hold 80+ folders and each handoff
