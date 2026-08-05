@@ -571,6 +571,19 @@ _DEAD_STATES = frozenset({
     "queueddl", "missingfiles", "error", "unknown",
 })
 
+# States that claim to be ACTIVELY DOWNLOADING. A torrent here is dead only when
+# its swarm is provably empty, so they need the extra seeder test below rather
+# than a place in _DEAD_STATES.
+#
+# They must be considered at all because THE PIPELINE'S OWN force-start moves
+# torrents out of every state above: `ensure_started` flips a grab to forcedDL,
+# and a force-started torrent with no peers then sits at 0% in forcedDL
+# permanently -- a state the reaper did not recognise, so it was immortal.
+# Measured: 34 of 254 torrents were at 0 seeders and 0% in forcedDL, some 6-9
+# DAYS old, surviving a 6-hour grace, while the forcedMetaDL ones beside them
+# were reaped correctly.
+_DOWNLOADING_STATES = frozenset({"downloading", "forceddl", "dl"})
+
 
 def dead_grab_reaper_pass(
     qbt: QbtClient, lidarr: Optional[LidarrClient], category: str = "",
@@ -607,8 +620,18 @@ def dead_grab_reaper_pass(
         state = (t.get("state") or "").lower()
         prog = float(t.get("progress") or 0.0)
         added = float(t.get("added_on") or 0)
-        if prog >= 0.01 or state not in _DEAD_STATES:
-            continue
+        if prog >= 0.01:
+            continue                       # making real progress -> leave alone
+        if state not in _DEAD_STATES:
+            # A force-started grab with an empty swarm looks "downloading"
+            # forever. Both seeder figures must be zero: `num_seeds` is what we
+            # are connected to, `num_complete` is what the tracker reports
+            # exists, so requiring both avoids killing a torrent whose peers we
+            # simply have not reached yet.
+            if not (state in _DOWNLOADING_STATES
+                    and int(t.get("num_seeds") or 0) == 0
+                    and int(t.get("num_complete") or 0) <= 0):
+                continue
         age = now - added if added else 0.0
         if age < grace_seconds:
             continue  # still within the grace window -> wait it out

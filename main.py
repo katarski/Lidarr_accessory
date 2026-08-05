@@ -145,11 +145,6 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     put("lidarr", "comp_hunt_grabs_per_pass", "COMP_HUNT_GRABS_PER_PASS", int)
     put("lidarr", "comp_hunt_min_title_score", "COMP_HUNT_MIN_TITLE_SCORE", float)
     put("lidarr", "comp_hunt_healthy_seeders", "COMP_HUNT_HEALTHY_SEEDERS", int)
-    put("lidarr", "dead_grab_reaper_enabled", "DEAD_GRAB_REAPER_ENABLED", bool)
-    put("lidarr", "dead_grab_grace_minutes", "DEAD_GRAB_GRACE_MINUTES", int)
-    put("lidarr", "dead_grab_require_no_data", "DEAD_GRAB_REQUIRE_NO_DATA", bool)
-    put("lidarr", "dead_grab_blocklist", "DEAD_GRAB_BLOCKLIST", bool)
-    put("lidarr", "dead_grab_max_per_pass", "DEAD_GRAB_MAX_PER_PASS", int)
     put("lidarr", "harvest_enabled", "HARVEST_ENABLED", bool)
     put("lidarr", "harvest_dry_run", "HARVEST_DRY_RUN", bool)
     put("lidarr", "harvest_duration_tolerance", "HARVEST_DURATION_TOLERANCE", float)
@@ -513,27 +508,6 @@ def queue_reaper_loop(
         delay = cadence
 
 
-def dead_grab_reaper_loop(
-    orch: Orchestrator,
-    stop: threading.Event,
-    interval: int,
-) -> None:
-    """
-    Periodically drop grabs that can never finish -- 0 seeders, 0% progress, no
-    data (see Orchestrator.reap_dead_grabs). Separate from the queue reaper,
-    which only handles torrents that DID download and then stuck on import and
-    which skips anything Lidarr still calls "downloading" -- so a seederless
-    torrent was immortal there. Minimum cadence 300s; first pass is staggered
-    one cadence out so startup stays light.
-    """
-    cadence = max(300, interval)
-    delay = cadence
-    while not stop.wait(delay):
-        try:
-            orch.reap_dead_grabs()
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("dead-grab reaper thread: %s", exc)
-        delay = cadence
 
 
 def interactive_search_loop(
@@ -1440,17 +1414,6 @@ def main() -> int:
             lidarr_cfg.get("comp_hunt_min_title_score", 0.6)),
         comp_hunt_healthy_seeders=int(
             lidarr_cfg.get("comp_hunt_healthy_seeders", 5)),
-        dead_grab_reaper_enabled=bool(
-            lidarr_cfg.get("dead_grab_reaper_enabled", True)),
-        dead_grab_reaper_interval_seconds=int(
-            lidarr_cfg.get("dead_grab_reaper_interval_seconds", 900)),
-        dead_grab_grace_minutes=int(
-            lidarr_cfg.get("dead_grab_grace_minutes", 60)),
-        dead_grab_require_no_data=bool(
-            lidarr_cfg.get("dead_grab_require_no_data", True)),
-        dead_grab_blocklist=bool(lidarr_cfg.get("dead_grab_blocklist", True)),
-        dead_grab_max_per_pass=int(
-            lidarr_cfg.get("dead_grab_max_per_pass", 40)),
         comp_hunt_collections_only=bool(
             lidarr_cfg.get("comp_hunt_collections_only", True)),
         harvest_enabled=bool(lidarr_cfg.get("harvest_enabled", True)),
@@ -1914,29 +1877,6 @@ def main() -> int:
             orch_cfg.queue_reaper_blocklist,
         )
 
-    # Dead grabs (0 seeders, 0%, no data) are a DIFFERENT failure from the one
-    # above and neither the queue reaper nor the qBit lifecycle can see them:
-    # both wait for a torrent to finish downloading, and these never start. So
-    # this runs regardless of whether either of those is on.
-    dead_grab_thread = None
-    if getattr(orch_cfg, "dead_grab_reaper_enabled", True):
-        dead_grab_thread = threading.Thread(
-            target=dead_grab_reaper_loop,
-            args=(orch, stop,
-                  orch_cfg.dead_grab_reaper_interval_seconds),
-            daemon=True,
-            name="cue-dead-grab-reaper",
-        )
-        dead_grab_thread.start()
-        logger.info(
-            "Dead-grab reaper: enabled (every %ds, grace=%dm, "
-            "require_no_data=%s, blocklist=%s, max %d/pass)",
-            max(300, orch_cfg.dead_grab_reaper_interval_seconds),
-            orch_cfg.dead_grab_grace_minutes,
-            orch_cfg.dead_grab_require_no_data,
-            orch_cfg.dead_grab_blocklist,
-            orch_cfg.dead_grab_max_per_pass,
-        )
     elif orch_cfg.queue_reaper_enabled and qbt_manage_on:
         logger.info(
             "Queue reaper: superseded by qBittorrent completed-torrent "

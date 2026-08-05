@@ -676,32 +676,6 @@ class OrchestratorConfig:
     # holding two more songs. Thin releases are still tried, just afterwards.
     comp_hunt_healthy_seeders: int = 5
 
-    # --- Dead-grab reaper --------------------------------------------------
-    # Remove grabs that will NEVER finish: 0 seeders, 0% progress, nothing
-    # downloaded. The existing queue reaper cannot touch these -- it only reaps
-    # a torrent that is fully downloaded but stuck importing, and it skips
-    # anything Lidarr still calls "downloading". A 0-seed torrent hunting
-    # metadata is permanently "downloading" without ever progressing, so it is
-    # immortal: 85 of 254 torrents were in exactly that state, some over a week
-    # old, because indexers advertise stale seeder counts and half of what they
-    # return here claims 0 or 1 seeders.
-    dead_grab_reaper_enabled: bool = True
-    dead_grab_reaper_interval_seconds: int = 900
-    # Grace before a torrent counts as dead, so a live-but-slow swarm that has
-    # to find peers over DHT is never killed. Metadata off a live swarm arrives
-    # in seconds, so this is already very generous.
-    dead_grab_grace_minutes: int = 60
-    # Only reap when NOTHING has been downloaded. A torrent with even partial
-    # data might be a slow swarm rather than a dead one, and deleting it would
-    # throw away real bytes.
-    dead_grab_require_no_data: bool = True
-    # Blocklist the release in Lidarr as it goes, so the next search does not
-    # hand back the same corpse. Without this the reaper and the searcher fight
-    # each other forever.
-    dead_grab_blocklist: bool = True
-    # Safety cap per pass, so a one-off outage that zeroes every swarm cannot
-    # wipe the whole queue in one go.
-    dead_grab_max_per_pass: int = 40
     # Only consider releases MusicBrainz marks as a compilation / soundtrack /
     # live record. A plain studio album cannot be the home of another artist's
     # stray side, so it is no use here.
@@ -9823,113 +9797,6 @@ class Orchestrator:
             " (DRY RUN -- nothing grabbed)" if cfg.interactive_search_dry_run else "")
         return grabbed
 
-    def reap_dead_grabs(self) -> int:
-        """
-        Remove grabs that can never finish: 0 seeders, 0% progress, no data.
-
-        These are invisible to `reap_lidarr_queue`, which only reaps a torrent
-        that has fully downloaded but is stuck importing and which skips
-        anything Lidarr still reports as "downloading". A torrent with no
-        seeders sits in metaDL/forcedDL forever -- permanently "downloading",
-        permanently at 0% -- so nothing ever collected it. A census found 85 of
-        254 torrents in that state, 78 of them holding zero bytes, some more
-        than a week old.
-
-        They pile up because a release's seeder count comes from the indexer as
-        a cached tracker scrape, not the live swarm: of 401 results measured
-        here, 22% advertised 0 seeders and 28% advertised exactly 1, and much of
-        that "1" is a torrent whose last seeder left long ago. The min-seeders
-        floor cannot filter what the indexer misreports, so the grab has to be
-        cleaned up afterwards instead.
-
-        Conservative by construction: a grace period (so a slow swarm finding
-        peers over DHT is never killed), a no-data requirement (so partial
-        downloads are left alone), and a per-pass cap (so an outage that
-        temporarily zeroes every swarm cannot empty the queue). Returns the
-        number of torrents removed.
-        """
-        if not getattr(self.cfg, "dead_grab_reaper_enabled", True):
-            return 0
-        try:
-            qbt = self._get_qbt()
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("dead-grab reaper: no qBittorrent: %s", exc)
-            return 0
-        if qbt is None:
-            return 0
-        try:
-            tors = qbt.torrents() or []
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("dead-grab reaper: torrent list failed: %s", exc)
-            return 0
-
-        grace = max(0, int(getattr(self.cfg, "dead_grab_grace_minutes", 60))) * 60
-        need_empty = bool(getattr(self.cfg, "dead_grab_require_no_data", True))
-        cap = max(1, int(getattr(self.cfg, "dead_grab_max_per_pass", 40)))
-        now = time.time()
-        dead = []
-        for t in tors:
-            try:
-                if float(t.get("progress") or 0.0) >= 0.001:
-                    continue                      # making progress
-                if int(t.get("num_seeds") or 0) > 0:
-                    continue                      # a seed exists
-                if int(t.get("num_complete") or 0) > 0:
-                    continue                      # tracker knows a seed
-                if need_empty and int(t.get("downloaded") or 0) > 0:
-                    continue                      # holds real bytes
-                added = int(t.get("added_on") or 0)
-                if added and (now - added) < grace:
-                    continue                      # still inside its grace
-                h = str(t.get("hash") or "")
-                if h:
-                    dead.append((h, str(t.get("name") or ""),
-                                 (now - added) / 3600.0 if added else -1.0))
-            except Exception:  # noqa: BLE001
-                continue
-        if not dead:
-            return 0
-        if len(dead) > cap:
-            logger.warning(
-                "dead-grab reaper: %d dead torrent(s) found but the per-pass cap "
-                "is %d -- reaping the oldest %d, the rest follow next pass",
-                len(dead), cap, cap)
-            dead.sort(key=lambda d: -d[2])
-            dead = dead[:cap]
-
-        blocklist = bool(getattr(self.cfg, "dead_grab_blocklist", True))
-        removed = 0
-        for h, name, age_h in dead:
-            # Blocklist FIRST, while Lidarr still has the queue row that carries
-            # the release identity -- once the torrent is gone the row goes too
-            # and the same corpse can be handed back by the next search.
-            if blocklist:
-                try:
-                    rec = self.lidarr.queue_find_by_download_id(h)
-                    if rec and rec.get("id") is not None:
-                        self.lidarr.queue_remove(int(rec["id"]),
-                                                 remove_from_client=True,
-                                                 blocklist=True)
-                        removed += 1
-                        logger.info("dead-grab reaper: %r (0 seeders, %.1fh old) "
-                                    "removed and blocklisted", name[:66], age_h)
-                        continue
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug("dead-grab reaper: queue lookup failed for "
-                                 "%s: %s", h[:12], exc)
-            try:
-                if qbt.remove(h, delete_files=True):
-                    removed += 1
-                    logger.info("dead-grab reaper: %r (0 seeders, %.1fh old) "
-                                "removed from qBittorrent", name[:66], age_h)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("dead-grab reaper: could not remove %s: %s",
-                               h[:12], exc)
-        if removed:
-            logger.info("dead-grab reaper: removed %d torrent(s) that had no "
-                        "seeders and no data", removed)
-        return removed
-
     def reap_lidarr_queue(self) -> int:
         """
         Remove fully-downloaded-but-stuck torrents from Lidarr's queue (and,
@@ -11168,16 +11035,6 @@ class Orchestrator:
          "How closely an indexer result must resemble the compilation searched for. The shortened queries that make these searches land also make them lie: 'The Lady: Complete Collection' has to be queried as 'Billie Holiday The Lady', which matches the already-owned 'Lady Sings The Blues'. Lower this and wrong releases get grabbed; raise it and obtainable compilations are missed."),
         ("lidarr.comp_hunt_healthy_seeders", "lidarr", "comp_hunt_healthy_seeders", "Compilation hunt: healthy seeders", "int", 5,
          "Seeder count at or above which a candidate is tried FIRST. This is a band, not a rank bonus: coverage counts for so much that a 25-seeder release would otherwise lose to a dead one holding two more songs, and a dead torrent yields no songs at all. Thin releases are still tried -- just after the healthy ones -- so nothing is refused when there is nothing better."),
-        ("lidarr.dead_grab_reaper_enabled", "lidarr", "dead_grab_reaper_enabled", "Reap dead grabs (0 seeders, 0%)", "bool", True,
-         "Remove grabs that can never finish: no seeders, no progress, no data. Neither the queue reaper nor the qBittorrent lifecycle can see these -- both wait for a torrent to finish downloading, and these never start, so a seederless torrent stays 'downloading' forever. Without this they accumulate: a census found 85 of 254 torrents in exactly that state, some over a week old. They arrive because a release's seeder count comes from the indexer as a cached scrape, not the live swarm, so the min-seeders floor cannot filter them out up front."),
-        ("lidarr.dead_grab_grace_minutes", "lidarr", "dead_grab_grace_minutes", "Reap dead grabs: grace (min)", "int", 60,
-         "How long a torrent may sit at 0% with no seeders before it is considered dead. Metadata off a live swarm arrives in seconds, so 60 minutes is already very generous -- it exists so a slow swarm that has to find its peers over DHT is never killed."),
-        ("lidarr.dead_grab_require_no_data", "lidarr", "dead_grab_require_no_data", "Reap dead grabs: only if empty", "bool", True,
-         "Only reap a torrent that has downloaded NOTHING. Keep this ON: a torrent holding even partial data may be a slow swarm rather than a dead one, and removing it would throw away real bytes."),
-        ("lidarr.dead_grab_blocklist", "lidarr", "dead_grab_blocklist", "Reap dead grabs: blocklist them", "bool", True,
-         "Blocklist the release in Lidarr as the torrent is dropped, so the next search does not hand back the same corpse. With this off, the reaper and the searcher fight each other forever."),
-        ("lidarr.dead_grab_max_per_pass", "lidarr", "dead_grab_max_per_pass", "Reap dead grabs: max / pass", "int", 40,
-         "Safety cap per pass, so a network outage that temporarily zeroes every swarm cannot wipe the whole queue at once. The oldest are reaped first and the rest follow on later passes."),
         ("lidarr.comp_hunt_collections_only", "lidarr", "comp_hunt_collections_only", "Compilation hunt: collections only", "bool", True,
          "Only consider releases MusicBrainz marks as a compilation, soundtrack or live record. A plain studio album cannot be the home of a stray side, so it is no use here."),
         ("lidarr.harvest_enabled", "lidarr", "harvest_enabled", "Harvest: salvage songs already on disk", "bool", True,
@@ -11361,11 +11218,6 @@ class Orchestrator:
             "lidarr.comp_hunt_min_title_score",
             "lidarr.comp_hunt_healthy_seeders",
             "lidarr.comp_hunt_collections_only",
-            "lidarr.dead_grab_reaper_enabled",
-            "lidarr.dead_grab_grace_minutes",
-            "lidarr.dead_grab_require_no_data",
-            "lidarr.dead_grab_blocklist",
-            "lidarr.dead_grab_max_per_pass",
             "lidarr.harvest_enabled",
             "lidarr.harvest_dry_run",
             "lidarr.harvest_duration_tolerance",

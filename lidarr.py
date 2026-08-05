@@ -367,25 +367,6 @@ class LidarrClient:
             logger.error("DownloadedAlbumsScan failed: %s", exc)
             return None
 
-    def queue_find_by_download_id(
-        self, download_id: str
-    ) -> Optional[Dict[str, Any]]:
-        """
-        The queue entry for a torrent INFOHASH, or None.
-
-        Exact where `queue_find_for` is fuzzy: Lidarr stores the torrent hash as
-        `downloadId`, so the dead-grab reaper can find the row that carries a
-        release's identity and blocklist it before dropping the torrent. Case is
-        normalized -- Lidarr reports the hash uppercase, qBittorrent lowercase.
-        """
-        want = str(download_id or "").strip().lower()
-        if not want:
-            return None
-        for e in (self.queue_list() or []):
-            if str(e.get("downloadId") or "").strip().lower() == want:
-                return e
-        return None
-
     def queue_find_for(
         self, artist_name: str, album_name: str
     ) -> Optional[Dict[str, Any]]:
