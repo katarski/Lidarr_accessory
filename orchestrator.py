@@ -4127,6 +4127,23 @@ class Orchestrator:
             _add(flac)
         return out
 
+    def _audio_files_recursive(self, folder: Path, cap: int = 400) -> List[Path]:
+        """Audio files at or below `folder`. Needed because a multi-disc handoff
+        targets the PARENT, whose direct children are Disc 1/Disc 2 -- so the
+        iterdir()-based `_sibling_audio_files` reports none. `cap` bounds a walk
+        into an accidentally huge tree."""
+        out: List[Path] = []
+        try:
+            for root, _dirs, files in os.walk(str(folder)):
+                for f in files:
+                    if os.path.splitext(f)[1].lower() in _ALL_AUDIO_EXTS:
+                        out.append(Path(root) / f)
+                        if len(out) >= cap:
+                            return out
+        except OSError as exc:
+            logger.debug("recursive audio scan failed for %s: %s", folder, exc)
+        return out
+
     def _align_release_to_disk(
         self, artist_id: Optional[int], artist_name: str, album_name: str,
         audios: List[Path],
@@ -4488,8 +4505,15 @@ class Orchestrator:
         # holds imported tracks unmaps them -- doing this by hand took Let It Be
         # from 27/57 to 0/12 and Revolver from 35/63 to 0/14, and both needed a
         # release restore plus a folder rescan to recover.
+        # Count RECURSIVELY. `_sibling_audio_files` uses iterdir(), so for a
+        # multi-disc handoff -- where `folder` is the parent and the audio lives
+        # in Disc 1/Disc 2 -- it returns ZERO and the align silently did nothing.
+        # That is precisely the case this exists for: Weezer's Blue Album deluxe
+        # is Disc 1 (10) + Disc 2 (14) = 24, and the 24-track release is the one
+        # to monitor. Verified against the live system: 42 handoffs produced 0
+        # aligns before this.
         self._align_release_to_disk(probe_artist_id, artist_name, album_name,
-                                    self._sibling_audio_files(folder))
+                                    self._audio_files_recursive(folder))
         try:
             candidates = self.lidarr.manual_import_candidates(
                 lidarr_path, artist_id=probe_artist_id)
