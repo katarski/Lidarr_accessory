@@ -4127,6 +4127,61 @@ class Orchestrator:
             _add(flac)
         return out
 
+    def _align_release_to_disk(
+        self, artist_id: Optional[int], artist_name: str, album_name: str,
+        audios: List[Path],
+    ) -> bool:
+        """
+        Switch an EMPTY album to the release whose track count matches the files
+        we are about to import. Returns True if it switched.
+
+        Lidarr tends to monitor the largest release it knows about -- a 68-track
+        Rubber Soul, a 33-track Meanwhile, a 57-track Let It Be -- which no
+        normal download can satisfy, so the album stays at 0/N while its files
+        sit in /downloads. Aligning first is what lets the import land.
+
+        HARD GUARD: only when the album has ZERO imported tracks. Switching a
+        release unmaps whatever Lidarr had already filed under the old one, and
+        the album's own statistics are the only reliable way to know. This is not
+        theoretical -- doing it without the guard cost Let It Be 27 mapped files
+        and Revolver 35, both needing a restore and a rescan.
+        """
+        if not artist_id or not album_name or not audios:
+            return False
+        try:
+            alb = self.lidarr.find_album(
+                int(artist_id), album_name, track_count=len(audios),
+                year=self._year_from_name(album_name))
+            if not alb:
+                return False
+            st = alb.get("statistics") or {}
+            have = int(st.get("trackFileCount") or 0)
+            if have > 0:
+                return False              # never re-point an album with files
+            album_id = int(alb.get("id"))
+            want = len(audios)
+            full = self.lidarr.get_album(album_id) or {}
+            rels = full.get("releases") or []
+            cur = next((r for r in rels if r.get("monitored")), None)
+            if cur is not None and int(cur.get("trackCount") or 0) == want:
+                return False              # already correct
+            target = self.lidarr.find_release_matching_track_count(album_id, want)
+            if not target or (cur is not None and target == cur.get("id")):
+                return False
+            tc = next((int(r.get("trackCount") or 0) for r in rels
+                       if r.get("id") == target), 0)
+            logger.info(
+                "release align: %s / %s has no files and monitors a %s-track "
+                "release, but %d file(s) are on disk -- switching to the "
+                "%d-track release so the import can match",
+                artist_name, album_name,
+                (cur or {}).get("trackCount", "?"), want, tc)
+            return bool(self.lidarr.set_album_monitored_release(album_id, target))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("release align failed for %s / %s: %s",
+                         artist_name, album_name, exc)
+            return False
+
     def _handoff_pre_split_to_lidarr(
         self,
         cue_path: Optional[Path],
@@ -4418,6 +4473,23 @@ class Orchestrator:
         except Exception:  # noqa: BLE001
             probe_artist_id = None
         lidarr_path = self.lidarr.windows_to_lidarr(folder)
+        # Point the album at the release that MATCHES WHAT IS ON DISK, before
+        # asking Lidarr to map the files. Lidarr routinely monitors the biggest
+        # release it knows, which no ordinary download can ever satisfy, so the
+        # album sits at 0/N forever with its files sitting right here:
+        #   Weezer / "Weezer" (Blue) monitored a 10-track release while the disk
+        #   held the 2004 Deluxe (Disc 1 = 10 + Disc 2 = 14 = 24) and a 24-track
+        #   release was available all along -- every import attempt mismatched.
+        #   The Beatles / Rubber Soul monitors a 68-track release against a
+        #   14-track album. Camouflage / Meanwhile monitored 33 against 15 on
+        #   disk.
+        #
+        # ONLY when the album has NO files yet. Realigning an album that already
+        # holds imported tracks unmaps them -- doing this by hand took Let It Be
+        # from 27/57 to 0/12 and Revolver from 35/63 to 0/14, and both needed a
+        # release restore plus a folder rescan to recover.
+        self._align_release_to_disk(probe_artist_id, artist_name, album_name,
+                                    self._sibling_audio_files(folder))
         try:
             candidates = self.lidarr.manual_import_candidates(
                 lidarr_path, artist_id=probe_artist_id)
