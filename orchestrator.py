@@ -5853,7 +5853,12 @@ class Orchestrator:
 
         album_rec: Optional[Dict[str, Any]] = None
         try:
-            album_rec = self.lidarr.find_album(artist_id, album_name)
+            # No file count in scope here (this only asks whether Lidarr already
+            # reflects the album), but the year still separates same-titled
+            # albums -- Weezer has seven called "Weezer".
+            album_rec = self.lidarr.find_album(
+                artist_id, album_name,
+                year=self._year_from_name(album_name))
         except Exception as exc:  # noqa: BLE001
             logger.debug("verify: find_album %r failed: %s", album_name, exc)
         if not album_rec:
@@ -7411,7 +7416,10 @@ class Orchestrator:
         #    NOT affect the clean matches.
         artist_rec = self.lidarr.find_artist(artist_name) if artist_name else None
         album_rec = (
-            self.lidarr.find_album(artist_rec["id"], album_name)
+            self.lidarr.find_album(
+                artist_rec["id"], album_name,
+                track_count=len(candidates),
+                year=self._year_from_name(album_name))
             if (artist_rec and album_name) else None
         )
         tracks_rec: list = []
@@ -11424,6 +11432,20 @@ class Orchestrator:
         except Exception:  # noqa: BLE001
             return False
         return bool(t) and self._qbt_ours(t)
+
+    @staticmethod
+    def _year_from_name(name: str) -> int:
+        """A 4-digit release year out of a folder/album name, or 0.
+
+        Discography dumps lead with it ("1994 - Weezer (Blue Album)",
+        "2008 - Weezer (Red Album)"), and it is the one thing that separates
+        albums an artist gave the SAME title -- Weezer has seven called
+        "Weezer". Only 1900..2099 counts, so a bitrate or catalogue number is
+        not mistaken for a year.
+        """
+        for m in re.finditer(r"(?<!\d)(19\d{2}|20\d{2})(?!\d)", str(name or "")):
+            return int(m.group(1))
+        return 0
 
     def _get_qbt(self):
         """Lazy, cached, logged-in QbtClient for WebUI torrent removal, or None

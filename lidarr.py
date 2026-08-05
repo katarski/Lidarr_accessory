@@ -944,22 +944,65 @@ class LidarrClient:
             return (None, 0, [])
 
     def find_album(
-        self, artist_id: int, album_title: str
+        self, artist_id: int, album_title: str,
+        track_count: int = 0, year: int = 0,
     ) -> Optional[Dict[str, Any]]:
-        """Fuzzy lookup of an album record by title under a given artist."""
+        """
+        Fuzzy lookup of an album record by title under a given artist.
+
+        DISAMBIGUATES same-titled albums, which is not an edge case: Weezer has
+        SEVEN albums called "Weezer" in this library (Blue 1994, Green 2001, Red
+        2008, White 2016, two 2019s, one unreleased). Returning the first title
+        match meant every self-titled folder resolved to the same record -- so the
+        Red Album's files were re-imported into an album already complete at
+        16/16 (failing with "destination already exists") while the Blue Album
+        sat at 0/10 with its folder sitting right there on disk.
+
+        `track_count` (audio files in the source folder) and `year` (parsed from
+        the folder name) are the discriminators when several albums share a
+        title. Both optional: with neither, the only change from the old
+        behaviour is that an INCOMPLETE album wins over a complete one, which is
+        always the better guess for something we are trying to import.
+        """
         target = (album_title or "").strip().lower()
         if not target:
             return None
         albums = self.list_albums_for_artist(artist_id)
-        # Exact match on title first.
-        for a in albums:
-            if (a.get("title") or "").strip().lower() == target:
-                return a
+
+        def _score(a: Dict[str, Any]) -> tuple:
+            st = a.get("statistics") or {}
+            have = int(st.get("trackFileCount") or 0)
+            total = int(st.get("totalTrackCount") or 0)
+            # Exact track-count agreement is the strongest signal available.
+            tc = 2 if (track_count and total == track_count) else (
+                1 if (track_count and abs(total - track_count) <= 1) else 0)
+            ay = str(a.get("releaseDate") or "")[:4]
+            yr = 1 if (year and ay.isdigit() and int(ay) == year) else 0
+            incomplete = 1 if (total == 0 or have < total) else 0
+            return (tc, yr, incomplete, -abs(total - (track_count or total)))
+
+        exact = [a for a in albums
+                 if (a.get("title") or "").strip().lower() == target]
+        if exact:
+            if len(exact) > 1:
+                best = max(exact, key=_score)
+                logger.info(
+                    "find_album: %d albums titled %r -- chose id=%s (%s, %s/%s "
+                    "tracks) using track_count=%s year=%s",
+                    len(exact), album_title, best.get("id"),
+                    str(best.get("releaseDate") or "")[:4],
+                    (best.get("statistics") or {}).get("trackFileCount"),
+                    (best.get("statistics") or {}).get("totalTrackCount"),
+                    track_count or "?", year or "?")
+                return best
+            return exact[0]
         # Substring either direction (handles "Ebbhead" vs "Ebbhead (2CD)").
-        for a in albums:
-            at = (a.get("title") or "").strip().lower()
-            if at and (target in at or at in target):
-                return a
+        near = [a for a in albums
+                if (a.get("title") or "").strip().lower()
+                and (target in (a.get("title") or "").strip().lower()
+                     or (a.get("title") or "").strip().lower() in target)]
+        if near:
+            return max(near, key=_score) if len(near) > 1 else near[0]
         return None
 
     def get_album(self, album_id: int) -> Optional[Dict[str, Any]]:
