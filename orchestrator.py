@@ -5258,23 +5258,14 @@ class Orchestrator:
             if self._sweep_ledger_skip(folder, audios, now_ts):
                 led_skipped += 1
                 continue
-            # Announce a folder ONCE per content signature. This line used to be
-            # re-emitted for every eligible folder on every sweep (60s), because
-            # only a folder that actually got handed off was recorded -- one
-            # skipped as a redundant edition, or left over past the pass's
-            # handoff budget, was re-discovered and re-logged forever. The
-            # in-process guard keeps the log honest without hiding a folder whose
-            # content really did change (that changes the signature, so the
-            # ledger check above lets it through and it is announced again).
-            if folder not in self._skip_seen:
-                logger.info(
-                    "cueless sweep: found pre-split folder with no .cue: %s "
-                    "(%d audio files)", folder, len(audios),
-                )
-            else:
-                logger.debug(
-                    "cueless sweep: %s still eligible (already considered this "
-                    "pass-cycle)", folder)
+            # Reaching here means the folder is NEW or its audio CHANGED -- every
+            # folder this pass considers is recorded at the end, so the ledger
+            # check above is what keeps this line to once per content signature
+            # instead of re-announcing the whole backlog every 60 seconds.
+            logger.info(
+                "cueless sweep: found pre-split folder with no .cue: %s "
+                "(%d audio files)", folder, len(audios),
+            )
             eligible.append((folder, audios))
 
         # Multi-disc unification FIRST: fold CD1/CD2/... leaf folders of one
@@ -5378,11 +5369,33 @@ class Orchestrator:
                 # Mark as seen so we don't retry in a tight loop.
                 self._skip_seen.add(folder)
 
+        # Record EVERY folder this pass considered, not just the ones handed off.
+        # The first pass after a start does the full walk (which is what we want)
+        # but afterwards an unchanged folder must cost nothing: previously only a
+        # handed-off folder was recorded, so anything deferred past this pass's
+        # work -- or dropped as a redundant edition -- was re-walked, re-tag-read,
+        # re-decided and re-logged every 60 seconds forever. 146 folders were
+        # being re-announced per sweep with only 1 ledger entry to show for it.
+        #
+        # Safe because the ledger is keyed by CONTENT SIGNATURE and expires
+        # (sweep_ledger_ttl_seconds, 24h): a folder whose audio changes is
+        # reconsidered immediately, and everything else gets a fresh look daily,
+        # so a deferred folder is retried rather than written off.
+        deferred = 0
+        for folder, audios in eligible:
+            if not self._sweep_ledger_skip(folder, audios, now_ts):
+                self._sweep_ledger_mark(folder, audios, now_ts)
+                deferred += 1
         self._sweep_ledger_save()
         if led_skipped:
             logger.info(
                 "cueless sweep: skipped %d folder(s) already handled and "
                 "unchanged (persistent ledger)", led_skipped)
+        if deferred:
+            logger.info(
+                "cueless sweep: recorded %d considered folder(s) so an unchanged "
+                "one is not re-examined next sweep (re-checked if its audio "
+                "changes, or after the ledger TTL)", deferred)
         logger.info(
             "cueless sweep: finished; handed off %d folder(s)", handed_off,
         )
