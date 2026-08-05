@@ -319,7 +319,22 @@ class LidarrClient:
             )
             return True
         except Exception as exc:  # noqa: BLE001
-            logger.warning("release grab failed (guid=%s): %s", guid, exc)
+            # A 404 here is the EXPECTED answer for any release Lidarr cannot
+            # attribute to a library artist -- every cross-artist compilation --
+            # and the caller handles it by adding the magnet itself. Logging it
+            # as a WARNING with the full guid dumped a 2KB magnet (every tracker
+            # URL) per attempt and read like a fault, so an ordinary, handled
+            # outcome looked like the pipeline breaking. Anything that is NOT a
+            # 404 is still a real problem and still warns.
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if status == 404:
+                logger.info(
+                    "release grab declined by Lidarr (404 -- it cannot match "
+                    "this release to a library artist/album); caller will add "
+                    "it directly if it has a magnet")
+            else:
+                logger.warning("release grab failed (guid=%s): %s",
+                               str(guid)[:80], exc)
             return False
 
     # ---- Public API ------------------------------------------------------

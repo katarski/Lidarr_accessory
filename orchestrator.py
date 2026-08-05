@@ -8663,6 +8663,15 @@ class Orchestrator:
                 # stray songs live. Add it ourselves, PAUSED, so the selection
                 # step runs before anything downloads.
                 if qbt is None or not magnet:
+                    # Nothing left to try: Lidarr refused it and there is no
+                    # magnet to add ourselves (the guid is a .torrent URL). Say
+                    # so -- this used to `continue` in silence, so a candidate
+                    # vanished with no reason logged and the pass just reported
+                    # finding nothing. 6 of 8 refusals went this way unseen.
+                    logger.info(
+                        "assembly: skipping %r -- Lidarr refused it and it "
+                        "publishes no magnet%s", title[:70],
+                        " (no qBittorrent either)" if qbt is None else "")
                     continue
                 logger.info(
                     "assembly: Lidarr would not grab %r (cannot attribute it) "
