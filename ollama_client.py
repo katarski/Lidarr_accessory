@@ -146,6 +146,9 @@ class OllamaClient:
         self.session = requests.Session()
         # Guard against stacking re-warm threads if timeouts cluster.
         self._rewarm_lock = threading.Lock()
+        # "Model not installed" is a permanent condition until someone pulls it,
+        # so it is reported ONCE with the fix rather than per call.
+        self._missing_model_logged = False
         self._rewarm_in_flight = False
         # Session-lifetime answer cache for album matching: the deselect
         # re-check and lifecycle passes ask the SAME (download, owned-albums)
@@ -227,8 +230,38 @@ class OllamaClient:
             self._schedule_rewarm()
             return ""
         except Exception as exc:
-            logger.warning("Ollama /api/generate failed: %s", exc)
+            # A 404 from Ollama means THE MODEL IS NOT INSTALLED, not that the
+            # endpoint or the server is missing -- and the bare
+            # "404 Not Found for url: .../api/generate" it produced read exactly
+            # like a wrong URL or a dead service, sending diagnosis in the wrong
+            # direction. Seen live: the box answered /api/version fine while
+            # /api/tags listed ZERO models, so every call 404'd. Say so once,
+            # with the fix, instead of repeating an opaque warning per call.
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if status == 404 and not self._missing_model_logged:
+                self._missing_model_logged = True
+                have = self._installed_models()
+                logger.error(
+                    "Ollama at %s has no model %r -- it is running but that model "
+                    "is not installed, so every LLM call will fail. Installed "
+                    "models: %s. Fix with: ollama pull %s   (the pipeline keeps "
+                    "working; it falls back to its deterministic paths)",
+                    self.base_url, self.model,
+                    ", ".join(have) if have else "NONE",
+                    self.model)
+            elif status != 404 or not self._missing_model_logged:
+                logger.warning("Ollama /api/generate failed: %s", exc)
             return ""
+
+    def _installed_models(self) -> List[str]:
+        """Model names Ollama actually has, for the missing-model diagnostic.
+        Empty on any failure -- this only ever decorates an error message."""
+        try:
+            r = self.session.get("%s/api/tags" % self.base_url, timeout=10)
+            r.raise_for_status()
+            return [str(m.get("name") or "") for m in (r.json().get("models") or [])]
+        except Exception:  # noqa: BLE001
+            return []
 
     def _schedule_rewarm(self) -> None:
         """
