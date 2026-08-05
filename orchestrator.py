@@ -5369,24 +5369,15 @@ class Orchestrator:
         # editions of a discography grab), only hand off the one whose track
         # count is closest to Lidarr's release; skip the rest as redundant.
         # Done before handoff so we never import two editions into one album.
-        _by_folder = {f: a for (f, a) in eligible}
         for folder in self._drop_duplicate_editions(eligible):
+            # IN-MEMORY ONLY -- deliberately NOT written to the sweep ledger.
+            # "Redundant edition" is a RELATIVE judgement: this folder lost to
+            # another folder that happened to be in the SAME batch. It says
+            # nothing durable about the folder itself, so persisting it is a lie
+            # the next pass believes. Doing so hid 123 folders as "already
+            # handled and unchanged" -- including every Weezer disc -- and the
+            # sweep then handed off 0 for pass after pass.
             self._skip_seen.add(folder)
-            # PERSIST the decision. "Redundant edition" is a verdict about this
-            # folder's CURRENT content, not a transient failure, so recording it
-            # against the content signature stops the sweep re-walking, re-tag-
-            # reading and re-deciding it every 60 seconds -- and stops a restart
-            # (which clears the in-memory `_skip_seen`) from replaying all of it.
-            # A genuine change alters the signature and it is reconsidered, and
-            # ledger entries expire anyway, so nothing is written off forever.
-            try:
-                self._sweep_ledger_mark(folder, _by_folder.get(folder) or [],
-                                        now_ts)
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("cueless sweep: could not record the redundant-"
-                             "edition verdict for %s: %s", folder, exc)
-        if self._skip_seen:
-            self._sweep_ledger_save()
 
         surviving = [(f, a) for (f, a) in eligible if f not in self._skip_seen]
         # IDENTIFY-FIRST ORDERING. A pass can hold 80+ folders and each handoff
