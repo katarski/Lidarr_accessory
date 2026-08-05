@@ -143,9 +143,18 @@ class QbtClient:
         # qBittorrent 5.x renamed 'pause' -> 'stop'; older builds use 'pause'.
         self._post_first_ok(("stop", "pause"), {"hashes": torrent_hash})
 
+    # Tag stamped on every torrent this pipeline adds ITSELF (song/compilation
+    # hunt). Such a torrent is deliberately added stopped and must stay stopped
+    # until the hunt has narrowed it to the one or two songs it wants -- so the
+    # generic deselect pass, which starts anything it finds added-stopped, has to
+    # be able to recognise and leave it alone. Without this the pass would start
+    # a 3-CD box in full and defeat the entire point of the hunt.
+    SELF_ADDED_TAG = "cue-assembly"
+
     def add_magnet(self, magnet: str, category: str = "",
                    paused: bool = True,
-                   stop_on_metadata: bool = True) -> Optional[str]:
+                   stop_on_metadata: bool = True,
+                   tags: str = SELF_ADDED_TAG) -> Optional[str]:
         """
         Add a magnet directly and return its infohash (lowercase), or None.
 
@@ -180,6 +189,8 @@ class QbtClient:
         data: Dict[str, str] = {"urls": mag}
         if category:
             data["category"] = category
+        if tags:
+            data["tags"] = tags
         if paused and stop_on_metadata:
             data["stopCondition"] = "MetadataReceived"
         elif paused:

@@ -589,7 +589,10 @@ def auto_deselect_pass(
                          f"qBittorrent did not restart it -- it is still paused")
             elif (start_added_stopped and was_stopped and first_sight
                   and float(t.get("progress") or 0) <= 0.0
-                  and not float(t.get("completion_on") or 0) > 0):
+                  and not float(t.get("completion_on") or 0) > 0
+                  and QbtClient.SELF_ADDED_TAG not in
+                      {x.strip() for x in
+                       str(t.get("tags") or "").split(",")}):
                 # A FRESH grab that arrived already stopped. This is what makes
                 # Lidarr's "Initial State = Stopped" usable: Lidarr adds the
                 # torrent stopped so NOTHING downloads before the file selection
@@ -601,6 +604,12 @@ def auto_deselect_pass(
                 # completion timestamp. A torrent YOU stopped by hand has either
                 # progress or a completion time (or has been seen before), so it
                 # is never resumed against your wishes.
+                #
+                # And NEVER one the pipeline added itself (SELF_ADDED_TAG): the
+                # song/compilation hunt adds its grabs stopped ON PURPOSE and
+                # starts them only after narrowing to the one or two songs it
+                # wants. Starting those here would pull a whole 3-CD box and
+                # defeat the hunt.
                 if qbt.ensure_resumed(h):
                     emit(f"  started {str(t.get('name'))[:60]!r} -- it was added "
                          f"stopped and is now narrowed")
