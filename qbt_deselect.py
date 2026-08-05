@@ -99,7 +99,18 @@ _UNOFFICIAL_ALBUM = re.compile(
     r"antholog(?:y|ies)|compilations?|collections?|box\s*sets?|sampler|"
     r"essential|definitive|singles\s+collection|hits\s+collection|"
     r"remix(?:es|ed)?|megamix|dj[\s\-_.]*mix|mixtape|karaoke|tribute|"
-    r"bootleg|rarities|b[\s\-_.]*sides|outtakes|unreleased"
+    r"bootleg|rarities|b[\s\-_.]*sides|outtakes|unreleased|"
+    # LIVE material. Deliberately anchored ("live at/in/from", "in concert",
+    # "unplugged") rather than a bare "live", because plenty of STUDIO albums
+    # simply contain the word -- "Live Through This", "Live and Let Die" -- and
+    # a bare match would deselect those. Without any live pattern at all, a
+    # discography torrent's concert albums were kept and downloaded whenever
+    # Lidarr had no record of them: "Bill Withers / Live At Carnegie Hall
+    # (not in library)" was kept while the four owned studio albums beside it
+    # were correctly dropped. Lidarr excludes live records from its default
+    # metadata profile, so "not in library" is the NORMAL state for them.
+    r"live\s+(?:at|in|from|on)\b|in\s+concert|unplugged|live\s+albums?|"
+    r"live\s+recordings?|live\s+bootleg"
     r")(?:$|[\s\-_.\)\]0-9])")
 
 
