@@ -1147,9 +1147,21 @@ def main() -> int:
         if ollama_client.ping():
             logger.info("LLM reachable: %s", label)
             # Local Ollama benefits from a warmup (VRAM preload); cloud is
-            # a no-op. Non-fatal either way.
+            # a no-op. IN A BACKGROUND THREAD, because it is not fatal but it
+            # IS slow and it was running inline on the startup path: when the
+            # GPU is already busy with somebody else's model (seen live --
+            # a 27B occupying 16.7 GB while this asks for a 14B) Ollama simply
+            # does not answer, and the whole pipeline hung there. The WebUI
+            # never bound its port, the watcher never started, and the only
+            # symptom was a log that stopped after "LLM reachable".
             if ollama_cfg.get("warmup_on_start", True):
-                ollama_client.warmup()
+                threading.Thread(
+                    target=ollama_client.warmup, daemon=True,
+                    name="cue-llm-warmup",
+                ).start()
+                logger.info(
+                    "LLM warmup started in the background -- startup continues "
+                    "regardless of how long the model takes to load")
         else:
             logger.warning("LLM unreachable (%s) -- continuing without LLM fallback", label)
 
