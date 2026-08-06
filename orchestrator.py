@@ -4242,16 +4242,46 @@ class Orchestrator:
                       if rid else self.lidarr.list_tracks_for_album(album_id))
         except Exception:  # noqa: BLE001
             tracks = self.lidarr.list_tracks_for_album(album_id) or []
-        by_num: Dict[int, Dict[str, Any]] = {}
-        for t in tracks or []:
-            try:
-                n = int(t.get("absoluteTrackNumber")
-                        or str(t.get("trackNumber") or "0").split("/")[0] or 0)
-            except (TypeError, ValueError):
-                continue
-            if n and n not in by_num:
-                by_num[n] = t
-        if not by_num:
+        # THREE indexes, so every signal the files carry can be used:
+        #   by_disc  (medium, track-within-medium) -- for per-disc numbering
+        #   by_pos   position in the release, ordered by (medium, track)
+        #   by_title normalized track title -- the last resort, and the only one
+        #            that works when the numbering is absent or simply wrong
+        # A multi-CD release numbers tracks BOTH ways and files follow either
+        # convention. `Howard Shore / The Lord of the Rings: The Two Towers` is
+        # the shape that exposed this: Lidarr holds 45 tracks over 3 media
+        # (16/15/14, each restarting at 1) while the library keeps all 45 files
+        # in ONE flat folder tagged disc 1/2/3 with tracks numbered 1..45.
+        def _ints(t):
+            def _n(v):
+                try:
+                    return int(str(v).split("/")[0] or 0)
+                except (TypeError, ValueError):
+                    return 0
+            return _n(t.get("mediumNumber")), _n(t.get("trackNumber"))
+
+        # POSITION is derived by ORDERING the release's tracks on
+        # (medium, track), never from absoluteTrackNumber -- Lidarr leaves that
+        # field empty on this call, and relying on it is what broke the multi-CD
+        # case: the fallback was trackNumber, which RESTARTS on every disc, so
+        # medium 2's "track 1" collided with medium 1's and was discarded.
+        # `The Two Towers: The Complete Recordings` mapped 16 of 45 files that
+        # way -- one CD imported and two silently dropped.
+        ordered = sorted([t for t in (tracks or []) if t.get("id")],
+                         key=lambda t: _ints(t))
+        by_pos: Dict[int, Dict[str, Any]] = {
+            i: t for i, t in enumerate(ordered, 1)}
+        by_disc: Dict[tuple, Dict[str, Any]] = {}
+        by_title: Dict[str, Dict[str, Any]] = {}
+        from song_harvest import norm_title
+        for t in ordered:
+            md, tn = _ints(t)
+            if md and tn:
+                by_disc.setdefault((md, tn), t)
+            k = norm_title(t.get("title"))
+            if k:
+                by_title.setdefault(k, t)
+        if not by_pos:
             return None
         # Quality has to come from Lidarr's own parse of the folder, or the
         # import is accepted and then dies in FileNameBuilder with a
@@ -4266,13 +4296,37 @@ class Orchestrator:
                     qmap[str(c["path"])] = c.get("quality")
         except Exception as exc:  # noqa: BLE001
             logger.debug("audit: quality probe failed: %s", exc)
-        items, unmapped = [], 0
+        items, unmapped, used = [], 0, set()
         for p in sorted(audios):
-            n = self._tag_track_number(p)
-            t = by_num.get(n) if n else None
-            if not t or not t.get("id"):
+            disc, n = self._tag_disc_and_track(p)
+            t = None
+            # Files use ONE of two conventions and both must work:
+            #   per-disc   disc=2 track=1   -> (medium 2, track 1)
+            #   continuous disc=2 track=17  -> the 17th track of the release
+            # Try (disc, track) first; it is unambiguous when it hits. A miss
+            # means the file is numbered continuously, so the number IS the
+            # position -- which is how this library tags its 45 Two Towers files
+            # (disc 1/2/3, tracks 1..45) against Lidarr's 16/15/14 media.
+            if disc and n:
+                t = by_disc.get((disc, n))
+            if t is None and n:
+                t = by_pos.get(n)
+            if t is None or int(t.get("id") or 0) in used:
+                # Numbering failed or already claimed -- fall back to the TITLE,
+                # off the file's own tag and then its filename. This is what
+                # rescues a folder whose numbering is missing, wrong, or shifted;
+                # a wrong number silently files the right song under the wrong
+                # track, whereas a title match either hits or it doesn't.
+                cand = by_title.get(norm_title(self._tag_title(p)))
+                if cand is None:
+                    stem = re.sub(r"^\s*\d{1,3}[\s.\-_]+", "", p.stem)
+                    cand = by_title.get(norm_title(stem))
+                if cand is not None and int(cand.get("id") or 0) not in used:
+                    t = cand
+            if not t or not t.get("id") or int(t["id"]) in used:
                 unmapped += 1
                 continue
+            used.add(int(t["id"]))
             lp = self.lidarr.windows_to_lidarr(p)
             q = qmap.get(lp)
             if q is None:
@@ -4296,17 +4350,33 @@ class Orchestrator:
         return self.lidarr.manual_import_apply_files(items, import_mode="move")
 
     @staticmethod
-    def _tag_track_number(path: Path) -> int:
-        """Track number from a file's own tags ("8/16" -> 8), or 0."""
+    def _tag_title(path: Path) -> str:
+        """The title a file claims in its own tags, or ""."""
+        try:
+            from mutagen import File as MutagenFile
+            m = MutagenFile(str(path), easy=True)
+            return str((m.get("title") or [""])[0]) if m else ""
+        except Exception:  # noqa: BLE001
+            return ""
+
+    @staticmethod
+    def _tag_disc_and_track(path: Path) -> tuple:
+        """(disc, track) from a file's own tags; either may be 0 when absent.
+        Handles the "8/16" form both fields commonly take."""
+        def _num(v) -> int:
+            try:
+                return int(str(v).split("/")[0].strip() or 0)
+            except (TypeError, ValueError):
+                return 0
         try:
             from mutagen import File as MutagenFile
             m = MutagenFile(str(path), easy=True)
             if not m:
-                return 0
-            raw = (m.get("tracknumber") or [""])[0]
-            return int(str(raw).split("/")[0].strip() or 0)
+                return 0, 0
+            return (_num((m.get("discnumber") or [""])[0]),
+                    _num((m.get("tracknumber") or [""])[0]))
         except Exception:  # noqa: BLE001
-            return 0
+            return 0, 0
 
     def _align_release_to_disk(
         self, artist_id: Optional[int], artist_name: str, album_name: str,
