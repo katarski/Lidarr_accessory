@@ -4380,7 +4380,8 @@ class Orchestrator:
 
     def _align_release_to_disk(
         self, artist_id: Optional[int], artist_name: str, album_name: str,
-        audios: List[Path],
+        audios: List[Path], album_rec: Optional[Dict[str, Any]] = None,
+        allow_when_populated: bool = False,
     ) -> bool:
         """
         Switch an EMPTY album to the release whose track count matches the files
@@ -4397,18 +4398,36 @@ class Orchestrator:
         theoretical -- doing it without the guard cost Let It Be 27 mapped files
         and Revolver 35, both needing a restore and a rescan.
         """
-        if not artist_id or not album_name or not audios:
+        if not artist_id or not audios or not (album_name or album_rec):
             return False
         try:
-            alb = self.lidarr.find_album(
+            # Prefer an ALREADY-RESOLVED album. Re-resolving by name here would
+            # reintroduce the very failure the caller just worked around: the
+            # LOTR folders are named after the edition and match no Lidarr title.
+            alb = album_rec or self.lidarr.find_album(
                 int(artist_id), album_name, track_count=len(audios),
                 year=self._year_from_name(album_name))
             if not alb:
                 return False
             st = alb.get("statistics") or {}
             have = int(st.get("trackFileCount") or 0)
-            if have > 0:
+            want_exact = len(audios)
+            if have > 0 and not allow_when_populated:
                 return False              # never re-point an album with files
+            if have > 0:
+                # Caller re-imports IMMEDIATELY after this, so the unmapping a
+                # switch causes is repaired in the same breath -- and only for
+                # an EXACT count match, where the switch turns a permanently
+                # incomplete album into a complete one. Fellowship of the Ring
+                # held 37 files inside a 74-track release (37/74, never
+                # completable) with a 37-track release sitting right there.
+                # Without the exact-match rule this is the change that cost
+                # Let It Be 27 mapped files.
+                rels_now = (self.lidarr.get_album(int(alb["id"]))
+                            or {}).get("releases") or []
+                if not any(int(r.get("trackCount") or 0) == want_exact
+                           for r in rels_now):
+                    return False
             album_id = int(alb.get("id"))
             want = len(audios)
             full = self.lidarr.get_album(album_id) or {}
@@ -7038,6 +7057,24 @@ class Orchestrator:
                                          album_dir.name, album_name_guess],
                                         len(audios))
                                 if rec is not None:
+                                    # Point the album at the release that MATCHES
+                                    # THE FILES before mapping them. Lidarr
+                                    # monitors the biggest release it knows and
+                                    # RefreshArtist resets it back there, so an
+                                    # album can hold exactly one release's worth
+                                    # of music and still read 0/N against a
+                                    # different one: Fellowship of the Ring has
+                                    # 37 files on disk and a 37-track release
+                                    # available, yet sat at 0/74 because a
+                                    # refresh had re-selected the 74-track
+                                    # edition. Guarded to empty albums inside.
+                                    self._align_release_to_disk(
+                                        aid, artist_name_guess,
+                                        str(rec.get("title") or ""), audios,
+                                        album_rec=rec,
+                                        allow_when_populated=True)
+                                    rec = (self.lidarr.get_album(int(rec["id"]))
+                                           or rec)
                                     tn_cmd = self._import_library_folder_by_tracknumber(
                                         rec, aid, audios)
                                     if tn_cmd:
