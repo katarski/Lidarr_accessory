@@ -4144,6 +4144,170 @@ class Orchestrator:
             logger.debug("recursive audio scan failed for %s: %s", folder, exc)
         return out
 
+    def _resolve_library_album(
+        self, artist_id: int, names: List[str], n_files: int,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Find the Lidarr album for a LIBRARY folder when name matching fails.
+
+        Lidarr's own matcher works off the folder name, and a library folder is
+        often named after the EDITION rather than the record: `The Lord Of The
+        Rings_The Two Towers - The Complete Recordings (OMPS) (2018) [24-48]`
+        against Lidarr's `The Lord of the Rings: The Two Towers: Original Motion
+        Picture Soundtrack`. Neither contains the other, so find_album returns
+        None, the audit records "album not in Lidarr", and its repair path --
+        which is gated on having an album -- never runs. The 45 files sat beside
+        a monitored 45-track release that matched them exactly.
+
+        `names` are candidate titles in order of trust (tag album, then folder).
+        Falls back to scoring the artist's albums on distinctive shared tokens,
+        requiring a release whose track count matches the files on disk, which
+        is what makes the answer safe to act on.
+        """
+        for nm in [n for n in names if n and n.strip()]:
+            try:
+                rec = self.lidarr.find_album(int(artist_id), nm,
+                                             track_count=n_files)
+                if rec:
+                    return rec
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            albums = self.lidarr.list_albums_for_artist(int(artist_id)) or []
+        except Exception:  # noqa: BLE001
+            return None
+        from prowlarr import _identity_tokens
+        want: set = set()
+        for nm in names:
+            want |= set(_identity_tokens(nm or ""))
+        if not want:
+            return None
+        best, best_score = None, 0.0
+        for a in albums:
+            got = set(_identity_tokens(str(a.get("title") or "")))
+            if not got:
+                continue
+            overlap = len(want & got)
+            if not overlap:
+                continue
+            score = 2.0 * overlap / float(len(want) + len(got))
+            # A release that matches the file count is the corroboration that
+            # makes a fuzzy title match trustworthy; without one, don't guess.
+            try:
+                rels = (self.lidarr.get_album(int(a["id"])) or {}).get("releases") or []
+            except Exception:  # noqa: BLE001
+                rels = []
+            if not any(abs(int(r.get("trackCount") or 0) - n_files) <= 1
+                       for r in rels):
+                continue
+            if score > best_score:
+                best, best_score = a, score
+        if best is not None and best_score >= 0.45:
+            logger.info(
+                "audit: resolved %r to Lidarr album %r (id=%s) by title tokens "
+                "(%.2f) plus a release matching %d file(s)",
+                (names[0] if names else "?")[:44], str(best.get("title"))[:44],
+                best.get("id"), best_score, n_files)
+            return best
+        return None
+
+    def _import_library_folder_by_tracknumber(
+        self, album_rec: Dict[str, Any], artist_id: int, audios: List[Path],
+    ) -> Optional[int]:
+        """
+        Import a LIBRARY folder by pairing each file to the track carrying its
+        own TAG TRACK NUMBER. Returns the ManualImport command id, or None.
+
+        The audit's existing fallback pairs files to tracks by SORTED POSITION,
+        which is only safe when the folder is complete. `Gloria Estefan /
+        Gloria!` holds tracks 1-4 and 6-16 -- track 5 is genuinely absent -- so
+        positional pairing would file "Don't Release Me" (6) as track 5 and shift
+        every remaining track by one. Reading the number off the tag is exact and
+        simply leaves the gap unfilled.
+
+        It also gets past Lidarr's `Has missing tracks` rejection, which is a
+        verdict about the CANDIDATE LIST, not about an explicit import: with
+        trackIds supplied, Lidarr files what it is given. That rejection is why
+        this album showed 0/16 while 15 of its songs sat in the library folder.
+        """
+        album_id = int(album_rec.get("id") or 0)
+        if not album_id or not audios:
+            return None
+        full = self.lidarr.get_album(album_id) or {}
+        rels = full.get("releases") or []
+        rid = next((r.get("id") for r in rels if r.get("monitored")), None)
+        tracks = []
+        try:
+            tracks = (self.lidarr.list_tracks_for_release(album_id, int(rid))
+                      if rid else self.lidarr.list_tracks_for_album(album_id))
+        except Exception:  # noqa: BLE001
+            tracks = self.lidarr.list_tracks_for_album(album_id) or []
+        by_num: Dict[int, Dict[str, Any]] = {}
+        for t in tracks or []:
+            try:
+                n = int(t.get("absoluteTrackNumber")
+                        or str(t.get("trackNumber") or "0").split("/")[0] or 0)
+            except (TypeError, ValueError):
+                continue
+            if n and n not in by_num:
+                by_num[n] = t
+        if not by_num:
+            return None
+        # Quality has to come from Lidarr's own parse of the folder, or the
+        # import is accepted and then dies in FileNameBuilder with a
+        # NullReferenceException and the file never lands.
+        qmap: Dict[str, Any] = {}
+        try:
+            folder = str(audios[0].parent)
+            for c in (self.lidarr.manual_import_candidates(
+                    self.lidarr.windows_to_lidarr(Path(folder)),
+                    artist_id=artist_id) or []):
+                if c.get("path"):
+                    qmap[str(c["path"])] = c.get("quality")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("audit: quality probe failed: %s", exc)
+        items, unmapped = [], 0
+        for p in sorted(audios):
+            n = self._tag_track_number(p)
+            t = by_num.get(n) if n else None
+            if not t or not t.get("id"):
+                unmapped += 1
+                continue
+            lp = self.lidarr.windows_to_lidarr(p)
+            q = qmap.get(lp)
+            if q is None:
+                unmapped += 1          # no quality -> Lidarr would drop it
+                continue
+            items.append({
+                "path": lp, "artistId": int(artist_id), "albumId": album_id,
+                "albumReleaseId": rid, "trackIds": [int(t["id"])],
+                "quality": q, "disableReleaseSwitching": True,
+                "additionalFile": False, "replaceExistingFiles": False,
+            })
+        if not items:
+            logger.info("audit: tag-number import for %r mapped nothing "
+                        "(%d file(s) unmapped)", album_rec.get("title"), unmapped)
+            return None
+        logger.info(
+            "audit: importing %r by TAG TRACK NUMBER -- %d of %d file(s) mapped "
+            "to tracks%s", str(album_rec.get("title"))[:50], len(items),
+            len(audios),
+            " (%d unmapped)" % unmapped if unmapped else "")
+        return self.lidarr.manual_import_apply_files(items, import_mode="move")
+
+    @staticmethod
+    def _tag_track_number(path: Path) -> int:
+        """Track number from a file's own tags ("8/16" -> 8), or 0."""
+        try:
+            from mutagen import File as MutagenFile
+            m = MutagenFile(str(path), easy=True)
+            if not m:
+                return 0
+            raw = (m.get("tracknumber") or [""])[0]
+            return int(str(raw).split("/")[0].strip() or 0)
+        except Exception:  # noqa: BLE001
+            return 0
+
     def _align_release_to_disk(
         self, artist_id: Optional[int], artist_name: str, album_name: str,
         audios: List[Path],
@@ -6774,6 +6938,34 @@ class Orchestrator:
                                         raise _AuditSkip()
 
                             if not importable:
+                                # LAST RESORT before giving up: pair files to
+                                # tracks by their own TAG TRACK NUMBER. Lidarr's
+                                # refusals here are about its fuzzy matcher, not
+                                # about the files -- "Has missing tracks" for a
+                                # folder holding 15 of 16 songs, "Couldn't find
+                                # similar album" for a folder named after the
+                                # edition. Both leave real music unimported, and
+                                # an explicit trackId import files it correctly.
+                                rec = album_rec
+                                if rec is None:
+                                    rec = self._resolve_library_album(
+                                        aid,
+                                        [self._album_from_tags(audios),
+                                         album_dir.name, album_name_guess],
+                                        len(audios))
+                                if rec is not None:
+                                    tn_cmd = self._import_library_folder_by_tracknumber(
+                                        rec, aid, audios)
+                                    if tn_cmd:
+                                        cmd_id = tn_cmd
+                                        action_taken = (
+                                            f"ManualImport-by-tracknumber "
+                                            f"cmd={tn_cmd} files={len(audios)}"
+                                        )
+                                        already_acted.add(album_key)
+                                        new_actions.append(
+                                            (album_dir, len(discrepancies)))
+                                        raise _AuditSkip()
                                 # No usable candidates -- log rejections so
                                 # the user can see WHY Lidarr refused.
                                 rej = []
