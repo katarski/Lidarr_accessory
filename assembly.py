@@ -488,9 +488,38 @@ class AssemblyStore:
             e = self._items.get(str(album_id))
             return dict(e) if e else None
 
-    def list(self) -> List[Dict[str, Any]]:
+    def list(self, verify_sources: bool = True) -> List[Dict[str, Any]]:
+        """
+        Every plan. With `verify_sources` (the default) a matched song whose
+        SOURCE FILE NO LONGER EXISTS is dropped and the counts recomputed, so
+        the tab never advertises an assembly it cannot perform.
+
+        This is not hypothetical: `Counting Crows / Saturday Nights & Sunday
+        Mornings` showed 14/14 "completely assembled" while all fourteen source
+        files were gone -- consumed by the harvest, which imports in MOVE mode,
+        or swept up by a purge. Pressing Add to library then failed with "no file
+        could be prepared", because there was nothing left to copy. The plan is
+        only ever as good as the files it points at, and those move underneath it.
+        """
         with self._lock:
             out = [dict(e) for e in self._items.values()]
+        if verify_sources:
+            for e in out:
+                matched = e.get("matched") or []
+                if not matched:
+                    continue
+                alive = [m for m in matched
+                         if m.get("source") and os.path.isfile(str(m["source"]))]
+                if len(alive) == len(matched):
+                    continue
+                gone = len(matched) - len(alive)
+                e["matched"] = alive
+                e["n_matched"] = len(alive)
+                total = int(e.get("total") or 0)
+                e["pct"] = (round(100.0 * len(alive) / total, 1) if total else 0.0)
+                e["sources_missing"] = gone
+                e["sources"] = {p: v for p, v in (e.get("sources") or {}).items()
+                                if os.path.isfile(str(p))}
         out.sort(key=lambda e: (-float(e.get("pct") or 0),
                                 str(e.get("artist") or "")))
         return out

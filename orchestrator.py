@@ -6457,7 +6457,21 @@ class Orchestrator:
         if not self.cfg.library_audit_report_file:
             return 0
         sig_path = self._audit_sig_path()
-        if self.cfg.library_audit_skip_unchanged:
+        # FIRST PASS AFTER A RESTART ALWAYS WALKS. The signature gate skips the
+        # ENTIRE audit in one shot, so a stale one hides every outstanding
+        # discrepancy indefinitely -- the library does not change, so the
+        # signature does not change, so the walk never runs again. That is how
+        # `Gloria Estefan / Gloria!` and the LOTR soundtracks stayed unimported
+        # while the report re-listed them hourly. A restart also means new code
+        # or new config, which is exactly when the previous verdict is least
+        # trustworthy. The per-item ledgers (sweep, deselect) are unaffected --
+        # those avoid repeating work item by item rather than skipping the pass.
+        first_after_start = not getattr(self, "_library_audit_ran", False)
+        if first_after_start:
+            logger.info("Library audit: first pass since startup -- walking in "
+                        "full, ignoring the change signature")
+        self._library_audit_ran = True
+        if self.cfg.library_audit_skip_unchanged and not first_after_start:
             sig = self._library_signature()
             last = ""
             try:
@@ -9217,9 +9231,14 @@ class Orchestrator:
             return False, "cannot create staging folder: %s" % exc
 
         items = []
+        n_gone = n_nocopy = n_notid = 0
         for m in matched:
             src = Path(str(m["source"]))
             if not src.is_file():
+                # The plan is a snapshot; its sources move underneath it. The
+                # harvest imports in MOVE mode and the purge deletes leftovers,
+                # so a plan can read "14/14 assembled" with every source gone.
+                n_gone += 1
                 continue
             num = m.get("number") or (len(items) + 1)
             safe = _SAFE_NAME_RE.sub("_", str(m.get("track") or src.stem))
@@ -9228,10 +9247,13 @@ class Orchestrator:
                 shutil.copy2(src, dst)
             except OSError as exc:
                 logger.warning("assembly: copy failed %s: %s", src, exc)
+                n_nocopy += 1
                 continue
             self._write_basic_tags(dst, artist, album,
                                    str(m.get("track") or ""), num, total)
             tid = m.get("track_id")
+            if not tid:
+                n_notid += 1
             if tid:
                 items.append({
                     "path": str(dst), "artistId": artist_id,
@@ -9242,7 +9264,25 @@ class Orchestrator:
                 })
         if not items:
             shutil.rmtree(staging, ignore_errors=True)
-            return False, "no file could be prepared (copy failed or no track id)"
+            # Say WHICH of the three reasons it was. "copy failed or no track
+            # id" sent diagnosis at the copy when the real answer was that every
+            # source file had already been moved into the library by the harvest.
+            if n_gone and not (n_nocopy or n_notid):
+                return False, (
+                    "every one of the %d matched song(s) is GONE from disk -- "
+                    "the source files were moved or deleted after this plan was "
+                    "made (the harvest imports in move mode). Nothing to "
+                    "assemble; the plan will drop them on its next refresh."
+                    % n_gone)
+            bits = []
+            if n_gone:
+                bits.append("%d source file(s) missing from disk" % n_gone)
+            if n_nocopy:
+                bits.append("%d copy failure(s)" % n_nocopy)
+            if n_notid:
+                bits.append("%d without a Lidarr track id" % n_notid)
+            return False, ("no file could be prepared: %s"
+                           % ("; ".join(bits) if bits else "no matched songs"))
         # Quality has to come from Lidarr's own parse, so ask it about the staged
         # folder and borrow the quality it reports per file.
         try:
