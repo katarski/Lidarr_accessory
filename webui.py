@@ -334,8 +334,13 @@ _PAGE = r"""<!doctype html>
       <label>Mode <select id="cv-mode" onchange="cvModeChanged()"></select></label>
       <label>Bitrate <select id="cv-bitrate"></select></label>
       <label>Quality <select id="cv-quality"></select></label>
+      <label id="cv-depth-wrap" style="display:none" title="Bit depth of the OUTPUT. 'original' keeps the source's depth. Only lossless formats store sample depth, so this is hidden for MP3/AAC/Opus.">Bit depth <select id="cv-depth"></select></label>
       <label>Sample rate <select id="cv-sr"></select></label>
       <label>Channels <select id="cv-ch"></select></label>
+      <label title="Where converted files are written. Unassigned devices are listed with their free space.">Output to <select id="cv-dest" onchange="cvDestChanged()"></select></label>
+      <label class="cvtoggle" id="cv-preserve-wrap" style="display:none" title="Recreate the source's folder structure under the chosen drive, so Artist/Album stays Artist/Album instead of every track landing in one folder."><span>Preserve source path</span><input type="checkbox" id="cv-preserve" checked></label>
+      <label class="cvtoggle" title="Only convert LOSSLESS sources (FLAC/WAV/APE/WV/AIFF/ALAC). Re-encoding an MP3 loses quality twice, and re-encoding one to FLAC just makes a bigger file."><span>Lossless sources only</span><input type="checkbox" id="cv-lossless-only"></label>
+      <label title="Order the folder/file list. Size uses the rolled-up folder size already cached by the library scan.">Sort <select id="cv-sort" onchange="cvSortChanged()"><option value="name">Name (A-Z)</option><option value="size">Size (largest first)</option><option value="size_asc">Size (smallest first)</option></select></label>
       <label>Files at a time <select id="cv-conc"></select></label>
       <label class="cvtoggle" title="Replace each source file with the converted one: the original (e.g. FLAC) is DELETED after a verified encode, sidecar .xml files are repointed at the new filename, and Lidarr is asked to rescan the album folder."><span>Delete original</span><input type="checkbox" id="cv-overwrite"></label>
       <span class="muted" id="cv-codechelp"></span>
@@ -1315,7 +1320,7 @@ document.addEventListener('scroll',function(){ctx.classList.remove('on');},true)
 buildColMenu();setTab('attention');refresh();setInterval(refresh,15000);
 
 /* ===================== Converter tab ===================== */
-var CVDEF={}, CVOPT=null, CVSEL=new Set(), CVINIT=false, CVPOLL=null, CVROOT='', CVDONE=new Set();
+var CVDEF={}, CVOPT=null, CVSEL=new Set(), CVINIT=false, CVPOLL=null, CVROOT='', CVDONE=new Set(), CVDEST=[], CVSORT='name';
 function cvEnter(){
   if(!CVINIT){CVINIT=true;
     fetch('/api/convert/options').then(function(r){return r.json();}).then(function(j){
@@ -1327,6 +1332,11 @@ function cvEnter(){
       var dc=CVDEF.concurrency||2;
       var cc=document.getElementById('cv-conc');
       cc.innerHTML=(j.concurrency||[1,2,3,4,5,6,7,8,9,10]).map(function(n){return '<option '+(n===dc?'selected':'')+'>'+n+'</option>';}).join('');
+      var dst=document.getElementById('cv-dest');
+      CVDEST=j.destinations||[];
+      dst.innerHTML=CVDEST.map(function(d){
+        return '<option value="'+h(d.id)+'">'+h(d.label)+'</option>';}).join('');
+      cvDestChanged();
       cvCodecChanged();
     });
     cvLoadDir('', 'cv-tree');
@@ -1335,6 +1345,18 @@ function cvEnter(){
   if(CVPOLL)clearInterval(CVPOLL);
   CVPOLL=setInterval(function(){if(TAB==='progress')cvPollOnce();},3000);
 }
+function cvSortChanged(){
+  CVSORT=document.getElementById('cv-sort').value||'name';
+  // Re-render from the root; expanded subfolders reload lazily on
+  // their next open, which is cheap because the data is cached.
+  cvLoadDir('','cv-tree');
+}
+function cvDestChanged(){
+  // "Preserve source path" only means something when writing to another
+  // drive -- beside the original, the path IS the source path.
+  var v=document.getElementById('cv-dest').value;
+  document.getElementById('cv-preserve-wrap').style.display=v?'':'none';
+}
 function cvCodecChanged(){
   var k=document.getElementById('cv-codec').value,o=CVOPT[k];if(!o)return;
   document.getElementById('cv-mode').innerHTML=o.modes.map(function(m){return '<option>'+m+'</option>';}).join('');
@@ -1342,6 +1364,15 @@ function cvCodecChanged(){
   document.getElementById('cv-quality').innerHTML=o.quality.map(function(q2){return '<option>'+h(q2)+'</option>';}).join('');
   document.getElementById('cv-sr').innerHTML=o.sample_rates.map(function(s){return '<option value="'+s+'">'+(s==='keep'?'keep source':h(''+s))+'</option>';}).join('');
   document.getElementById('cv-ch').innerHTML=o.channels.map(function(c){return '<option>'+h(c)+'</option>';}).join('');
+  // Bit depth exists only for formats that store samples. Showing it for MP3
+  // would imply a "24-bit MP3", which is not a thing.
+  var dw=document.getElementById('cv-depth-wrap'),ds=document.getElementById('cv-depth');
+  if(o.bit_depths&&o.bit_depths.length){
+    ds.innerHTML=o.bit_depths.map(function(b){
+      return '<option value="'+b+'">'+(b==='original'?'original (keep source)':h(''+b)+'-bit')+'</option>';}).join('');
+    cvPick('cv-depth',o.default_bit_depth||'original');
+    dw.style.display='';
+  }else{ds.innerHTML='';dw.style.display='none';}
   // Preselect the defaults where the codec actually offers them; anything it
   // does not offer just keeps the first option.
   cvPick('cv-mode',o.default_mode);
@@ -1372,6 +1403,14 @@ function cvLoadDir(rel,elId){
     if(j.scanning){el.innerHTML='<div class="empty">First library scan running… this can take a few minutes. The tree loads from cache afterwards.</div>';
       setTimeout(function(){cvLoadDir(rel,elId);},8000);return;}
     var out='';
+    // Sort BOTH lists by the chosen key. The server already sends
+    // rolled-up folder sizes, so size sorting needs no extra call.
+    var _cmp=function(a,b){
+      if(CVSORT==='size')return (b.size||0)-(a.size||0);
+      if(CVSORT==='size_asc')return (a.size||0)-(b.size||0);
+      return String(a.name||'').toLowerCase().localeCompare(String(b.name||'').toLowerCase());
+    };
+    (j.folders||[]).sort(_cmp); (j.files||[]).sort(_cmp);
     (j.folders||[]).forEach(function(f){
       var id='cvk-'+btoa(unescape(encodeURIComponent(f.rel))).replace(/[^a-zA-Z0-9]/g,'');
       out+='<div class="cvrow" data-rel="'+h(f.rel)+'" data-dir="1">'
@@ -1461,17 +1500,41 @@ function cvConvertSel(){cvConvert(Array.from(CVSEL));}
 function cvConvert(rels){
   if(!rels.length){toast('Nothing selected');return;}
   var ow=document.getElementById('cv-overwrite').checked;
-  var where=ow
-    ? 'OVERWRITE MODE: each ORIGINAL FILE WILL BE DELETED and replaced by the converted one.\nSidecar .xml files are repointed and Lidarr rescans the folder.\nThis cannot be undone.'
-    : 'Converted files are written NEXT TO the originals.';
+  var dsel=document.getElementById('cv-dest');
+  var dtxt=dsel.options[dsel.selectedIndex]?dsel.options[dsel.selectedIndex].text:'';
+  var where;
+  if(dsel.value){
+    // Another drive: overwrite is ignored server-side, so do not
+    // threaten to delete anything.
+    where='Converted files are written to:
+  '+dtxt
+      +(document.getElementById('cv-preserve').checked?'
+  (source folder structure preserved)':'
+  (all files in one folder)')
+      +'
+
+Originals are NOT touched.';
+  }else{
+    where=ow
+      ? 'OVERWRITE MODE: each ORIGINAL FILE WILL BE DELETED and replaced by the converted one.\nSidecar .xml files are repointed and Lidarr rescans the folder.\nThis cannot be undone.'
+      : 'Converted files are written NEXT TO the originals.';
+  }
+  if(document.getElementById('cv-lossless-only').checked)
+    where+='
+
+Already-lossy files in the selection will be SKIPPED.';
   if(!confirm('Convert '+rels.length+' item(s) (folders expand to their audio files) to:\n'+cvSettingsSummary()+'\n\n'+where+'\n\nContinue?'))return;
-  if(ow&&!confirm('Really DELETE '+rels.length+' original file(s) after converting?'))return;
+  if(ow&&!dsel.value&&!confirm('Really DELETE '+rels.length+' original file(s) after converting?'))return;
   var body={files:rels,codec:document.getElementById('cv-codec').value,
     opts:{mode:document.getElementById('cv-mode').value,
       bitrate:document.getElementById('cv-bitrate').value,
       quality:document.getElementById('cv-quality').value,
       sample_rate:document.getElementById('cv-sr').value,
       channels:document.getElementById('cv-ch').value,
+      bit_depth:document.getElementById('cv-depth').value||'original',
+      out_dest:document.getElementById('cv-dest').value||'',
+      preserve_path:document.getElementById('cv-preserve').checked,
+      lossless_only:document.getElementById('cv-lossless-only').checked,
       overwrite:ow},
     concurrency:parseInt(document.getElementById('cv-conc').value||'2',10)};
   fetch('/api/convert/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})

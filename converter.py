@@ -99,7 +99,53 @@ CODEC_OPTIONS: Dict[str, Dict[str, Any]] = {
                 "compression effort (quality vs speed, all lossy-equal "
                 "bitrate).",
     },
+    # --- LOSSLESS -------------------------------------------------------
+    # Bit depth only means anything here. A lossy codec stores no samples, so
+    # "24-bit MP3" is not a thing -- the depth selector is hidden for those.
+    "flac": {
+        "label": "FLAC (lossless)",
+        "ext": ".flac",
+        "modes": ["Lossless"],
+        "bitrates": [],
+        "quality": [
+            "8 (smallest, slowest)", "7", "6", "5 (default)", "4", "3",
+            "2", "1", "0 (fastest, largest)",
+        ],
+        "sample_rates": ["keep", 192000, 96000, 88200, 48000, 44100],
+        "channels": ["keep", "stereo", "mono"],
+        "bit_depths": ["original", 16, 24, 32],
+        "default_mode": "Lossless",
+        "default_quality": "5 (default)",
+        "default_bit_depth": "original",
+        "help": "Lossless. Quality is the FLAC COMPRESSION level -- it changes "
+                "file size and encode time only, never the audio. Bit depth "
+                "'original' keeps the source's depth; picking 16 downsamples "
+                "24/32-bit masters (irreversible, but that is the point when "
+                "shrinking a hi-res library).",
+    },
+    "wav": {
+        "label": "WAV (uncompressed)",
+        "ext": ".wav",
+        "modes": ["Lossless"],
+        "bitrates": [],
+        "quality": [],
+        "sample_rates": ["keep", 192000, 96000, 88200, 48000, 44100],
+        "channels": ["keep", "stereo", "mono"],
+        "bit_depths": ["original", 16, 24, 32],
+        "default_mode": "Lossless",
+        "default_bit_depth": "original",
+        "help": "Uncompressed PCM. Large; useful as an interchange format. "
+                "Carries almost no tags -- prefer FLAC unless something "
+                "downstream demands WAV.",
+    },
 }
+
+# Bit depth -> ffmpeg. Keyed by STRING because it arrives from JSON as either.
+# FLAC has no s24 sample format: it carries 24-bit inside s32 and needs
+# -bits_per_raw_sample to say so. WAV instead encodes the depth in the codec
+# name, so the two need different handling.
+_FLAC_FMT = {"16": "s16", "24": "s32", "32": "s32"}
+_WAV_PCM = {"16": "pcm_s16le", "24": "pcm_s24le", "32": "pcm_s32le"}
 
 
 def _fmt_size(n: int) -> str:
@@ -444,9 +490,112 @@ class ConvertManager:
         self._workers = 2
 
     # ---------- public ----------
+    # Where the container sees Unraid's unassigned devices. /mnt/disks is bind
+    # mounted here so EVERY unassigned drive shows up without a container
+    # recreate -- mounting one specific drive would need a new -v (and a
+    # recreate) every time a disk is swapped.
+    UNASSIGNED_ROOT = Path("/unassigned")
+
+    def destinations(self) -> List[Dict[str, Any]]:
+        """
+        Output targets: the library itself (in place) plus every mounted
+        unassigned device, with free space so a 3 TB job isn't aimed at a
+        200 GB disk.
+
+        Returns [] for the drives when /unassigned isn't mounted -- the WebUI
+        then shows only in-place, which is the pre-existing behaviour.
+        """
+        out: List[Dict[str, Any]] = [{
+            "id": "", "label": "Source folder (write beside the original)",
+            "path": "", "kind": "inplace",
+        }]
+        root = self.UNASSIGNED_ROOT
+        try:
+            if not root.is_dir():
+                return out
+            for d in sorted(root.iterdir(), key=lambda e: e.name.lower()):
+                if not d.is_dir():
+                    continue
+                free = total = 0
+                try:
+                    st = os.statvfs(str(d))
+                    free = st.f_bavail * st.f_frsize
+                    total = st.f_blocks * st.f_frsize
+                except OSError:
+                    pass
+                out.append({
+                    "id": d.name,
+                    "label": "%s  (%s free of %s)" % (
+                        d.name, _fmt_size(free), _fmt_size(total)),
+                    "path": str(d), "kind": "unassigned",
+                    "free": free, "total": total,
+                })
+        except OSError as exc:
+            logger.debug("destinations: %s unreadable: %s", root, exc)
+        return out
+
+    def _resolve_out_dir(self, src: Path, opts: Dict[str, Any]) -> Path:
+        """
+        The folder a converted file goes in.
+
+        `out_dest` empty  -> beside the source (unchanged behaviour)
+        `out_dest` set    -> that unassigned drive, and when `preserve_path` is
+                             on, the source's path UNDER THE LIBRARY ROOT is
+                             recreated there, so
+                             /music/Music/Artist/Album/01.flac becomes
+                             /unassigned/<drive>/Artist/Album/01.flac
+                             rather than dumping every track in one folder.
+        Falls back to the source folder if the target cannot be created, so a
+        bad destination never silently drops the job.
+        """
+        dest = str(opts.get("out_dest") or "").strip()
+        if not dest:
+            return src.parent
+        base = self.UNASSIGNED_ROOT / dest
+        try:
+            base = base.resolve()
+            if self.UNASSIGNED_ROOT.resolve() not in base.parents:
+                logger.warning("convert: destination %r escapes %s -- writing "
+                               "beside the source instead", dest,
+                               self.UNASSIGNED_ROOT)
+                return src.parent
+        except OSError:
+            return src.parent
+        out = base
+        if opts.get("preserve_path", True):
+            try:
+                out = base / src.parent.relative_to(self.root.resolve())
+            except (ValueError, OSError):
+                out = base / src.parent.name
+        try:
+            out.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.warning("convert: cannot create %s (%s) -- writing beside "
+                           "the source instead", out, exc)
+            return src.parent
+        return out
+
     def options(self) -> Dict[str, Any]:
         return {"codecs": CODEC_OPTIONS,
                 "concurrency": list(range(1, 11)),
+                # Output targets (in-place + each unassigned device).
+                "destinations": self.destinations(),
+                "preserve_path": {
+                    "label": "Preserve source path",
+                    "help": ("Recreate the source's folder structure under the "
+                             "chosen drive, so Artist/Album stays Artist/Album "
+                             "instead of every track landing in one folder. "
+                             "Ignored when writing beside the original."),
+                    "default": True,
+                },
+                "lossless_only": {
+                    "label": "Skip files that are already lossy",
+                    "help": ("Only convert LOSSLESS sources (FLAC/WAV/APE/WV/"
+                             "AIFF/ALAC). Re-encoding an MP3 to another lossy "
+                             "format loses quality twice, and re-encoding one "
+                             "to FLAC just makes a bigger file with no gain."),
+                    "default": False,
+                },
                 # What the Converter tab opens on. Per-codec mode/quality
                 # defaults live in CODEC_OPTIONS above.
                 "defaults": {"codec": "aac", "bitrate": 320,
@@ -496,6 +645,9 @@ class ConvertManager:
         queued = 0
         errors: List[str] = []
         root_r = self.root.resolve()
+        opts = dict(opts or {})
+        lossless_only = bool(opts.get("lossless_only"))
+        skipped_lossy = 0
         for rel in rels:
             p = (self.root / rel.strip("/")).resolve()
             try:
@@ -505,13 +657,19 @@ class ConvertManager:
                 if not p.is_file():
                     errors.append(f"not a file: {rel}")
                     continue
+                if lossless_only and p.suffix.lower() not in LOSSLESS_EXTS:
+                    # Deliberately silent per file -- selecting a whole album
+                    # with this on would otherwise produce an error per MP3.
+                    # Counted and reported once below.
+                    skipped_lossy += 1
+                    continue
             except OSError as exc:
                 errors.append(f"{rel}: {exc}")
                 continue
             jid = uuid.uuid4().hex[:12]
             job = {
                 "id": jid, "rel": rel, "name": p.name,
-                "codec": codec, "opts": dict(opts or {}),
+                "codec": codec, "opts": dict(opts),
                 "state": "queued", "pct": 0.0, "msg": "",
                 "added": time.time(),
             }
@@ -519,6 +677,11 @@ class ConvertManager:
                 self._jobs[jid] = job
                 self._queue.append(jid)
             queued += 1
+        if skipped_lossy:
+            msg = ("skipped %d already-lossy file(s) (lossless-only is on)"
+                   % skipped_lossy)
+            logger.info("convert: %s", msg)
+            errors.append(msg)
         self._pump()
         return queued, errors
 
@@ -618,6 +781,31 @@ class ConvertManager:
                 args += ["-q:a", mv.group(1) if mv else "4"]
             else:
                 args += ["-b:a", f"{br or 192}k"]
+        elif codec in ("flac", "wav"):
+            depth = str(opts.get("bit_depth") or "original").strip().lower()
+            if codec == "flac":
+                args += ["-c:a", "flac"]
+                mv = re.search(r"(\d+)", q)
+                # FLAC "quality" is COMPRESSION LEVEL: size/time only, never
+                # the audio. Keeping ffmpeg's default when unparsable.
+                if mv:
+                    args += ["-compression_level", mv.group(1)]
+            if codec == "wav":
+                # For WAV the PCM CODEC NAME is the bit depth -- adding
+                # -sample_fmt on top just contradicts it. "original" names no
+                # codec at all, so ffmpeg picks the pcm_* matching the source
+                # instead of silently promoting everything to 24-bit.
+                pcm = _WAV_PCM.get(depth)
+                if pcm:
+                    args += ["-c:a", pcm]
+            elif depth not in ("", "original", "keep"):
+                fmt = _FLAC_FMT.get(depth)
+                if fmt:
+                    args += ["-sample_fmt", fmt]
+                    # FLAC stores 24-bit inside an s32 sample format, so the
+                    # container needs telling explicitly or it writes 32.
+                    if depth == "24":
+                        args += ["-bits_per_raw_sample", "24"]
         elif codec == "opus":
             args += ["-c:a", "libopus", "-b:a", f"{br or 128}k"]
             if mode == "CBR":
@@ -757,8 +945,15 @@ class ConvertManager:
                 return
             src = (self.root / job["rel"].strip("/")).resolve()
             spec = CODEC_OPTIONS[job["codec"]]
-            overwrite = bool((job.get("opts") or {}).get("overwrite"))
-            dst = src.with_suffix(spec["ext"])
+            jopts = job.get("opts") or {}
+            overwrite = bool(jopts.get("overwrite"))
+            out_dir = self._resolve_out_dir(src, jopts)
+            dst = (out_dir / src.name).with_suffix(spec["ext"])
+            if out_dir != src.parent:
+                # Writing to another drive: "replace the original" makes no
+                # sense there (the source is somewhere else entirely), so it is
+                # ignored rather than deleting a file the user still has.
+                overwrite = False
             if overwrite:
                 # REPLACE MODE: the lossy file takes the source's place and the
                 # original is deleted after a VERIFIED encode. Encode to a temp
@@ -773,11 +968,14 @@ class ConvertManager:
                 except OSError:
                     pass
             else:
+                # Collision naming must stay IN out_dir. Using src.with_name()
+                # here would quietly drop the file next to the original the
+                # moment a same-named file already existed on the target drive.
                 if dst == src:
-                    dst = src.with_name(src.stem + " (converted)" + spec["ext"])
+                    dst = out_dir / (src.stem + " (converted)" + spec["ext"])
                 n = 1
                 while dst.exists():
-                    dst = src.with_name(f"{src.stem} ({n}){spec['ext']}")
+                    dst = out_dir / f"{src.stem} ({n}){spec['ext']}"
                     n += 1
             job["state"] = "running"
             job["out"] = dst.name
