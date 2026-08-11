@@ -1581,7 +1581,9 @@ function cvConvert(rels){
     concurrency:parseInt(document.getElementById('cv-conc').value||'2',10)};
   fetch('/api/convert/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
    .then(function(r){return r.json();}).then(function(j){
-     toast(j.ok?('Queued '+j.queued+' conversion(s)'):(j.message||'failed'));
+     var t=j.ok?('Queued '+j.queued+' conversion(s)'):(j.message||'failed');
+     if(j.dropped)t+=' -- '+j.dropped+' of '+j.selected+' NOT queued (cap)';
+     toast(t);
      document.getElementById('cv-sec-prog').open=true;cvPollOnce();})
    .catch(function(e){toast('Error: '+e);});
 }
@@ -1680,13 +1682,21 @@ document.getElementById('cv-tree').addEventListener('contextmenu',function(e){
 </body></html>"""
 
 
-def _expand_audio(lt, rels, cap: int = 1000):
-    """Expand selected folders to their audio files (recursive), pass files
-    through, keep everything inside the library root. Capped for sanity."""
+def _expand_audio(lt, rels, cap: int = 50000):
+    """
+    Expand selected folders to their audio files (recursive), pass files
+    through, keep everything inside the library root.
+
+    Returns (files, total_found). `cap` is a runaway guard, NOT a batch size --
+    it used to be 1000 and it returned the moment it hit it, so selecting a
+    whole library queued the first thousand tracks and reported success as if
+    that were everything. The caller compares len(files) with total_found and
+    tells the user when anything was left out.
+    """
     try:
         from converter import AUDIO_EXTS
     except Exception:  # noqa: BLE001
-        return []
+        return [], 0
     out = []
     for rel in rels:
         p = lt._safe_rel(rel)
@@ -1699,13 +1709,17 @@ def _expand_audio(lt, rels, cap: int = 1000):
                         r = os.path.relpath(os.path.join(dirpath, fn),
                                             lt.root).replace("\\", "/")
                         out.append(r)
-                        if len(out) >= cap:
-                            return out
         else:
             out.append(rel.strip("/"))
-        if len(out) >= cap:
-            break
-    return out
+    # De-duplicate: ticking a folder AND a file inside it would otherwise queue
+    # that file twice. Order is preserved so the queue still reads sensibly.
+    seen, uniq = set(), []
+    for r in out:
+        if r not in seen:
+            seen.add(r)
+            uniq.append(r)
+    total = len(uniq)
+    return uniq[:max(1, int(cap))], total
 
 
 _PLAYER_MIME = {
@@ -2029,7 +2043,7 @@ def make_handler(store, actions: HeldActions):
                 if lt is None:
                     self._json(503, {"tracks": []})
                     return
-                rels = _expand_audio(lt, [rel], cap=2000)
+                rels, _total = _expand_audio(lt, [rel], cap=2000)
                 root = str(getattr(lt, "root", "")).rstrip("/")
                 # Duration comes from the library-tree cache ONLY -- probing
                 # 88 files with mutagen to draw a playlist would stall the UI.
@@ -2161,12 +2175,26 @@ def make_handler(store, actions: HeldActions):
                     body = json.loads(self.rfile.read(length) or b"{}") or {}
                 except Exception:  # noqa: BLE001
                     body = {}
-                rels = _expand_audio(lt, list(body.get("files") or []))
+                rels, total = _expand_audio(
+                    lt, list(body.get("files") or []))
                 queued, errs = conv.start(
                     rels, str(body.get("codec") or "mp3"),
                     dict(body.get("opts") or {}),
                     int(body.get("concurrency") or 2))
+                # NEVER let a cap pass silently. The old code returned the first
+                # 1000 files and reported plain success, so "convert my whole
+                # library" looked like it worked and quietly did a fraction.
+                dropped = max(0, total - len(rels))
+                if dropped:
+                    errs = list(errs) + [
+                        "%d of %d selected file(s) were NOT queued -- the "
+                        "per-request cap is %d. Convert in batches, or raise "
+                        "the cap." % (dropped, total, len(rels))]
+                    logger.warning(
+                        "convert: capped -- %d of %d selected file(s) queued",
+                        len(rels), total)
                 self._json(200, {"ok": queued > 0, "queued": queued,
+                                 "selected": total, "dropped": dropped,
                                  "errors": errs,
                                  "message": "; ".join(errs)[:300]})
                 return
