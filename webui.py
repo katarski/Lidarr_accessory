@@ -334,7 +334,7 @@ _PAGE = r"""<!doctype html>
       <label>Mode <select id="cv-mode" onchange="cvModeChanged()"></select></label>
       <label>Bitrate <select id="cv-bitrate"></select></label>
       <label>Quality <select id="cv-quality"></select></label>
-      <label id="cv-depth-wrap" style="display:none" title="Bit depth of the OUTPUT. 'original' keeps the source's depth. Only lossless formats store sample depth, so this is hidden for MP3/AAC/Opus.">Bit depth <select id="cv-depth"></select></label>
+      <label id="cv-depth-wrap" title="Bit depth of the OUTPUT. 'original' keeps the source's depth. Only lossless formats store sample depth, so this is hidden for MP3/AAC/Opus.">Bit depth <select id="cv-depth"></select></label>
       <label>Sample rate <select id="cv-sr"></select></label>
       <label>Channels <select id="cv-ch"></select></label>
       <label title="Where converted files are written. Unassigned devices are listed with their free space.">Output to <select id="cv-dest" onchange="cvDestChanged()"></select></label>
@@ -1381,13 +1381,19 @@ function cvCodecChanged(){
   document.getElementById('cv-ch').innerHTML=o.channels.map(function(c){return '<option>'+h(c)+'</option>';}).join('');
   // Bit depth exists only for formats that store samples. Showing it for MP3
   // would imply a "24-bit MP3", which is not a thing.
-  var dw=document.getElementById('cv-depth-wrap'),ds=document.getElementById('cv-depth');
+  // Bit depth stays VISIBLE and greys out for codecs that cannot store one,
+  // matching how Bitrate/Quality behave. Hiding it just made people hunt for a
+  // control that had silently vanished.
+  var ds=document.getElementById('cv-depth');
   if(o.bit_depths&&o.bit_depths.length){
     ds.innerHTML=o.bit_depths.map(function(b){
       return '<option value="'+b+'">'+(b==='original'?'original (keep source)':h(''+b)+'-bit')+'</option>';}).join('');
     cvPick('cv-depth',o.default_bit_depth||'original');
-    dw.style.display='';
-  }else{ds.innerHTML='';dw.style.display='none';}
+    ds.disabled=false;
+  }else{
+    ds.innerHTML='<option value="original">n/a for lossy formats</option>';
+    ds.disabled=true;
+  }
   // Preselect the defaults where the codec actually offers them; anything it
   // does not offer just keeps the first option.
   cvPick('cv-mode',o.default_mode);
@@ -1408,9 +1414,13 @@ function cvPick(id,val){
 }
 function cvModeChanged(){
   var k=document.getElementById('cv-codec').value,m=document.getElementById('cv-mode').value;
+  var lossless=(k==='flac'||k==='wav');
   var isVbr=(m==='VBR'&&k!=='opus');
-  document.getElementById('cv-bitrate').disabled=isVbr;
-  document.getElementById('cv-quality').disabled=(k==='mp3'||k==='aac')&&m==='CBR';
+  // Lossless has no bitrate to choose -- the audio decides it. FLAC's
+  // "quality" is its COMPRESSION level (size/speed only); WAV has neither.
+  document.getElementById('cv-bitrate').disabled=lossless||isVbr;
+  document.getElementById('cv-quality').disabled=
+    lossless ? (k==='wav') : ((k==='mp3'||k==='aac')&&m==='CBR');
 }
 function cvLoadDir(rel,elId){
   fetch('/api/library/ls?path='+encodeURIComponent(rel)).then(function(r){return r.json();}).then(function(j){
