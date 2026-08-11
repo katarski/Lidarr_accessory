@@ -338,11 +338,10 @@ _PAGE = r"""<!doctype html>
       <label>Sample rate <select id="cv-sr"></select></label>
       <label>Channels <select id="cv-ch"></select></label>
       <label title="Where converted files are written. Unassigned devices are listed with their free space.">Output to <select id="cv-dest" onchange="cvDestChanged()"></select></label>
-      <label class="cvtoggle" id="cv-preserve-wrap" style="display:none" title="Recreate the source's folder structure under the chosen drive, so Artist/Album stays Artist/Album instead of every track landing in one folder."><span>Preserve source path</span><input type="checkbox" id="cv-preserve" checked></label>
       <label class="cvtoggle" title="Only convert LOSSLESS sources (FLAC/WAV/APE/WV/AIFF/ALAC). Re-encoding an MP3 loses quality twice, and re-encoding one to FLAC just makes a bigger file."><span>Lossless sources only</span><input type="checkbox" id="cv-lossless-only"></label>
       <label title="Order the folder/file list. Size uses the rolled-up folder size already cached by the library scan.">Sort <select id="cv-sort" onchange="cvSortChanged()"><option value="name">Name (A-Z)</option><option value="size">Size (largest first)</option><option value="size_asc">Size (smallest first)</option></select></label>
       <label>Files at a time <select id="cv-conc"></select></label>
-      <label class="cvtoggle" title="Replace each source file with the converted one: the original (e.g. FLAC) is DELETED after a verified encode, sidecar .xml files are repointed at the new filename, and Lidarr is asked to rescan the album folder."><span>Delete original</span><input type="checkbox" id="cv-overwrite"></label>
+      <label class="cvtoggle" id="cv-overwrite-wrap" title="Replace each source file with the converted one: the original (e.g. FLAC) is DELETED after a verified encode, sidecar .xml files are repointed at the new filename, and Lidarr is asked to rescan the album folder."><span>Delete original</span><input type="checkbox" id="cv-overwrite"></label>
       <span class="muted" id="cv-codechelp"></span>
       <div class="grow"></div>
       <span id="cv-seln" class="muted">0 selected</span>
@@ -1336,8 +1335,19 @@ function cvEnter(){
       cc.innerHTML=(j.concurrency||[1,2,3,4,5,6,7,8,9,10]).map(function(n){return '<option '+(n===dc?'selected':'')+'>'+n+'</option>';}).join('');
       var dst=document.getElementById('cv-dest');
       CVDEST=j.destinations||[];
-      dst.innerHTML=CVDEST.map(function(d){
-        return '<option value="'+h(d.id)+'">'+h(d.label)+'</option>';}).join('');
+      var _o=[];
+      CVDEST.forEach(function(d){
+        if(d.kind!=='unassigned'){
+          _o.push('<option value="">'+h(d.label)+'</option>');
+          return;
+        }
+        // dBpoweramp-style: the PATH MODE lives in this list, not in a
+        // separate checkbox that only applies to some choices.
+        var free=d.label.replace(/^[^(]*/,'');
+        _o.push('<option value="'+h(d.id)+'|p">'+h(d.id)+' \ Source Path \ Filename  '+h(free)+'</option>');
+        _o.push('<option value="'+h(d.id)+'|f">'+h(d.id)+' \ Single folder  '+h(free)+'</option>');
+      });
+      dst.innerHTML=_o.join('');
       cvDestChanged();
       cvCodecChanged();
     });
@@ -1354,10 +1364,13 @@ function cvSortChanged(){
   cvLoadDir('','cv-tree');
 }
 function cvDestChanged(){
-  // "Preserve source path" only means something when writing to another
-  // drive -- beside the original, the path IS the source path.
-  var v=document.getElementById('cv-dest').value;
-  document.getElementById('cv-preserve-wrap').style.display=v?'':'none';
+  // Writing to another drive leaves the source untouched, so
+  // "Delete original" is meaningless there -- and the backend
+  // ignores it. Hide it rather than offering a no-op.
+  var other=!!document.getElementById('cv-dest').value;
+  var w=document.getElementById('cv-overwrite-wrap');
+  if(w)w.style.display=other?'none':'';
+  if(other)document.getElementById('cv-overwrite').checked=false;
 }
 function cvCodecChanged(){
   var k=document.getElementById('cv-codec').value,o=CVOPT[k];if(!o)return;
@@ -1523,15 +1536,17 @@ function cvConvert(rels){
   if(!rels.length){toast('Nothing selected');return;}
   var ow=document.getElementById('cv-overwrite').checked;
   var dsel=document.getElementById('cv-dest');
+  // The dropdown value carries BOTH the drive and the path mode
+  // ("<id>|p" preserve, "<id>|f" flat), so there is no separate
+  // checkbox to keep in sync.
+  var _dv=(dsel.value||'').split('|');
+  var destId=_dv[0]||'', keepPath=(_dv[1]!=='f');
   var dtxt=dsel.options[dsel.selectedIndex]?dsel.options[dsel.selectedIndex].text:'';
   var where;
-  if(dsel.value){
+  if(destId){
     // Another drive: overwrite is ignored server-side, so do not
     // threaten to delete anything.
     where='Converted files are written to:\n  '+dtxt
-      +(document.getElementById('cv-preserve').checked
-        ?'\n  (source folder structure preserved)'
-        :'\n  (all files in one folder)')
       +'\n\nOriginals are NOT touched.';
   }else{
     where=ow
@@ -1541,7 +1556,7 @@ function cvConvert(rels){
   if(document.getElementById('cv-lossless-only').checked)
     where+='\n\nAlready-lossy files in the selection will be SKIPPED.';
   if(!confirm('Convert '+rels.length+' item(s) (folders expand to their audio files) to:\n'+cvSettingsSummary()+'\n\n'+where+'\n\nContinue?'))return;
-  if(ow&&!dsel.value&&!confirm('Really DELETE '+rels.length+' original file(s) after converting?'))return;
+  if(ow&&!destId&&!confirm('Really DELETE '+rels.length+' original file(s) after converting?'))return;
   var body={files:rels,codec:document.getElementById('cv-codec').value,
     opts:{mode:document.getElementById('cv-mode').value,
       bitrate:document.getElementById('cv-bitrate').value,
@@ -1549,8 +1564,8 @@ function cvConvert(rels){
       sample_rate:document.getElementById('cv-sr').value,
       channels:document.getElementById('cv-ch').value,
       bit_depth:document.getElementById('cv-depth').value||'original',
-      out_dest:document.getElementById('cv-dest').value||'',
-      preserve_path:document.getElementById('cv-preserve').checked,
+      out_dest:destId,
+      preserve_path:keepPath,
       lossless_only:document.getElementById('cv-lossless-only').checked,
       overwrite:ow},
     concurrency:parseInt(document.getElementById('cv-conc').value||'2',10)};
