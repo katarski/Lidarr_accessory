@@ -346,6 +346,8 @@ _PAGE = r"""<!doctype html>
       <span class="muted" id="cv-codechelp"></span>
       <div class="grow"></div>
       <span id="cv-seln" class="muted">0 selected</span>
+      <button class="b-copy" onclick="cvSelectAll()" title="Tick every top-level folder and file. Because ticking a folder means everything inside it, this selects the whole library at the current view.">Select all</button>
+      <button class="b-copy" onclick="cvClearSel()" title="Clear the selection">&#10005;</button>
       <button class="b-move" onclick="cvConvertSel()">Convert selected</button>
       <button class="b-disc" onclick="cvDeleteSel()">Delete selected</button>
     </div>
@@ -1470,6 +1472,26 @@ function cvRefreshDir(rel){
      var box=document.getElementById(id);
      if(box&&box.dataset.loaded){cvLoadDir(rel,id);}      // node is open -> redraw it
    });
+}
+function cvSelectAll(){
+  // Only the TOP-LEVEL rows are ticked: a folder already means
+  // everything beneath it (cvSel cascades, and the server expands
+  // it recursively), so adding descendants too would double-count.
+  var tree=document.getElementById('cv-tree'); if(!tree)return;
+  var n=0;
+  tree.querySelectorAll(':scope > .cvrow').forEach(function(row){
+    var r=row.getAttribute('data-rel')||''; if(!r)return;
+    var cb=row.querySelector('input[type=checkbox]');
+    if(cb)cb.checked=true;
+    cvSel(r,true,row.getAttribute('data-dir')==='1');
+    n++;
+  });
+  toast(n?('Selected '+n+' top-level item(s) -- folders include everything inside'):'Nothing to select yet');
+}
+function cvClearSel(){
+  CVSEL.clear();
+  document.querySelectorAll('#cv-tree input[type=checkbox]').forEach(function(cb){cb.checked=false;});
+  cvSelCount();
 }
 function cvSelCount(){
   document.getElementById('cv-seln').textContent=CVSEL.size+' selected';
