@@ -1682,7 +1682,7 @@ document.getElementById('cv-tree').addEventListener('contextmenu',function(e){
 </body></html>"""
 
 
-def _expand_audio(lt, rels, cap: int = 50000):
+def _expand_audio(lt, rels, cap: int = 250000):
     """
     Expand selected folders to their audio files (recursive), pass files
     through, keep everything inside the library root.
@@ -1692,6 +1692,9 @@ def _expand_audio(lt, rels, cap: int = 50000):
     whole library queued the first thousand tracks and reported success as if
     that were everything. The caller compares len(files) with total_found and
     tells the user when anything was left out.
+
+    250000 is deliberately well clear of this library's 86544 audio files, so
+    "convert everything" means everything; it exists only to stop a runaway.
     """
     try:
         from converter import AUDIO_EXTS

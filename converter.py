@@ -673,7 +673,11 @@ class ConvertManager:
             jid = uuid.uuid4().hex[:12]
             job = {
                 "id": jid, "rel": rel, "name": p.name,
-                "codec": codec, "opts": dict(opts),
+                # ONE shared dict for the whole batch, not a copy per job:
+                # a full-library run is ~86k jobs and the options are identical
+                # for all of them. Nothing mutates job["opts"] (the run path
+                # only reads it), so sharing is safe and saves ~85 MB.
+                "codec": codec, "opts": opts,
                 "state": "queued", "pct": 0.0, "msg": "",
                 "added": time.time(),
             }
