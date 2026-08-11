@@ -1506,23 +1506,18 @@ function cvConvert(rels){
   if(dsel.value){
     // Another drive: overwrite is ignored server-side, so do not
     // threaten to delete anything.
-    where='Converted files are written to:
-  '+dtxt
-      +(document.getElementById('cv-preserve').checked?'
-  (source folder structure preserved)':'
-  (all files in one folder)')
-      +'
-
-Originals are NOT touched.';
+    where='Converted files are written to:\n  '+dtxt
+      +(document.getElementById('cv-preserve').checked
+        ?'\n  (source folder structure preserved)'
+        :'\n  (all files in one folder)')
+      +'\n\nOriginals are NOT touched.';
   }else{
     where=ow
       ? 'OVERWRITE MODE: each ORIGINAL FILE WILL BE DELETED and replaced by the converted one.\nSidecar .xml files are repointed and Lidarr rescans the folder.\nThis cannot be undone.'
       : 'Converted files are written NEXT TO the originals.';
   }
   if(document.getElementById('cv-lossless-only').checked)
-    where+='
-
-Already-lossy files in the selection will be SKIPPED.';
+    where+='\n\nAlready-lossy files in the selection will be SKIPPED.';
   if(!confirm('Convert '+rels.length+' item(s) (folders expand to their audio files) to:\n'+cvSettingsSummary()+'\n\n'+where+'\n\nContinue?'))return;
   if(ow&&!dsel.value&&!confirm('Really DELETE '+rels.length+' original file(s) after converting?'))return;
   var body={files:rels,codec:document.getElementById('cv-codec').value,
