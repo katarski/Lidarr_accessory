@@ -113,15 +113,17 @@ CODEC_OPTIONS: Dict[str, Dict[str, Any]] = {
         ],
         "sample_rates": ["keep", 192000, 96000, 88200, 48000, 44100],
         "channels": ["keep", "stereo", "mono"],
-        "bit_depths": ["original", 16, 24, 32],
+        "bit_depths": ["original", 16, 24],
         "default_mode": "Lossless",
         "default_quality": "5 (default)",
         "default_bit_depth": "original",
         "help": "Lossless. Quality is the FLAC COMPRESSION level -- it changes "
                 "file size and encode time only, never the audio. Bit depth "
-                "'original' keeps the source's depth; picking 16 downsamples "
-                "24/32-bit masters (irreversible, but that is the point when "
-                "shrinking a hi-res library).",
+                "'original' keeps the source's depth; 16 downsamples a hi-res "
+                "master (irreversible, but that is the point when shrinking a "
+                "library). NO 32-bit option: ffmpeg's FLAC encoder caps at 24 "
+                "and silently writes 24 if asked for 32, so offering it would "
+                "be a promise it cannot keep. Use WAV for true 32-bit.",
     },
     "wav": {
         "label": "WAV (uncompressed)",
@@ -144,7 +146,9 @@ CODEC_OPTIONS: Dict[str, Dict[str, Any]] = {
 # FLAC has no s24 sample format: it carries 24-bit inside s32 and needs
 # -bits_per_raw_sample to say so. WAV instead encodes the depth in the codec
 # name, so the two need different handling.
-_FLAC_FMT = {"16": "s16", "24": "s32", "32": "s32"}
+# No "32": the encoder caps at 24 (verified -- it writes
+# bits_per_raw_sample=24 even when asked for 32), so the option is not offered.
+_FLAC_FMT = {"16": "s16", "24": "s32"}
 _WAV_PCM = {"16": "pcm_s16le", "24": "pcm_s24le", "32": "pcm_s32le"}
 
 

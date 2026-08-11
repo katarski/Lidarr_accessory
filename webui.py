@@ -334,7 +334,7 @@ _PAGE = r"""<!doctype html>
       <label>Mode <select id="cv-mode" onchange="cvModeChanged()"></select></label>
       <label>Bitrate <select id="cv-bitrate"></select></label>
       <label>Quality <select id="cv-quality"></select></label>
-      <label id="cv-depth-wrap" title="Bit depth of the OUTPUT. 'original' keeps the source's depth. Only lossless formats store sample depth, so this is hidden for MP3/AAC/Opus.">Bit depth <select id="cv-depth"></select></label>
+      <label id="cv-depth-wrap" title="Bit depth of the OUTPUT. 'original' keeps the source's depth. Only lossless formats store a sample depth, so this greys out for MP3/AAC/Opus. FLAC offers 16/24 (its encoder cannot store 32); WAV also offers 32.">Bit depth <select id="cv-depth"></select></label>
       <label>Sample rate <select id="cv-sr"></select></label>
       <label>Channels <select id="cv-ch"></select></label>
       <label title="Where converted files are written. Unassigned devices are listed with their free space.">Output to <select id="cv-dest" onchange="cvDestChanged()"></select></label>
