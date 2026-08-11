@@ -764,7 +764,42 @@ class ConvertManager:
             out["artist"] = artist_guess
         return out
 
-    def _build_args(self, codec: str, opts: Dict[str, Any]) -> List[str]:
+    def _source_bit_depth(self, path: Path) -> int:
+        """
+        The source's REAL stored sample depth, or 0 when it has none.
+
+        A lossy file (AAC/MP3/Opus/Vorbis) stores no sample depth at all: it
+        reports sample_fmt=fltp and no bits_per_raw_sample, because it decodes to
+        32-bit FLOAT. Treating that as "the original depth" is how converting an
+        M4A to FLAC produced a 24-bit s32 file -- bigger than the source, with
+        not one bit of extra information in it.
+
+        Returns 0 for those so the caller can pick a sane depth instead of
+        inheriting the decoder's working format.
+        """
+        try:
+            r = subprocess.run(
+                [self.ffmpeg.replace("ffmpeg", "ffprobe"), "-v", "error",
+                 "-select_streams", "a:0", "-show_entries",
+                 "stream=bits_per_raw_sample,sample_fmt", "-of", "json",
+                 str(path)],
+                capture_output=True, text=True, timeout=30)
+            st = (json.loads(r.stdout).get("streams") or [{}])[0]
+        except Exception:  # noqa: BLE001
+            return 0
+        try:
+            n = int(st.get("bits_per_raw_sample") or 0)
+        except (TypeError, ValueError):
+            n = 0
+        if n:
+            return n
+        fmt = str(st.get("sample_fmt") or "")
+        # Integer formats carry a real depth; float ones do not.
+        return {"u8": 8, "s16": 16, "s16p": 16,
+                "s32": 32, "s32p": 32}.get(fmt, 0)
+
+    def _build_args(self, codec: str, opts: Dict[str, Any],
+                    src: Optional[Path] = None) -> List[str]:
         mode = str(opts.get("mode", "")).upper()
         br = int(opts.get("bitrate") or 0)
         q = str(opts.get("quality") or "")
@@ -787,6 +822,13 @@ class ConvertManager:
                 args += ["-b:a", f"{br or 192}k"]
         elif codec in ("flac", "wav"):
             depth = str(opts.get("bit_depth") or "original").strip().lower()
+            if depth in ("", "original", "keep") and src is not None:
+                # "original" means the SOURCE's depth -- resolve it explicitly
+                # rather than letting the encoder inherit the decoder's format.
+                # A lossy source has none (0), and 16 bits already holds
+                # everything it can represent, so anything more is dead weight.
+                sd = self._source_bit_depth(src)
+                depth = "16" if sd <= 16 else ("24" if sd <= 24 else "32")
             if codec == "flac":
                 args += ["-c:a", "flac"]
                 mv = re.search(r"(\d+)", q)
@@ -984,7 +1026,7 @@ class ConvertManager:
             job["state"] = "running"
             job["out"] = dst.name
             dur = self._duration(src)
-            args = self._build_args(job["codec"], job["opts"])
+            args = self._build_args(job["codec"], job["opts"], src)
             meta: List[str] = ["-map_metadata", "0"]
             for k, v in self._missing_tags(src).items():
                 meta += ["-metadata", f"{k}={v}"]
