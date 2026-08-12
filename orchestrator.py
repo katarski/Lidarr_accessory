@@ -8314,31 +8314,49 @@ class Orchestrator:
         return sorted({m.group(1).lower().strip()
                        for m in self._UNOFFICIAL_RE.finditer(title or "")})
 
-    # A release that advertises VIDEO is never a music album, whatever else the
-    # title says. Three Simply Red concert Blu-rays were grabbed for the album
-    # "Blue" on 2026-08-11 because RuTracker writes the genre into the title and
-    # "blue-eyed soul" contains the album name. Two of the three carried a
-    # "live at"/"live in" marker; the third -- "Simply Red. Montreux Jazz
-    # Festival 2016 [2017, ..., HDTV, 720p]" -- carried NO unofficial marker at
-    # all, so no amount of tuning the live/compilation words would have stopped
-    # it. The resolution/codec IS the reliable signal.
-    _VIDEO_RE = re.compile(
+    # A release whose title advertises a NON-AUDIO payload is never a music
+    # album, whatever else it says. Two measured cases, both grabbed:
+    #
+    #  * 2026-08-11 -- three Simply Red concert Blu-rays taken for the album
+    #    "Blue", because RuTracker writes the genre into the title and
+    #    "blue-eyed soul" contains the album name. Two carried a "live at" /
+    #    "live in" marker; the third ("... Montreux Jazz Festival 2016 [2017,
+    #    ..., HDTV, 720p]") carried NO unofficial marker at all, so tuning the
+    #    live/compilation wordlist could never have stopped it.
+    #  * 2026-08-12 -- the band "Corona" pulled in `[3D Models] 3DSky Pro
+    #    3D-Models Collection ... [Corona|V-Ray|*.max, FBX, OBJ]`, because
+    #    Corona is also a 3D renderer. "Collection" made it look like a
+    #    discography, and a discography is scored on fill value alone, so it
+    #    skipped every content check. The pipeline then grabbed 78 GiB just to
+    #    learn there was no audio in it -- eight times in two minutes.
+    #
+    # The payload words are in the title both times. Read them before grabbing.
+    _NON_AUDIO_RE = re.compile(
+        # video
         r"(?i)\b(bd ?rip|blu ?-? ?ray|bdremux|hdtv|pdtv|dvd ?rip|dvd ?[59]|"
         r"hd ?rip|web ?-? ?dl|x ?26[45]|h\.? ?26[45]|xvid|divx|"
-        r"[0-9]{3,4}p|mkv|avi|vob|ifo)\b")
+        r"[0-9]{3,4}p|mkv|avi|vob|ifo"
+        # 3D / CAD asset packs
+        r"|3d ?-? ?models?|3dsky|3ddd|v ?-? ?ray|fbx|\*\.max|3ds ?max"
+        # ebooks and software
+        r"|epub|mobi|azw3|keygen|cracked|\.exe|apk)\b")
+    # Kept deliberately narrow. Words that DO occur in real music releases are
+    # left out however tempting: "pdf"/"djvu" (booklet and scan tags),
+    # "repack"/"portable" (scene tags), "blender"/"obj"/"max" (band names,
+    # "Max Richter"), and console names (game soundtracks are music).
     # ...except formats that are audio delivered on a video-era disc, which the
     # pipeline explicitly supports (DVD-Audio ISOs, Blu-ray Audio).
-    _VIDEO_EXEMPT_RE = re.compile(
+    _NON_AUDIO_EXEMPT_RE = re.compile(
         r"(?i)\b(dvd ?-? ?a(udio)?|blu ?-? ?ray ?audio|bd ?-? ?a(udio)?|"
         r"audio ?_? ?ts|sacd|dsd|dff|dsf)\b")
 
-    def _release_is_video(self, title: str) -> str:
-        """The video marker that disqualifies this release, or '' if it is
-        audio. Exempts DVD-Audio / Blu-ray Audio, which ARE music."""
+    def _release_is_non_audio(self, title: str) -> str:
+        """The payload marker that disqualifies this release, or '' if it looks
+        like audio. Exempts DVD-Audio / Blu-ray Audio, which ARE music."""
         t = title or ""
-        if self._VIDEO_EXEMPT_RE.search(t):
+        if self._NON_AUDIO_EXEMPT_RE.search(t):
             return ""
-        m = self._VIDEO_RE.search(t)
+        m = self._NON_AUDIO_RE.search(t)
         return m.group(1).lower().strip() if m else ""
 
     def _album_allows_unofficial(self, album_rec: Optional[Dict[str, Any]],
@@ -8444,7 +8462,7 @@ class Orchestrator:
             if not guid or guid in blocked:
                 continue
             title = raw.get("title") or ""
-            vid = self._release_is_video(title)
+            vid = self._release_is_non_audio(title)
             if vid:
                 dropped_video.append(f"{title} [{vid}]")
                 continue
@@ -10205,7 +10223,7 @@ class Orchestrator:
             # (`is_disco`) is judged on fill value alone and skips the
             # unofficial check entirely, so this is the only gate a concert
             # Blu-ray would ever meet on the artist path.
-            vid = self._release_is_video(title)
+            vid = self._release_is_non_audio(title)
             if vid:
                 dropped_video_a += 1
                 continue
