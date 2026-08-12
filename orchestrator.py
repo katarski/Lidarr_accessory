@@ -8242,8 +8242,14 @@ class Orchestrator:
         """
         want = [w for w in (want_norm or "").split() if w]
         seq = difflib.SequenceMatcher(None, want_norm, title_norm).ratio()
-        if len(want) < 2:
-            # One token ("4", "112") is far too weak to accept on containment.
+        # Containment is only evidence when the words carry information. A
+        # dotted initialism explodes into single letters -- "M.I.A." + the
+        # album "/\/\ /\ Y /\" normalizes to the tokens m, i, a, y, and every
+        # one of those appears in the letter soup of
+        # "C.O.Y.C.A.M.I.I.K. - Two Cassettes", which then scored a perfect
+        # 1.0 and was grabbed. Require at least two tokens of >= 2 characters
+        # before containment may speak; otherwise fall back to the ratio.
+        if len([w for w in want if len(w) >= 2]) < 2:
             return seq
         have = set((title_norm or "").split())
         return 1.0 if all(w in have for w in want) else seq
@@ -8392,6 +8398,17 @@ class Orchestrator:
         dropped_junk: List[str] = []
         dropped_dead = 0
         scored: List[Dict[str, Any]] = []
+        # Short-artist guard, mirroring the artist-level search. Only for names
+        # that collapse to <= 4 characters ("M.I.A." -> mia, "112", "U2"):
+        # those are weak enough to turn up inside unrelated titles, so the
+        # release must actually START with the artist. Longer names are left
+        # unguarded here on purpose -- a "Various Artists" album is titled
+        # "VA - ..." on every tracker, and requiring the name would drop the
+        # lot of them.
+        artn = self._norm_title(artist)
+        artn_bare = artn.replace(" ", "")
+        guard_artist = bool(artn) and len(artn_bare) <= 4
+        dropped_artist = 0
         for raw in releases or []:
             if (raw.get("protocol") or "").lower() != "torrent":
                 continue
@@ -8399,6 +8416,9 @@ class Orchestrator:
             if not guid or guid in blocked:
                 continue
             title = raw.get("title") or ""
+            if guard_artist and not self._norm_title(title).startswith(artn):
+                dropped_artist += 1
+                continue
             q = raw.get("quality") or {}
             qname = ((q.get("quality") or {}).get("name")
                      or q.get("name") or "")
@@ -8445,6 +8465,11 @@ class Orchestrator:
                 "interactive search: %s / %s -- skipped %d release(s) with "
                 "< %d seeder(s) (dead swarm)",
                 artist, album, dropped_dead, min_seeders)
+        if dropped_artist:
+            logger.info(
+                "interactive search: %s / %s -- skipped %d release(s) that do "
+                "not start with the short artist name %r",
+                artist, album, dropped_artist, artist)
         # Relevant (title >= floor) first; then lossless precedence (when
         # preferring); then title/seeder score. So a lossless of the right album
         # wins, but an irrelevant lossless never beats a relevant lossy.
