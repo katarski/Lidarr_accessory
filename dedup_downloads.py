@@ -144,12 +144,18 @@ def read_tags(path: Path) -> tuple[str, str]:
 
 
 def album_complete_in_library(
-    lidarr: LidarrClient, artist: str, album: str, _cache: dict = None, llm=None
+    lidarr: LidarrClient, artist: str, album: str, _cache: dict = None, llm=None,
+    out: dict = None,
 ):
     """
     Return (complete: bool, have: int, total: int). `complete` is True only
     when Lidarr knows the artist+album and every monitored track has a file.
     Mirrors the pipeline's _album_already_in_library check.
+
+    `out`, when given, receives the matched Lidarr album record under "album"
+    (however it was matched -- exact, word-subset or LLM). Callers that need to
+    ask a follow-up question about the album should use it rather than redo the
+    matching, which is the delicate part.
 
     Matching is EXACT on a normalized title against the artist's full album
     list -- not Lidarr's fuzzy find_album substring search, which both
@@ -231,6 +237,8 @@ def album_complete_in_library(
                             break
         if not alb:
             return False, 0, 0
+        if out is not None:
+            out["album"] = alb
         album_id = alb.get("id")
         full = lidarr.get_album(album_id) or {}
         stats = full.get("statistics") or alb.get("statistics") or {}

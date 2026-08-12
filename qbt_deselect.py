@@ -246,6 +246,43 @@ def _file_album_key(f: Dict[str, Any], torrent_name: str) -> str:
     return "/".join(adir) if adir else torrent_name
 
 
+def _release_big_enough(
+    lidarr: LidarrClient, album: Optional[Dict[str, Any]], want: int,
+    _cache: Optional[Dict[int, int]] = None,
+) -> int:
+    """
+    The track count of the LARGEST release Lidarr knows for this album, if it
+    can hold `want` tracks -- else 0.
+
+    This answers "does an edition with these bonus tracks actually exist?".
+    Lidarr's release list comes straight from MusicBrainz, so a US bonus-track
+    edition that MusicBrainz has appears here and a tracker-only assembly does
+    not. Read-only: it decides whether to KEEP the download, never switches
+    anything.
+    """
+    if not album or want <= 0:
+        return 0
+    try:
+        album_id = int(album.get("id") or 0)
+    except (TypeError, ValueError):
+        return 0
+    if not album_id:
+        return 0
+    if _cache is not None and album_id in _cache:
+        biggest = _cache[album_id]
+    else:
+        biggest = 0
+        try:
+            for r in lidarr.iter_album_releases(album_id) or []:
+                biggest = max(biggest, int(r.get("trackCount") or 0))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("release lookup failed for album %s: %s", album_id, exc)
+            return 0
+        if _cache is not None:
+            _cache[album_id] = biggest
+    return biggest if biggest >= want else 0
+
+
 def plan_torrent(
     lidarr: LidarrClient, torrent_name: str, files: List[Dict[str, Any]],
     forced_artist: str = "", llm=None,
@@ -273,6 +310,7 @@ def plan_torrent(
     # Cache Lidarr artist/album lookups across this torrent's many folders
     # (a discography can be 100+ folders -- don't re-query per folder).
     lib_cache: Dict[str, Any] = {}
+    rel_cache: Dict[int, int] = {}
     plan: List[Dict[str, Any]] = []
     for key, afiles in sorted(groups.items()):
         parts = _rel_parts(key)
@@ -283,8 +321,9 @@ def plan_torrent(
         # name ("50 Cent - Before I Self Destruct (2009) [FLAC]") -- otherwise a
         # single-album torrent keeps its "Artist - " prefix and never matches.
         album = _clean_album(album_raw, artist=artist)
+        matched: Dict[str, Any] = {}
         complete, have, total = album_complete_in_library(
-            lidarr, artist, album, _cache=lib_cache, llm=llm
+            lidarr, artist, album, _cache=lib_cache, llm=llm, out=matched
         )
         if _is_noise_category(key) or _album_looks_unofficial(album):
             # Noise-category folder (bootlegs/live/singles/...): deselect by
@@ -296,6 +335,32 @@ def plan_torrent(
             # Deselect only when the library fully has it AND has >= as many
             # tracks as the torrent folder (don't drop a bigger edition).
             deselect = bool(complete and total >= len(afiles))
+            if complete and total < len(afiles):
+                # Owned, but the tracker folder is BIGGER than the release
+                # Lidarr monitors -- a deluxe/bonus edition. Keeping the whole
+                # folder means re-downloading every track you already have to
+                # gain the extras, which is what made Priscilla Ahn's "This Is
+                # Where We Are" (13/13 owned, 16 files on the tracker: 13 +
+                # 3 US bonus) sit selected for download.
+                #
+                # So keep it only when the extras have somewhere to LAND: a
+                # release of this same album, known to Lidarr/MusicBrainz, big
+                # enough to hold them. The import path switches to it later
+                # (_align_release_to_disk, exact count + immediate import) --
+                # re-pointing a populated album HERE would unmap the files you
+                # already have, which is what cost Let It Be 27 tracks.
+                # No such release exists -> the extras can never be tracked,
+                # so the folder is redundant and gets dropped.
+                room = _release_big_enough(
+                    lidarr, matched.get("album"), len(afiles), _cache=rel_cache)
+                deselect = not room
+                logger.info(
+                    "  edition check: %s / %s -- library release holds %d, "
+                    "tracker folder has %d -> %s", artist, album, total,
+                    len(afiles),
+                    "keeping (a %d-track release exists to hold the extras)"
+                    % room if room else
+                    "deselecting (no release of this album can hold the extras)")
         allf = all_by_key.get(key, afiles)
         plan.append({
             "artist": artist, "album": album,
