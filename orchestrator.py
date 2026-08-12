@@ -25,6 +25,7 @@ import difflib
 import hashlib
 import json
 import logging
+import logging.handlers
 import os
 import re
 import shutil
@@ -11609,6 +11610,78 @@ class Orchestrator:
             return f"(log file not found: {path})"
         except OSError as exc:  # noqa: BLE001
             return f"(could not read log: {exc})"
+
+    def clear_log(self, which: str = "pipeline") -> tuple:
+        """
+        Empty the pipeline log (and drop its rotated .1/.2/... siblings) for
+        the WebUI's Clear button. Returns (ok, message).
+
+        Truncation goes through the live RotatingFileHandler rather than
+        `open(path, "w")`: the handler holds the file open and keeps writing at
+        its own offset, so truncating underneath it leaves a file that reports
+        megabytes of NULs and reads as corrupt. Seeking the handler's own
+        stream to 0 resets writer and file together.
+
+        `flac2mp3` belongs to the Lidarr container and is mounted read-only, so
+        it is refused rather than half-attempted.
+        """
+        if which and which != "pipeline":
+            return False, "only the pipeline log can be cleared here"
+        path = getattr(self.cfg, "log_file", None)
+        if not path:
+            return False, "no log file configured"
+        freed = 0
+        try:
+            freed = Path(path).stat().st_size
+        except OSError:
+            pass
+        done = False
+        for h in list(logging.getLogger().handlers):
+            if not isinstance(h, logging.handlers.RotatingFileHandler):
+                continue
+            try:
+                if Path(getattr(h, "baseFilename", "")) != Path(path):
+                    continue
+            except (TypeError, ValueError):
+                continue
+            try:
+                h.acquire()
+                try:
+                    if h.stream is None:
+                        h.stream = h._open()
+                    h.stream.seek(0)
+                    h.stream.truncate()
+                    h.stream.flush()
+                    done = True
+                finally:
+                    h.release()
+            except OSError as exc:
+                return False, f"could not truncate: {exc}"
+        if not done:
+            # No handler owns it (log-to-stdout config) -- plain truncate.
+            try:
+                with open(path, "w", encoding="utf-8"):
+                    pass
+            except OSError as exc:
+                return False, f"could not truncate: {exc}"
+        rotated = 0
+        try:
+            base = Path(path)
+            for old in sorted(base.parent.glob(base.name + ".*")):
+                if old.suffix.lstrip(".").isdigit():
+                    try:
+                        freed += old.stat().st_size
+                        old.unlink()
+                        rotated += 1
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        msg = "Log cleared (%.1f MB freed%s)." % (
+            freed / 1048576.0,
+            f", {rotated} rotated file(s) removed" if rotated else "")
+        logger.info("WebUI: %s", msg)
+        return True, msg
 
     # WebUI Settings tab: (id, section, cfgkey, label, type, default, help).
     # Curated tunables the user changes most; saved to webui_overrides.json

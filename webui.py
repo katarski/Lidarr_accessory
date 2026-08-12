@@ -365,6 +365,7 @@ _PAGE = r"""<!doctype html>
         <option value="0">entire file</option>
       </select>
       <button class="b-copy" onclick="loadLog()">Refresh log</button>
+      <button class="b-copy" onclick="clearLog()">Clear log</button>
       <label class="muted"><input type="checkbox" id="logtail" checked> auto-refresh</label>
     </div>
     <pre id="logbox" style="background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:.6rem;max-height:70vh;overflow:auto;font-size:.72rem;white-space:pre-wrap"></pre>
@@ -1102,6 +1103,14 @@ function loadLog(){
   var w=document.getElementById('logwhich').value;
   fetch('/api/log?lines='+n+'&which='+w).then(function(r){return r.text();}).then(function(t){
     var b=document.getElementById('logbox');b.textContent=t;b.scrollTop=b.scrollHeight;});}
+function clearLog(){
+  var w=document.getElementById('logwhich').value;
+  if(w!=='pipeline'){toast('Only pipeline.log can be cleared here');return;}
+  if(!confirm('Empty pipeline.log and delete its rotated copies? This cannot be undone.'))return;
+  fetch('/api/log/clear',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({which:w})}).then(function(r){return r.json();})
+   .then(function(j){toast(j.message||(j.ok?'cleared':'failed'));loadLog();})
+   .catch(function(e){toast('error: '+e);});}
 function toggleFilter(el){var f=el.dataset.f;FILT[f]=!FILT[f];el.classList.toggle('on',FILT[f]);render();}
 function fmtStr(d){if(!d||!d.formats)return'';return Object.keys(d.formats).map(function(k){return k.replace('.','')+'×'+d.formats[k];}).join(' ');}
 function buildColMenu(){var cm=document.getElementById('cm');cm.innerHTML=COLS.map(function(c,i){return '<label><input type="checkbox" '+(c.on?'checked':'')+' onchange="COLS['+i+'].on=this.checked;render()"> '+h(c.name)+'</label>';}).join('');}
@@ -2135,6 +2144,18 @@ def make_handler(store, actions: HeldActions):
                     self._json(501, {"ok": False, "message": "not supported"})
                     return
                 ok, msg = actions.save_settings(changes)
+                self._json(200 if ok else 500, {"ok": ok, "message": msg})
+                return
+            if path == "/api/log/clear":
+                length = int(self.headers.get("Content-Length") or 0)
+                try:
+                    body = json.loads(self.rfile.read(length) or b"{}") or {}
+                except Exception:  # noqa: BLE001
+                    body = {}
+                if not hasattr(actions, "clear_log"):
+                    self._json(501, {"ok": False, "message": "not supported"})
+                    return
+                ok, msg = actions.clear_log(body.get("which") or "pipeline")
                 self._json(200 if ok else 500, {"ok": ok, "message": msg})
                 return
             if path in ("/api/assembly/remove", "/api/assembly/find",
