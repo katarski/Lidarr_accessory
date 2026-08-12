@@ -761,6 +761,21 @@ class OrchestratorConfig:
     # Re-examine an unchanged, already-handled folder after this long (default
     # 24h). Lower = more retries, higher = less repeated work.
     sweep_ledger_ttl_seconds: int = 86400
+
+    # --- Persistent CUE ledger --------------------------------------------
+    # The per-.cue equivalent of the sweep ledger. Without it, `_skip_seen`
+    # died with the process and every restart re-split every disc image under
+    # the watch root -- an hour of ffmpeg, per restart, to reach the same
+    # verdict as last time.
+    cue_ledger_enabled: bool = True
+    # JSON store {cue_path: [sig, ts, outcome, attempts]}. Lives in /config.
+    cue_ledger_file: Optional[Path] = None
+    # How many times a CUE whose import FAILED may be retried before it is
+    # left to the WebUI needs-attention list. Successes are never retried.
+    cue_ledger_max_attempts: int = 3
+    # Forget entries older than this so the file cannot grow forever and a
+    # long-dormant folder eventually gets a fresh look.
+    cue_ledger_ttl_days: int = 90
     # JSON store backing the Assembly tab. Lives in /config.
     assembly_file: Optional[Path] = None
     # JSON state file: {albumId: {first_missing, last_attempt, blocklisted[]}}.
@@ -924,6 +939,15 @@ class Orchestrator:
         """
         # Don't spam logs for CUEs we already decided to skip this run.
         if cue_path in self._skip_seen:
+            return None
+
+        # ...and don't redo one we already decided in a PREVIOUS run. This is
+        # checked before stability/companion/parse work so a settled CUE costs
+        # one stat() instead of a full re-split. See _cue_ledger_verdict.
+        verdict = self._cue_ledger_verdict(cue_path)
+        if verdict:
+            logger.info("Skipping %s -- %s", cue_path.name, verdict)
+            self._skip_seen.add(cue_path)
             return None
 
         logger.info("=== Processing %s ===", cue_path)
@@ -2718,6 +2742,122 @@ class Orchestrator:
         led = self._sweep_ledger()
         led[str(folder)] = [self._folder_signature(audios), now_ts]
         self._sweep_led_dirty = True
+
+    # ---- persistent CUE ledger ------------------------------------------
+    # `_skip_seen` lives in memory, so every restart re-queued every .cue under
+    # the watch root and re-ran the FULL split. Measured: "Dimash Kudaibergen -
+    # ID" -- a 384 MB single-image FLAC -- was decoded into 15 tracks on
+    # 2026-08-11 at 08:50, 14:10, 15:10, 15:22, 15:49, 23:37 and again on
+    # 2026-08-12 08:52. Seven identical encodes of an album Lidarr already
+    # holds at 11/11, each ending in the same failed import. The container gets
+    # recreated on every code deploy, so this is routine, not rare.
+    #
+    # Per [[incremental state]]: mark on a DECIDED verdict (via _record), never
+    # on discovery, write with temp+replace, and bound the file by age.
+    _CUE_RETRYABLE = frozenset({"failed", "skipped_unmonitored"})
+
+    def _cue_ledger(self) -> Dict[str, Any]:
+        """Lazily load the on-disk CUE ledger ({cue: [sig, ts, outcome, n]})."""
+        led = getattr(self, "_cue_led", None)
+        if led is not None:
+            return led
+        led = {}
+        path = getattr(self.cfg, "cue_ledger_file", None)
+        if path:
+            try:
+                data = json.loads(Path(path).read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    led = data.get("cues") or {}
+            except Exception:  # noqa: BLE001 (missing/corrupt -> start fresh)
+                led = {}
+        self._cue_led = led
+        return led
+
+    def _cue_ledger_save(self) -> None:
+        """Persist the CUE ledger. Called on every recorded verdict, so a kill
+        mid-pass never loses more than the entry being written."""
+        path = getattr(self.cfg, "cue_ledger_file", None)
+        if not path:
+            return
+        led = getattr(self, "_cue_led", None) or {}
+        ttl = max(1, int(getattr(self.cfg, "cue_ledger_ttl_days", 90))) * 86400
+        cutoff = time.time() - ttl
+        try:
+            for k in [k for k, v in led.items()
+                      if not isinstance(v, list) or len(v) < 4
+                      or float(v[1]) < cutoff]:
+                led.pop(k, None)
+            if len(led) > 20000:
+                for k in sorted(led, key=lambda k: led[k][1])[:len(led) - 20000]:
+                    led.pop(k, None)
+            pth = Path(path)
+            pth.parent.mkdir(parents=True, exist_ok=True)
+            tmp = pth.with_suffix(pth.suffix + ".tmp")
+            tmp.write_text(json.dumps({"cues": led}), encoding="utf-8")
+            tmp.replace(pth)
+        except (OSError, ValueError, TypeError) as exc:
+            logger.debug("cue ledger save failed: %s", exc)
+
+    @staticmethod
+    def _cue_signature(cue_path: Path) -> str:
+        """Identity of a .cue: its own size + mtime. Deliberately NOT the
+        folder's -- in_place staging writes the split tracks INTO the source
+        folder, so a folder signature would change every pass and the entry
+        would never match."""
+        try:
+            st = cue_path.stat()
+            return "%d:%d" % (st.st_size, int(st.st_mtime))
+        except OSError:
+            return ""
+
+    def _cue_ledger_verdict(self, cue_path: Path) -> Optional[str]:
+        """
+        Why this CUE should be skipped without any work, or None to process it.
+        A CUE that changed on disk always gets a fresh look.
+        """
+        if not getattr(self.cfg, "cue_ledger_enabled", True):
+            return None
+        if cue_path.suffix.lower() != ".cue":
+            return None            # folder handoffs use the sweep ledger
+        rec = self._cue_ledger().get(str(cue_path))
+        if not isinstance(rec, list) or len(rec) < 4:
+            return None
+        sig, ts, outcome, attempts = rec[0], rec[1], str(rec[2]), int(rec[3])
+        if not sig or sig != self._cue_signature(cue_path):
+            return None            # the .cue itself changed -> redo it
+        when = datetime.fromtimestamp(
+            float(ts), timezone.utc).isoformat(timespec="seconds")
+        if outcome not in self._CUE_RETRYABLE:
+            return f"already handled ({outcome} at {when})"
+        cap = max(1, int(getattr(self.cfg, "cue_ledger_max_attempts", 3)))
+        if attempts >= cap:
+            return (f"gave up after {attempts} attempt(s) ({outcome} at "
+                    f"{when}); it is in the WebUI needs-attention list -- "
+                    f"replace or edit the .cue to retry")
+        return None
+
+    def _cue_ledger_mark(self, cue_path: Path, outcome: str) -> None:
+        """Record a DECIDED verdict for this CUE and flush it immediately."""
+        if not getattr(self.cfg, "cue_ledger_enabled", True):
+            return
+        try:
+            if Path(cue_path).suffix.lower() != ".cue":
+                return
+        except (TypeError, ValueError):
+            return
+        sig = self._cue_signature(Path(cue_path))
+        if not sig:
+            return                 # gone from disk -> nothing to remember
+        led = self._cue_ledger()
+        prev = led.get(str(cue_path))
+        attempts = 0
+        if (isinstance(prev, list) and len(prev) >= 4 and prev[0] == sig
+                and str(prev[2]) in self._CUE_RETRYABLE):
+            attempts = int(prev[3])
+        if outcome in self._CUE_RETRYABLE:
+            attempts += 1
+        led[str(cue_path)] = [sig, time.time(), outcome, attempts]
+        self._cue_ledger_save()
 
     def _dvda_rip_in_progress(
         self, folder: Path, isos: List[Path], now_ts: float,
@@ -8044,7 +8184,53 @@ class Orchestrator:
 
     @staticmethod
     def _norm_title(s: str) -> str:
-        return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
+        """
+        Normalize a title for comparison. Script-folding FIRST, because the
+        `[^a-z0-9]` collapse below is an ASCII filter: it does not merely
+        ignore other scripts, it DELETES them. 'Георги Христов' normalized to
+        the empty string, so every release for a Cyrillic-titled artist scored
+        a 0.0 title relation and was dropped as irrelevant -- the same for
+        Greek, and 'Beyoncé' lost its final letter.
+
+        NFKD + combining-strip folds accents; _translit_cyrillic folds Cyrillic
+        to Latin, so the Lidarr side and the tracker side meet in the middle
+        whichever script each of them used ('Георги Христов' == 'Georgi
+        Hristov'). This is the same folding _match_key already applied to
+        artist/album equality -- the search ranking simply never got it.
+        """
+        s = unicodedata.normalize("NFKD", (s or "").lower())
+        s = "".join(ch for ch in s if not unicodedata.combining(ch))
+        s = _translit_cyrillic(s)
+        return re.sub(r"[^a-z0-9]+", " ", s).strip()
+
+    @classmethod
+    def _title_relation(cls, want_norm: str, title_norm: str) -> float:
+        """
+        How well does a release title match "<artist> <album>"? Both inputs are
+        already _norm_title'd.
+
+        Plain SequenceMatcher over the WHOLE title punishes the decoration that
+        trackers put around a perfectly good release. Measured case:
+
+            want  : jewel 0304
+            title : (Pop / Folk / Soft Rock) Jewel - 0304 - 2003 (CD-Extra),
+                    FLAC (image+.cue) lossless
+            ratio : 0.26   -> below the 0.45 floor -> "needs manual attention"
+
+        That is the release a human picks instantly, and every RuTracker entry
+        is shaped like it (genre prefix, format/bitrate suffix). So when the
+        title CONTAINS every word of the artist+album, the relation is 1.0 --
+        the extra words are format noise, not evidence of a different album.
+        Anything short of a full containment falls back to the old ratio, so a
+        partial/wrong match is judged exactly as before.
+        """
+        want = [w for w in (want_norm or "").split() if w]
+        seq = difflib.SequenceMatcher(None, want_norm, title_norm).ratio()
+        if len(want) < 2:
+            # One token ("4", "112") is far too weak to accept on containment.
+            return seq
+        have = set((title_norm or "").split())
+        return 1.0 if all(w in have for w in want) else seq
 
     def _classify_torrent_files(
         self, files: List[Dict[str, Any]]
@@ -8218,8 +8404,7 @@ class Orchestrator:
             if seeders < min_seeders:
                 dropped_dead += 1
                 continue
-            ratio = difflib.SequenceMatcher(
-                None, want, self._norm_title(title)).ratio()
+            ratio = self._title_relation(want, self._norm_title(title))
             # (a) Swarm health is a first-class ranking signal now (was a token
             # seeders/10 nudge), so among releases of the right album the
             # healthiest wins.
@@ -9665,6 +9850,47 @@ class Orchestrator:
                 files, self._album_track_titles(int(album_id)))
         return best
 
+    def _await_torrent_files(self, qbt, thash: str, label: str,
+                             timeout: int = 90) -> List[Dict[str, Any]]:
+        """
+        Wait for a freshly-grabbed torrent's file list, THEN pause it. Returns
+        [] if the metadata never arrived.
+
+        Order matters and used to be the other way round. A magnet has no file
+        list until its metadata is fetched from the swarm, and a PAUSED magnet
+        never fetches it -- so pausing first guaranteed an empty list, and both
+        verifiers fail open on an empty list ("accept, no metadata"). Every
+        magnet grab was therefore accepted unverified: that is how Jewel's
+        'Let It Snow: A Holiday Collection' was logged as an ACCEPTED
+        discography with `0 album folder(s)` when it is neither a discography
+        nor missing from the library.
+
+        Torrents that came from a .torrent file already have their files, so
+        they return on the first poll and are paused just as promptly.
+        """
+        files: List[Dict[str, Any]] = []
+        deadline = time.time() + max(15, timeout)
+        try:
+            while time.time() < deadline:
+                files = qbt.files(thash) or []
+                if files:
+                    break
+                time.sleep(3)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("file list poll failed for %s: %s", label, exc)
+        finally:
+            # Pause regardless: verification decides next, and we don't want a
+            # rejected release pulling data in the meantime.
+            try:
+                qbt.pause(thash)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("pause failed for %s: %s", thash[:12], exc)
+        if not files:
+            logger.warning(
+                "interactive search: %s -- no torrent metadata after %ds; "
+                "accepting it UNVERIFIED (contents unknown)", label, timeout)
+        return files
+
     def _verify_torrent(self, qbt, thash: str, expected: int, label: str,
                         album_id: Optional[int] = None):
         """
@@ -9680,14 +9906,7 @@ class Orchestrator:
         """
         if qbt is None:
             return "accept", {"note": "no qbit"}
-        qbt.pause(thash)
-        files: List[Dict[str, Any]] = []
-        deadline = time.time() + 45
-        while time.time() < deadline:
-            files = qbt.files(thash)
-            if files:
-                break
-            time.sleep(3)
+        files = self._await_torrent_files(qbt, thash, label)
         if not files:
             return "accept", {"note": "no metadata"}
         info = self._classify_torrent_files(files)
@@ -9810,7 +10029,15 @@ class Orchestrator:
                 "interactive search: %s -> grabbing %r (seeders=%s quality=%s)",
                 label, cand.get("title"), cand.get("_seeders"),
                 cand.get("_quality"))
-            if not self.lidarr.release_grab(guid, indexer):
+            # Force the attribution -- this album is the whole reason we ran
+            # the search, so a release Lidarr can't parse ("Unknown Artist")
+            # should still be grabbed against it, exactly as confirming the
+            # UI's "Grab Release" dialog does.
+            if not self.lidarr.release_grab(
+                guid, indexer, album_id=aid,
+                artist_id=(alb.get("artistId")
+                           or (alb.get("artist") or {}).get("id")),
+            ):
                 continue
             thash, _rec = self._await_queue_hash(artist, album, timeout=90)
             if not thash:
@@ -9898,8 +10125,17 @@ class Orchestrator:
             # weak as a loose substring (it matched "Now That's What I Call Music
             # (101 to 112)"), so require it to PREFIX the title (real releases
             # are "Artist - ..."); longer, distinctive names may match anywhere.
+            #
+            # The length is measured with the SPACES REMOVED. "M.I.A."
+            # normalizes to "m i a" -- 5 characters, so it used to escape the
+            # short-name rule and fall through to the loose substring test,
+            # where it matched the middle of "A.R.M.I.A" ("...a r m i a...")
+            # and grabbed that band's 2008-2014 discography. Dotted initialisms
+            # are the very case the strict rule exists for; only the spaces
+            # were hiding them. "mia" is 3 -> strict prefix -> no match.
             if artn:
-                if len(artn) <= 4 or artn.replace(" ", "").isdigit():
+                bare = artn.replace(" ", "")
+                if len(bare) <= 4 or bare.isdigit():
                     if not tnorm.startswith(artn):
                         continue
                 elif artn not in tnorm:
@@ -9908,7 +10144,7 @@ class Orchestrator:
             # Best single missing-album match.
             best_ratio, best_match = 0.0, None
             for mn, t, exp, aid in m_norm:
-                ratio = difflib.SequenceMatcher(None, mn, tnorm).ratio()
+                ratio = self._title_relation(mn, tnorm)
                 if ratio > best_ratio:
                     best_ratio, best_match = ratio, (t, exp, aid)
             is_disco = info is not None
@@ -10007,14 +10243,7 @@ class Orchestrator:
         folders. Returns ('accept', n_albums) or ('reject:<reason>', n)."""
         if qbt is None:
             return "accept", 0
-        qbt.pause(thash)
-        files: List[Dict[str, Any]] = []
-        deadline = time.time() + 45
-        while time.time() < deadline:
-            files = qbt.files(thash)
-            if files:
-                break
-            time.sleep(3)
+        files = self._await_torrent_files(qbt, thash, tname)
         if not files:
             return "accept", 0
         audio = [f for f in files
@@ -10104,7 +10333,15 @@ class Orchestrator:
                 "interactive search: %s -> grabbing %s %r (fills~%s seeders=%s "
                 "quality=%s)", artist_name, kind, cand.get("title"),
                 cand.get("_fill"), cand.get("_seeders"), cand.get("_quality"))
-            if not self.lidarr.release_grab(guid, indexer):
+            # Same forced attribution as the album path. A discography can
+            # only be pinned to the artist; a single-album match also carries
+            # the album id it fills (`_match` is (title, expected, album_id)).
+            _m = cand.get("_match") or ()
+            _alb_id = (_m[2] if (not cand.get("_is_disco") and len(_m) > 2)
+                       else None)
+            if not self.lidarr.release_grab(
+                guid, indexer, album_id=_alb_id, artist_id=artist_id,
+            ):
                 continue
             thash, _rec = self._await_queue_hash_by_title(
                 cand.get("title") or "", timeout=90)
@@ -10485,6 +10722,13 @@ class Orchestrator:
                     w.writerow(row)
         except OSError as exc:
             logger.debug("Ledger write failed: %s", exc)
+        # Remember this verdict across restarts so the CUE is never re-split.
+        # Every terminal path in _process() funnels through _record(), which
+        # makes this the one place that has to be right.
+        try:
+            self._cue_ledger_mark(Path(cue_path), outcome)
+        except Exception as exc:  # noqa: BLE001 (bookkeeping is never fatal)
+            logger.debug("cue ledger mark failed for %s: %s", cue_path, exc)
         # Keep the manual-attention WebUI store (#11) in sync with this outcome.
         self._update_held(cue_path, outcome, artist, album, track_count, reason)
 
@@ -11585,6 +11829,12 @@ class Orchestrator:
          "Keep a ledger of folders already handled so a restart does not replay the whole queue."),
         ("watch.sweep_ledger_ttl_seconds", "watch", "sweep_ledger_ttl_seconds", "Ledger memory (s)", "int", 86400,
          "How long a folder stays remembered before it is looked at again."),
+        ("watch.cue_ledger_enabled", "watch", "cue_ledger_enabled", "Remember split cues", "bool", True,
+         "Remember the verdict for every .cue so a restart never re-splits an album that was already handled."),
+        ("watch.cue_ledger_max_attempts", "watch", "cue_ledger_max_attempts", "Cue retry limit", "int", 3,
+         "How many times a .cue whose import failed is retried before it is left to the needs-attention list. Successes are never retried."),
+        ("watch.cue_ledger_ttl_days", "watch", "cue_ledger_ttl_days", "Cue memory (days)", "int", 90,
+         "How long a .cue stays remembered before it is looked at again."),
         ("lidarr.library_audit_enabled", "lidarr", "library_audit_enabled", "Library audit", "bool", False,
          "Scan the library itself for albums that are mis-tagged, incomplete or in the wrong place."),
         ("lidarr.library_audit_on_startup", "lidarr", "library_audit_on_startup", "Library audit at startup", "bool", False,
@@ -11750,6 +12000,9 @@ class Orchestrator:
             "watch.sweep_min_stable_seconds",
             "watch.sweep_ledger_enabled",
             "watch.sweep_ledger_ttl_seconds",
+            "watch.cue_ledger_enabled",
+            "watch.cue_ledger_max_attempts",
+            "watch.cue_ledger_ttl_days",
             "lidarr.library_audit_enabled",
             "lidarr.library_audit_on_startup",
             "lidarr.library_audit_interval_seconds",

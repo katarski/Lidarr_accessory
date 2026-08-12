@@ -305,18 +305,38 @@ class LidarrClient:
                 "artist release search failed for artist %s: %s", artist_id, exc)
             return []
 
-    def release_grab(self, guid: str, indexer_id: int) -> bool:
+    def release_grab(
+        self,
+        guid: str,
+        indexer_id: int,
+        album_id: Optional[int] = None,
+        artist_id: Optional[int] = None,
+    ) -> bool:
         """
         Grab one specific release (interactive push): POST /api/v1/release
         {guid, indexerId}. Lidarr sends it to its download client (qBittorrent)
         and creates a queue item whose `downloadId` is the torrent hash. Returns
         True on success.
+
+        `album_id` / `artist_id` are the FORCED attribution the Lidarr UI sends
+        when you confirm its "Grab Release" dialog. Lidarr's interactive search
+        returns plenty of releases it could not parse to a library artist --
+        they show the red (!) with rejection `Unknown Artist` and
+        `downloadAllowed: false` (RuTracker's `(Rock) [LP] [24/192] Artist -
+        Album ...` naming is the usual case). A bare {guid, indexerId} POST for
+        those hits `remoteAlbum.Artist == null` server-side and comes back 404,
+        which is why the pipeline used to skip exactly the releases the user
+        would have grabbed by hand. Passing the ids we already know makes Lidarr
+        attribute the release to that album instead of re-parsing the title --
+        the same thing clicking "Grab" does.
         """
+        payload: Dict[str, Any] = {"guid": guid, "indexerId": int(indexer_id)}
+        if album_id is not None:
+            payload["albumId"] = int(album_id)
+        if artist_id is not None:
+            payload["artistId"] = int(artist_id)
         try:
-            self._post(
-                "/api/v1/release",
-                {"guid": guid, "indexerId": int(indexer_id)},
-            )
+            self._post("/api/v1/release", payload)
             return True
         except Exception as exc:  # noqa: BLE001
             # A 404 here is the EXPECTED answer for any release Lidarr cannot
@@ -330,8 +350,10 @@ class LidarrClient:
             if status == 404:
                 logger.info(
                     "release grab declined by Lidarr (404 -- it cannot match "
-                    "this release to a library artist/album); caller will add "
-                    "it directly if it has a magnet")
+                    "this release to a library artist/album%s); caller will add "
+                    "it directly if it has a magnet",
+                    "" if album_id is None
+                    else f", even with albumId={album_id} forced")
             else:
                 logger.warning("release grab failed (guid=%s): %s",
                                str(guid)[:80], exc)

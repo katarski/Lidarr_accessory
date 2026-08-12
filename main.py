@@ -204,6 +204,9 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     put("watch", "cue_rescan_interval_seconds", "CUE_RESCAN_INTERVAL", int)
     put("watch", "sweep_ledger_enabled", "SWEEP_LEDGER_ENABLED", _as_bool)
     put("watch", "sweep_ledger_ttl_seconds", "SWEEP_LEDGER_TTL", int)
+    put("watch", "cue_ledger_enabled", "CUE_LEDGER_ENABLED", _as_bool)
+    put("watch", "cue_ledger_max_attempts", "CUE_LEDGER_MAX_ATTEMPTS", int)
+    put("watch", "cue_ledger_ttl_days", "CUE_LEDGER_TTL_DAYS", int)
     put("qbittorrent", "ai_match", "QBIT_AI_MATCH", _as_bool)
     # AcoustID fingerprint identification (import fallback)
     put("acoustid", "enabled", "ACOUSTID_ENABLED", _as_bool)
@@ -1237,6 +1240,15 @@ def main() -> int:
         sweep_ledger_path = isearch_state_path.parent / "sweep_seen.json"
     else:
         sweep_ledger_path = None
+    # Persistent per-.cue ledger -- same place, same shape as the sweep one.
+    _cue_led_cfg = (lidarr_cfg.get("cue_ledger_file")
+                    or watch_cfg.get("cue_ledger_file"))
+    if _cue_led_cfg:
+        cue_ledger_path = Path(_cue_led_cfg)
+    elif isearch_state_path is not None:
+        cue_ledger_path = isearch_state_path.parent / "cue_seen.json"
+    else:
+        cue_ledger_path = None
     # Album-assembly store (requirement e) -- beside the other /config state.
     _asm_cfg = lidarr_cfg.get("assembly_file")
     if _asm_cfg:
@@ -1560,6 +1572,16 @@ def main() -> int:
         sweep_ledger_ttl_seconds=int(
             watch_cfg.get("sweep_ledger_ttl_seconds",
                           lidarr_cfg.get("sweep_ledger_ttl_seconds", 86400))),
+        cue_ledger_enabled=bool(
+            watch_cfg.get("cue_ledger_enabled",
+                          lidarr_cfg.get("cue_ledger_enabled", True))),
+        cue_ledger_file=cue_ledger_path,
+        cue_ledger_max_attempts=int(
+            watch_cfg.get("cue_ledger_max_attempts",
+                          lidarr_cfg.get("cue_ledger_max_attempts", 3))),
+        cue_ledger_ttl_days=int(
+            watch_cfg.get("cue_ledger_ttl_days",
+                          lidarr_cfg.get("cue_ledger_ttl_days", 90))),
         interactive_search_cooldown_seconds=int(
             lidarr_cfg.get("interactive_search_cooldown_seconds", 43200)
         ),
