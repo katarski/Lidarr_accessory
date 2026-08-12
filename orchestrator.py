@@ -8314,6 +8314,33 @@ class Orchestrator:
         return sorted({m.group(1).lower().strip()
                        for m in self._UNOFFICIAL_RE.finditer(title or "")})
 
+    # A release that advertises VIDEO is never a music album, whatever else the
+    # title says. Three Simply Red concert Blu-rays were grabbed for the album
+    # "Blue" on 2026-08-11 because RuTracker writes the genre into the title and
+    # "blue-eyed soul" contains the album name. Two of the three carried a
+    # "live at"/"live in" marker; the third -- "Simply Red. Montreux Jazz
+    # Festival 2016 [2017, ..., HDTV, 720p]" -- carried NO unofficial marker at
+    # all, so no amount of tuning the live/compilation words would have stopped
+    # it. The resolution/codec IS the reliable signal.
+    _VIDEO_RE = re.compile(
+        r"(?i)\b(bd ?rip|blu ?-? ?ray|bdremux|hdtv|pdtv|dvd ?rip|dvd ?[59]|"
+        r"hd ?rip|web ?-? ?dl|x ?26[45]|h\.? ?26[45]|xvid|divx|"
+        r"[0-9]{3,4}p|mkv|avi|vob|ifo)\b")
+    # ...except formats that are audio delivered on a video-era disc, which the
+    # pipeline explicitly supports (DVD-Audio ISOs, Blu-ray Audio).
+    _VIDEO_EXEMPT_RE = re.compile(
+        r"(?i)\b(dvd ?-? ?a(udio)?|blu ?-? ?ray ?audio|bd ?-? ?a(udio)?|"
+        r"audio ?_? ?ts|sacd|dsd|dff|dsf)\b")
+
+    def _release_is_video(self, title: str) -> str:
+        """The video marker that disqualifies this release, or '' if it is
+        audio. Exempts DVD-Audio / Blu-ray Audio, which ARE music."""
+        t = title or ""
+        if self._VIDEO_EXEMPT_RE.search(t):
+            return ""
+        m = self._VIDEO_RE.search(t)
+        return m.group(1).lower().strip() if m else ""
+
     def _album_allows_unofficial(self, album_rec: Optional[Dict[str, Any]],
                                  album_title: str = "") -> bool:
         """
@@ -8396,6 +8423,7 @@ class Orchestrator:
             self.cfg, "interactive_search_refuse_unofficial", True))
         allows_unofficial = self._album_allows_unofficial(album_rec, album)
         dropped_junk: List[str] = []
+        dropped_video: List[str] = []
         dropped_dead = 0
         scored: List[Dict[str, Any]] = []
         # Short-artist guard, mirroring the artist-level search. Only for names
@@ -8416,6 +8444,10 @@ class Orchestrator:
             if not guid or guid in blocked:
                 continue
             title = raw.get("title") or ""
+            vid = self._release_is_video(title)
+            if vid:
+                dropped_video.append(f"{title} [{vid}]")
+                continue
             if guard_artist and not self._norm_title(title).startswith(artn):
                 dropped_artist += 1
                 continue
@@ -8470,6 +8502,13 @@ class Orchestrator:
                 "interactive search: %s / %s -- skipped %d release(s) that do "
                 "not start with the short artist name %r",
                 artist, album, dropped_artist, artist)
+        if dropped_video:
+            logger.info(
+                "interactive search: %s / %s -- refused %d VIDEO release(s) "
+                "(concert film / rip, not an audio album): %s",
+                artist, album, len(dropped_video),
+                "; ".join(dropped_video[:3])
+                + (" ..." if len(dropped_video) > 3 else ""))
         # Relevant (title >= floor) first; then lossless precedence (when
         # preferring); then title/seeder score. So a lossless of the right album
         # wins, but an irrelevant lossless never beats a relevant lossy.
@@ -10153,6 +10192,7 @@ class Orchestrator:
         n_missing = len(missing)
         m_norm = [(self._norm_title(f"{artist} {t}"), t, exp, aid)
                   for (t, exp, aid) in missing]
+        dropped_video_a = 0
         scored: List[Dict[str, Any]] = []
         for raw in releases or []:
             if (raw.get("protocol") or "").lower() != "torrent":
@@ -10161,6 +10201,14 @@ class Orchestrator:
             if not guid or guid in blocked:
                 continue
             title = raw.get("title") or ""
+            # Video first, before anything else can whitelist it: a discography
+            # (`is_disco`) is judged on fill value alone and skips the
+            # unofficial check entirely, so this is the only gate a concert
+            # Blu-ray would ever meet on the artist path.
+            vid = self._release_is_video(title)
+            if vid:
+                dropped_video_a += 1
+                continue
             tnorm = self._norm_title(title)
             # Artist-name guard. A short/numeric artist name ("112", "4") is too
             # weak as a loose substring (it matched "Now That's What I Call Music
@@ -10237,6 +10285,11 @@ class Orchestrator:
                      _disco=info, _is_disco=is_disco, _fill=fill,
                      _match=best_match, _title_ratio=round(best_ratio, 3))
             scored.append(r)
+        if dropped_video_a:
+            logger.info(
+                "interactive search: %s -- refused %d VIDEO release(s) at the "
+                "artist scope (concert film / rip, not audio)",
+                artist, dropped_video_a)
         scored.sort(key=lambda x: x["_score"], reverse=True)
         return scored
 
