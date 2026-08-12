@@ -18,6 +18,7 @@ The `path_mapping` config handles that translation.
 
 from __future__ import annotations
 
+import difflib
 import logging
 import re
 import time
@@ -826,6 +827,33 @@ class LidarrClient:
         for a in results:
             if target in a.get("artistName", "").strip().lower():
                 return a
+        # Last resort: a very close spelling. Romanization of a non-Latin name
+        # is not standardized, so the tag on disk and Lidarr's canonical name
+        # legitimately differ by a letter or two -- "Dimash Kudaibergen" (tags,
+        # cue sheets, trackers) vs "Dimash Qudaibergen" (Lidarr/MusicBrainz).
+        # None of the tests above can bridge that, so the pre-flight kept
+        # missing and the album was re-split on every restart for an album
+        # already sitting complete in the library.
+        #
+        # Kept deliberately tight, because callers act destructively on a hit:
+        # >= 0.90 similarity AND a clear margin over the runner-up, so an
+        # ambiguous field never resolves to a guess. Logged, because a fuzzy
+        # identity match should never be silent.
+        if ntarget and len(ntarget) >= 6:
+            scored = sorted(
+                ((difflib.SequenceMatcher(
+                    None, ntarget, _norm_artist(a.get("artistName", ""))).ratio(), a)
+                 for a in results),
+                key=lambda x: x[0], reverse=True)
+            if scored and scored[0][0] >= 0.90:
+                runner_up = scored[1][0] if len(scored) > 1 else 0.0
+                if scored[0][0] - runner_up >= 0.05:
+                    best = scored[0][1]
+                    logger.info(
+                        "find_artist: '%s' matched '%s' on spelling (%.2f, next "
+                        "best %.2f) -- romanization variant",
+                        name, best.get("artistName"), scored[0][0], runner_up)
+                    return best
         return None
 
     def list_albums_for_artist(self, artist_id: int) -> List[Dict[str, Any]]:

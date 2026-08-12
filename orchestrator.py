@@ -1079,19 +1079,34 @@ class Orchestrator:
                 artist_name = cue.performer or ""
                 album_name = cue.title or ""
                 stats = matched.get("statistics") or {}
+                lib_total = int(stats.get("totalTrackCount") or 0)
+                cue_tracks = len(cue.tracks or [])
+                # The library edition may be SMALLER than what this CUE holds.
+                # Dimash's "iD" is complete at 11/11 in Lidarr while the disc
+                # image is a 15-track pressing -- deleting the source would
+                # destroy four tracks the library has no record of, and the
+                # only copy of the disc image. So skipping is unconditional
+                # (the point is to stop re-splitting), but deleting requires
+                # the library to hold at least as much as we would remove.
+                bigger_on_disk = bool(cue_tracks and lib_total
+                                      and cue_tracks > lib_total)
                 logger.info(
-                    "Already in Lidarr library: %s / %s "
-                    "(%s/%s tracks present). Deleting source folder.",
-                    artist_name, album_name,
-                    stats.get("trackFileCount"), stats.get("totalTrackCount"),
+                    "Already in Lidarr library: %s / %s (%s/%s tracks "
+                    "present). %s", artist_name, album_name,
+                    stats.get("trackFileCount"), lib_total,
+                    ("Source PRESERVED -- this CUE has %d track(s), more than "
+                     "the %d-track edition Lidarr holds."
+                     % (cue_tracks, lib_total)) if bigger_on_disk
+                    else "Deleting source folder.",
                 )
-                # Remove the source CUE + audio as well (belt-and-braces
-                # for the case where the CUE sits at watch_root with no
-                # enclosing folder and _delete_source_folder bails out).
-                if self.cfg.delete_originals_on_success:
-                    self._delete_originals(cue_path, audio_path)
-                if self.cfg.delete_source_folder_on_success:
-                    self._delete_source_folder(cue_path)
+                if not bigger_on_disk:
+                    # Remove the source CUE + audio as well (belt-and-braces
+                    # for the case where the CUE sits at watch_root with no
+                    # enclosing folder and _delete_source_folder bails out).
+                    if self.cfg.delete_originals_on_success:
+                        self._delete_originals(cue_path, audio_path)
+                    if self.cfg.delete_source_folder_on_success:
+                        self._delete_source_folder(cue_path)
                 self._skip_seen.add(cue_path)
                 self._record(
                     cue_path, outcome="already_in_lidarr", pre_split=False,
