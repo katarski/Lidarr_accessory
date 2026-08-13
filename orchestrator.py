@@ -4366,6 +4366,50 @@ class Orchestrator:
             logger.warning("RenameFiles for album %s failed: %s", album_id, exc)
             return False
 
+    @staticmethod
+    def _title_candidates_from_name(path: Path) -> List[str]:
+        """
+        Song titles a filename might be carrying, best first.
+
+        The old fallback stripped only a leading `NN - ` and used the rest. That
+        is wrong for the most common filename in the whole library -- the one
+        LIDARR ITSELF writes, `{Artist} - {Album} - {track:00} - {Title}`:
+
+            Nine Inch Nails - TRON - Ares - ... - 07 - A Question of Trust.flac
+
+        which does not start with a number, so the whole 70-character string was
+        taken as the title and matched nothing. That is why 8 tracks of TRON:
+        Ares stayed unregistered while sitting in the album's own folder --
+        their tags were unusable and the only other signal was thrown away.
+
+        So: prefer the text after the LAST ` - <digits> - ` separator, then the
+        leading-number strip, then the bare stem.
+        """
+        stem = path.stem
+        out: List[str] = []
+        m = None
+        for m in re.finditer(r"\s[-_]\s*\d{1,3}\s*[-_]\s", stem):
+            pass                      # keep the last one
+        if m:
+            tail = stem[m.end():].strip()
+            if tail:
+                out.append(tail)
+        lead = re.sub(r"^\s*\d{1,3}[\s.\-_]+", "", stem).strip()
+        if lead and lead not in out:
+            out.append(lead)
+        if stem not in out:
+            out.append(stem)
+        return out
+
+    # A MEDIUM folder inside an album, as Lidarr writes it from
+    # `{Medium Format} {medium:00}`: "CD 01", "Vinyl 02", "12 Vinyl 01"
+    # (the format is `12" Vinyl` with the illegal quote stripped),
+    # "Digital Media 01", plus the bare "CD1"/"Disc 2" spelling.
+    _MEDIUM_DIR_RE = re.compile(
+        r"(?i)^\s*(?:\d+\s*[\"']?\s*)?"
+        r"(?:cd|disc|disk|dvd|vinyl|lp|cassette|sacd|blu-?ray|digital\s*media|"
+        r"media|file|side)\b[\s.\-_]*\d+\s*$")
+
     def _library_album_dirs(self, artist_dir: Path) -> List[Path]:
         """
         The album folders under an artist, descending through CONTAINER folders.
@@ -4388,11 +4432,22 @@ class Orchestrator:
             try:
                 if not child.is_dir():
                     continue
+                kids = list(child.iterdir())
                 direct = any(p.is_file() and p.suffix.lower() in _ALL_AUDIO_EXTS
-                             for p in child.iterdir())
+                             for p in kids)
             except OSError:
                 continue
             if direct:
+                out.append(child)
+                continue
+            # MEDIA of one album, not separate albums. Lidarr writes these
+            # itself from `{Medium Format} {medium:00}` -- "12 Vinyl 01",
+            # "CD 02", "Digital Media 01" -- and _album_subfolders only knows
+            # the bare "CD1"/"Disc 2" spelling, so without this a 2xVinyl album
+            # was split into two albums, each matched separately and each
+            # half-empty.
+            if any(self._MEDIUM_DIR_RE.match(p.name or "")
+                   for p in kids if p.is_dir()):
                 out.append(child)
                 continue
             subs = self._album_subfolders(child)
@@ -4681,8 +4736,10 @@ class Orchestrator:
                 # track, whereas a title match either hits or it doesn't.
                 cand = by_title.get(norm_title(self._tag_title(p)))
                 if cand is None:
-                    stem = re.sub(r"^\s*\d{1,3}[\s.\-_]+", "", p.stem)
-                    cand = by_title.get(norm_title(stem))
+                    for stem in self._title_candidates_from_name(p):
+                        cand = by_title.get(norm_title(stem))
+                        if cand is not None:
+                            break
                 if cand is not None and int(cand.get("id") or 0) not in used:
                     t = cand
             if not t or not t.get("id") or int(t["id"]) in used:
