@@ -138,6 +138,29 @@ def _translit_cyrillic(value: str) -> str:
     return "".join(out)
 
 
+def _demojibake(value: str) -> str:
+    """
+    Repair Cyrillic text that was written as cp1251 bytes and read back as
+    latin-1: 'Ëèëè Èâàíîâà' -> 'Лили Иванова', 'Òàíãî' -> 'Танго'.
+
+    Endemic in older Eastern-European rips -- most files in the Lili Ivanova
+    discography carry tags in this state, which is why Lidarr's manualimport
+    reported `artist=None album=None` for them. Only accepted when the repair
+    yields MORE Cyrillic than the input, so ordinary latin text is untouched.
+    """
+    if not value or not any("À" <= ch <= "ÿ" for ch in value):
+        return value
+
+    def _cyr(s: str) -> int:
+        return sum(1 for c in s if "Ѐ" <= c <= "ӿ")
+
+    try:
+        fixed = value.encode("latin-1").decode("windows-1251")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return value
+    return fixed if _cyr(fixed) > _cyr(value) else value
+
+
 def _match_key(value: str) -> str:
     """
     Aggressive normalization for fuzzy equality of artist/album names.
@@ -154,7 +177,7 @@ def _match_key(value: str) -> str:
       * Cyrillic -> Latin (Азис == Azis, Болка == Bolka)
       * Double/extra whitespace
     """
-    s = (value or "").strip().lower()
+    s = _demojibake((value or "").strip()).lower()
     if not s:
         return ""
     # Fold accents: "Beyoncé" -> "beyonce", "Motörhead" -> "motorhead".
@@ -4302,6 +4325,7 @@ class Orchestrator:
 
     def _resolve_library_album(
         self, artist_id: int, names: List[str], n_files: int,
+        audios: Optional[List[Path]] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Find the Lidarr album for a LIBRARY folder when name matching fails.
@@ -4337,7 +4361,7 @@ class Orchestrator:
         for nm in names:
             want |= set(_identity_tokens(nm or ""))
         if not want:
-            return None
+            return self._resolve_album_by_song_titles(artist_id, audios or [])
         best, best_score = None, 0.0
         for a in albums:
             got = set(_identity_tokens(str(a.get("title") or "")))
@@ -4365,7 +4389,100 @@ class Orchestrator:
                 (names[0] if names else "?")[:44], str(best.get("title"))[:44],
                 best.get("id"), best_score, n_files)
             return best
-        return None
+        # Nothing the NAME can say resolved it. Ask the songs.
+        return self._resolve_album_by_song_titles(artist_id, audios or [])
+
+    def _resolve_album_by_song_titles(
+        self, artist_id: int, audios: List[Path],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Resolve a folder to a Lidarr album by matching its SONG TITLES against
+        the album's track list -- the last resort when no name test can work.
+
+        Every name-based stage above compares the folder/tag title to Lidarr's
+        album title, which is useless when the two are in different scripts.
+        Measured on Лили Иванова, whose Lidarr metadata is Cyrillic while the
+        folders are Latin transliterations:
+
+            folder                       Lidarr album            name  songs
+            1976 - Stari Moi Priatelu    Лили Иванова (1976)     0.27   12/12
+            1977 - Gulubut               Лили Иванова (1977)     0.11   12/12
+            1981 - Kein Film War Schoner Lili Ivanova            0.30   10/10
+
+        Three albums whose names share essentially nothing, and whose track
+        lists match perfectly. The songs are the evidence; the folder name is
+        not. Titles are folded through _match_key, so mojibake, Cyrillic and
+        accents all meet on the same ground.
+
+        Only INCOMPLETE albums are considered, and only a decisive winner is
+        returned: >= 60% of the album's tracks present AND a clear margin over
+        the runner-up, so a greatest-hits record cannot swallow a studio album
+        whose songs it happens to share.
+        """
+        if not artist_id or not audios:
+            return None
+        want: List[str] = []
+        for p in audios:
+            t = _match_key(self._tag_title(p))
+            if not t:
+                stem = re.sub(r"^\s*\d{1,3}[\s.\-_]+", "", p.stem)
+                t = _match_key(stem)
+            if t:
+                want.append(t)
+        if len(want) < 3:
+            return None            # too little to be decisive
+        try:
+            albums = self.lidarr.list_albums_for_artist(int(artist_id)) or []
+        except Exception:  # noqa: BLE001
+            return None
+        scored: List[Tuple[float, Dict[str, Any], int]] = []
+        for a in albums:
+            st = a.get("statistics") or {}
+            have = int(st.get("trackFileCount") or 0)
+            total = int(st.get("totalTrackCount") or 0)
+            if total and have >= total:
+                continue           # already complete -- nothing to fix
+            try:
+                tracks = self.lidarr.list_tracks_for_album(int(a["id"])) or []
+            except Exception:  # noqa: BLE001
+                continue
+            if not tracks:
+                continue
+            pool = list(want)
+            hits = 0
+            for tr in tracks:
+                key = _match_key(str(tr.get("title") or ""))
+                if not key:
+                    continue
+                best_i, best_s = -1, 0.0
+                for i, w in enumerate(pool):
+                    s = difflib.SequenceMatcher(None, key, w).ratio()
+                    if s > best_s:
+                        best_i, best_s = i, s
+                if best_i >= 0 and best_s >= 0.72:
+                    hits += 1
+                    pool.pop(best_i)      # each file answers for one track
+            scored.append((hits / float(len(tracks)), a, hits))
+        if not scored:
+            return None
+        scored.sort(key=lambda x: x[0], reverse=True)
+        cov, alb, hits = scored[0]
+        runner = scored[1][0] if len(scored) > 1 else 0.0
+        if cov < 0.60 or (cov - runner) < 0.15:
+            if cov >= 0.30:
+                logger.info(
+                    "audit: song-title resolve inconclusive for %s (best %r "
+                    "%.2f vs next %.2f) -- leaving it alone",
+                    audios[0].parent.name[:40], str(alb.get("title"))[:40],
+                    cov, runner)
+            return None
+        logger.info(
+            "audit: resolved %r to Lidarr album %r (id=%s) by SONG TITLES "
+            "(%d/%d tracks present, next best %.2f) -- the names do not match, "
+            "the songs do", audios[0].parent.name[:44],
+            str(alb.get("title"))[:44], alb.get("id"), hits,
+            int(round(hits / cov)) if cov else 0, runner)
+        return alb
 
     def _import_library_folder_by_tracknumber(
         self, album_rec: Dict[str, Any], artist_id: int, audios: List[Path],
@@ -7211,7 +7328,7 @@ class Orchestrator:
                                         aid,
                                         [self._album_from_tags(audios),
                                          album_dir.name, album_name_guess],
-                                        len(audios))
+                                        len(audios), audios=audios)
                                 if rec is not None:
                                     # Point the album at the release that MATCHES
                                     # THE FILES before mapping them. Lidarr
