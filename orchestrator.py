@@ -4324,6 +4324,57 @@ class Orchestrator:
         # Nothing the NAME can say resolved it. Ask the songs.
         return self._resolve_album_by_song_titles(artist_id, audios or [])
 
+    def _library_album_dirs(self, artist_dir: Path) -> List[Path]:
+        """
+        The album folders under an artist, descending through CONTAINER folders.
+
+        The audit used to take `artist_dir.iterdir()` as the album list. A
+        library organised as `Артист/Студийные альбомы/2000 - Ветрове/` then
+        broke twice over: the container holds no audio of its own, so the
+        rglob fallback swallowed all 76 files across its six albums as ONE
+        album, which can never match anything -- and the six real albums were
+        never examined. Sixteen tracks of Ветрове sat unregistered for two
+        weeks that way.
+
+        A folder with audio directly in it is an album. A folder without is a
+        container IF its subfolders are separate titled albums -- reusing
+        _album_subfolders, which already refuses to split bare CD1/CD2 discs,
+        so a normal multi-disc album stays one album.
+        """
+        out: List[Path] = []
+        for child in sorted(artist_dir.iterdir()):
+            try:
+                if not child.is_dir():
+                    continue
+                direct = any(p.is_file() and p.suffix.lower() in _ALL_AUDIO_EXTS
+                             for p in child.iterdir())
+            except OSError:
+                continue
+            if direct:
+                out.append(child)
+                continue
+            subs = self._album_subfolders(child)
+            if not subs:
+                # One nested album, or bare CD1/CD2 discs. Descend for the
+                # former; leave the latter to the caller's rglob, which
+                # correctly reads both discs as one album.
+                try:
+                    with_audio = [d for d in sorted(child.iterdir())
+                                  if d.is_dir() and any(
+                                      p.is_file()
+                                      and p.suffix.lower() in _ALL_AUDIO_EXTS
+                                      for p in d.iterdir())]
+                except OSError:
+                    with_audio = []
+                subs = with_audio if len(with_audio) == 1 else []
+            if subs:
+                logger.debug("audit: %s is a container -- expanding %d album(s)",
+                             child.name, len(subs))
+                out.extend(subs)
+            else:
+                out.append(child)
+        return out
+
     def _rescue_by_song_titles(
         self, key_path: Path, folder: Path, audios: List[Path],
         artist_name: str, album_name: str, reason: str,
@@ -7061,7 +7112,7 @@ class Orchestrator:
             artist_rec = self._lidarr_lookup_artist(artist_dir.name, artist_index)
 
             try:
-                album_children = sorted(artist_dir.iterdir())
+                album_children = self._library_album_dirs(artist_dir)
             except OSError as exc:
                 logger.debug("audit: cannot iterate %s: %s", artist_dir, exc)
                 continue
