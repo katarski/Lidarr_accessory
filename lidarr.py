@@ -1145,6 +1145,16 @@ class LidarrClient:
             logger.warning("get_album(%s) failed: %s", album_id, exc)
             return None
 
+    def list_trackfiles_for_album(self, album_id: int) -> List[Dict[str, Any]]:
+        """Every imported file Lidarr has for this album (id + path). Used to
+        target a RenameFiles command at exactly one album."""
+        try:
+            return self._get("/api/v1/trackfile", albumId=int(album_id)) or []
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("list_trackfiles_for_album(%s) failed: %s",
+                           album_id, exc)
+            return []
+
     def list_tracks_for_album(self, album_id: int) -> List[Dict[str, Any]]:
         """Return the track list for an album (SELECTED release only)."""
         try:

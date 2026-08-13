@@ -4324,6 +4324,48 @@ class Orchestrator:
         # Nothing the NAME can say resolved it. Ask the songs.
         return self._resolve_album_by_song_titles(artist_id, audios or [])
 
+    def _rename_album_to_convention(
+        self, artist_id: int, album_id: int, after_cmd: Optional[int] = None,
+    ) -> bool:
+        """
+        Ask Lidarr to rename an album's files into the user's configured naming
+        scheme. Best-effort; never fatal.
+
+        An explicit trackId import registers files WHERE THEY LIE. That is the
+        whole point when rescuing a folder Lidarr's parser cannot read -- but it
+        leaves the album correct in the database and wrong on disk: Ветрове read
+        16/16 while its files were still `Студийные альбомы/2000 - Ветрове
+        (128 - 192)/01.Vetrove.mp3`. RenameFiles is what moves them to
+        `Ветрове (2000)/Лили Иванова - Ветрове - 01 - Ветрове.mp3`, i.e. to
+        whatever `/config/naming` says, so a rescued album is indistinguishable
+        from a normally-imported one.
+        """
+        if not artist_id or not album_id:
+            return False
+        try:
+            if after_cmd:
+                # Renaming before the import commits would find nothing.
+                self.lidarr.wait_for_command(
+                    int(after_cmd),
+                    timeout_seconds=int(getattr(
+                        self.cfg, "manual_import_timeout_seconds", 300) or 300))
+            files = self.lidarr.list_trackfiles_for_album(int(album_id)) \
+                if hasattr(self.lidarr, "list_trackfiles_for_album") else []
+            ids = [int(f["id"]) for f in (files or []) if f.get("id")]
+            if not ids:
+                return False
+            self.lidarr._post("/api/v1/command", {
+                "name": "RenameFiles", "artistId": int(artist_id),
+                "albumId": int(album_id), "files": ids,
+            })
+            logger.info(
+                "Rescue: asked Lidarr to rename %d file(s) of album %s into the "
+                "configured naming scheme", len(ids), album_id)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("RenameFiles for album %s failed: %s", album_id, exc)
+            return False
+
     def _library_album_dirs(self, artist_dir: Path) -> List[Path]:
         """
         The album folders under an artist, descending through CONTAINER folders.
@@ -4430,6 +4472,7 @@ class Orchestrator:
         logger.info(
             "Song-title rescue: %s -> Lidarr album %r (cmd=%s), %d file(s)",
             folder.name[:50], str(alb.get("title"))[:44], cmd, len(audios))
+        self._rename_album_to_convention(aid, int(alb.get("id") or 0), cmd)
         self._record(
             key_path, outcome="imported_via_manual", pre_split=True,
             artist=artist_name, album=str(alb.get("title") or album_name),
