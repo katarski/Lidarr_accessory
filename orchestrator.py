@@ -41,7 +41,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from cue_parser import Cue, parse_cue
 from dedup_downloads import _EDITION_WORDS as _EDITION_NOISE_WORDS
 from held_store import HeldStore
-from lidarr import LidarrClient
+from lidarr import LidarrClient, _demojibake, _translit_cyrillic
 from ollama_client import OllamaClient
 from splitter import SplitResult, probe_duration, repair_leadin, split_cue
 from tagger import TagPlan, album_folder_name, tag_splits
@@ -91,74 +91,6 @@ def _album_track_file_count(album_rec: Dict[str, Any]) -> int:
         if isinstance(v, int):
             return v
     return 0
-
-
-# Cyrillic -> Latin transliteration (Bulgarian/Russian/Ukrainian covered).
-# Needed so folder "Azis" matches Lidarr artist "Азис", folder "Bolka"
-# matches Lidarr album "Болка", etc. NFKD alone won't do this -- Cyrillic
-# letters are distinct code points, not Latin-with-diacritics.
-_CYRILLIC_TO_LATIN = {
-    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e",
-    "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l",
-    "м": "m", "н": "n", "о": "o", "п": "p", "р": "r", "с": "s",
-    "т": "t", "у": "u", "ф": "f", "х": "h", "ц": "ts", "ч": "ch",
-    "ш": "sh", "щ": "sht", "ъ": "a", "ь": "y", "ю": "yu", "я": "ya",
-    "ы": "y", "э": "e", "ё": "yo",
-    # Ukrainian extras
-    "є": "ye", "і": "i", "ї": "yi", "ґ": "g",
-    # Serbian / Macedonian extras (phonetic Latin)
-    "ј": "j", "љ": "lj", "њ": "nj", "ћ": "c", "ђ": "dj", "џ": "dz",
-    "ѕ": "dz", "ѓ": "g", "ќ": "k", "ѐ": "e", "ѝ": "i", "ѣ": "e",
-}
-
-
-def _translit_cyrillic(value: str) -> str:
-    """
-    Fold any Cyrillic characters in `value` to a rough Latin
-    transliteration. ASCII letters pass through untouched. Used as a
-    best-effort equalizer for cross-script name matching: the folder on
-    disk is often Latin ("Azis") while Lidarr stores the canonical
-    Cyrillic ("Азис"), or vice-versa.
-    """
-    if not value:
-        return value
-    # Fast path: no Cyrillic, nothing to do.
-    if not any("\u0400" <= ch <= "\u04ff" for ch in value):
-        return value
-    out = []
-    for ch in value:
-        lower = ch.lower()
-        rep = _CYRILLIC_TO_LATIN.get(lower)
-        if rep is None:
-            out.append(ch)
-        elif ch == lower:
-            out.append(rep)
-        else:
-            out.append(rep.capitalize() if len(rep) > 1 else rep.upper())
-    return "".join(out)
-
-
-def _demojibake(value: str) -> str:
-    """
-    Repair Cyrillic text that was written as cp1251 bytes and read back as
-    latin-1: 'Ëèëè Èâàíîâà' -> 'Лили Иванова', 'Òàíãî' -> 'Танго'.
-
-    Endemic in older Eastern-European rips -- most files in the Lili Ivanova
-    discography carry tags in this state, which is why Lidarr's manualimport
-    reported `artist=None album=None` for them. Only accepted when the repair
-    yields MORE Cyrillic than the input, so ordinary latin text is untouched.
-    """
-    if not value or not any("À" <= ch <= "ÿ" for ch in value):
-        return value
-
-    def _cyr(s: str) -> int:
-        return sum(1 for c in s if "Ѐ" <= c <= "ӿ")
-
-    try:
-        fixed = value.encode("latin-1").decode("windows-1251")
-    except (UnicodeEncodeError, UnicodeDecodeError):
-        return value
-    return fixed if _cyr(fixed) > _cyr(value) else value
 
 
 def _match_key(value: str) -> str:
@@ -4392,6 +4324,69 @@ class Orchestrator:
         # Nothing the NAME can say resolved it. Ask the songs.
         return self._resolve_album_by_song_titles(artist_id, audios or [])
 
+    def _rescue_by_song_titles(
+        self, key_path: Path, folder: Path, audios: List[Path],
+        artist_name: str, album_name: str, reason: str,
+    ) -> bool:
+        """
+        Last resort for a folder Lidarr will not import: identify the album from
+        its SONG TITLES, then import by explicit trackId. True if it landed.
+
+        Shared by the downloads handoff and the library audit so a folder is
+        rescued wherever it happens to sit. The artist still has to resolve --
+        that part works even across scripts, because MusicBrainz carries the
+        romanized alias ("Lili Ivanova" -> Лили Иванова) and find_artist also
+        tolerates a spelling variant. It is only the ALBUM that no name test can
+        reach.
+        """
+        if not audios:
+            return False
+        # The folder name is a transliteration, but the TAGS often carry the
+        # canonical Cyrillic artist ("Лили Иванова") even when the album tag is
+        # missing or mojibake -- so try both.
+        tag_artist = ""
+        for p in audios[:3]:
+            tag_artist = (self._read_audio_tags(p) or ("", ""))[0]
+            if tag_artist:
+                break
+        aid = None
+        for nm in (artist_name, tag_artist):
+            if not nm:
+                continue
+            try:
+                rec = self.lidarr.find_artist(nm)
+            except Exception:  # noqa: BLE001
+                rec = None
+            if rec and rec.get("id"):
+                aid = int(rec["id"])
+                break
+        if not aid:
+            return False
+        alb = self._resolve_album_by_song_titles(aid, audios)
+        if not alb:
+            return False
+        # Point the album at the release matching what is on disk before
+        # mapping, exactly as the audit does -- otherwise a 12-file folder can
+        # map against a 24-track edition and half the files find no track.
+        try:
+            self._align_release_to_disk(aid, artist_name, str(alb.get("title") or ""),
+                                        audios, album_rec=alb)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("release align failed for %s: %s", folder, exc)
+        cmd = self._import_library_folder_by_tracknumber(alb, aid, audios)
+        if cmd is None:
+            return False
+        logger.info(
+            "Song-title rescue: %s -> Lidarr album %r (cmd=%s), %d file(s)",
+            folder.name[:50], str(alb.get("title"))[:44], cmd, len(audios))
+        self._record(
+            key_path, outcome="imported_via_manual", pre_split=True,
+            artist=artist_name, album=str(alb.get("title") or album_name),
+            track_count=len(audios),
+            reason=f"song-title rescue after: {reason}"[:300],
+        )
+        return True
+
     def _resolve_album_by_song_titles(
         self, artist_id: int, audios: List[Path],
     ) -> Optional[Dict[str, Any]]:
@@ -5087,6 +5082,18 @@ class Orchestrator:
                         cue_path, folder, key_path, f_artist, f_album, audios, reason,
                     ):
                         return
+            # Everything above compares NAMES -- Lidarr's own matcher, our
+            # tag identity, the folder identity. When the download is a
+            # transliteration of a non-Latin release none of them can work:
+            # `1976 - Stari Moi Priatelu` against Lidarr's `Лили Иванова
+            # (1976)` shares no token in any script. Resolve by the SONGS
+            # instead and import by explicit trackId, the same route the
+            # library audit uses. This is the downloads-side half of it --
+            # without it, only music already sitting in the library could ever
+            # be rescued this way.
+            if self._rescue_by_song_titles(key_path, folder, audios,
+                                           artist_name, album_name, reason):
+                return
             logger.warning(
                 "Pre-split handoff: no acceptable candidates (floor=%.0f%%) "
                 "for %s -- leaving audio in place.",

@@ -32,12 +32,94 @@ import requests
 logger = logging.getLogger(__name__)
 
 
+# Cyrillic -> Latin transliteration (Bulgarian/Russian/Ukrainian covered).
+# Needed so folder "Azis" matches Lidarr artist "Азис", folder "Bolka"
+# matches Lidarr album "Болка", etc. NFKD alone won't do this -- Cyrillic
+# letters are distinct code points, not Latin-with-diacritics.
+_CYRILLIC_TO_LATIN = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e",
+    "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l",
+    "м": "m", "н": "n", "о": "o", "п": "p", "р": "r", "с": "s",
+    "т": "t", "у": "u", "ф": "f", "х": "h", "ц": "ts", "ч": "ch",
+    "ш": "sh", "щ": "sht", "ъ": "a", "ь": "y", "ю": "yu", "я": "ya",
+    "ы": "y", "э": "e", "ё": "yo",
+    # Ukrainian extras
+    "є": "ye", "і": "i", "ї": "yi", "ґ": "g",
+    # Serbian / Macedonian extras (phonetic Latin)
+    "ј": "j", "љ": "lj", "њ": "nj", "ћ": "c", "ђ": "dj", "џ": "dz",
+    "ѕ": "dz", "ѓ": "g", "ќ": "k", "ѐ": "e", "ѝ": "i", "ѣ": "e",
+}
+
+
+def _translit_cyrillic(value: str) -> str:
+    """
+    Fold any Cyrillic characters in `value` to a rough Latin
+    transliteration. ASCII letters pass through untouched. Used as a
+    best-effort equalizer for cross-script name matching: the folder on
+    disk is often Latin ("Azis") while Lidarr stores the canonical
+    Cyrillic ("Азис"), or vice-versa.
+    """
+    if not value:
+        return value
+    # Fast path: no Cyrillic, nothing to do.
+    if not any("\u0400" <= ch <= "\u04ff" for ch in value):
+        return value
+    out = []
+    for ch in value:
+        lower = ch.lower()
+        rep = _CYRILLIC_TO_LATIN.get(lower)
+        if rep is None:
+            out.append(ch)
+        elif ch == lower:
+            out.append(rep)
+        else:
+            out.append(rep.capitalize() if len(rep) > 1 else rep.upper())
+    return "".join(out)
+
+
+def _demojibake(value: str) -> str:
+    """
+    Repair Cyrillic text that was written as cp1251 bytes and read back as
+    latin-1: 'Ëèëè Èâàíîâà' -> 'Лили Иванова', 'Òàíãî' -> 'Танго'.
+
+    Endemic in older Eastern-European rips -- most files in the Lili Ivanova
+    discography carry tags in this state, which is why Lidarr's manualimport
+    reported `artist=None album=None` for them.
+
+    The test is deliberately strict, because a naive "did this produce any
+    Cyrillic?" check mangles ordinary accented Latin: 'Beyoncé' round-trips to
+    'Beyoncй' (é is 0xE9, which is 'й' in cp1251) and then transliterates to
+    "beyoncy". Real mojibake is high-range almost throughout, so require at
+    least 3 such characters AND at least 40% of the letters. 'Ëèëè Èâàíîâà' is
+    11 of 11; 'Beyoncé' is 1 of 7 and is left alone.
+    """
+    if not value:
+        return value
+    letters = [c for c in value if c.isalpha()]
+    suspect = [c for c in letters if "À" <= c <= "ÿ"]
+    if len(suspect) < 3 or len(suspect) < 0.4 * len(letters):
+        return value
+
+    def _cyr(s: str) -> int:
+        return sum(1 for c in s if "Ѐ" <= c <= "ӿ")
+
+    try:
+        fixed = value.encode("latin-1").decode("windows-1251")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return value
+    return fixed if _cyr(fixed) > _cyr(value) else value
+
+
 def _norm_artist(s: str) -> str:
     """Fold an artist name for tolerant equality: casefold, strip accents
     (NFKD, drop combining marks), '&' -> 'and', drop a leading 'the ', keep
     [a-z0-9]. So 'Sigur Ros' == 'Sigur Rós', 'Motorhead' == 'Motörhead',
     'AC and DC' == 'AC & DC', 'The Cure' == 'Cure'."""
-    s = (s or "").casefold().replace("&", " and ")
+    # Fold script BEFORE the [^a-z0-9] filter, which deletes rather than
+    # ignores anything non-Latin: "Лили Иванова" normalized to the EMPTY
+    # string, so find_artist could never match a Cyrillic artist by its
+    # romanized name -- and every Cyrillic artist folded to the same "".
+    s = _translit_cyrillic(_demojibake(s or "")).casefold().replace("&", " and ")
     s = "".join(c for c in unicodedata.normalize("NFKD", s)
                 if not unicodedata.combining(c))
     s = re.sub(r"^\s*the\s+", "", s)
