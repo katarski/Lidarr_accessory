@@ -4703,16 +4703,27 @@ class Orchestrator:
         # Quality has to come from Lidarr's own parse of the folder, or the
         # import is accepted and then dies in FileNameBuilder with a
         # NullReferenceException and the file never lands.
+        # Probe EVERY folder the files live in, not just the first one's.
+        # `audios[0].parent` covered one medium of a multi-disc album, so every
+        # file on disc 2 came back without a quality and was dropped as
+        # unmapped -- TRON: Ares mapped exactly its 16 disc-1 files and none of
+        # the 8 sitting in `12 Vinyl 02`, whatever the titles said.
         qmap: Dict[str, Any] = {}
-        try:
-            folder = str(audios[0].parent)
-            for c in (self.lidarr.manual_import_candidates(
-                    self.lidarr.windows_to_lidarr(Path(folder)),
-                    artist_id=artist_id) or []):
-                if c.get("path"):
-                    qmap[str(c["path"])] = c.get("quality")
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("audit: quality probe failed: %s", exc)
+        seen_dirs: set = set()
+        for parent in dict.fromkeys(p.parent for p in audios):
+            key = str(parent)
+            if key in seen_dirs:
+                continue
+            seen_dirs.add(key)
+            try:
+                for c in (self.lidarr.manual_import_candidates(
+                        self.lidarr.windows_to_lidarr(parent),
+                        artist_id=artist_id) or []):
+                    if c.get("path"):
+                        qmap[str(c["path"])] = c.get("quality")
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("audit: quality probe failed for %s: %s",
+                             parent, exc)
         items, unmapped, used = [], 0, set()
         for p in sorted(audios):
             disc, n = self._tag_disc_and_track(p)
@@ -4734,14 +4745,20 @@ class Orchestrator:
                 # rescues a folder whose numbering is missing, wrong, or shifted;
                 # a wrong number silently files the right song under the wrong
                 # track, whereas a title match either hits or it doesn't.
-                cand = by_title.get(norm_title(self._tag_title(p)))
-                if cand is None:
-                    for stem in self._title_candidates_from_name(p):
-                        cand = by_title.get(norm_title(stem))
-                        if cand is not None:
-                            break
-                if cand is not None and int(cand.get("id") or 0) not in used:
-                    t = cand
+                # Try EVERY title we can derive, and keep the first that lands
+                # on a track nobody has claimed. Stopping at the first title
+                # that merely resolves is what lost 8 tracks of TRON: Ares --
+                # those files carry the WRONG tags (the file named
+                # "- 07 - A Question of Trust.flac" is tagged "I Know You Can
+                # Feel It"), so the tag title resolved to a disc-1 track that
+                # was already taken, and the correct filename title was never
+                # tried.
+                for name in ([self._tag_title(p)]
+                             + self._title_candidates_from_name(p)):
+                    cand = by_title.get(norm_title(name or ""))
+                    if cand is not None and int(cand.get("id") or 0) not in used:
+                        t = cand
+                        break
             if not t or not t.get("id") or int(t["id"]) in used:
                 unmapped += 1
                 continue
