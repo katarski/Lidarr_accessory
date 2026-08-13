@@ -7274,14 +7274,35 @@ class Orchestrator:
                         reason = "album not in Lidarr"
                     else:
                         # Album metadata exists. Do tracks actually exist
-                        # in Lidarr's DB? Only flag if Lidarr has ZERO files.
-                        # If Lidarr has ANY files for the album, trust it --
-                        # don't touch a working album over a small track-count
-                        # mismatch (Lidarr is the source of truth for what
-                        # belongs; disk may legitimately have extras like
-                        # bonus tracks, hidden tracks, or rip artifacts).
+                        # in Lidarr's DB?
                         files_in_lidarr = _album_track_file_count(album_rec)
-                        if files_in_lidarr <= 0:
+                        # UNDER-REGISTERED: the folder holds more audio than
+                        # Lidarr has files for, and the album is still short of
+                        # its own track count. Those files are sitting in the
+                        # album's own folder doing nothing, and Lidarr reports
+                        # the tracks as MISSING -- so the interactive search
+                        # goes and downloads them again. TRON: Ares sat at
+                        # 16/24 with all 24 files present; library-wide this is
+                        # 121 albums and ~869 tracks.
+                        #
+                        # Only when BOTH counts say so, so a folder with bonus
+                        # tracks or rip artifacts beyond what Lidarr tracks
+                        # (disk > wanted) is left alone -- the old comment's
+                        # concern, which stays honoured.
+                        wanted = 0
+                        try:
+                            wanted = int((album_rec.get("statistics") or {})
+                                         .get("totalTrackCount") or 0)
+                        except (TypeError, ValueError):
+                            wanted = 0
+                        if (files_in_lidarr > 0 and wanted
+                                and files_in_lidarr < wanted
+                                and len(audios) > files_in_lidarr):
+                            reason = (
+                                "album under-registered: %d file(s) on disk, "
+                                "Lidarr has %d of %d"
+                                % (len(audios), files_in_lidarr, wanted))
+                        elif files_in_lidarr <= 0:
                             # One more live check -- the cached album_rec
                             # may be stale from the index snapshot. Confirm
                             # against Lidarr RIGHT NOW before flagging.
@@ -7306,6 +7327,9 @@ class Orchestrator:
                 # Discrepancy! Decide whether to act.
                 album_key = str(album_dir)
                 action_taken = ""
+                # Defined here, not inside the album_rec branch: the green
+                # gates below close over it and run on every path.
+                _under = reason.startswith("album under-registered")
                 if in_act_mode and album_key not in already_acted:
                     try:
                         if artist_rec is not None:
@@ -7325,7 +7349,16 @@ class Orchestrator:
                                     album_rec.get("title"), album_rec.get("id"),
                                     live_count, len(audios),
                                 )
-                                if live_count > 0:
+                                # "Any file at all means it works" is true for
+                                # the album-is-empty cases this guard was
+                                # written for, but NOT for an under-registered
+                                # album -- that is defined by having some files
+                                # and still being short, so this guard skipped
+                                # exactly the albums the new check exists to
+                                # repair (TRON: Ares, 16 live files, 24 on
+                                # disk). Let those through; everything else
+                                # keeps the old protection.
+                                if live_count > 0 and not _under:
                                     action_taken = "already-imported-skip"
                                     cmd_id = None
                                     already_acted.add(album_key)
@@ -7334,6 +7367,11 @@ class Orchestrator:
                                         "Lidarr; skipping action",
                                         album_rec.get("title"),
                                     )
+                                    raise _AuditSkip()
+                                if _under and live_count >= len(audios):
+                                    action_taken = "already-imported-skip"
+                                    cmd_id = None
+                                    already_acted.add(album_key)
                                     raise _AuditSkip()
                             # Green-gate helper. Before ANY mutation (refresh,
                             # release-flip, auto-switch toggle, import), we
@@ -7351,7 +7389,13 @@ class Orchestrator:
                                     l = self.lidarr.get_album(int(album_rec["id"]))
                                 except Exception:  # noqa: BLE001
                                     return
-                                if l and _album_track_file_count(l) > 0:
+                                # Same exception as the guard above: an
+                                # under-registered album HAS files by
+                                # definition, so "green" must mean "has as many
+                                # as the folder holds", not "has any".
+                                _n = _album_track_file_count(l) if l else 0
+                                if l and _n > 0 and (not _under
+                                                     or _n >= len(audios)):
                                     already_acted.add(album_key)
                                     action_taken = f"green-skip ({reason})"
                                     logger.info(
