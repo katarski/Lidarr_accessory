@@ -378,7 +378,8 @@ _PAGE = r"""<!doctype html>
       <button class="b-copy" onclick="cvSelectAll()" title="Tick every top-level folder and file. Because ticking a folder means everything inside it, this selects the whole library at the current view.">Select all</button>
       <button class="b-copy" onclick="cvClearSel()" title="Clear the selection">&#10005;</button>
       <button class="b-go" onclick="cvConvertSel()">Convert</button>
-      <button class="b-stop" onclick="cvCancel()" title="Clear the conversion queue. Files already encoding finish.">Clear</button>
+      <button class="b-stop" onclick="cvCancel()" title="Cancel the whole run: empties the queue AND pauses, so nothing starts again.">Cancel</button>
+      <button class="b-copy" onclick="cvClear()" title="Empty the conversion queue. Files already encoding finish and the converter keeps running.">Clear</button>
       <button class="b-hold" id="cv-pause" onclick="cvPause()" title="Stop starting new conversions. Anything already encoding finishes; the queue is kept.">Pause</button>
       <button class="b-disc" onclick="cvDeleteSel()">Delete selected</button>
     </div>
@@ -1431,14 +1432,17 @@ function cvMkRoot(){
        var op=document.createElement('option');op.value=j.name;op.textContent=j.name;
        sel.appendChild(op);sel.value=j.name;}
    }).catch(function(e){toast('error: '+e);});}
-function cvClearDone(){
-  fetch('/api/convert/cleardone',{method:'POST'}).then(function(r){return r.json();})
+function cvClear(){
+  // Empty the queue, keep the converter running.
+  fetch('/api/convert/cancel',{method:'POST'}).then(function(r){return r.json();})
    .then(function(j){toast(j.message||'cleared');cvPollOnce();})
    .catch(function(e){toast('error: '+e);});}
 function cvCancel(){
-  if(!confirm('Cancel the conversion?'))return;
+  // Stop the whole run: empty the queue AND pause, so nothing starts again.
+  if(!confirm('Cancel the conversion run?'))return;
   fetch('/api/convert/cancel',{method:'POST'}).then(function(r){return r.json();})
-   .then(function(j){toast(j.message||'cleared');cvPollOnce();})
+   .then(function(j){return fetch('/api/convert/pause',{method:'POST'}).then(function(){return j;});})
+   .then(function(j){toast(j.message||'cancelled');cvPollOnce();})
    .catch(function(e){toast('error: '+e);});}
 function cvPause(){
   var b=document.getElementById('cv-pause');
