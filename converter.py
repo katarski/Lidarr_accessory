@@ -27,6 +27,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -638,6 +639,18 @@ class ConvertManager:
                              "Ignored when writing beside the original."),
                     "default": "",
                 },
+                "copy_lossy": {
+                    "label": "Copy lossy files instead of skipping",
+                    "help": ("With 'lossless sources only' on, carry the "
+                             "already-lossy files across to the destination "
+                             "untouched instead of leaving them out, so the "
+                             "destination holds the whole selection. "
+                             "Re-encoding them would lose quality twice; "
+                             "skipping them leaves gaps. Needs a destination "
+                             "drive -- copying beside the original would just "
+                             "duplicate the file in place."),
+                    "default": False,
+                },
                 "lossless_only": {
                     "label": "Skip files that are already lossy",
                     "help": ("Only convert LOSSLESS sources (FLAC/WAV/APE/WV/"
@@ -711,7 +724,12 @@ class ConvertManager:
         root_r = self.root.resolve()
         opts = dict(opts or {})
         lossless_only = bool(opts.get("lossless_only"))
+        # Copying beside the original would just duplicate the file in place,
+        # so it only means anything when writing to a destination.
+        copy_lossy = bool(opts.get("copy_lossy")) and bool(
+            str(opts.get("out_dest") or "").strip())
         skipped_lossy = 0
+        copied_lossy = 0
         for rel in rels:
             p = (self.root / rel.strip("/")).resolve()
             try:
@@ -722,11 +740,21 @@ class ConvertManager:
                     errors.append(f"not a file: {rel}")
                     continue
                 if lossless_only and p.suffix.lower() not in LOSSLESS_EXTS:
-                    # Deliberately silent per file -- selecting a whole album
-                    # with this on would otherwise produce an error per MP3.
-                    # Counted and reported once below.
-                    skipped_lossy += 1
-                    continue
+                    # Lossy source with lossless-only on. Either drop it, or --
+                    # when copy_lossy is set -- COPY it across untouched, so a
+                    # destination drive ends up holding the WHOLE selection:
+                    # the lossless re-encoded, the lossy carried over as-is.
+                    # Re-encoding those would lose quality twice; leaving them
+                    # out leaves gaps in the copy.
+                    if not copy_lossy:
+                        # Deliberately silent per file -- selecting a whole
+                        # album with this on would otherwise produce an error
+                        # per MP3. Counted and reported once below.
+                        skipped_lossy += 1
+                        continue
+                    is_copy = True
+                else:
+                    is_copy = False
             except OSError as exc:
                 errors.append(f"{rel}: {exc}")
                 continue
@@ -739,12 +767,18 @@ class ConvertManager:
                 # only reads it), so sharing is safe and saves ~85 MB.
                 "codec": codec, "opts": opts,
                 "state": "queued", "pct": 0.0, "msg": "",
+                "copy": is_copy,
                 "added": time.time(),
             }
+            if is_copy:
+                copied_lossy += 1
             with self._lock:
                 self._jobs[jid] = job
                 self._queue.append(jid)
             queued += 1
+        if copied_lossy:
+            logger.info("convert: %d lossy file(s) will be COPIED, not "
+                        "re-encoded (lossless-only is on)", copied_lossy)
         if skipped_lossy:
             msg = ("skipped %d already-lossy file(s) (lossless-only is on)"
                    % skipped_lossy)
@@ -1124,6 +1158,48 @@ class ConvertManager:
             jopts = job.get("opts") or {}
             overwrite = bool(jopts.get("overwrite"))
             out_dir = self._resolve_out_dir(src, jopts)
+
+            # COPY JOB: a lossy source under lossless-only, carried across
+            # untouched so the destination holds the whole selection. Same
+            # destination rules and the same skip-existing rule as an encode --
+            # it just moves bytes instead of re-encoding them.
+            if job.get("copy"):
+                cdst = out_dir / src.name
+                if cdst == src:
+                    job["state"] = "skipped"
+                    job["error"] = "source and destination are the same"
+                    return
+                if (jopts.get("skip_existing", True) and cdst.exists()
+                        and cdst.stat().st_size == src.stat().st_size):
+                    job["state"] = "skipped"
+                    job["out"] = cdst.name
+                    job["error"] = "already copied"
+                    job["pct"] = 100.0
+                    return
+                job["state"] = "running"
+                job["out"] = cdst.name
+                tmp = cdst.with_name("." + cdst.name + ".copying")
+                try:
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src, tmp)
+                    tmp.replace(cdst)
+                except OSError as exc:
+                    try:
+                        tmp.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    job["state"] = "error"
+                    job["error"] = "copy failed: %s" % exc
+                    logger.warning("convert: copy %s failed: %s", src.name, exc)
+                    return
+                job["pct"] = 100.0
+                job["state"] = "done"
+                job["msg"] = "copied (lossy, not re-encoded)"
+                logger.info("convert: copied %s -> %s", src.name, out_dir)
+                # The tree refresh is done by the finally block for every job,
+                # and it takes a REL path -- passing an absolute one here was
+                # simply wrong as well as redundant.
+                return
             dst = (out_dir / src.name).with_suffix(spec["ext"])
             if out_dir != src.parent:
                 # Writing to another drive: "replace the original" makes no

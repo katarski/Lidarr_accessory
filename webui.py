@@ -340,6 +340,7 @@ _PAGE = r"""<!doctype html>
       <label title="Where converted files are written. Unassigned devices are listed with their free space.">Output to <select id="cv-dest" onchange="cvDestChanged()"></select></label>
       <label id="cv-root-wrap" title="Optional folder created under the chosen drive that everything is written into, e.g. 'Converted' gives <drive>/Converted/Artist/Album/. Ignored when writing beside the original.">Root folder <input type="text" id="cv-root" size="12" placeholder="(none)"></label>
       <label class="cvtoggle" title="If the output file is already there, leave it alone instead of encoding a second copy. Without this the converter appends (1), (2), (3)... and re-encodes the same track on every run."><span>Skip already converted</span><input type="checkbox" id="cv-skip-existing" checked></label>
+      <label class="cvtoggle" id="cv-copylossy-wrap" title="With 'Lossless sources only' on, copy the already-lossy files to the destination untouched instead of leaving them out, so the destination holds the whole selection. Re-encoding them would lose quality twice. Needs a destination drive."><span>Copy lossy instead of skipping</span><input type="checkbox" id="cv-copy-lossy"></label>
       <label class="cvtoggle" title="Only convert LOSSLESS sources (FLAC/WAV/APE/WV/AIFF/ALAC). Re-encoding an MP3 loses quality twice, and re-encoding one to FLAC just makes a bigger file."><span>Lossless sources only</span><input type="checkbox" id="cv-lossless-only"></label>
       <label title="Order the folder/file list. Size uses the rolled-up folder size already cached by the library scan.">Sort <select id="cv-sort" onchange="cvSortChanged()"><option value="name">Name (A-Z)</option><option value="size">Size (largest first)</option><option value="size_asc">Size (smallest first)</option></select></label>
       <label>Files at a time <select id="cv-conc"></select></label>
@@ -1395,6 +1396,9 @@ function cvDestChanged(){
   var other=!!document.getElementById('cv-dest').value;
   var rw=document.getElementById('cv-root-wrap');
   if(rw)rw.style.display=other?'':'none';
+  var cw=document.getElementById('cv-copylossy-wrap');
+  if(cw)cw.style.display=other?'':'none';
+  if(!other)document.getElementById('cv-copy-lossy').checked=false;
   var w=document.getElementById('cv-overwrite-wrap');
   if(w)w.style.display=other?'none':'';
   if(other)document.getElementById('cv-overwrite').checked=false;
@@ -1605,6 +1609,7 @@ function cvConvert(rels){
       preserve_path:keepPath,
       lossless_only:document.getElementById('cv-lossless-only').checked,
       skip_existing:document.getElementById('cv-skip-existing').checked,
+      copy_lossy:document.getElementById('cv-copy-lossy').checked,
       out_root:(document.getElementById('cv-root').value||'').trim(),
       overwrite:ow},
     concurrency:parseInt(document.getElementById('cv-conc').value||'2',10)};
