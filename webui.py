@@ -333,7 +333,7 @@ _PAGE = r"""<!doctype html>
   <div id="progress" style="display:none">
     <div class="cvcols">
       <details id="cv-sec-prog" class="cvsec" open><summary>Progress</summary><div id="cv-prog" class="cvbody"><span class="muted">nothing running</span></div></details>
-      <details id="cv-sec-conv" class="cvsec" open><summary>Conversions <span class="n" id="cv-nconv">0</span></summary><div id="cv-convlist" class="cvbody"></div></details>
+      <details id="cv-sec-conv" class="cvsec" open><summary>Conversions <span class="n" id="cv-nconv">0</span> <span class="muted" id="cv-nalb"></span></summary><div id="cv-convlist" class="cvbody"></div></details>
     </div>
     <details id="cv-sec-split" class="cvsec"><summary>Cue splits <span class="n" id="cv-nsplit">0</span></summary><div id="cv-splitlist" class="cvbody"></div></details>
     <div class="cvbar">
@@ -1735,9 +1735,26 @@ function cvPollOnce(){
     document.getElementById('cv-prog').innerHTML=out||'<span class="muted">nothing running</span>';
     // Conversions section: queue + recent results.
     document.getElementById('cv-nconv').textContent=nAct;
+    var na=document.getElementById('cv-nalb');
+    if(na)na.textContent=(conv.n_folders?('across '+conv.n_folders+' album(s)'):'');
     var cl='';
-    running.forEach(function(jb){cl+='<div class="pline"><span class="plab">'+h(jb.rel)+'</span><span class="'+(jb.state==='running'?'badge b-out':'muted')+'">'+h(jb.state)+'</span></div>';});
-    if(nAct>running.length)cl+='<div class="pline"><span class="plab muted">… and '+(nAct-running.length)+' more queued (list capped so the page stays responsive)</span></div>';
+    // BY ALBUM. A full-library run is ~86,000 files; no flat list of those is
+    // readable however it is capped, so the server groups them by album folder
+    // and sends only the active ones.
+    var fl=(conv.folders||[]);
+    if(fl.length){
+      var nF=(conv.n_folders||fl.length),nFD=(conv.n_folders_done||0);
+      cl+='<div class="pline"><span class="plab"><b>'+nFD+' of '+nF+' album(s) complete</b></span></div>';
+      fl.forEach(function(f){
+        var col=f.pct>=100?'#3fb950':(f.running?'#58a6ff':'#8b949e');
+        cl+='<div class="pline"><span class="plab" title="'+h(f.dir)+'">'+h(f.dir||'(root)')+'</span>'
+          +'<div class="pbar"><div class="pfill" style="width:'+(f.pct||0)+'%;background:'+col+'"></div></div>'
+          +'<span class="ppct">'+f.done+'/'+f.total+'</span></div>';
+      });
+      if(nF>fl.length)cl+='<div class="pline"><span class="plab muted">… and '+(nF-fl.length)+' more album(s) queued</span></div>';
+    }else{
+      running.forEach(function(jb){cl+='<div class="pline"><span class="plab">'+h(jb.rel)+'</span><span class="'+(jb.state==='running'?'badge b-out':'muted')+'">'+h(jb.state)+'</span></div>';});
+    }
     (conv.done||[]).slice().reverse().forEach(function(jb){cl+='<div class="pline"><span class="plab">'+h(jb.rel)+'</span><span class="'+(jb.state==='done'?'muted':'badge b-lossy')+'">'+h(jb.state)+' '+h(jb.msg||'')+'</span></div>';});
     document.getElementById('cv-convlist').innerHTML=cl||'<span class="muted">no conversions yet</span>';
     // Cue splits section.

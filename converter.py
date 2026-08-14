@@ -742,6 +742,34 @@ class ConvertManager:
         # Everything running is always included -- that is at most the
         # concurrency setting -- plus enough of the queue to see what is next.
         shown = running + queued[:max(0, self.STATUS_WINDOW - len(running))]
+        # BY ALBUM, not by file. A full-library run is ~86k files; no list of
+        # those is readable no matter how it is capped. The useful unit is the
+        # album folder -- "Artist/Album 12/19" -- which turns 86k rows into a
+        # few thousand, of which only the active handful is ever shown.
+        folders: Dict[str, Dict[str, Any]] = {}
+        for j in jobs:
+            rel = str(j.get("rel") or "")
+            d = rel.rsplit("/", 1)[0] if "/" in rel else ""
+            f = folders.get(d)
+            if f is None:
+                f = folders[d] = {"dir": d, "total": 0, "done": 0,
+                                  "running": 0, "queued": 0, "pct": 0.0}
+            f["total"] += 1
+            st = j.get("state")
+            if st == "running":
+                f["running"] += 1
+                f["pct"] += float(j.get("pct") or 0.0) / 100.0
+            elif st == "queued":
+                f["queued"] += 1
+            else:
+                f["done"] += 1
+                f["pct"] += 1.0
+        for f in folders.values():
+            f["pct"] = round(100.0 * f["pct"] / max(1, f["total"]), 1)
+        # Active albums first, then the least finished -- so the ones being
+        # worked on stay at the top and finished ones drop away.
+        ordered = sorted(folders.values(),
+                         key=lambda f: (-f["running"], f["pct"], f["dir"]))
         return {"active": shown, "done": done[-25:],
                 "total_pct": round(total_pct, 1),
                 "n_active": n_active,
@@ -749,6 +777,9 @@ class ConvertManager:
                 "n_queued": len(queued),
                 "n_shown": len(shown),
                 "n_done": len(done), "n_total": len(jobs),
+                "folders": ordered[:30], "n_folders": len(folders),
+                "n_folders_done": sum(1 for f in folders.values()
+                                      if f["done"] >= f["total"]),
                 "paused": bool(self._paused),
                 "held_for_pipeline": self._pipeline_busy()}
 
