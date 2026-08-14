@@ -1764,12 +1764,22 @@ function cvPollOnce(){
     var splitAct=act.filter(function(a){return /split/i.test(a.stage||'');});
     var spct=splitAct.length&&typeof splitAct[0].pct==='number'?splitAct[0].pct:0;
     var anyAct=act.length+nRun;
-    setSlot('slot-conv',!!nT,conv.total_pct||0,
-            nT?(nD+' of '+nT+' — '+(conv.total_pct||0)+'%'):'no conversions yet');
-    setSlot('slot-split',!!splitq.length,spct,
+    // ONE number per bar. The batch total lives in the bar at the top, so
+    // repeating it on two section headers just gave three bars all reading
+    // 1.7%. Each header now shows only what it alone knows:
+    //   Conversions - counts, no bar (the total above IS its bar)
+    //   Progress    - how far the files CURRENTLY ENCODING have got
+    //   Cue splits  - the split actually running
+    var encoding=running.filter(function(j){return j.state!=='queued';});
+    var encPct=encoding.length
+      ? encoding.reduce(function(a,j){return a+(j.pct||0);},0)/encoding.length : 0;
+    setSlot('slot-conv',false,0,
+            nT?(nD+' of '+nT+' done'):'no conversions yet');
+    setSlot('slot-split',!!splitAct.length,spct,
             splitq.length?(splitq.length+' queued'):'no cue splits');
-    setSlot('slot-prog',!!anyAct,conv.total_pct||0,
-            anyAct?(anyAct+' active'):'nothing running');
+    setSlot('slot-prog',!!encoding.length,encPct,
+            encoding.length?(encoding.length+' encoding — '+Math.round(encPct)+'%')
+                           :(anyAct?(anyAct+' active'):'nothing running'));
     var out='';
     if(running.length){
 
