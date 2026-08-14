@@ -123,7 +123,27 @@ def _norm_artist(s: str) -> str:
     s = "".join(c for c in unicodedata.normalize("NFKD", s)
                 if not unicodedata.combining(c))
     s = re.sub(r"^\s*the\s+", "", s)
-    return re.sub(r"[^a-z0-9]+", "", s)
+    # Drop a leading HONORIFIC. Lidarr/MusicBrainz carry the legal-ish name
+    # ("Ms. Lauryn Hill") while every torrent and tag says "Lauryn Hill", so
+    # the two normalized to different keys and compared unequal everywhere
+    # names are matched by equality rather than by find_artist's substring
+    # fallback.
+    #
+    # Deliberately a SHORT list. "St." is part of real names (St. Vincent),
+    # "Dr." of others (Dr. Dre, Dr. John) where stripping could collide with a
+    # bare "Dre"/"John", and DJ/MC/Lil are integral to stage names. Only
+    # titles that are never themselves the name are removed, and only when
+    # something follows them.
+    s = re.sub(r"^\s*(?:ms|mrs|miss|mr)\.?\s+(?=\S)", "", s)
+    key = re.sub(r"[^a-z0-9]+", "", s)
+    # A name written in a script this filter cannot represent -- Arabic, CJK --
+    # folds to the EMPTY string, so every such artist collides with every
+    # other: 'عمرو دياب' and '北川保昌' shared one key. Cyrillic is handled by
+    # the transliteration above; for the rest, fall back to the codepoints so
+    # each name keeps a distinct, stable key of its own.
+    if not key and s.strip():
+        key = "u" + "".join("%x" % ord(c) for c in s.strip() if not c.isspace())
+    return key
 
 
 @dataclass
