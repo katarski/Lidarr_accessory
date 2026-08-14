@@ -364,7 +364,7 @@ _PAGE = r"""<!doctype html>
       <button class="b-copy" onclick="cvSelectAll()" title="Tick every top-level folder and file. Because ticking a folder means everything inside it, this selects the whole library at the current view.">Select all</button>
       <button class="b-copy" onclick="cvClearSel()" title="Clear the selection">&#10005;</button>
       <button class="b-go" onclick="cvConvertSel()">Convert</button>
-      <button class="b-stop" onclick="cvCancel()" title="Drop everything still queued. Files already encoding are left to finish.">Cancel</button>
+      <button class="b-stop" onclick="cvCancel()" title="Cancel the conversion. Files already encoding finish.">Cancel</button>
       <button class="b-hold" id="cv-pause" onclick="cvPause()" title="Stop starting new conversions. Anything already encoding finishes; the queue is kept.">Pause</button>
       <button class="b-disc" onclick="cvDeleteSel()">Delete selected</button>
     </div>
@@ -1418,7 +1418,7 @@ function cvMkRoot(){
        sel.appendChild(op);sel.value=j.name;}
    }).catch(function(e){toast('error: '+e);});}
 function cvCancel(){
-  if(!confirm('Drop every QUEUED conversion? Files already encoding will finish.'))return;
+  if(!confirm('Cancel the conversion?'))return;
   fetch('/api/convert/cancel',{method:'POST'}).then(function(r){return r.json();})
    .then(function(j){toast(j.message||'cleared');cvPollOnce();})
    .catch(function(e){toast('error: '+e);});}
@@ -2324,8 +2324,7 @@ def make_handler(store, actions: HeldActions):
                     return
                 n = cv.cancel_queued()
                 self._json(200, {"ok": True, "cancelled": n,
-                                 "message": "Cancelled %d queued conversion(s); "
-                                            "anything already encoding finishes" % n})
+                                 "message": "Cancelled (%d job(s))" % n})
                 return
             if path in ("/api/convert/pause", "/api/convert/resume"):
                 cv = getattr(actions, "converter", None)
