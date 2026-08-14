@@ -362,7 +362,11 @@ def plan_torrent(
         album = _clean_album(album_raw, artist=artist)
         matched: Dict[str, Any] = {}
         complete, have, total = album_complete_in_library(
-            lidarr, artist, album, _cache=lib_cache, llm=llm, out=matched
+            lidarr, artist, album, _cache=lib_cache, llm=llm, out=matched,
+            # The RAW folder name still carries the year ("2001 - Weezer"),
+            # which is the only thing separating seven albums all called
+            # "Weezer". _clean_album strips it out of `album`.
+            folder_hint=album_raw,
         )
         # The artist came from the torrent's TOP FOLDER, which is often not an
         # artist at all: `BJ_Discography/01 Studio albums/1986-Slippery When

@@ -19,11 +19,13 @@ from __future__ import annotations
 
 import argparse
 import os
+import logging
 import re
 import shutil
 import sys
 import time
 from pathlib import Path
+from typing import Any, Dict
 
 import yaml
 
@@ -98,6 +100,8 @@ def _extra_words_are_noise(dl_words: set, ow_words: set) -> bool:
 
 from lidarr import LidarrClient, LidarrConfig
 
+logger = logging.getLogger("dedup")
+
 AUDIO_EXTS = {
     ".flac", ".ape", ".wv", ".wav", ".aiff", ".aif",
     ".m4a", ".m4b", ".alac",
@@ -143,9 +147,22 @@ def read_tags(path: Path) -> tuple[str, str]:
     return artist, album
 
 
+def _year_of(text: str) -> str:
+    """A 19xx/20xx year in the folder or album name, else ''."""
+    m = re.search(r"(?:^|[^0-9])((?:19|20)\d{2})(?:[^0-9]|$)", str(text or ""))
+    return m.group(1) if m else ""
+
+
+def _album_full(a: Dict[str, Any]) -> bool:
+    st = a.get("statistics") or {}
+    f = int(st.get("trackFileCount") or 0)
+    t = int(st.get("totalTrackCount") or 0)
+    return f > 0 and t > 0 and f >= t
+
+
 def album_complete_in_library(
     lidarr: LidarrClient, artist: str, album: str, _cache: dict = None, llm=None,
-    out: dict = None,
+    out: dict = None, folder_hint: str = "",
 ):
     """
     Return (complete: bool, have: int, total: int). `complete` is True only
@@ -181,11 +198,36 @@ def album_complete_in_library(
         if not arec:
             return False, 0, 0
         target = norm_title(album)
-        alb = None
-        for a in albums:
-            if norm_title(a.get("title")) == target:
-                alb = a
-                break
+        same_title = [a for a in albums if norm_title(a.get("title")) == target]
+        alb = same_title[0] if same_title else None
+        # SEVERAL ALBUMS, ONE TITLE. Weezer has seven records all called
+        # "Weezer" -- Blue, Green, Red, White, Teal, Black, Gold -- separated
+        # only by year and Lidarr's `disambiguation`. Taking the first hit
+        # meant the complete Blue Album answered for all of them, so a
+        # discography grab deselected the GREEN album folder (2/10) as
+        # "already owned" and the torrent was left with nothing to download.
+        if len(same_title) > 1:
+            year = _year_of(folder_hint or album)
+            by_year = [a for a in same_title
+                       if year and str(a.get("releaseDate") or "")[:4] == year]
+            if len(by_year) == 1:
+                alb = by_year[0]
+            else:
+                # Cannot tell them apart. If ANY of them is still incomplete,
+                # answer "not complete" -- deselecting on a coin flip is how
+                # the one album actually missing stops downloading.
+                incomplete = [a for a in same_title if not _album_full(a)]
+                if incomplete:
+                    st = (incomplete[0].get("statistics") or {})
+                    logger.info(
+                        "  %r matches %d albums by that name (%s) -- %d still "
+                        "incomplete, so NOT treating it as owned",
+                        album[:40], len(same_title),
+                        ", ".join(filter(None, (a.get("disambiguation")
+                                                for a in same_title)))[:60],
+                        len(incomplete))
+                    return (False, int(st.get("trackFileCount") or 0),
+                            int(st.get("totalTrackCount") or 0))
         def _owned(a: Dict[str, Any]) -> bool:
             st = a.get("statistics") or {}
             f = int(st.get("trackFileCount") or 0)
