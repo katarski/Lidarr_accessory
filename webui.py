@@ -378,8 +378,7 @@ _PAGE = r"""<!doctype html>
       <button class="b-copy" onclick="cvSelectAll()" title="Tick every top-level folder and file. Because ticking a folder means everything inside it, this selects the whole library at the current view.">Select all</button>
       <button class="b-copy" onclick="cvClearSel()" title="Clear the selection">&#10005;</button>
       <button class="b-go" onclick="cvConvertSel()">Convert</button>
-      <button class="b-stop" onclick="cvCancel()" title="Cancel the conversion. Files already encoding finish.">Cancel</button>
-      <button class="b-copy" onclick="cvClearDone()" title="Clear the list of finished conversions. The queue keeps running.">Clear done</button>
+      <button class="b-stop" onclick="cvCancel()" title="Clear the conversion queue. Files already encoding finish.">Clear</button>
       <button class="b-hold" id="cv-pause" onclick="cvPause()" title="Stop starting new conversions. Anything already encoding finishes; the queue is kept.">Pause</button>
       <button class="b-disc" onclick="cvDeleteSel()">Delete selected</button>
     </div>
