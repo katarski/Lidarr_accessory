@@ -489,7 +489,8 @@ class ConvertManager:
 
     def __init__(self, root: Path, ffmpeg: str = "ffmpeg", llm=None,
                  lidarr=None, lidarr_root: str = "", tree=None,
-                 busy_provider=None, nice_level: int = 15):
+                 busy_provider=None, nice_level: int = 15,
+                 state_file: "Optional[Path]" = None):
         self.root = Path(root)
         self.ffmpeg = ffmpeg
         self.llm = llm
@@ -515,6 +516,13 @@ class ConvertManager:
         self._active = 0
         self._repump = None
         self._paused = False
+        # The queue lived only in memory, so every container recreate threw it
+        # away -- and a code deploy IS a recreate. A 225-file selection died
+        # that way. Queued/running jobs are now written to /config and reloaded
+        # at startup; anything running when we stopped comes back as queued,
+        # since a half-written output was never committed.
+        self._state_file = Path(state_file) if state_file else None
+        self._load_state()
         self._workers = 2
 
     # ---------- public ----------
@@ -852,6 +860,8 @@ class ConvertManager:
                 self._jobs[jid] = job
                 self._queue.append(jid)
             queued += 1
+        if queued:
+            self._save_state()
         if copied_lossy:
             logger.info("convert: %d lossy file(s) will be COPIED, not "
                         "re-encoded (lossless-only is on)", copied_lossy)
@@ -864,6 +874,43 @@ class ConvertManager:
         return queued, errors
 
     # ---------- internals ----------
+    def _load_state(self) -> None:
+        if not self._state_file or not self._state_file.exists():
+            return
+        try:
+            data = json.loads(self._state_file.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("convert: could not read saved queue: %s", exc)
+            return
+        n = 0
+        for j in (data.get("jobs") or []):
+            if not j.get("id") or not j.get("rel"):
+                continue
+            j["state"] = "queued"          # never resume mid-encode
+            j["pct"] = 0.0
+            self._jobs[j["id"]] = j
+            self._queue.append(j["id"])
+            n += 1
+        if n:
+            logger.info("convert: restored %d queued conversion(s) from %s",
+                        n, self._state_file.name)
+
+    def _save_state(self) -> None:
+        """Persist the pending queue. Cheap and called on every change, so a
+        kill at any moment loses nothing."""
+        if not self._state_file:
+            return
+        try:
+            with self._lock:
+                jobs = [j for j in self._jobs.values()
+                        if j.get("state") in ("queued", "running")]
+            tmp = self._state_file.with_suffix(self._state_file.suffix + ".tmp")
+            tmp.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(json.dumps({"jobs": jobs}), encoding="utf-8")
+            tmp.replace(self._state_file)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("convert: could not save queue: %s", exc)
+
     def cancel_queued(self) -> int:
         """Drop everything still QUEUED. Files already encoding are left to
         finish -- killing ffmpeg mid-file would leave a truncated output.
@@ -879,6 +926,7 @@ class ConvertManager:
                 self._jobs.pop(jid, None)
         if drop:
             logger.info("convert: cancelled %d queued job(s)", len(drop))
+            self._save_state()
         return len(drop)
 
     def pause(self) -> bool:
@@ -1402,6 +1450,7 @@ class ConvertManager:
                     job["refreshed"] = parent
             except Exception as exc:  # noqa: BLE001
                 logger.debug("post-convert tree refresh failed: %s", exc)
+            self._save_state()
             with self._lock:
                 self._active -= 1
             self._pump()

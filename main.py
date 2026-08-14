@@ -1670,7 +1670,10 @@ def main() -> int:
             # while a cue split or SACD/DVD-Audio extraction is running, and
             # their ffmpeg is niced so the pipeline wins any contention.
             busy_provider=orch.pipeline_encoding,
-            nice_level=int(os.environ.get("CONVERT_NICE", "15")))
+            nice_level=int(os.environ.get("CONVERT_NICE", "15")),
+            # Survive a container recreate -- every code deploy is one.
+            state_file=((isearch_state_path.parent / "convert_queue.json")
+                        if isearch_state_path else None))
         orch.work_queue = q   # cue-split queue, shown in the Converter tab
 
         def _lib_rescan_loop():
