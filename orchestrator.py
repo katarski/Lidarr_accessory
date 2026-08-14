@@ -523,6 +523,17 @@ class OrchestratorConfig:
     # albumType / secondaryTypes / own title) -- i.e. it's explicitly part of the
     # artist's work. Off = grab whatever ranks best.
     interactive_search_refuse_unofficial: bool = True
+    # Ceiling on GB grabbed per album a release would actually FILL. A
+    # discography is scored on how many gaps it closes and never on what it
+    # costs, so the pipeline pulled 27.34 GB of '2PAC, Tupac' to fill ONE
+    # 14-track album, and a 49-disc Genshin Impact collection against
+    # 'Various Artists'. 0 disables the check.
+    interactive_search_max_gb_per_album: float = 2.5
+    # Artist names that are placeholders, not artists. Every compilation
+    # release title contains them, so an artist-scope search on one matches
+    # essentially anything -- that is how a Genshin Impact OST was grabbed
+    # for 'Various Artists'.
+    interactive_search_skip_placeholder_artists: bool = True
     # (d) SONG-TITLE VERIFICATION: before committing a grab, compare Lidarr's
     # track titles for the album against the songs actually in the torrent (its
     # file names). A matching track COUNT proves nothing about which songs these
@@ -10667,6 +10678,32 @@ class Orchestrator:
                 "interactive search: %s -- refused %d VIDEO release(s) at the "
                 "artist scope (concert film / rip, not audio)",
                 artist, dropped_video_a)
+        # COST vs BENEFIT. Everything above ranks a discography purely on how
+        # many gaps it could close; nothing ever looked at its size. Measured
+        # consequences, all live: 27.34 GB of '2PAC, Tupac' downloading to fill
+        # one 14-track Makaveli album, a 2.55 GB 22-release Apparat collection
+        # for 5 Ellen Allien gaps, 8.38 GB of Little Feat for 20 tracks. The
+        # artist is ~100% owned in every case, so nearly all of that data is
+        # music already on disk.
+        cap = float(getattr(self.cfg, "interactive_search_max_gb_per_album", 2.5))
+        if cap > 0:
+            keep, dropped_big = [], []
+            for r in scored:
+                gb = float(r.get("size") or 0) / (1024.0 ** 3)
+                fill = max(1, int(r.get("_fill") or 1))
+                per = gb / fill
+                if gb > 0 and per > cap:
+                    dropped_big.append("%s [%.1f GB / ~%d album(s) = %.1f GB each]"
+                                       % ((r.get("title") or "")[:52], gb, fill, per))
+                    continue
+                keep.append(r)
+            if dropped_big:
+                logger.info(
+                    "interactive search: %s -- refused %d oversized release(s) "
+                    "(> %.1f GB per album filled): %s", artist,
+                    len(dropped_big), cap, "; ".join(dropped_big[:3])
+                    + (" ..." if len(dropped_big) > 3 else ""))
+            scored = keep
         scored.sort(key=lambda x: x["_score"], reverse=True)
         return scored
 
@@ -10767,6 +10804,23 @@ class Orchestrator:
                 logger.warning("interactive search: could not remove %s: %s",
                                thash[:12], exc)
 
+    # Not artists -- placeholders Lidarr uses for compilations and soundtracks.
+    # Their names appear in the title of a huge share of releases, so an
+    # artist-scope search on one matches nearly anything: 'Various Artists'
+    # pulled in `[TR24][OF][WEB][GM] HOYO-MiX, Various Artists / Genshin Impact
+    # - Hi-Res (49 )`, a 49-disc game soundtrack, against six of its albums --
+    # five of which were already complete.
+    _PLACEHOLDER_ARTIST_RE = re.compile(
+        r"(?i)^\s*(various(\s+artists?)?|v\.?\s*a\.?|va|verschiedene|"
+        r"soundtrack|ost|original\s+soundtrack|unknown(\s+artist)?|"
+        r"no\s+artist|sampler|compilation)\s*$")
+
+    def _is_placeholder_artist(self, name: str) -> bool:
+        if not bool(getattr(
+                self.cfg, "interactive_search_skip_placeholder_artists", True)):
+            return False
+        return bool(self._PLACEHOLDER_ARTIST_RE.match(str(name or "").strip()))
+
     def _try_artist_fill(self, artist_id: int, artist_name: str,
                          missing: List[Tuple[str, int, int]],
                          blocklisted: List[str], qbt) -> bool:
@@ -10779,6 +10833,13 @@ class Orchestrator:
         the caller skips per-album search for this artist.
         """
         cfg = self.cfg
+        if self._is_placeholder_artist(artist_name):
+            logger.info(
+                "interactive search: %r is a placeholder, not an artist -- "
+                "skipping the artist-scope search (its name is in the title of "
+                "most compilations, so it matches almost anything)",
+                artist_name)
+            return False
         cands = self._rank_artist_releases(
             self.lidarr.release_search_artist(artist_id), artist_name,
             missing, blocklisted)
@@ -12160,6 +12221,10 @@ class Orchestrator:
          "Prefer lossless; grab lossy only when no lossless release exists."),
         ("lidarr.interactive_search_refuse_unofficial", "lidarr", "interactive_search_refuse_unofficial", "Official releases only", "bool", True,
          "Refuse compilation / greatest-hits / live / remix / karaoke / bootleg releases, unless the album being filled is itself that kind of record."),
+        ("lidarr.interactive_search_max_gb_per_album", "lidarr", "interactive_search_max_gb_per_album", "Max GB per album filled", "float", 2.5,
+         "Refuse a release that costs more than this many GB for each album it would actually fill. Stops a 27 GB discography being grabbed for one missing album. 0 = no limit."),
+        ("lidarr.interactive_search_skip_placeholder_artists", "lidarr", "interactive_search_skip_placeholder_artists", "Skip Various Artists", "bool", True,
+         "Never run an artist-scope search for placeholder artists (Various Artists, Soundtrack, Unknown) -- their names are in most compilation titles, so they match almost anything."),
         ("lidarr.assembly_enabled", "lidarr", "assembly_enabled", "Album assembly", "bool", True,
          "Work out which songs of a missing album sit in the compilations stuck in needs-attention, and show % assembled in the Assembly tab. Songs an assembly needs are kept when a torrent is deselected."),
         ("lidarr.external_audit_enabled", "lidarr", "external_audit_enabled", "Cross-check albums vs MusicBrainz", "bool", True,
@@ -12432,6 +12497,8 @@ class Orchestrator:
         ("Which release to accept", [
             "lidarr.interactive_search_require_lossless",
             "lidarr.interactive_search_refuse_unofficial",
+            "lidarr.interactive_search_max_gb_per_album",
+            "lidarr.interactive_search_skip_placeholder_artists",
             "lidarr.verify_track_titles",
             "lidarr.interactive_search_min_seeders",
             "lidarr.interactive_search_seeder_weight",

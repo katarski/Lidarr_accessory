@@ -1471,6 +1471,10 @@ def main() -> int:
         interactive_search_refuse_unofficial=bool(
             lidarr_cfg.get("interactive_search_refuse_unofficial", True)
         ),
+        interactive_search_max_gb_per_album=float(
+            lidarr_cfg.get("interactive_search_max_gb_per_album", 2.5)),
+        interactive_search_skip_placeholder_artists=bool(
+            lidarr_cfg.get("interactive_search_skip_placeholder_artists", True)),
         verify_track_titles=bool(
             lidarr_cfg.get("verify_track_titles", True)
         ),
