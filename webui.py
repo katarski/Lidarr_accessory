@@ -347,6 +347,7 @@ _PAGE = r"""<!doctype html>
       <span class="muted" id="cv-codechelp"></span>
       <div class="grow"></div>
       <span id="cv-seln" class="muted">0 selected</span>
+      <button class="b-copy" id="cv-pause" onclick="cvPause()" title="Stop starting new conversions. Anything already encoding finishes; the queue is kept.">Pause</button>
       <button class="b-copy" onclick="cvSelectAll()" title="Tick every top-level folder and file. Because ticking a folder means everything inside it, this selects the whole library at the current view.">Select all</button>
       <button class="b-copy" onclick="cvClearSel()" title="Clear the selection">&#10005;</button>
       <button class="b-move" onclick="cvConvertSel()">Convert selected</button>
@@ -1369,6 +1370,18 @@ function cvEnter(){
   if(CVPOLL)clearInterval(CVPOLL);
   CVPOLL=setInterval(function(){if(TAB==='progress')cvPollOnce();},3000);
 }
+function cvPause(){
+  var b=document.getElementById('cv-pause');
+  var want=(b&&b.dataset.paused==='1')?'resume':'pause';
+  fetch('/api/convert/'+want,{method:'POST'}).then(function(r){return r.json();})
+   .then(function(j){toast(j.message||(j.ok?want+'d':'failed'));cvPollOnce();})
+   .catch(function(e){toast('error: '+e);});}
+function cvSyncPause(conv){
+  var b=document.getElementById('cv-pause');if(!b)return;
+  var p=!!(conv&&conv.paused);
+  b.dataset.paused=p?'1':'0';
+  b.textContent=p?'Resume':'Pause';
+}
 function cvSortChanged(){
   CVSORT=document.getElementById('cv-sort').value||'name';
   // Re-render from the root; expanded subfolders reload lazily on
@@ -1647,12 +1660,19 @@ function cvPollOnce(){
             :String(jb.rel||'').replace(/\/[^/]*$/,'');
       if(d!==undefined&&d!==null)cvRefreshDir(d);
     });
+    cvSyncPause(conv);
     var running=(conv.active||[]);
-    document.getElementById('n-prog').textContent=(running.length+act.length)||0;
+    var nAct=(conv.n_active!==undefined)?conv.n_active:running.length;
+    var nRun=(conv.n_running!==undefined)?conv.n_running:running.length;
+    var nQ=(conv.n_queued!==undefined)?conv.n_queued:0;
+    document.getElementById('n-prog').textContent=(nAct+act.length)||0;
     // Progress section: total bar + each running conversion + each activity.
     var out='';
     if(running.length){
-      out+='<div class="pline"><span class="plab"><b>Conversion total ('+running.length+' file(s))</b></span><div class="pbar"><div class="pfill" style="width:'+(conv.total_pct||0)+'%"></div></div><span class="ppct">'+(conv.total_pct||0)+'%</span></div>';
+      var hdr='Conversion total ('+nRun+' running, '+nQ+' queued)';
+      if(conv.paused)hdr+=' — PAUSED';
+      else if(conv.held_for_pipeline)hdr+=' — waiting for the pipeline';
+      out+='<div class="pline"><span class="plab"><b>'+h(hdr)+'</b></span><div class="pbar"><div class="pfill" style="width:'+(conv.total_pct||0)+'%"></div></div><span class="ppct">'+(conv.total_pct||0)+'%</span></div>';
       running.forEach(function(jb){
         out+='<div class="pline"><span class="plab">'+h(jb.name)+'</span><div class="pbar"><div class="pfill" style="width:'+(jb.pct||0)+'%"></div></div><span class="ppct">'+(jb.state==='queued'?'queued':(jb.pct||0)+'%')+'</span></div>';
       });
@@ -1662,9 +1682,10 @@ function cvPollOnce(){
       out+='<div class="pline"><span class="plab"><span class="badge b-out">'+h(a.stage)+'</span> '+h(a.name)+(a.detail?' <span class="muted">'+h(a.detail)+'</span>':'')+'</span>'
         +(pct!==null?'<div class="pbar"><div class="pfill" style="width:'+pct+'%"></div></div><span class="ppct">'+pct+'%</span>':'<span class="ppct">'+ago(a.started)+'</span>')+'</div>';
     });
+    if(nAct>running.length)out+='<div class="pline"><span class="plab muted">… and '+(nAct-running.length)+' more queued (list capped so the page stays responsive)</span></div>';
     document.getElementById('cv-prog').innerHTML=out||'<span class="muted">nothing running</span>';
     // Conversions section: queue + recent results.
-    document.getElementById('cv-nconv').textContent=running.length;
+    document.getElementById('cv-nconv').textContent=nAct;
     var cl='';
     running.forEach(function(jb){cl+='<div class="pline"><span class="plab">'+h(jb.rel)+'</span><span class="muted">'+h(jb.state)+'</span></div>';});
     (conv.done||[]).slice().reverse().forEach(function(jb){cl+='<div class="pline"><span class="plab">'+h(jb.rel)+'</span><span class="'+(jb.state==='done'?'muted':'badge b-lossy')+'">'+h(jb.state)+' '+h(jb.msg||'')+'</span></div>';});
@@ -2195,6 +2216,21 @@ def make_handler(store, actions: HeldActions):
                                  "results": results})
                 return
 
+            if path in ("/api/convert/pause", "/api/convert/resume"):
+                cv = getattr(actions, "converter", None)
+                if cv is None:
+                    self._json(503, {"ok": False, "message": "converter unavailable"})
+                    return
+                if path.endswith("pause"):
+                    cv.pause()
+                    self._json(200, {"ok": True, "paused": True,
+                                     "message": "Converter paused -- running "
+                                                "encodes finish, nothing new starts"})
+                else:
+                    cv.resume()
+                    self._json(200, {"ok": True, "paused": False,
+                                     "message": "Converter resumed"})
+                return
             if path == "/api/convert/start":
                 conv = getattr(actions, "converter", None)
                 lt = getattr(actions, "library_tree", None)

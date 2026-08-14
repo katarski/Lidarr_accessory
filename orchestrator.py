@@ -11765,6 +11765,20 @@ class Orchestrator:
         }
 
     # ---- Conversion activity (WebUI "In progress" tab) ----------------
+    def pipeline_encoding(self) -> bool:
+        """True while the pipeline itself is encoding -- a cue split, or an
+        SACD / DVD-Audio / DTS / DSD / archive extraction. The manual converter
+        holds its queue while this is true, so the work that actually gets
+        music into the library is never starved by a bulk transcode."""
+        act = getattr(self, "_activity", None)
+        if not act:
+            return False
+        try:
+            with self._activity_lock:
+                return bool(self._activity)
+        except Exception:  # noqa: BLE001
+            return False
+
     def _activity_start(self, folder: Path, stage: str, detail: str = "",
                         pct: Optional[float] = None) -> None:
         """Mark a folder as undergoing a conversion (SACD/DVD-Audio/DTS/DSD/

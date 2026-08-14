@@ -1655,7 +1655,12 @@ def main() -> int:
             # Overwrite mode needs Lidarr (to rescan a replaced file) and the
             # path prefix Lidarr sees for the library root.
             lidarr=lidarr, lidarr_root=lidarr_cfg["library_root_lidarr"],
-            tree=orch.library_tree)
+            tree=orch.library_tree,
+            # Manual conversions yield to the pipeline: they hold their queue
+            # while a cue split or SACD/DVD-Audio extraction is running, and
+            # their ffmpeg is niced so the pipeline wins any contention.
+            busy_provider=orch.pipeline_encoding,
+            nice_level=int(os.environ.get("CONVERT_NICE", "15")))
         orch.work_queue = q   # cue-split queue, shown in the Converter tab
 
         def _lib_rescan_loop():

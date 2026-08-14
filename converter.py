@@ -483,8 +483,12 @@ class LibraryTree:
 class ConvertManager:
     """Converts library files to MP3/AAC/Opus with live progress."""
 
+    # How many active/queued jobs status() ships per poll. See status().
+    STATUS_WINDOW = 40
+
     def __init__(self, root: Path, ffmpeg: str = "ffmpeg", llm=None,
-                 lidarr=None, lidarr_root: str = "", tree=None):
+                 lidarr=None, lidarr_root: str = "", tree=None,
+                 busy_provider=None, nice_level: int = 15):
         self.root = Path(root)
         self.ffmpeg = ffmpeg
         self.llm = llm
@@ -495,10 +499,21 @@ class ConvertManager:
         # LibraryTree, so a finished conversion updates just its folder in the
         # cache and the new (or removed) file shows in the UI immediately.
         self.tree = tree
+        # Manual conversions YIELD to the pipeline. `busy_provider()` is true
+        # while a cue split / SACD / DVD-Audio / DTS / DSD extraction is
+        # running: those are the jobs the pipeline needs to finish to get music
+        # into the library, and they were competing with up to 10 converter
+        # ffmpegs for the same cores with nothing arbitrating.
+        self.busy_provider = busy_provider
+        # ...and even when nothing is running, the converter's own ffmpeg is
+        # niced so the pipeline wins any contention it does hit.
+        self.nice_level = max(0, min(19, int(nice_level or 0)))
         self._lock = threading.Lock()
         self._jobs: Dict[str, Dict[str, Any]] = {}   # id -> job dict
         self._queue: List[str] = []
         self._active = 0
+        self._repump = None
+        self._paused = False
         self._workers = 2
 
     # ---------- public ----------
@@ -656,14 +671,28 @@ class ConvertManager:
         with self._lock:
             jobs = [dict(j) for j in self._jobs.values()]
         jobs.sort(key=lambda j: j.get("added", 0))
-        act = [j for j in jobs if j["state"] in ("running", "queued")]
+        running = [j for j in jobs if j["state"] == "running"]
+        queued = [j for j in jobs if j["state"] == "queued"]
         done = [j for j in jobs if j["state"] not in ("running", "queued")]
+        n_active = len(running) + len(queued)
         total_pct = 0.0
-        if act:
-            total_pct = sum(j.get("pct", 0.0) for j in act) / len(act)
-        return {"active": act, "done": done[-25:],
+        if n_active:
+            total_pct = (sum(j.get("pct", 0.0) for j in running)
+                         / float(n_active))
+        # SEND A WINDOW, NOT THE WHOLE QUEUE. This payload is polled every 3
+        # seconds; selecting the library queues ~86,500 jobs, and shipping all
+        # of them as JSON on every poll is what makes the browser fall over.
+        # Everything running is always included -- that is at most the
+        # concurrency setting -- plus enough of the queue to see what is next.
+        shown = running + queued[:max(0, self.STATUS_WINDOW - len(running))]
+        return {"active": shown, "done": done[-25:],
                 "total_pct": round(total_pct, 1),
-                "n_active": len(act)}
+                "n_active": n_active,
+                "n_running": len(running),
+                "n_queued": len(queued),
+                "n_shown": len(shown),
+                "paused": bool(self._paused),
+                "held_for_pipeline": self._pipeline_busy()}
 
     def clear_done(self) -> None:
         with self._lock:
@@ -725,7 +754,48 @@ class ConvertManager:
         return queued, errors
 
     # ---------- internals ----------
+    def pause(self) -> bool:
+        """Stop starting NEW jobs. Running encodes finish; nothing is lost."""
+        with self._lock:
+            self._paused = True
+            n = len(self._queue)
+        logger.info("convert: PAUSED (%d job(s) held, %d still running)",
+                    n, self._active)
+        return True
+
+    def resume(self) -> bool:
+        with self._lock:
+            self._paused = False
+        logger.info("convert: resumed")
+        self._pump()
+        return True
+
+    def is_paused(self) -> bool:
+        return bool(self._paused)
+
+    def _pipeline_busy(self) -> bool:
+        """Is the pipeline itself encoding right now?"""
+        if self.busy_provider is None:
+            return False
+        try:
+            return bool(self.busy_provider())
+        except Exception:  # noqa: BLE001
+            return False
+
     def _pump(self) -> None:
+        if self._paused:
+            return
+        # Hold the queue while the pipeline is encoding. Jobs already running
+        # are left alone -- killing them mid-encode would waste the work -- so
+        # this drains the converter down rather than stopping it dead.
+        if self._pipeline_busy():
+            with self._lock:
+                waiting = len(self._queue)
+            if waiting:
+                logger.debug("convert: pipeline is encoding -- holding %d "
+                             "queued job(s)", waiting)
+            self._schedule_repump()
+            return
         with self._lock:
             while self._active < self._workers and self._queue:
                 jid = self._queue.pop(0)
@@ -737,6 +807,31 @@ class ConvertManager:
                     target=self._run_job, args=(jid,), daemon=True,
                     name=f"convert-{jid}")
                 t.start()
+
+    def _schedule_repump(self, delay: float = 15.0) -> None:
+        """Look again shortly; the pipeline's extractions are minutes long."""
+        with self._lock:
+            if getattr(self, "_repump", None) is not None:
+                return
+            t = threading.Timer(delay, self._repump_fire)
+            t.daemon = True
+            self._repump = t
+        t.start()
+
+    def _repump_fire(self) -> None:
+        with self._lock:
+            self._repump = None
+        self._pump()
+
+    def _nice_prefix(self) -> List[str]:
+        """`nice`(+`ionice`) prefix for the converter's own ffmpeg."""
+        if not self.nice_level:
+            return []
+        pre: List[str] = []
+        if os.path.exists("/usr/bin/ionice") or os.path.exists("/bin/ionice"):
+            pre += ["ionice", "-c", "3"]        # idle I/O class
+        pre += ["nice", "-n", str(self.nice_level)]
+        return pre
 
     def _duration(self, path: Path) -> float:
         ffprobe = str(Path(self.ffmpeg).with_name("ffprobe"))
@@ -1078,7 +1173,8 @@ class ConvertManager:
             meta: List[str] = ["-map_metadata", "0"]
             for k, v in self._missing_tags(src).items():
                 meta += ["-metadata", f"{k}={v}"]
-            cmd = [self.ffmpeg, "-hide_banner", "-nostdin", "-y",
+            cmd = [*self._nice_prefix(),
+                   self.ffmpeg, "-hide_banner", "-nostdin", "-y",
                    "-i", str(src), "-vn", *meta, *args,
                    "-progress", "pipe:1", "-nostats",
                    "-loglevel", "error", str(dst)]
