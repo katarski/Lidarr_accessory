@@ -395,10 +395,12 @@ def _is_excluded(path: Path, excluded: list) -> bool:
 
 
 class CueEventHandler(FileSystemEventHandler):
-    def __init__(self, q: "queue.Queue[Path]", excluded: list):
+    def __init__(self, q: "queue.Queue[Path]", excluded: list,
+                 seen: "Optional[set]" = None):
         super().__init__()
         self.q = q
         self.excluded = excluded
+        self.seen = seen
 
     def _maybe_enqueue(self, raw_path: str) -> None:
         p = Path(raw_path)
@@ -406,8 +408,9 @@ class CueEventHandler(FileSystemEventHandler):
             return
         if _is_excluded(p, self.excluded):
             return
+        if not enqueue_cue(self.q, p, self.seen):
+            return
         logger.info("New CUE detected: %s", p)
-        self.q.put(p)
 
     def on_created(self, event):
         if event.is_directory:
@@ -720,6 +723,7 @@ def qbt_auto_deselect_loop(
     qcfg: Dict[str, Any], lidarr, stop: threading.Event, interval: int,
     download_root: str = "", llm=None, q: "Optional[queue.Queue[Path]]" = None,
     assembly_keep_provider=None, deselect_ledger_path: Optional[Path] = None,
+    cue_seen: "Optional[set]" = None,
 ) -> None:
     """
     Poll qBittorrent on a schedule. Two jobs per pass:
@@ -819,8 +823,8 @@ def qbt_auto_deselect_loop(
                 for name in files:
                     if name.lower().endswith(".cue"):
                         cue = Path(dirpath) / name
-                        q.put(cue)
-                        logger.info("qbt complete -> queued %s", cue)
+                        if enqueue_cue(q, cue, cue_seen):
+                            logger.info("qbt complete -> queued %s", cue)
         except OSError as exc:
             logger.debug("qbt complete: cue scan of %s failed: %s", folder, exc)
 
@@ -976,6 +980,28 @@ def purge_imported_loop(
 # --- Startup scan -------------------------------------------------------
 
 
+def enqueue_cue(q, cue: Path, seen: "Optional[set]" = None) -> bool:
+    """Queue a .cue once. True if it was queued, False if it was already there.
+
+    THREE places enqueue cues -- the startup/rescan walk, the watchdog, and the
+    torrent-complete hook -- and only the walk consulted a `seen` set. A cue
+    found by more than one of them was queued more than once: the live queue
+    held 48 entries for 19 distinct cues, the worst repeated three times. The
+    worker skips the repeats (in-memory `_skip_seen` and the on-disk ledger),
+    so this cost no extra splits -- but it made the WebUI's pending count read
+    2-3x the real backlog, which is what it looked like for Barenaked Ladies.
+    """
+    if q is None or cue is None:
+        return False
+    if seen is not None:
+        key = str(cue)
+        if key in seen:
+            return False
+        seen.add(key)
+    q.put(cue)
+    return True
+
+
 def scan_existing(root: Path, excluded: list, q: "queue.Queue[Path]",
                   seen: "Optional[set]" = None, quiet: bool = False) -> int:
     """Enqueue any .cue files present under `root`, honoring excludes.
@@ -1012,12 +1038,8 @@ def scan_existing(root: Path, excluded: list, q: "queue.Queue[Path]",
             if _is_excluded(cue, excluded):
                 skipped += 1
                 continue
-            if seen is not None:
-                key = str(cue)
-                if key in seen:
-                    continue
-                seen.add(key)
-            q.put(cue)
+            if not enqueue_cue(q, cue, seen):
+                continue
             count += 1
     if errored:
         logger.warning("cue scan: %d director(y/ies) were unreadable "
@@ -1662,7 +1684,10 @@ def main() -> int:
             ", ".join(str(p) for p in excluded_dirs),
         )
 
-    handler = CueEventHandler(q, excluded_dirs)
+    # Shared with the #9 recurring re-scan so it only enqueues .cue files the
+    # watchdog later misses -- not everything, every pass.
+    cue_seen: set = set()
+    handler = CueEventHandler(q, excluded_dirs, seen=cue_seen)
 
     # Watchdog's default Observer uses ReadDirectoryChangesW on Windows.
     # Over a UNC share (\\host\share\...), change notifications depend on
@@ -1706,9 +1731,6 @@ def main() -> int:
         )
         heartbeat_thread.start()
 
-    # Shared with the #9 recurring re-scan so it only enqueues .cue files the
-    # watchdog later misses -- not everything, every pass.
-    cue_seen: set = set()
     pre_existing = scan_existing(watch_root, excluded_dirs, q, seen=cue_seen)
     if pre_existing:
         logger.info("Queued %d pre-existing .cue files at startup", pre_existing)
@@ -1956,6 +1978,7 @@ def main() -> int:
                       # re-plans (and re-LLMs) every torrent from scratch.
                       (isearch_state_path.parent / "deselect_planned.json"
                        if isearch_state_path else None)),
+                kwargs={"cue_seen": cue_seen},
                 daemon=True,
                 name="cue-qbt",
             )
