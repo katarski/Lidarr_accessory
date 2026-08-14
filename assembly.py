@@ -359,11 +359,26 @@ class AssemblyPlanner:
         want_artist = norm_artist(artist)
         matched: List[Dict[str, Any]] = []
         missing: List[Dict[str, Any]] = []
+        # Tracks the LIBRARY already holds. Previously every track was either
+        # sourced from a download or declared missing, with no third state, so
+        # a song already sitting in the library was reported as "still missing"
+        # purely because no download folder happened to contain it. Odetta's
+        # `Sings Ballads and Blues` read 18/20 with "Deep River" and "Chilly
+        # Winds" listed as missing while Lidarr had both -- the album is
+        # completable, and the UI said it was not.
+        present: List[Dict[str, Any]] = []
         for t in tracks:
             title = str(t.get("title") or "").strip()
             nt = norm_title(title)
             if not nt:
                 continue
+            if t.get("hasFile"):
+                present.append({
+                    "track_id": t.get("id"), "track": title,
+                    "number": (t.get("absoluteTrackNumber")
+                               or t.get("trackNumber")),
+                })
+                continue        # nothing to source; it is already in place
             best: Optional[Tuple[float, Dict[str, Any], str]] = None
             # Only compare against songs the inverted index says could match.
             for e in index.candidates_for(nt):
@@ -398,15 +413,20 @@ class AssemblyPlanner:
                     "number": t.get("absoluteTrackNumber") or t.get("trackNumber"),
                     "best_score": round(best[0], 3) if best else 0.0,
                 })
-        total = len(matched) + len(missing)
+        total = len(matched) + len(missing) + len(present)
         sources: Dict[str, List[str]] = {}
         for m in matched:
             sources.setdefault(m["source"], []).append(m["track"])
+        # Completeness is what the album will look like AFTER the import, so
+        # already-present tracks count towards it. Odetta: 18 sourced + 2
+        # already in the library = 100%, not 90% with two "missing".
+        have = len(matched) + len(present)
         return {
             "artist": artist, "album": album, "total": total,
-            "matched": matched, "missing": missing,
+            "matched": matched, "missing": missing, "present": present,
             "n_matched": len(matched), "n_missing": len(missing),
-            "pct": round(100.0 * len(matched) / total, 1) if total else 0.0,
+            "n_present": len(present),
+            "pct": round(100.0 * have / total, 1) if total else 0.0,
             "sources": sources,
             "updated": time.time(),
         }

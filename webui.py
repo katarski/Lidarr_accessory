@@ -1012,7 +1012,8 @@ function asmRender(){
       +' onclick="asmSel(event,\''+h(String(a.id))+'\',this.checked)"> '
       +'<b>'+h(a.artist)+' / '+h(a.album)+'</b> '
       +'<span style="color:'+col+'">'+pct.toFixed(0)+'%</span> '
-      +'<span class="muted">'+(a.n_matched||0)+'/'+(a.total||0)+' songs</span> '
+      +'<span class="muted">'+((a.n_matched||0)+(a.n_present||0))+'/'+(a.total||0)+' songs</span> '
+      +((a.n_present||0)?'<span class="muted">('+(a.n_present||0)+' already in library)</span> ':'')
       +bar
       +'<div class="acts" style="margin-left:auto">'
       +'<button class="b-ll" title="Search torrents for the songs this album is '
