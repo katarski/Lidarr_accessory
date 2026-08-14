@@ -980,6 +980,29 @@ class Orchestrator:
                     reason="orphan cue + split audio (no disc image)",
                 )
                 return None
+            # The cue may sit in a SIDECAR folder with the rest of the rip
+            # metadata, one level below the album. EAC writes exactly this:
+            #   2001. Weezer (Green Album) [069493045-2]/
+            #       01. ... .flac  ... 10 tracks
+            #       Technical/  foo_dr.txt  .accurip  .log  .cue
+            # There is no audio beside the cue, so this used to log "No
+            # companion audio" and stop -- leaving an album that was sitting
+            # right there, already split, unimported. Look in the PARENT.
+            if self._is_sidecar_dir(cue_path.parent):
+                up = cue_path.parent.parent
+                up_audio = self._sibling_audio_files(up)
+                if up_audio:
+                    logger.info(
+                        "%s is rip metadata in %s/; the album is one level up "
+                        "with %d split file(s) -- handing that off to Lidarr.",
+                        cue_path.name, cue_path.parent.name, len(up_audio),
+                    )
+                    self._handoff_pre_split_to_lidarr(
+                        cue_path, up,
+                        reason="cue in a %s sidecar folder; album is the parent"
+                               % cue_path.parent.name,
+                    )
+                    return None
             logger.error("No companion audio next to %s", cue_path)
             self._record(cue_path, outcome="failed", pre_split=False,
                          reason="no companion audio")
@@ -1550,6 +1573,23 @@ class Orchestrator:
                 return True
             time.sleep(1)
         return False
+
+    # Folders a ripper puts its PAPERWORK in, beside the album rather than in
+    # it: EAC's "Technical" (log/accurip/foo_dr), plus the usual art folders.
+    # A .cue in one of these is reference metadata for the album ABOVE it.
+    _SIDECAR_DIR_RE = re.compile(
+        r"(?i)^-?(?:technical|scans?|artwork|art|covers?|cover|sleeves?|"
+        r"booklet|images?|logs?|info|extras?|other)$")
+
+    def _is_sidecar_dir(self, folder: Path) -> bool:
+        """True when this folder holds rip paperwork, not the album itself."""
+        try:
+            if not self._SIDECAR_DIR_RE.match(folder.name or ""):
+                return False
+            # ...and it really has no audio of its own.
+            return not self._sibling_audio_files(folder)
+        except OSError:
+            return False
 
     def _sibling_audio_files(self, folder: Path) -> List[Path]:
         """
