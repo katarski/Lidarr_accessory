@@ -180,6 +180,12 @@ _PAGE = r"""<!doctype html>
   .pline .plab{flex:0 0 22rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:.74rem}
   /* Total conversion progress, pinned above the panels so it is the first
      thing on the tab and never scrolls away behind a long queue. */
+  /* Each section carries its OWN bar in the header, so progress is readable
+     whether the list is expanded or collapsed. */
+  .cvsec>summary{display:flex;align-items:center;gap:.5rem}
+  .sbar{flex:1 1 auto;height:6px;background:var(--chip);border-radius:4px;overflow:hidden;min-width:4rem;max-width:40rem}
+  .sbar>span{display:block;height:100%;width:0;background:var(--acc);transition:width .3s}
+  .spct{flex:0 0 3.4rem;text-align:right;font-size:.72rem;color:var(--mut)}
   .cvtotal{margin:0 0 .6rem 0}
   .cvtotal:empty{display:none}
   .cvtotal .pline{background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:.5rem .7rem}
@@ -339,9 +345,9 @@ _PAGE = r"""<!doctype html>
   </div>
   <div id="progress" style="display:none">
     <div id="cv-total" class="cvtotal"></div>
-    <details id="cv-sec-prog" class="cvsec" open><summary>Progress</summary><div id="cv-prog" class="cvbody"><span class="muted">nothing running</span></div></details>
-    <details id="cv-sec-conv" class="cvsec" open><summary>Conversions <span class="n" id="cv-nconv">0</span> <span class="muted" id="cv-nalb"></span></summary><div id="cv-convlist" class="cvbody"></div></details>
-    <details id="cv-sec-split" class="cvsec"><summary>Cue splits <span class="n" id="cv-nsplit">0</span></summary><div id="cv-splitlist" class="cvbody"></div></details>
+    <details id="cv-sec-prog" class="cvsec" open><summary>Progress<span class="sbar"><span id="sb-prog"></span></span><span class="spct" id="sp-prog"></span></summary><div id="cv-prog" class="cvbody"><span class="muted">nothing running</span></div></details>
+    <details id="cv-sec-conv" class="cvsec" open><summary>Conversions <span class="n" id="cv-nconv">0</span> <span class="muted" id="cv-nalb"></span><span class="sbar"><span id="sb-conv"></span></span><span class="spct" id="sp-conv"></span></summary><div id="cv-convlist" class="cvbody"></div></details>
+    <details id="cv-sec-split" class="cvsec"><summary>Cue splits <span class="n" id="cv-nsplit">0</span><span class="sbar"><span id="sb-split"></span></span><span class="spct" id="sp-split"></span></summary><div id="cv-splitlist" class="cvbody"></div></details>
     <div class="cvbar">
       <label>Codec <select id="cv-codec" onchange="cvCodecChanged()"></select></label>
       <label>Mode <select id="cv-mode" onchange="cvModeChanged()"></select></label>
@@ -1736,6 +1742,19 @@ function cvPollOnce(){
       tot='<div class="pline"><span class="plab"><b>'+h(hdr)+'</b></span><div class="pbar"><div class="pfill" style="width:'+(conv.total_pct||0)+'%"></div></div><span class="ppct">'+(conv.total_pct||0)+'%</span></div>';
     }
     document.getElementById('cv-total').innerHTML=tot;
+    // Section header bars. Progress and Conversions track the batch; Cue
+    // splits tracks whatever split is actually running.
+    function setBar(id,pid,pct,label){
+      var b=document.getElementById(id),p=document.getElementById(pid);
+      if(b)b.style.width=Math.max(0,Math.min(100,pct||0))+'%';
+      if(p)p.textContent=label;
+    }
+    setBar('sb-conv','sp-conv',conv.total_pct||0,nT?((conv.total_pct||0)+'%'):'');
+    var splitAct=act.filter(function(a){return /split/i.test(a.stage||'');});
+    var spct=splitAct.length&&typeof splitAct[0].pct==='number'?splitAct[0].pct:0;
+    setBar('sb-split','sp-split',spct,splitAct.length?(Math.round(spct)+'%'):'');
+    var anyAct=act.length+nRun;
+    setBar('sb-prog','sp-prog',conv.total_pct||0,anyAct?(anyAct+' active'):'');
     var out='';
     if(running.length){
 
