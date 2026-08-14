@@ -864,6 +864,23 @@ class ConvertManager:
         return queued, errors
 
     # ---------- internals ----------
+    def cancel_queued(self) -> int:
+        """Drop everything still QUEUED. Files already encoding are left to
+        finish -- killing ffmpeg mid-file would leave a truncated output.
+
+        Without this a mis-aimed selection could only be undone by restarting
+        the container: pause stops new jobs starting but the queue stays, and
+        clear_done() deliberately keeps anything queued or running.
+        """
+        with self._lock:
+            drop = {jid for jid in self._queue}
+            self._queue = []
+            for jid in drop:
+                self._jobs.pop(jid, None)
+        if drop:
+            logger.info("convert: cancelled %d queued job(s)", len(drop))
+        return len(drop)
+
     def pause(self) -> bool:
         """Stop starting NEW jobs. Running encodes finish; nothing is lost."""
         with self._lock:

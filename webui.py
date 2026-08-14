@@ -358,6 +358,7 @@ _PAGE = r"""<!doctype html>
       <button class="b-copy" onclick="cvSelectAll()" title="Tick every top-level folder and file. Because ticking a folder means everything inside it, this selects the whole library at the current view.">Select all</button>
       <button class="b-copy" onclick="cvClearSel()" title="Clear the selection">&#10005;</button>
       <button class="b-move" onclick="cvConvertSel()">Convert</button>
+      <button class="b-copy" onclick="cvCancel()" title="Drop everything still queued. Files already encoding are left to finish.">Clear queue</button>
       <button class="b-copy" id="cv-pause" onclick="cvPause()" title="Stop starting new conversions. Anything already encoding finishes; the queue is kept.">Pause</button>
       <button class="b-disc" onclick="cvDeleteSel()">Delete selected</button>
     </div>
@@ -1410,6 +1411,11 @@ function cvMkRoot(){
        var op=document.createElement('option');op.value=j.name;op.textContent=j.name;
        sel.appendChild(op);sel.value=j.name;}
    }).catch(function(e){toast('error: '+e);});}
+function cvCancel(){
+  if(!confirm('Drop every QUEUED conversion? Files already encoding will finish.'))return;
+  fetch('/api/convert/cancel',{method:'POST'}).then(function(r){return r.json();})
+   .then(function(j){toast(j.message||'cleared');cvPollOnce();})
+   .catch(function(e){toast('error: '+e);});}
 function cvPause(){
   var b=document.getElementById('cv-pause');
   var want=(b&&b.dataset.paused==='1')?'resume':'pause';
@@ -2303,6 +2309,16 @@ def make_handler(store, actions: HeldActions):
                 self._json(200 if ok else 400,
                            {"ok": ok, "name": msg if ok else "",
                             "message": ("Created %s" % msg) if ok else msg})
+                return
+            if path == "/api/convert/cancel":
+                cv = getattr(actions, "converter", None)
+                if cv is None:
+                    self._json(503, {"ok": False, "message": "converter unavailable"})
+                    return
+                n = cv.cancel_queued()
+                self._json(200, {"ok": True, "cancelled": n,
+                                 "message": "Cancelled %d queued conversion(s); "
+                                            "anything already encoding finishes" % n})
                 return
             if path in ("/api/convert/pause", "/api/convert/resume"):
                 cv = getattr(actions, "converter", None)
