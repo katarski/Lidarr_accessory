@@ -379,6 +379,7 @@ _PAGE = r"""<!doctype html>
       <button class="b-copy" onclick="cvClearSel()" title="Clear the selection">&#10005;</button>
       <button class="b-go" onclick="cvConvertSel()">Convert</button>
       <button class="b-stop" onclick="cvCancel()" title="Cancel the conversion. Files already encoding finish.">Cancel</button>
+      <button class="b-copy" onclick="cvClearDone()" title="Clear the list of finished conversions. The queue keeps running.">Clear done</button>
       <button class="b-hold" id="cv-pause" onclick="cvPause()" title="Stop starting new conversions. Anything already encoding finishes; the queue is kept.">Pause</button>
       <button class="b-disc" onclick="cvDeleteSel()">Delete selected</button>
     </div>
@@ -1431,6 +1432,10 @@ function cvMkRoot(){
        var op=document.createElement('option');op.value=j.name;op.textContent=j.name;
        sel.appendChild(op);sel.value=j.name;}
    }).catch(function(e){toast('error: '+e);});}
+function cvClearDone(){
+  fetch('/api/convert/cleardone',{method:'POST'}).then(function(r){return r.json();})
+   .then(function(j){toast(j.message||'cleared');cvPollOnce();})
+   .catch(function(e){toast('error: '+e);});}
 function cvCancel(){
   if(!confirm('Cancel the conversion?'))return;
   fetch('/api/convert/cancel',{method:'POST'}).then(function(r){return r.json();})
@@ -2366,6 +2371,14 @@ def make_handler(store, actions: HeldActions):
                 self._json(200 if ok else 400,
                            {"ok": ok, "name": msg if ok else "",
                             "message": ("Created %s" % msg) if ok else msg})
+                return
+            if path == "/api/convert/cleardone":
+                cv = getattr(actions, "converter", None)
+                if cv is None:
+                    self._json(503, {"ok": False, "message": "converter unavailable"})
+                    return
+                cv.clear_done()
+                self._json(200, {"ok": True, "message": "Cleared finished conversions"})
                 return
             if path == "/api/convert/cancel":
                 cv = getattr(actions, "converter", None)
