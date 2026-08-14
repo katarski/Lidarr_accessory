@@ -178,11 +178,12 @@ _PAGE = r"""<!doctype html>
   .pfill{height:100%;background:#4f8ef7;border-radius:5px;transition:width .6s}
   .pline{display:flex;align-items:center;gap:.6rem}
   .pline .plab{flex:0 0 22rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:.74rem}
-  /* Progress and Conversions sit SIDE BY SIDE -- the conversion list under
-     the progress bars pushed everything off-screen during a big run. */
-  .cvcols{display:flex;gap:.6rem;align-items:flex-start;flex-wrap:wrap}
-  .cvcols>details{flex:1 1 24rem;min-width:0}
-  .cvcols .cvbody{max-height:46vh;overflow:auto}
+  /* Total conversion progress, pinned above the panels so it is the first
+     thing on the tab and never scrolls away behind a long queue. */
+  .cvtotal{margin:0 0 .6rem 0}
+  .cvtotal:empty{display:none}
+  .cvtotal .pline{background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:.5rem .7rem}
+  .cvsec .cvbody{max-height:42vh;overflow:auto}
   .pline .ppct{flex:0 0 3.2rem;text-align:right;font-size:.72rem;color:var(--mut)}
   #cv-modal{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;z-index:60}
   #cv-modal .mbox{background:var(--card);border:1px solid var(--bd);border-radius:12px;max-width:44rem;max-height:80vh;overflow:auto;padding:1rem 1.2rem;min-width:24rem}
@@ -337,10 +338,9 @@ _PAGE = r"""<!doctype html>
     <div id="asm-list"></div>
   </div>
   <div id="progress" style="display:none">
-    <div class="cvcols">
-      <details id="cv-sec-prog" class="cvsec" open><summary>Progress</summary><div id="cv-prog" class="cvbody"><span class="muted">nothing running</span></div></details>
-      <details id="cv-sec-conv" class="cvsec" open><summary>Conversions <span class="n" id="cv-nconv">0</span> <span class="muted" id="cv-nalb"></span></summary><div id="cv-convlist" class="cvbody"></div></details>
-    </div>
+    <div id="cv-total" class="cvtotal"></div>
+    <details id="cv-sec-prog" class="cvsec" open><summary>Progress</summary><div id="cv-prog" class="cvbody"><span class="muted">nothing running</span></div></details>
+    <details id="cv-sec-conv" class="cvsec" open><summary>Conversions <span class="n" id="cv-nconv">0</span> <span class="muted" id="cv-nalb"></span></summary><div id="cv-convlist" class="cvbody"></div></details>
     <details id="cv-sec-split" class="cvsec"><summary>Cue splits <span class="n" id="cv-nsplit">0</span></summary><div id="cv-splitlist" class="cvbody"></div></details>
     <div class="cvbar">
       <label>Codec <select id="cv-codec" onchange="cvCodecChanged()"></select></label>
@@ -1725,14 +1725,20 @@ function cvPollOnce(){
     var nQ=(conv.n_queued!==undefined)?conv.n_queued:0;
     document.getElementById('n-prog').textContent=(nAct+act.length)||0;
     // Progress section: total bar + each running conversion + each activity.
-    var out='';
-    if(running.length){
-      var nD=(conv.n_done!==undefined)?conv.n_done:0;
-      var nT=(conv.n_total!==undefined)?conv.n_total:(nAct+nD);
+    // TOTAL first, in its own element at the top of the tab.
+    var tot='';
+    var nD=(conv.n_done!==undefined)?conv.n_done:0;
+    var nT=(conv.n_total!==undefined)?conv.n_total:(nAct+nD);
+    if(nT){
       var hdr='Conversion total — '+nD+' of '+nT+' done ('+nRun+' running, '+nQ+' queued)';
       if(conv.paused)hdr+=' — PAUSED';
       else if(conv.held_for_pipeline)hdr+=' — waiting for the pipeline';
-      out+='<div class="pline"><span class="plab"><b>'+h(hdr)+'</b></span><div class="pbar"><div class="pfill" style="width:'+(conv.total_pct||0)+'%"></div></div><span class="ppct">'+(conv.total_pct||0)+'%</span></div>';
+      tot='<div class="pline"><span class="plab"><b>'+h(hdr)+'</b></span><div class="pbar"><div class="pfill" style="width:'+(conv.total_pct||0)+'%"></div></div><span class="ppct">'+(conv.total_pct||0)+'%</span></div>';
+    }
+    document.getElementById('cv-total').innerHTML=tot;
+    var out='';
+    if(running.length){
+
       // Only the files actually ENCODING get a bar here. Listing the queue
       // too made this column a duplicate of the Conversions column beside it,
       // and with hundreds queued the two filled the screen with the same rows.
