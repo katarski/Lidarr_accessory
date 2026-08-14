@@ -1378,8 +1378,15 @@ function cvEnter(){
   if(CVPOLL)clearInterval(CVPOLL);
   CVPOLL=setInterval(function(){if(TAB==='progress')cvPollOnce();},3000);
 }
+function cvDestId(){
+  // The dest <select> value is "<driveId>|p" / "<driveId>|f" -- the suffix is
+  // the preserve-path mode, folded into the dropdown so it is not a separate
+  // checkbox. Anything asking the SERVER about the drive must strip it, or it
+  // looks for a folder literally named "TO_Exter_nal_USB_3.0|p".
+  return ((document.getElementById('cv-dest').value)||'').split('|')[0]||'';
+}
 function cvLoadRoots(){
-  var d=document.getElementById('cv-dest').value, sel=document.getElementById('cv-root');
+  var d=cvDestId(), sel=document.getElementById('cv-root');
   if(!sel)return;
   if(!d){sel.innerHTML='<option value="">(drive root)</option>';return;}
   var keep=sel.value;
@@ -1391,7 +1398,7 @@ function cvLoadRoots(){
      if(keep)sel.value=keep;
    }).catch(function(){});}
 function cvMkRoot(){
-  var d=document.getElementById('cv-dest').value;
+  var d=cvDestId();
   if(!d){toast('Choose a destination drive first');return;}
   var name=prompt('New folder on the destination drive:');
   if(!name)return;
