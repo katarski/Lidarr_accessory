@@ -1030,6 +1030,29 @@ class Orchestrator:
         # In both cases there's no reason to split again; just erase the
         # source folder and move on.
         if self.cfg.pre_check_lidarr_library:
+            # A disc holding several albums, all of which we already have.
+            # Skip the split; never delete here -- the disc belongs to a box
+            # set whose other discs may still be wanted, and the parts' track
+            # counts do not describe this image.
+            combined = self._combined_disc_fully_owned(
+                (cue.performer or "").strip(), (cue.title or "").strip())
+            if combined:
+                names = ", ".join("%s (%s/%s)" % (
+                    r.get("title"),
+                    (r.get("statistics") or {}).get("trackFileCount"),
+                    (r.get("statistics") or {}).get("totalTrackCount"))
+                    for r in combined)
+                logger.info(
+                    "Combined disc %r holds only albums already complete in "
+                    "the library -- skipping the split. [%s]",
+                    cue.title, names)
+                self._skip_seen.add(cue_path)
+                self._record(
+                    cue_path, outcome="already_in_lidarr", pre_split=False,
+                    artist=cue.performer or "", album=cue.title or "",
+                    reason="combined disc, all parts complete: %s" % names,
+                )
+                return None
             matched = self._already_in_library(cue)
             if matched:
                 artist_name = cue.performer or ""
@@ -12975,6 +12998,56 @@ class Orchestrator:
                 staging_dir.rmdir()
         except OSError:
             pass
+
+    # "A + B" / "A / B" on one disc -- the 2-in-1 reissue. Split only on these
+    # two separators: "&" is part of far too many real album titles.
+    _COMBINED_SPLIT_RE = re.compile(r"\s*[+/]\s*")
+
+    def _combined_album_parts(self, title: str) -> List[str]:
+        """The individual albums named by a combined-disc title, else []."""
+        parts = [p.strip(" -_.") for p in
+                 self._COMBINED_SPLIT_RE.split(title or "") if p.strip(" -_.")]
+        return parts if len(parts) >= 2 and all(len(p) >= 3 for p in parts) else []
+
+    def _combined_disc_fully_owned(
+        self, artist: str, title: str,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """
+        For a disc holding SEVERAL albums, the records for them if the library
+        already has every one complete -- else None.
+
+        `Odetta - 7 Classic Album Plus Bonus Radio Tracks (4 CD Box)` was
+        grabbed to fill four genuinely missing Odetta albums, and its Disc 1 is
+        `The Tin Angel (With Larry Mohr) + My Eyes Have Seen`. Both of those are
+        complete in the library (19/19 and 13/13), but the plain pre-flight
+        cannot say so: its subset guard refuses a download title carrying extra
+        words, deliberately, because the reverse direction deletes music we do
+        not own. So the pipeline re-extracted all 23 tracks of a disc image it
+        needed none of.
+
+        Splitting the title and requiring EVERY part to be complete keeps that
+        guard intact -- this can only ever add a skip, never a deletion.
+        """
+        parts = self._combined_album_parts(title)
+        if not parts:
+            return None
+        recs = []
+        for p in parts:
+            # Try the part verbatim, then without its parentheticals: the disc
+            # says "The Tin Angel (With Larry Mohr)" and Lidarr says "The Tin
+            # Angel", and the subset guard rejects the extra words -- rightly,
+            # since it cannot tell a guest credit from a different record.
+            bare = re.sub(r"[\(\[\{][^)\]\}]*[)\]\}]", " ", p)
+            bare = re.sub(r"\s{2,}", " ", bare).strip(" -_.")
+            r = None
+            for name in [p] + ([bare] if bare and bare != p else []):
+                r = self._album_already_in_library(artist, name)
+                if r:
+                    break
+            if not r:
+                return None
+            recs.append(r)
+        return recs
 
     def _already_in_library(self, cue: Cue) -> Optional[Dict[str, Any]]:
         """CUE-based wrapper around _album_already_in_library()."""
