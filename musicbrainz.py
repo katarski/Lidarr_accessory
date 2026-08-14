@@ -28,6 +28,7 @@ import collections
 import json
 import logging
 import re
+import unicodedata
 import threading
 import time
 import urllib.parse
@@ -59,6 +60,15 @@ COLLECTION_SECONDARY = frozenset({"compilation", "soundtrack", "live"})
 _LUCENE_ESCAPE_RE = re.compile(r'(["\\])')
 _NORM_BRACKETS_RE = re.compile(r"\(.*?\)|\[.*?\]")
 _NORM_KEEP_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _norm_name(s: Any) -> str:
+    """Casefold + strip accents + keep [a-z0-9], for comparing artist names
+    and their aliases. Same shape as the Lidarr-side key, kept local so this
+    module stays free of that import."""
+    t = unicodedata.normalize("NFKD", str(s or "").casefold())
+    t = "".join(c for c in t if not unicodedata.combining(c))
+    return re.sub(r"[^a-z0-9]+", "", t)
 
 
 def norm_release_title(s: Any) -> str:
@@ -113,6 +123,32 @@ class MusicBrainzClient:
             if attempt < self.retries:
                 time.sleep(2.0)
         logger.warning("musicbrainz GET %s failed: %s", path, last)
+        return None
+
+    def artist_mbid_for_name(self, name: str) -> Optional[str]:
+        """
+        The MusicBrainz id of the artist known by `name`, matching ALIASES as
+        well as the canonical name. [] / None when nothing matches confidently.
+
+        This is what lets 'Lauryn Hill' find the artist Lidarr stores as 'Ms.
+        Lauryn Hill': MusicBrainz lists the aliases (Lauryn Hill, Lauren Hill,
+        Laurin Hill, L-Boogie, ローリン・ヒル) and Lidarr keeps the MBID, so the
+        two can be tied together without guessing at prefixes.
+
+        Only an exact (normalized) hit on the name or one of its aliases is
+        accepted -- MusicBrainz's search will happily return loosely-similar
+        artists, and a wrong artist here is worse than no answer.
+        """
+        want = _norm_name(name)
+        if not want:
+            return None
+        data = self._get("/artist", query='artist:"%s"' % name.replace('"', ""),
+                         limit=10, inc="aliases")
+        for a in ((data or {}).get("artists") or []):
+            names = [a.get("name") or "", a.get("sort-name") or ""]
+            names += [al.get("name") or "" for al in (a.get("aliases") or [])]
+            if any(_norm_name(n) == want for n in names):
+                return a.get("id")
         return None
 
     def release_groups(

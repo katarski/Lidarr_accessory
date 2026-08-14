@@ -963,6 +963,42 @@ class LidarrClient:
                         "best %.2f) -- romanization variant",
                         name, best.get("artistName"), scored[0][0], runner_up)
                     return best
+        # LAST RESORT: ask MusicBrainz. It carries the artist's ALIASES, and
+        # Lidarr stores the same MusicBrainz id, so the two can be tied
+        # together without guessing at prefixes or spellings -- 'Lauryn Hill'
+        # -> e8414012-... -> the artist Lidarr calls 'Ms. Lauryn Hill'. Also
+        # covers stage names and misspellings, which no rule of mine would.
+        return self._find_artist_via_musicbrainz(name, results)
+
+    def _find_artist_via_musicbrainz(
+        self, name: str, results: List[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve `name` through MusicBrainz aliases to a library artist."""
+        mb = getattr(self, "mb", None)
+        if mb is None:
+            return None
+        key = _norm_artist(name)
+        cache = getattr(self, "_mb_artist_cache", None)
+        if cache is None:
+            cache = self._mb_artist_cache = {}
+        if key in cache:                      # negatives cached too: MusicBrainz
+            mbid = cache[key]                 # is rate-limited to ~1 req/sec
+        else:
+            try:
+                mbid = mb.artist_mbid_for_name(name)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("musicbrainz artist lookup failed for %r: %s",
+                             name, exc)
+                mbid = None
+            cache[key] = mbid
+        if not mbid:
+            return None
+        for a in results:
+            if str(a.get("foreignArtistId") or "").lower() == str(mbid).lower():
+                logger.info(
+                    "find_artist: '%s' resolved to '%s' via a MusicBrainz "
+                    "alias (%s)", name, a.get("artistName"), mbid)
+                return a
         return None
 
     def list_albums_for_artist(self, artist_id: int) -> List[Dict[str, Any]]:

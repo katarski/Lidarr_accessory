@@ -1640,6 +1640,14 @@ def main() -> int:
         content_identify_llm=bool(lidarr_cfg.get("content_identify_llm", True)),
     )
 
+    # Let find_artist fall back to MusicBrainz aliases ('Lauryn Hill' ->
+    # the artist Lidarr calls 'Ms. Lauryn Hill'). Optional: without it the
+    # earlier name tests still apply, this only adds a last resort.
+    try:
+        from musicbrainz import MusicBrainzClient as _MB
+        lidarr.mb = _MB()
+    except Exception as _exc:  # noqa: BLE001
+        logger.debug('MusicBrainz alias lookup unavailable: %s', _exc)
     orch = Orchestrator(orch_cfg, lidarr, ollama_client, acoustid=acoustid_client,
                         raw_cfg=cfg)
     q: "queue.Queue[Path]" = queue.Queue()
