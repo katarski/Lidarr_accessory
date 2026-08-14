@@ -89,6 +89,12 @@ _PAGE = r"""<!doctype html>
   .acts{display:flex;gap:.3rem;flex-wrap:wrap}
   button{font:inherit;border:0;border-radius:7px;padding:.32rem .6rem;cursor:pointer;white-space:nowrap}
   .b-copy{background:var(--chip);color:var(--fg)}.b-keep{background:#334155;color:#fff}.b-move{background:var(--acc);color:#fff}.b-disc{background:var(--danger);color:#fff}
+  /* Action colours: green = go, amber = hold, red = destructive. Pause and
+     Resume share one button, so it recolours with its label. */
+  .b-go{background:#238636;color:#fff}
+  .b-hold{background:#9e6a03;color:#fff}
+  .b-stop{background:#a1242f;color:#fff}
+  .b-danger{background:var(--danger);color:#fff}
   button:disabled{opacity:.5;cursor:default}
   .empty{padding:3rem;text-align:center;color:var(--mut)}
   .muted{color:var(--mut)}
@@ -351,15 +357,15 @@ _PAGE = r"""<!doctype html>
       <label class="cvtoggle" title="Only convert LOSSLESS sources (FLAC/WAV/APE/WV/AIFF/ALAC). Re-encoding an MP3 loses quality twice, and re-encoding one to FLAC just makes a bigger file."><span>Lossless sources only</span><input type="checkbox" id="cv-lossless-only"></label>
       <label title="Order the folder/file list. Size uses the rolled-up folder size already cached by the library scan.">Sort <select id="cv-sort" onchange="cvSortChanged()"><option value="name">Name (A-Z)</option><option value="size">Size (largest first)</option><option value="size_asc">Size (smallest first)</option></select></label>
       <label>Files at a time <select id="cv-conc"></select></label>
-      <label class="cvtoggle" id="cv-overwrite-wrap" title="Replace each source file with the converted one: the original (e.g. FLAC) is DELETED after a verified encode, sidecar .xml files are repointed at the new filename, and Lidarr is asked to rescan the album folder."><span>Delete original</span><input type="checkbox" id="cv-overwrite"></label>
+      <label class="cvtoggle" id="cv-overwrite-wrap" title="Replace each source file with the converted one: the original (e.g. FLAC) is DELETED after a verified encode, sidecar .xml files are repointed at the new filename, and Lidarr is asked to rescan the album folder."><span style="color:var(--danger)">Delete original</span><input type="checkbox" id="cv-overwrite"></label>
       <span class="muted" id="cv-codechelp"></span>
       <div class="grow"></div>
       <span id="cv-seln" class="muted">0 selected</span>
       <button class="b-copy" onclick="cvSelectAll()" title="Tick every top-level folder and file. Because ticking a folder means everything inside it, this selects the whole library at the current view.">Select all</button>
       <button class="b-copy" onclick="cvClearSel()" title="Clear the selection">&#10005;</button>
-      <button class="b-move" onclick="cvConvertSel()">Convert</button>
-      <button class="b-copy" onclick="cvCancel()" title="Drop everything still queued. Files already encoding are left to finish.">Clear queue</button>
-      <button class="b-copy" id="cv-pause" onclick="cvPause()" title="Stop starting new conversions. Anything already encoding finishes; the queue is kept.">Pause</button>
+      <button class="b-go" onclick="cvConvertSel()">Convert</button>
+      <button class="b-stop" onclick="cvCancel()" title="Drop everything still queued. Files already encoding are left to finish.">Cancel</button>
+      <button class="b-hold" id="cv-pause" onclick="cvPause()" title="Stop starting new conversions. Anything already encoding finishes; the queue is kept.">Pause</button>
       <button class="b-disc" onclick="cvDeleteSel()">Delete selected</button>
     </div>
     <div id="cv-tree" class="cvtree"><div class="empty">Loading library…</div></div>
@@ -1427,6 +1433,7 @@ function cvSyncPause(conv){
   var p=!!(conv&&conv.paused);
   b.dataset.paused=p?'1':'0';
   b.textContent=p?'Resume':'Pause';
+  b.className=p?'b-go':'b-hold';
 }
 function cvSortChanged(){
   CVSORT=document.getElementById('cv-sort').value||'name';
