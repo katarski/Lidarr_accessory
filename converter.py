@@ -36,6 +36,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("converter")
 
+# The destination root comes straight from the user, so a stray "../" or ":"
+# must not escape the drive or break the path. `\w` keeps letters of any
+# script (the library has Cyrillic and CJK artists) while dropping
+# separators. NB: a literal dash must be LAST in the class or it forms a
+# RANGE -- an earlier draft of this line did exactly that and sanitised
+# nothing at all.
+_SAFE_DIR_RE = re.compile(r"[^\w ._-]+", re.UNICODE)
+
 AUDIO_EXTS = {
     ".flac", ".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav", ".ape",
     ".wv", ".aiff", ".aif", ".alac", ".dsf", ".dff", ".wma", ".mpc",
@@ -565,6 +573,13 @@ class ConvertManager:
                 return src.parent
         except OSError:
             return src.parent
+        # Optional root folder INSIDE the drive, so the user gets one place
+        # everything lands in instead of artists dumped at the drive root.
+        root_name = str(opts.get("out_root") or "").strip().strip("/\\")
+        if root_name:
+            safe = _SAFE_DIR_RE.sub("_", root_name).strip(" .")
+            if safe:
+                base = base / safe
         out = base
         if opts.get("preserve_path", True):
             try:
@@ -591,6 +606,22 @@ class ConvertManager:
                              "instead of every track landing in one folder. "
                              "Ignored when writing beside the original."),
                     "default": True,
+                },
+                "skip_existing": {
+                    "label": "Skip files already converted",
+                    "help": ("If the output file is already there, leave it "
+                             "alone instead of encoding a second copy. Without "
+                             "this the converter appends (1), (2), (3)... and "
+                             "re-encodes the same track on every run."),
+                    "default": True,
+                },
+                "out_root": {
+                    "label": "Destination root folder",
+                    "help": ("Optional folder created under the chosen drive "
+                             "that everything is written into, e.g. "
+                             "'Converted' -> <drive>/Converted/Artist/Album/. "
+                             "Ignored when writing beside the original."),
+                    "default": "",
                 },
                 "lossless_only": {
                     "label": "Skip files that are already lossy",
@@ -1023,6 +1054,19 @@ class ConvertManager:
                 # moment a same-named file already existed on the target drive.
                 if dst == src:
                     dst = out_dir / (src.stem + " (converted)" + spec["ext"])
+                # Already converted? Leave it. Without this the loop below
+                # appends (1), (2), (3)... so every run re-encodes the same
+                # track into yet another copy -- the whole library again on the
+                # second pass, and again on the third.
+                if (jopts.get("skip_existing", True) and dst.exists()
+                        and dst.stat().st_size > 0):
+                    job["state"] = "skipped"
+                    job["out"] = dst.name
+                    job["error"] = "already converted"
+                    job["pct"] = 100.0
+                    logger.info("convert: %s already exists -- skipping",
+                                dst.name)
+                    return
                 n = 1
                 while dst.exists():
                     dst = out_dir / f"{src.stem} ({n}){spec['ext']}"
