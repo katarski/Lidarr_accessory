@@ -183,12 +183,16 @@ _PAGE = r"""<!doctype html>
   /* Each section carries its OWN bar in the header, so progress is readable
      whether the list is expanded or collapsed. */
   .cvsec>summary{display:flex;align-items:center;gap:.5rem}
-  .sbar{flex:1 1 auto;height:6px;background:var(--chip);border-radius:4px;overflow:hidden;min-width:4rem;max-width:40rem}
+  /* The bar takes whatever width is left, so it grows and shrinks with the
+     window instead of sitting at a fixed size. */
+  .sbar{flex:1 1 auto;height:6px;background:var(--chip);border-radius:4px;overflow:hidden;min-width:3rem}
   .sbar>span{display:block;height:100%;width:0;background:var(--acc);transition:width .3s}
-  .spct{flex:0 0 3.4rem;text-align:right;font-size:.72rem;color:var(--mut)}
+  .spct{flex:0 0 auto;white-space:nowrap;text-align:right;font-size:.72rem;color:var(--mut)}
   .cvtotal{margin:0 0 .6rem 0}
   .cvtotal:empty{display:none}
-  .cvtotal .pline{background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:.5rem .7rem}
+  .cvtotal .pline{background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:.5rem .7rem;display:flex;align-items:center;gap:.6rem}
+  .cvtotal .pbar{flex:1 1 auto;min-width:4rem}
+  .cvtotal .plab{flex:0 1 auto;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .cvsec .cvbody{max-height:42vh;overflow:auto}
   .pline .ppct{flex:0 0 3.2rem;text-align:right;font-size:.72rem;color:var(--mut)}
   #cv-modal{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;z-index:60}
@@ -1749,12 +1753,15 @@ function cvPollOnce(){
       if(b)b.style.width=Math.max(0,Math.min(100,pct||0))+'%';
       if(p)p.textContent=label;
     }
-    setBar('sb-conv','sp-conv',conv.total_pct||0,nT?((conv.total_pct||0)+'%'):'');
+    setBar('sb-conv','sp-conv',conv.total_pct||0,
+           nT?(nD+' of '+nT+' — '+(conv.total_pct||0)+'%'):'no conversions yet');
     var splitAct=act.filter(function(a){return /split/i.test(a.stage||'');});
     var spct=splitAct.length&&typeof splitAct[0].pct==='number'?splitAct[0].pct:0;
-    setBar('sb-split','sp-split',spct,splitAct.length?(Math.round(spct)+'%'):'');
+    setBar('sb-split','sp-split',spct,
+           splitq.length?(splitq.length+' queued — '+Math.round(spct)+'%'):'no cue splits');
     var anyAct=act.length+nRun;
-    setBar('sb-prog','sp-prog',conv.total_pct||0,anyAct?(anyAct+' active'):'');
+    setBar('sb-prog','sp-prog',conv.total_pct||0,
+           anyAct?(anyAct+' active'):'nothing running');
     var out='';
     if(running.length){
 
@@ -1770,7 +1777,7 @@ function cvPollOnce(){
       out+='<div class="pline"><span class="plab"><span class="badge b-out">'+h(a.stage)+'</span> '+h(a.name)+(a.detail?' <span class="muted">'+h(a.detail)+'</span>':'')+'</span>'
         +(pct!==null?'<div class="pbar"><div class="pfill" style="width:'+pct+'%"></div></div><span class="ppct">'+pct+'%</span>':'<span class="ppct">'+ago(a.started)+'</span>')+'</div>';
     });
-    document.getElementById('cv-prog').innerHTML=out||'<span class="muted">nothing running</span>';
+    document.getElementById('cv-prog').innerHTML=out||'';
     // Conversions section: queue + recent results.
     document.getElementById('cv-nconv').textContent=nAct;
     var na=document.getElementById('cv-nalb');
@@ -1794,7 +1801,7 @@ function cvPollOnce(){
       running.forEach(function(jb){cl+='<div class="pline"><span class="plab">'+h(jb.rel)+'</span><span class="'+(jb.state==='running'?'badge b-out':'muted')+'">'+h(jb.state)+'</span></div>';});
     }
     (conv.done||[]).slice().reverse().forEach(function(jb){cl+='<div class="pline"><span class="plab">'+h(jb.rel)+'</span><span class="'+(jb.state==='done'?'muted':'badge b-lossy')+'">'+h(jb.state)+' '+h(jb.msg||'')+'</span></div>';});
-    document.getElementById('cv-convlist').innerHTML=cl||'<span class="muted">no conversions yet</span>';
+    document.getElementById('cv-convlist').innerHTML=cl||'';
     // Cue splits section.
     document.getElementById('cv-nsplit').textContent=splitqTotal;
     document.getElementById('cv-splitlist').innerHTML=splitq.length
