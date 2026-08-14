@@ -1714,12 +1714,17 @@ function cvPollOnce(){
     // Progress section: total bar + each running conversion + each activity.
     var out='';
     if(running.length){
-      var hdr='Conversion total ('+nRun+' running, '+nQ+' queued)';
+      var nD=(conv.n_done!==undefined)?conv.n_done:0;
+      var nT=(conv.n_total!==undefined)?conv.n_total:(nAct+nD);
+      var hdr='Conversion total — '+nD+' of '+nT+' done ('+nRun+' running, '+nQ+' queued)';
       if(conv.paused)hdr+=' — PAUSED';
       else if(conv.held_for_pipeline)hdr+=' — waiting for the pipeline';
       out+='<div class="pline"><span class="plab"><b>'+h(hdr)+'</b></span><div class="pbar"><div class="pfill" style="width:'+(conv.total_pct||0)+'%"></div></div><span class="ppct">'+(conv.total_pct||0)+'%</span></div>';
-      running.forEach(function(jb){
-        out+='<div class="pline"><span class="plab">'+h(jb.name)+'</span><div class="pbar"><div class="pfill" style="width:'+(jb.pct||0)+'%"></div></div><span class="ppct">'+(jb.state==='queued'?'queued':(jb.pct||0)+'%')+'</span></div>';
+      // Only the files actually ENCODING get a bar here. Listing the queue
+      // too made this column a duplicate of the Conversions column beside it,
+      // and with hundreds queued the two filled the screen with the same rows.
+      running.filter(function(jb){return jb.state!=='queued';}).forEach(function(jb){
+        out+='<div class="pline"><span class="plab">'+h(jb.name)+'</span><div class="pbar"><div class="pfill" style="width:'+(jb.pct||0)+'%"></div></div><span class="ppct">'+(jb.pct||0)+'%</span></div>';
       });
     }
     act.forEach(function(a){
@@ -1727,12 +1732,12 @@ function cvPollOnce(){
       out+='<div class="pline"><span class="plab"><span class="badge b-out">'+h(a.stage)+'</span> '+h(a.name)+(a.detail?' <span class="muted">'+h(a.detail)+'</span>':'')+'</span>'
         +(pct!==null?'<div class="pbar"><div class="pfill" style="width:'+pct+'%"></div></div><span class="ppct">'+pct+'%</span>':'<span class="ppct">'+ago(a.started)+'</span>')+'</div>';
     });
-    if(nAct>running.length)out+='<div class="pline"><span class="plab muted">… and '+(nAct-running.length)+' more queued (list capped so the page stays responsive)</span></div>';
     document.getElementById('cv-prog').innerHTML=out||'<span class="muted">nothing running</span>';
     // Conversions section: queue + recent results.
     document.getElementById('cv-nconv').textContent=nAct;
     var cl='';
-    running.forEach(function(jb){cl+='<div class="pline"><span class="plab">'+h(jb.rel)+'</span><span class="muted">'+h(jb.state)+'</span></div>';});
+    running.forEach(function(jb){cl+='<div class="pline"><span class="plab">'+h(jb.rel)+'</span><span class="'+(jb.state==='running'?'badge b-out':'muted')+'">'+h(jb.state)+'</span></div>';});
+    if(nAct>running.length)cl+='<div class="pline"><span class="plab muted">… and '+(nAct-running.length)+' more queued (list capped so the page stays responsive)</span></div>';
     (conv.done||[]).slice().reverse().forEach(function(jb){cl+='<div class="pline"><span class="plab">'+h(jb.rel)+'</span><span class="'+(jb.state==='done'?'muted':'badge b-lossy')+'">'+h(jb.state)+' '+h(jb.msg||'')+'</span></div>';});
     document.getElementById('cv-convlist').innerHTML=cl||'<span class="muted">no conversions yet</span>';
     // Cue splits section.

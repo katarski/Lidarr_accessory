@@ -725,10 +725,17 @@ class ConvertManager:
         queued = [j for j in jobs if j["state"] == "queued"]
         done = [j for j in jobs if j["state"] not in ("running", "queued")]
         n_active = len(running) + len(queued)
+        # BATCH progress, not an average over the queue. Averaging every
+        # active job's pct meant 2 files encoding against 415 queued read
+        # "0.3%" and never visibly moved. What the user wants to see is how
+        # far through the whole run they are, so finished jobs count as 1 and
+        # the ones encoding count as their fraction.
+        n_total = len(jobs)
+        n_done = len(done)
         total_pct = 0.0
-        if n_active:
-            total_pct = (sum(j.get("pct", 0.0) for j in running)
-                         / float(n_active))
+        if n_total:
+            frac = n_done + sum(j.get("pct", 0.0) for j in running) / 100.0
+            total_pct = 100.0 * frac / float(n_total)
         # SEND A WINDOW, NOT THE WHOLE QUEUE. This payload is polled every 3
         # seconds; selecting the library queues ~86,500 jobs, and shipping all
         # of them as JSON on every poll is what makes the browser fall over.
@@ -741,6 +748,7 @@ class ConvertManager:
                 "n_running": len(running),
                 "n_queued": len(queued),
                 "n_shown": len(shown),
+                "n_done": len(done), "n_total": len(jobs),
                 "paused": bool(self._paused),
                 "held_for_pipeline": self._pipeline_busy()}
 
