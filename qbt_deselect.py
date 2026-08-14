@@ -31,10 +31,11 @@ from typing import Callable, List, Dict, Any, Iterable, Optional, Tuple
 
 import yaml
 
-from lidarr import LidarrClient, LidarrConfig
+from lidarr import LidarrClient, LidarrConfig, _norm_artist as norm_artist
 from ollama_client import OllamaClient
 from qbittorrent_client import QbtClient
-from dedup_downloads import AUDIO_EXTS, album_complete_in_library, human
+from dedup_downloads import (AUDIO_EXTS, album_complete_in_library, human,
+                              norm_title)
 
 logger = logging.getLogger("qbt_deselect")
 
@@ -283,6 +284,44 @@ def _release_big_enough(
     return biggest if biggest >= want else 0
 
 
+def _artist_owning_album(lidarr: LidarrClient, album: str,
+                         _cache: Optional[dict] = None) -> str:
+    """
+    Which artist in the library owns an album with this title?
+
+    The artist normally comes from the torrent's TOP FOLDER, which is often not
+    an artist at all: `BJ_Discography/01 Studio albums/1986-Slippery When Wet`
+    gave artist="BJ_Discography", every Lidarr lookup missed, and all 16 Bon
+    Jovi albums -- every one complete in the library -- were reported "not in
+    library" and left selected. 16 GB of music already owned.
+
+    This works off Lidarr alone, deliberately: the deselect runs BEFORE the
+    files are downloaded, so there are no tags to read. Only an UNAMBIGUOUS
+    answer is returned -- if two artists have an album by that name we cannot
+    tell which this is, and the safe outcome is to keep downloading.
+    """
+    key = norm_title(album)
+    if not key:
+        return ""
+    if _cache is None:
+        _cache = {}
+    index = _cache.get("__album_owners__")
+    if index is None:
+        index = {}
+        try:
+            for a in (lidarr.list_all_albums() or []):
+                k = norm_title(a.get("title"))
+                nm = ((a.get("artist") or {}).get("artistName") or "").strip()
+                if not k or not nm:
+                    continue
+                index.setdefault(k, set()).add(nm)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("album-owner index failed: %s", exc)
+        _cache["__album_owners__"] = index
+    owners = index.get(key) or set()
+    return next(iter(owners)) if len(owners) == 1 else ""
+
+
 def plan_torrent(
     lidarr: LidarrClient, torrent_name: str, files: List[Dict[str, Any]],
     forced_artist: str = "", llm=None,
@@ -325,6 +364,24 @@ def plan_torrent(
         complete, have, total = album_complete_in_library(
             lidarr, artist, album, _cache=lib_cache, llm=llm, out=matched
         )
+        # The artist came from the torrent's TOP FOLDER, which is often not an
+        # artist at all: `BJ_Discography/01 Studio albums/1986-Slippery When
+        # Wet` gave artist="BJ_Discography", every Lidarr lookup missed, and
+        # all 16 Bon Jovi albums -- every one of them complete in the library
+        # -- were reported "not in library" and left selected. 16 GB of music
+        # already owned. So when the folder name resolves to nothing, ask the
+        # FILES: their tags carry the real artist.
+        if total == 0 and not forced_artist:
+            owner = _artist_owning_album(lidarr, album, _cache=lib_cache)
+            if owner and norm_artist(owner) != norm_artist(artist):
+                c2, h2, t2 = album_complete_in_library(
+                    lidarr, owner, album, _cache=lib_cache, llm=llm,
+                    out=matched)
+                if t2 > 0:
+                    logger.info(
+                        "  folder %r is not an artist -- %r is owned by %r "
+                        "(%d/%d)", raw_artist[:40], album[:40], owner, h2, t2)
+                    artist, complete, have, total = owner, c2, h2, t2
         if _is_noise_category(key) or _album_looks_unofficial(album):
             # Noise-category folder (bootlegs/live/singles/...): deselect by
             # default. Keep ONLY if Lidarr explicitly tracks a matching album
