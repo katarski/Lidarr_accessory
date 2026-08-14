@@ -524,6 +524,43 @@ class ConvertManager:
     # recreate) every time a disk is swapped.
     UNASSIGNED_ROOT = Path("/unassigned")
 
+    def dest_folders(self, dest: str) -> List[str]:
+        """Top-level folder names on a destination drive, so the UI can offer
+        the ones that already exist instead of making the user retype."""
+        dest = str(dest or "").strip()
+        if not dest:
+            return []
+        base = self.UNASSIGNED_ROOT / dest
+        try:
+            base = base.resolve()
+            if self.UNASSIGNED_ROOT.resolve() not in base.parents:
+                return []
+            return sorted((d.name for d in base.iterdir()
+                           if d.is_dir() and not d.name.startswith(".")),
+                          key=str.lower)[:500]
+        except OSError:
+            return []
+
+    def make_dest_folder(self, dest: str, name: str) -> Tuple[bool, str]:
+        """Create a folder on the destination drive. Same sanitising as the
+        conversion path, so what is created is what gets written to."""
+        dest = str(dest or "").strip()
+        safe = _SAFE_DIR_RE.sub("_", str(name or "").strip()).strip(" .")
+        if not dest:
+            return False, "choose a destination drive first"
+        if not safe:
+            return False, "give the folder a name"
+        base = self.UNASSIGNED_ROOT / dest
+        try:
+            base = base.resolve()
+            if self.UNASSIGNED_ROOT.resolve() not in base.parents:
+                return False, "refused: destination escapes the drive root"
+            (base / safe).mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return False, "could not create: %s" % exc
+        logger.info("convert: created destination folder %s on %s", safe, dest)
+        return True, safe
+
     def destinations(self) -> List[Dict[str, Any]]:
         """
         Output targets: the library itself (in place) plus every mounted

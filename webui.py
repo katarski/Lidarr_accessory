@@ -172,6 +172,11 @@ _PAGE = r"""<!doctype html>
   .pfill{height:100%;background:#4f8ef7;border-radius:5px;transition:width .6s}
   .pline{display:flex;align-items:center;gap:.6rem}
   .pline .plab{flex:0 0 22rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:.74rem}
+  /* Progress and Conversions sit SIDE BY SIDE -- the conversion list under
+     the progress bars pushed everything off-screen during a big run. */
+  .cvcols{display:flex;gap:.6rem;align-items:flex-start;flex-wrap:wrap}
+  .cvcols>details{flex:1 1 24rem;min-width:0}
+  .cvcols .cvbody{max-height:46vh;overflow:auto}
   .pline .ppct{flex:0 0 3.2rem;text-align:right;font-size:.72rem;color:var(--mut)}
   #cv-modal{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;z-index:60}
   #cv-modal .mbox{background:var(--card);border:1px solid var(--bd);border-radius:12px;max-width:44rem;max-height:80vh;overflow:auto;padding:1rem 1.2rem;min-width:24rem}
@@ -326,8 +331,10 @@ _PAGE = r"""<!doctype html>
     <div id="asm-list"></div>
   </div>
   <div id="progress" style="display:none">
-    <details id="cv-sec-prog" class="cvsec" open><summary>Progress</summary><div id="cv-prog" class="cvbody"><span class="muted">nothing running</span></div></details>
-    <details id="cv-sec-conv" class="cvsec"><summary>Conversions <span class="n" id="cv-nconv">0</span></summary><div id="cv-convlist" class="cvbody"></div></details>
+    <div class="cvcols">
+      <details id="cv-sec-prog" class="cvsec" open><summary>Progress</summary><div id="cv-prog" class="cvbody"><span class="muted">nothing running</span></div></details>
+      <details id="cv-sec-conv" class="cvsec" open><summary>Conversions <span class="n" id="cv-nconv">0</span></summary><div id="cv-convlist" class="cvbody"></div></details>
+    </div>
     <details id="cv-sec-split" class="cvsec"><summary>Cue splits <span class="n" id="cv-nsplit">0</span></summary><div id="cv-splitlist" class="cvbody"></div></details>
     <div class="cvbar">
       <label>Codec <select id="cv-codec" onchange="cvCodecChanged()"></select></label>
@@ -338,7 +345,7 @@ _PAGE = r"""<!doctype html>
       <label>Sample rate <select id="cv-sr"></select></label>
       <label>Channels <select id="cv-ch"></select></label>
       <label title="Where converted files are written. Unassigned devices are listed with their free space.">Output to <select id="cv-dest" onchange="cvDestChanged()"></select></label>
-      <label id="cv-root-wrap" title="Optional folder created under the chosen drive that everything is written into, e.g. 'Converted' gives <drive>/Converted/Artist/Album/. Ignored when writing beside the original.">Root folder <input type="text" id="cv-root" size="12" placeholder="(none)"></label>
+      <label id="cv-root-wrap" title="Folder under the chosen drive that everything is written into, e.g. 'Converted' gives <drive>/Converted/Artist/Album/. Ignored when writing beside the original.">Root folder <select id="cv-root"><option value="">(drive root)</option></select><button class="b-copy" onclick="cvMkRoot()" title="Create a new folder on the destination drive">+</button></label>
       <label class="cvtoggle" title="If the output file is already there, leave it alone instead of encoding a second copy. Without this the converter appends (1), (2), (3)... and re-encodes the same track on every run."><span>Skip already converted</span><input type="checkbox" id="cv-skip-existing" checked></label>
       <label class="cvtoggle" id="cv-copylossy-wrap" title="With 'Lossless sources only' on, copy the already-lossy files to the destination untouched instead of leaving them out, so the destination holds the whole selection. Re-encoding them would lose quality twice. Needs a destination drive."><span>Copy lossy instead of skipping</span><input type="checkbox" id="cv-copy-lossy"></label>
       <label class="cvtoggle" title="Only convert LOSSLESS sources (FLAC/WAV/APE/WV/AIFF/ALAC). Re-encoding an MP3 loses quality twice, and re-encoding one to FLAC just makes a bigger file."><span>Lossless sources only</span><input type="checkbox" id="cv-lossless-only"></label>
@@ -348,10 +355,10 @@ _PAGE = r"""<!doctype html>
       <span class="muted" id="cv-codechelp"></span>
       <div class="grow"></div>
       <span id="cv-seln" class="muted">0 selected</span>
-      <button class="b-copy" id="cv-pause" onclick="cvPause()" title="Stop starting new conversions. Anything already encoding finishes; the queue is kept.">Pause</button>
       <button class="b-copy" onclick="cvSelectAll()" title="Tick every top-level folder and file. Because ticking a folder means everything inside it, this selects the whole library at the current view.">Select all</button>
       <button class="b-copy" onclick="cvClearSel()" title="Clear the selection">&#10005;</button>
-      <button class="b-move" onclick="cvConvertSel()">Convert selected</button>
+      <button class="b-move" onclick="cvConvertSel()">Convert</button>
+      <button class="b-copy" id="cv-pause" onclick="cvPause()" title="Stop starting new conversions. Anything already encoding finishes; the queue is kept.">Pause</button>
       <button class="b-disc" onclick="cvDeleteSel()">Delete selected</button>
     </div>
     <div id="cv-tree" class="cvtree"><div class="empty">Loading library…</div></div>
@@ -1371,6 +1378,31 @@ function cvEnter(){
   if(CVPOLL)clearInterval(CVPOLL);
   CVPOLL=setInterval(function(){if(TAB==='progress')cvPollOnce();},3000);
 }
+function cvLoadRoots(){
+  var d=document.getElementById('cv-dest').value, sel=document.getElementById('cv-root');
+  if(!sel)return;
+  if(!d){sel.innerHTML='<option value="">(drive root)</option>';return;}
+  var keep=sel.value;
+  fetch('/api/convert/folders?dest='+encodeURIComponent(d)).then(function(r){return r.json();})
+   .then(function(j){
+     var o='<option value="">(drive root)</option>';
+     (j.folders||[]).forEach(function(f){o+='<option value="'+h(f)+'">'+h(f)+'</option>';});
+     sel.innerHTML=o;
+     if(keep)sel.value=keep;
+   }).catch(function(){});}
+function cvMkRoot(){
+  var d=document.getElementById('cv-dest').value;
+  if(!d){toast('Choose a destination drive first');return;}
+  var name=prompt('New folder on the destination drive:');
+  if(!name)return;
+  fetch('/api/convert/mkdir',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({dest:d,name:name})}).then(function(r){return r.json();})
+   .then(function(j){
+     toast(j.message||'');
+     if(j.ok){var sel=document.getElementById('cv-root');
+       var op=document.createElement('option');op.value=j.name;op.textContent=j.name;
+       sel.appendChild(op);sel.value=j.name;}
+   }).catch(function(e){toast('error: '+e);});}
 function cvPause(){
   var b=document.getElementById('cv-pause');
   var want=(b&&b.dataset.paused==='1')?'resume':'pause';
@@ -1396,6 +1428,7 @@ function cvDestChanged(){
   var other=!!document.getElementById('cv-dest').value;
   var rw=document.getElementById('cv-root-wrap');
   if(rw)rw.style.display=other?'':'none';
+  cvLoadRoots();
   var cw=document.getElementById('cv-copylossy-wrap');
   if(cw)cw.style.display=other?'':'none';
   if(!other)document.getElementById('cv-copy-lossy').checked=false;
@@ -2029,6 +2062,11 @@ def make_handler(store, actions: HeldActions):
             elif path == "/api/activity":
                 acts = actions.list_activity() if hasattr(actions, "list_activity") else []
                 self._json(200, {"items": acts})
+            elif path == "/api/convert/folders":
+                cv = getattr(actions, "converter", None)
+                qs = parse_qs(urlparse(self.path).query)
+                dest = (qs.get("dest", [""]) or [""])[0]
+                self._json(200, {"folders": cv.dest_folders(dest) if cv else []})
             elif path == "/api/convert/options":
                 conv = getattr(actions, "converter", None)
                 if conv is None:
@@ -2221,6 +2259,22 @@ def make_handler(store, actions: HeldActions):
                                  "results": results})
                 return
 
+            if path == "/api/convert/mkdir":
+                cv = getattr(actions, "converter", None)
+                length = int(self.headers.get("Content-Length") or 0)
+                try:
+                    body = json.loads(self.rfile.read(length) or b"{}") or {}
+                except Exception:  # noqa: BLE001
+                    body = {}
+                if cv is None:
+                    self._json(503, {"ok": False, "message": "converter unavailable"})
+                    return
+                ok, msg = cv.make_dest_folder(body.get("dest") or "",
+                                              body.get("name") or "")
+                self._json(200 if ok else 400,
+                           {"ok": ok, "name": msg if ok else "",
+                            "message": ("Created %s" % msg) if ok else msg})
+                return
             if path in ("/api/convert/pause", "/api/convert/resume"):
                 cv = getattr(actions, "converter", None)
                 if cv is None:
