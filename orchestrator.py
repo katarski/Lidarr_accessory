@@ -2518,6 +2518,29 @@ class Orchestrator:
             return False
 
         iso = max(isos, key=lambda p: p.stat().st_size if p.exists() else 0)
+
+        # Do we already OWN this record? Extracting an SACD costs minutes of
+        # CPU and gigabytes of DSF, and nothing here ever asked. `Macy Gray -
+        # The Trouble With Being Myself.iso` was extracted while Lidarr held
+        # that album complete at 12/12. The name is on the ISO itself
+        # ("Artist - Album.iso") and on the folder, so ask before working.
+        for who, what in (self._album_folder_identity(Path(iso.stem)),
+                          self._album_folder_identity(folder)):
+            if not (who and what):
+                continue
+            try:
+                owned = self._album_already_in_library(who, what)
+            except Exception:  # noqa: BLE001
+                owned = None
+            if owned:
+                st = owned.get("statistics") or {}
+                logger.info(
+                    "SACD: %s is %s / %s, already complete in the library "
+                    "(%s/%s) -- not extracting.", iso.name, who, what,
+                    st.get("trackFileCount"), st.get("totalTrackCount"))
+                self._sweep_ledger_mark(folder, isos, now_ts)
+                self._sweep_ledger_save()
+                return True
         area = self._sacd_best_area(iso)
         if area is None:
             logger.info(
@@ -4439,10 +4462,16 @@ class Orchestrator:
     # `{Medium Format} {medium:00}`: "CD 01", "Vinyl 02", "12 Vinyl 01"
     # (the format is `12" Vinyl` with the illegal quote stripped),
     # "Digital Media 01", plus the bare "CD1"/"Disc 2" spelling.
+    # The format name may be prefixed or parenthesised -- Lidarr writes exactly
+    # what MusicBrainz calls the medium: "Enhanced CD 02", "Hybrid SACD (SACD
+    # layer, 2 channels) 02". Requiring the keyword to START the name missed
+    # both, and the audit then treated each medium as its own album ("album not
+    # in Lidarr" for 'Hybrid SACD (SACD layer, 2 channels) 02'). So: a medium
+    # keyword anywhere, and a trailing medium number.
     _MEDIUM_DIR_RE = re.compile(
-        r"(?i)^\s*(?:\d+\s*[\"']?\s*)?"
+        r"(?i)^.{0,60}?\b"
         r"(?:cd|disc|disk|dvd|vinyl|lp|cassette|sacd|blu-?ray|digital\s*media|"
-        r"media|file|side)\b[\s.\-_]*\d+\s*$")
+        r"media|file|side)\b.{0,60}?[\s.\-_]\d{1,2}\s*$")
 
     def _library_album_dirs(self, artist_dir: Path) -> List[Path]:
         """
