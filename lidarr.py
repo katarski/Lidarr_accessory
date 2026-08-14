@@ -738,7 +738,14 @@ class LidarrClient:
         try:
             resp = self._post("/api/v1/command", {
                 "name": "ManualImport", "files": payload,
-                "importMode": import_mode, "replaceExistingFiles": False,
+                "importMode": import_mode,
+                # Never True. Combined with importMode="move" on a file that is
+                # already inside the library, Lidarr moves the file onto itself
+                # and deletes the "existing" copy -- with the recycle bin off
+                # that is permanent, and it destroyed every audio file in
+                # Frida / Shine (1984). The prefer-lossless path moves the
+                # redundant file aside and rescans instead.
+                "replaceExistingFiles": False,
             })
             cmd_id = resp.get("id") if isinstance(resp, dict) else None
             logger.info("assembly ManualImport id=%s with %d file(s) (mode=%s)",

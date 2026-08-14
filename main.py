@@ -1495,6 +1495,8 @@ def main() -> int:
         ),
         interactive_search_max_gb_per_album=float(
             lidarr_cfg.get("interactive_search_max_gb_per_album", 2.5)),
+        prefer_lossless_over_lossy=bool(
+            lidarr_cfg.get("prefer_lossless_over_lossy", True)),
         interactive_search_skip_placeholder_artists=bool(
             lidarr_cfg.get("interactive_search_skip_placeholder_artists", True)),
         verify_track_titles=bool(

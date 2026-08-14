@@ -523,6 +523,11 @@ class OrchestratorConfig:
     # albumType / secondaryTypes / own title) -- i.e. it's explicitly part of the
     # artist's work. Off = grab whatever ranks best.
     interactive_search_refuse_unofficial: bool = True
+    # Keep the lossless copy of a song and drop the lossy twin sitting beside
+    # it. Measured: 60 albums holding 604 redundant lossy files, e.g. Frida /
+    # Shine (1984) with 12 FLACs AND 12 MP3s. A lossy file is only ever
+    # deleted once Lidarr has the lossless copy of that song registered.
+    prefer_lossless_over_lossy: bool = True
     # Ceiling on GB grabbed per album a release would actually FILL. A
     # discography is scored on how many gaps it closes and never on what it
     # costs, so the pipeline pulled 27.34 GB of '2PAC, Tupac' to fill ONE
@@ -4381,6 +4386,93 @@ class Orchestrator:
         # Nothing the NAME can say resolved it. Ask the songs.
         return self._resolve_album_by_song_titles(artist_id, audios or [])
 
+    # Same song present twice in one album folder, once lossless and once
+    # lossy. Frida / Shine (1984) held 12 FLACs AND 12 MP3s, with Lidarr
+    # registering the MP3s and the FLACs sitting there unregistered. Every
+    # ManualImport the pipeline builds sets replaceExistingFiles=False, so a
+    # better copy lands beside the worse one instead of replacing it.
+    # Library-wide: 60 albums, 604 redundant lossy files.
+    #
+    # NOTHING HERE DELETES. An earlier version of this asked Lidarr to
+    # ManualImport the lossless copy over the lossy one with
+    # importMode="move" + replaceExistingFiles=True. The files were already
+    # INSIDE the library, so Lidarr moved each onto itself and deleted the
+    # "existing" copy -- and with the recycle bin off that was permanent. It
+    # destroyed every audio file in Frida / Shine (1984). The lossy twin is
+    # now MOVED to a quarantine folder and Lidarr is asked to rescan; it drops
+    # the record for the file that is gone and picks up the lossless one
+    # sitting right there. The quarantined file stays on disk for the user.
+    _LOSSLESS_EXTS = frozenset({".flac", ".wav", ".ape", ".wv", ".aiff",
+                                ".aif", ".alac", ".dsf", ".dff"})
+    QUARANTINE_DIR = "_superseded_by_lossless"
+
+    @staticmethod
+    def _same_song_key(p: Path) -> str:
+        """Filename identity ignoring extension and apostrophe style -- Lidarr
+        writes "Don't Do It.mp3" and "Don’t Do It.flac" for one song."""
+        s = p.stem.lower().replace("’", "'").replace("‘", "'")
+        return re.sub(r"[^a-z0-9]+", "", s)
+
+    def _prefer_lossless_in_album(
+        self, album_rec: Dict[str, Any], artist_id: int, audios: List[Path],
+    ) -> int:
+        """
+        Where a song exists as BOTH lossless and lossy in one album folder,
+        keep the lossless and move the lossy one aside. Returns how many were
+        moved. A lossy file with no lossless twin is never touched -- that is
+        the "lossy only when no lossless can be found" half of the rule.
+        """
+        if not bool(getattr(self.cfg, "prefer_lossless_over_lossy", True)):
+            return 0
+        album_id = int((album_rec or {}).get("id") or 0)
+        if not album_id or not audios:
+            return 0
+        groups: Dict[str, List[Path]] = {}
+        for p in audios:
+            groups.setdefault(self._same_song_key(p), []).append(p)
+        moved, folder = 0, audios[0].parent
+        for members in groups.values():
+            lossless = [p for p in members
+                        if p.suffix.lower() in self._LOSSLESS_EXTS]
+            lossy = [p for p in members
+                     if p.suffix.lower() not in self._LOSSLESS_EXTS]
+            if not (lossless and lossy):
+                continue          # only one format present -- keep it, whatever it is
+            keep = max(lossless, key=lambda p: p.stat().st_size
+                       if p.exists() else 0)
+            quarantine = folder / self.QUARANTINE_DIR
+            for p in lossy:
+                try:
+                    quarantine.mkdir(parents=True, exist_ok=True)
+                    target = quarantine / p.name
+                    n = 1
+                    while target.exists():
+                        target = quarantine / f"{p.stem} ({n}){p.suffix}"
+                        n += 1
+                    shutil.move(str(p), str(target))
+                    moved += 1
+                    logger.info(
+                        "prefer-lossless: %s moved to %s/ (the lossless %s is "
+                        "in this album)", p.name, self.QUARANTINE_DIR, keep.name)
+                except OSError as exc:
+                    logger.warning("prefer-lossless: cannot move %s: %s",
+                                   p.name, exc)
+        if moved:
+            # Lidarr re-reads the folder: the record for the file that is no
+            # longer there is dropped, and the lossless sitting beside it is
+            # picked up. No import command, no replace, nothing deleted.
+            try:
+                self.lidarr.rescan_folder(
+                    self.lidarr.windows_to_lidarr(folder))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("prefer-lossless: rescan of %s failed: %s",
+                               folder, exc)
+            logger.info(
+                "prefer-lossless: %s -- moved %d lossy file(s) aside into %s/ "
+                "and asked Lidarr to rescan", folder.name, moved,
+                self.QUARANTINE_DIR)
+        return moved
+
     def _rename_album_to_convention(
         self, artist_id: int, album_id: int, after_cmd: Optional[int] = None,
     ) -> bool:
@@ -7333,6 +7425,16 @@ class Orchestrator:
                     album_rec = _album_lookup(
                         album_name_guess, int(artist_rec["id"])
                     )
+                    # Same song as both lossless and lossy in one folder? Keep
+                    # the lossless. Cheap to check (a filename grouping) and
+                    # only touches Lidarr when a duplicate actually exists.
+                    if album_rec is not None and in_act_mode:
+                        try:
+                            self._prefer_lossless_in_album(
+                                album_rec, int(artist_rec["id"]), audios)
+                        except Exception as exc:  # noqa: BLE001
+                            logger.debug("prefer-lossless failed for %s: %s",
+                                         album_dir, exc)
                     if album_rec is None:
                         reason = "album not in Lidarr"
                     else:
@@ -12266,6 +12368,8 @@ class Orchestrator:
          "Refuse compilation / greatest-hits / live / remix / karaoke / bootleg releases, unless the album being filled is itself that kind of record."),
         ("lidarr.interactive_search_max_gb_per_album", "lidarr", "interactive_search_max_gb_per_album", "Max GB per album filled", "float", 2.5,
          "Refuse a release that costs more than this many GB for each album it would actually fill. Stops a 27 GB discography being grabbed for one missing album. 0 = no limit."),
+        ("lidarr.prefer_lossless_over_lossy", "lidarr", "prefer_lossless_over_lossy", "Prefer lossless over lossy", "bool", True,
+         "When an album folder holds the same song as both lossless and lossy, keep the lossless and drop the lossy one. The lossy file is only deleted once Lidarr has the lossless registered."),
         ("lidarr.interactive_search_skip_placeholder_artists", "lidarr", "interactive_search_skip_placeholder_artists", "Skip Various Artists", "bool", True,
          "Never run an artist-scope search for placeholder artists (Various Artists, Soundtrack, Unknown) -- their names are in most compilation titles, so they match almost anything."),
         ("lidarr.assembly_enabled", "lidarr", "assembly_enabled", "Album assembly", "bool", True,
@@ -12541,6 +12645,7 @@ class Orchestrator:
             "lidarr.interactive_search_require_lossless",
             "lidarr.interactive_search_refuse_unofficial",
             "lidarr.interactive_search_max_gb_per_album",
+            "lidarr.prefer_lossless_over_lossy",
             "lidarr.interactive_search_skip_placeholder_artists",
             "lidarr.verify_track_titles",
             "lidarr.interactive_search_min_seeders",
