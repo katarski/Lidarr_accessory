@@ -951,14 +951,36 @@ class Orchestrator:
         # the CUE against one of the split tracks (via stem fallback or
         # extension drift) and try to process it as a "disc image".
         if self._looks_pre_split(cue_path.parent) and not self._cue_is_single_image(cue_path):
-            audios = self._sibling_audio_files(cue_path.parent)
+            target = cue_path.parent
+            audios = self._sibling_audio_files(target)
+            # ONE ALBUM, NOT ONE PER DISC. The sweep already collapses CD1/CD2
+            # leaves into a single handoff at their parent; the CUE path did
+            # not, and a release that ships tracks+cue PER DISC comes down this
+            # path. `ATB - neXt [CD-FLAC]` was handed off twice -- CD1's 13
+            # files landed, then CD2's 12 were refused with "no release of ATB /
+            # neXt fits 12 files", because the album is a single 25-track
+            # release and half of it was being offered on its own. Hand off the
+            # album root with every disc so Lidarr sees all 25 at once.
+            if self._DISC_SUBDIR_RE.match(target.name or ""):
+                parent = target.parent
+                discs = self._present_disc_subfolders(parent)
+                if len(discs) > 1:
+                    allaudio: List[Path] = []
+                    for d in discs:
+                        allaudio.extend(self._sibling_audio_files(d))
+                    if allaudio:
+                        logger.info(
+                            "multi-disc album %r -- handing off %d disc(s) / "
+                            "%d tracks together (as ONE album, not one handoff "
+                            "per disc)", parent.name, len(discs), len(allaudio))
+                        target, audios = parent, allaudio
             logger.info(
                 "Folder %s looks pre-split (%d audio files, no dominant "
                 "disc image) -- handing off to Lidarr.",
-                cue_path.parent, len(audios),
+                target, len(audios),
             )
             self._handoff_pre_split_to_lidarr(
-                cue_path, cue_path.parent,
+                cue_path, target,
                 reason=f"{len(audios)} similarly-sized audio files (no disc image)",
             )
             return None
