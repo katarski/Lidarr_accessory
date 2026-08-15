@@ -12682,30 +12682,54 @@ class Orchestrator:
             return "(no log file configured)"
         try:
             n = int(lines)
-            with open(path, "rb") as fh:
-                if n <= 0:
-                    # Entire file, straight reflection (no line processing).
-                    data = fh.read()
-                else:
-                    # Tail read: seek back only ~enough bytes for n lines so a
-                    # 400-line refresh never reads a multi-MB file.
-                    fh.seek(0, 2)
-                    size = fh.tell()
-                    want = min(size, max(4096, n * 220))
-                    fh.seek(size - want)
-                    data = fh.read()
-                    nl = data.count(b"\n")
-                    if nl > n:
-                        # Drop the extra leading lines (and the partial first).
-                        idx = 0
-                        for _ in range(nl - n):
-                            idx = data.find(b"\n", idx) + 1
-                        data = data[idx:]
-            return data.decode("utf-8", "replace")
-        except FileNotFoundError:
+        except (TypeError, ValueError):
+            n = 400
+        # The handler rotates at 5 MB, leaving pipeline.log.1/.2/.3 beside the
+        # live file (OLDEST last). Reading only the live file meant that the
+        # moment it rotated, "last 40000 lines" returned however few lines had
+        # been written since -- 98 of them, while 15 MB of history sat in the
+        # rotations. So walk newest -> oldest until the request is satisfied.
+        base = Path(path)
+        chain = [base] + [base.with_name(base.name + "." + str(i))
+                          for i in range(1, 10)]
+        chunks: List[bytes] = []
+        got = 0
+        found_any = False
+        for q in chain:
+            try:
+                if not q.is_file():
+                    continue
+                found_any = True
+                with open(q, "rb") as fh:
+                    if n <= 0:
+                        data = fh.read()
+                    else:
+                        # Tail read: seek back only ~enough bytes for the lines
+                        # still needed, so a 400-line refresh never reads MBs.
+                        need = n - got
+                        fh.seek(0, 2)
+                        size = fh.tell()
+                        want = min(size, max(4096, need * 220))
+                        fh.seek(size - want)
+                        data = fh.read()
+                        nl = data.count(b"\n")
+                        if nl > need:
+                            # Drop extra leading lines (and the partial first).
+                            idx = 0
+                            for _ in range(nl - need):
+                                idx = data.find(b"\n", idx) + 1
+                            data = data[idx:]
+            except OSError as exc:  # noqa: BLE001
+                logger.debug("read_log: %s unreadable: %s", q, exc)
+                continue
+            chunks.append(data)
+            got += data.count(b"\n")
+            if n > 0 and got >= n:
+                break
+        if not found_any:
             return f"(log file not found: {path})"
-        except OSError as exc:  # noqa: BLE001
-            return f"(could not read log: {exc})"
+        chunks.reverse()                     # oldest first, so time reads down
+        return b"".join(chunks).decode("utf-8", "replace")
 
     def clear_log(self, which: str = "pipeline") -> tuple:
         """
