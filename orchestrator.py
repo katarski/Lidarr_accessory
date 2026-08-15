@@ -196,6 +196,8 @@ class OrchestratorConfig:
     filename_template: str = "{artist} - {album} - {number:02d} - {title}.{ext}"
     # Lidarr policy overrides.
     min_match_percent: float = 60.0  # force-accept if match >= this
+    # Skip decoding a disc image none of whose track titles Lidarr wants.
+    skip_unwanted_cue_splits: bool = True
     cleanup_lidarr_queue: bool = True
     # How long to wait for a ManualImport command to drain the staging
     # folder. Lidarr's internal scheduler can sit on a command for a
@@ -983,6 +985,11 @@ class Orchestrator:
                 cue_path, target,
                 reason=f"{len(audios)} similarly-sized audio files (no disc image)",
             )
+            return None
+
+        # Nothing on this disc is wanted? Do not decode it.
+        if not self._cue_worth_splitting(cue_path):
+            self._skip_seen.add(cue_path)
             return None
 
         candidates = self._find_companion_candidates(cue_path)
@@ -6028,6 +6035,87 @@ class Orchestrator:
         return any(s.stem.lower() == stem
                    for s in self._sibling_audio_files(parent))
 
+    _WANTED_IDX = None
+    _WANTED_IDX_TS = 0.0
+
+    def _wanted_title_keys(self) -> set:
+        """Normalized titles of every track Lidarr is missing. Cached 10 min."""
+        now = time.time()
+        if (self._WANTED_IDX is not None
+                and (now - self._WANTED_IDX_TS) < 600):
+            return self._WANTED_IDX
+        keys: set = set()
+        try:
+            from song_harvest import build_wanted_index, artist_key
+            # (title, artist) pairs, not titles alone. Library-wide there are
+            # ~9,600 wanted titles, so ANY compilation shares one by accident
+            # and a title-only test never skips anything -- measured 175 of 175
+            # discs still split. The question is whether this disc has a song
+            # WE ARE MISSING BY THIS ARTIST.
+            for k, wts in (build_wanted_index(self.lidarr) or {}).items():
+                for wt in wts:
+                    keys.add((k, artist_key(getattr(wt, "artist_name", ""))))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("wanted index build failed: %s", exc)
+            return set()
+        type(self)._WANTED_IDX = keys
+        type(self)._WANTED_IDX_TS = now
+        return keys
+
+    def _cue_worth_splitting(self, cue_path: Path) -> bool:
+        """
+        Does this disc image contain anything Lidarr actually wants?
+
+        A CUE is decoded track by track -- minutes of ffmpeg -- and only judged
+        afterwards. `Anni-Frid Lyngstad - Frida 1967-1972 (CD2)`, an 18-track
+        Swedish compilation, was split in full while Frida's only gap was
+        `Shine` (0/10), not one track of which is on that disc. The cue sheet
+        lists its track TITLES, so this is answerable from text before any
+        audio is touched.
+
+        Conservative by design: True (split it) whenever the answer is not a
+        confident no -- unreadable cue, empty wanted index, too few titles to
+        judge, or any error. Only a disc whose titles are all readable and none
+        of which is wanted is skipped.
+        """
+        if not bool(getattr(self.cfg, "skip_unwanted_cue_splits", True)):
+            return True
+        wanted = self._wanted_title_keys()
+        if not wanted:
+            return True                     # cannot judge -> never skip
+        try:
+            from cue_parser import parse_cue
+            from song_harvest import norm_title
+            cue = parse_cue(cue_path, None, ollama=None)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("cue worth-check: parse failed for %s: %s",
+                         cue_path.name, exc)
+            return True
+        titles = [str(getattr(tr, "title", "") or "") for tr in (cue.tracks or [])]
+        titles = [x for x in titles if x.strip()]
+        if len(titles) < 3:
+            return True                     # not enough to judge safely
+        from song_harvest import artist_key
+        perf = artist_key(str(getattr(cue, "performer", "") or ""))
+        if not perf:
+            return True                     # no artist on the sheet -> cannot judge
+        hits = 0
+        for x in titles:
+            k = norm_title(x)
+            for wk, wa in wanted:
+                if wk != k or not wa:
+                    continue
+                if wa in perf or perf in wa:
+                    hits += 1
+                    break
+        if hits:
+            return True
+        logger.info(
+            "skipping split of %s -- none of its %d track title(s) is a track "
+            "Lidarr is missing (nothing to gain from decoding it)",
+            cue_path.name[:60], len(titles))
+        return False
+
     def _looks_pre_split(self, folder: Path) -> bool:
         """
         Heuristic: does this folder already contain split tracks (i.e. no
@@ -11025,6 +11113,19 @@ class Orchestrator:
                 files = qbt.files(thash) or []
                 if files:
                     break
+                # The torrent may have been removed (by us, a reaper, or the
+                # user) while we waited. Polling a dead hash just logs a 404
+                # every 3s for the whole wait -- observed on a grab whose
+                # torrent was gone from qBittorrent and from Lidarr's queue.
+                try:
+                    if qbt.torrent_by_hash(thash) is None:
+                        logger.info(
+                            "%s: torrent %s is no longer in qBittorrent -- "
+                            "abandoning the metadata wait", label[:40],
+                            str(thash)[:12])
+                        return []
+                except Exception:  # noqa: BLE001
+                    pass
                 time.sleep(3)
         except Exception as exc:  # noqa: BLE001
             logger.debug("file list poll failed for %s: %s", label, exc)
@@ -11541,7 +11642,14 @@ class Orchestrator:
             # Best single missing-album match.
             best_ratio, best_match = 0.0, None
             for mn, t, exp, aid in m_norm:
-                ratio = self._title_relation(mn, tnorm)
+                # Pass the album and artist so the SELF-TITLED rule applies
+                # here too. Without it "Muddy Waters / Muddy Waters" matched
+                # every Muddy Waters album by containment alone -- Folk Singer,
+                # Hard Again, King Bee, At Newport -- each later thrown out by
+                # the song verifier at 0-4 of 18.
+                ratio = self._title_relation(
+                    mn, tnorm, album_norm=self._norm_title(t),
+                    artist_norm=artn)
                 # THE ALBUM HAS TO BE NAMED, not just the artist. `mn` is
                 # "<artist> <album>" and the artist is in every one of that
                 # artist's releases, so a long artist name alone can carry the
