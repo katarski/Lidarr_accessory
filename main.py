@@ -1030,6 +1030,7 @@ def scan_existing(root: Path, excluded: list, q: "queue.Queue[Path]",
         logger.warning("cue scan: skipping unreadable dir %s: %s",
                        getattr(err, "filename", "?"), err)
 
+    found: list = []
     for dirpath, _dirnames, filenames in os.walk(root, onerror=_on_walk_error):
         for name in filenames:
             if not name.lower().endswith(".cue"):
@@ -1038,9 +1039,34 @@ def scan_existing(root: Path, excluded: list, q: "queue.Queue[Path]",
             if _is_excluded(cue, excluded):
                 skipped += 1
                 continue
-            if not enqueue_cue(q, cue, seen):
-                continue
-            count += 1
+            found.append(cue)
+
+    # CHEAP WORK FIRST. A .cue beside already-split tracks needs no decoding at
+    # all -- `_process` recognises it and hands the folder straight to Lidarr,
+    # in seconds. A real disc image takes MINUTES to split. Enqueued in walk
+    # order, one album's instant handoff sits behind every image ahead of it:
+    # `ATB - neXt [CD-FLAC]` (13+12 tracks + sidecar cues, nothing to decode)
+    # was queued 61st behind a Lowell Fulson image split and had not been
+    # reached 8 minutes later. Ordering by cost costs one stat per folder.
+    from orchestrator import _ALL_AUDIO_EXTS
+
+    def _is_cheap(c: Path) -> bool:
+        try:
+            sibs = [p for p in c.parent.iterdir()
+                    if p.is_file() and p.suffix.lower() in _ALL_AUDIO_EXTS]
+            if len(sibs) < 2:
+                return False
+            sizes = sorted((p.stat().st_size for p in sibs), reverse=True)
+            mid = sizes[len(sizes) // 2]
+            return bool(mid) and sizes[0] < 3 * mid
+        except OSError:
+            return False
+
+    found.sort(key=lambda c: (not _is_cheap(c), str(c).lower()))
+    for cue in found:
+        if not enqueue_cue(q, cue, seen):
+            continue
+        count += 1
     if errored:
         logger.warning("cue scan: %d director(y/ies) were unreadable "
                        "(network/SMB errors); their .cue files were NOT queued.",

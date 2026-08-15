@@ -4915,11 +4915,41 @@ class Orchestrator:
                 mapped = f"{wr}/{base}" if base else ""
                 if (cp == fr or mapped == fr or fr.startswith(cp + "/")
                         or (mapped and fr.startswith(mapped + "/"))):
-                    rec = d.get(str(t.get("hash") or "").lower())
+                    thash = str(t.get("hash") or "").lower()
+                    rec = d.get(thash)
                     if rec:
-                        return rec
+                        return dict(rec, source="recorded")
+                    # Not one of ours -- but Lidarr's QUEUE still says which
+                    # album it grabbed this download for, which beats parsing
+                    # an artist out of a folder name ("Lowell Fulsom",
+                    # "DJ Tiesto"). Corroborated by song titles before use,
+                    # because Lidarr's own attribution can be wrong (a Glee EP
+                    # is sitting in the queue against five cupcakKe albums).
+                    qrec = self._queue_target_for_hash(thash)
+                    if qrec:
+                        return qrec
         except Exception as exc:  # noqa: BLE001
             logger.debug("grab target lookup failed for %s: %s", folder, exc)
+        return None
+
+    def _queue_target_for_hash(self, thash: str) -> Optional[Dict[str, Any]]:
+        """The album Lidarr's queue attributes to this download, or None."""
+        if not thash:
+            return None
+        try:
+            for rec in (self.lidarr.queue_list() or []):
+                if str(rec.get("downloadId") or "").lower() != thash:
+                    continue
+                aid = rec.get("albumId") or (rec.get("album") or {}).get("id")
+                if not aid:
+                    continue
+                art = (rec.get("artistId")
+                       or (rec.get("artist") or {}).get("id") or 0)
+                return {"album_id": int(aid), "artist_id": int(art or 0),
+                        "title": str(rec.get("title") or "")[:200],
+                        "source": "queue"}
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("queue target lookup failed for %s: %s", thash, exc)
         return None
 
     def _import_grab_target(self, key_path: Path, folder: Path,
@@ -4940,6 +4970,27 @@ class Orchestrator:
         if not aid:
             return False
         artist_name = str((alb.get("artist") or {}).get("artistName") or "")
+        # OUR OWN grab is trusted -- we chose the album and verified the
+        # release before adding it. Lidarr's queue attribution is NOT: its
+        # queue currently holds a Glee EP against five cupcakKe albums, and a
+        # by-track-number import would file those blind. So when the target
+        # came from the queue, the folder's SONGS have to agree first.
+        if str(rec.get("source") or "") == "queue":
+            try:
+                files = [{"name": p.name} for p in audios]
+                cov, matched, total = self._best_release_title_coverage(
+                    files, album_id)
+            except Exception:  # noqa: BLE001
+                cov, matched, total = 0.0, 0, 0
+            floor = float(getattr(self.cfg, "verify_track_titles_accept", 0.60))
+            if not total or cov < floor:
+                logger.info(
+                    "Queue target: %s claims %s / %r but only %d/%d song "
+                    "titles agree (%.0f%% < %.0f%%) -- not importing on that "
+                    "claim", folder.name[:40], artist_name[:22],
+                    str(alb.get("title"))[:30], matched, total, cov * 100,
+                    floor * 100)
+                return False
         try:
             self._align_release_to_disk(
                 aid, artist_name, str(alb.get("title") or ""), audios,
