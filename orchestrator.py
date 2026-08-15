@@ -869,6 +869,8 @@ class Orchestrator:
         self._activity_lock = threading.Lock()
         # Lazily-created qBittorrent client for WebUI torrent removal.
         self._qbt_webui = None
+        # infohash -> the album a search grabbed it for (lazy-loaded).
+        self._grab_tgt: Optional[Dict[str, Any]] = None
         # Album IDs we've already release-cycled in this process lifetime,
         # so we don't hammer Lidarr with PUT+Refresh on every audit pass.
         self._audit_cycled_album_ids: set = set()
@@ -4832,6 +4834,131 @@ class Orchestrator:
         )
         return True
 
+    # ---- what a grab was FOR -------------------------------------------
+    # When the search grabs a torrent it knows exactly which album it wanted.
+    # That fact used to be dropped on the floor: the download landed, and the
+    # handoff tried to re-derive the identity from the folder name. For
+    # `Tiësto / In My Memory` the tracker names it "DJ Tiesto", so every name
+    # test failed and the album we had just gone looking for was written off as
+    # unmonitored. Remembering the target makes the import a lookup, not a
+    # guess.
+
+    def _grab_targets(self) -> Dict[str, Any]:
+        if getattr(self, "_grab_tgt", None) is None:
+            self._grab_tgt = {}
+            p = self._grab_targets_path()
+            if p:
+                try:
+                    d = json.loads(Path(p).read_text(encoding="utf-8"))
+                    if isinstance(d, dict):
+                        self._grab_tgt = d
+                except Exception:  # noqa: BLE001
+                    self._grab_tgt = {}
+        return self._grab_tgt
+
+    def _grab_targets_path(self) -> Optional[str]:
+        base = getattr(self.cfg, "sweep_ledger_file", None)
+        if not base:
+            return None
+        return str(Path(base).with_name("grab_targets.json"))
+
+    def record_grab_target(self, thash: str, album_id: int,
+                           artist_id: Optional[int], title: str = "") -> None:
+        """Remember that `thash` was grabbed to fill `album_id`."""
+        if not thash or not album_id:
+            return
+        d = self._grab_targets()
+        d[str(thash).lower()] = {
+            "album_id": int(album_id),
+            "artist_id": int(artist_id) if artist_id else 0,
+            "title": str(title)[:200],
+            "ts": time.time(),
+        }
+        # Bounded: keep the newest 500 so this can never grow without limit.
+        if len(d) > 500:
+            for k in sorted(d, key=lambda k: float(
+                    (d[k] or {}).get("ts") or 0))[:len(d) - 500]:
+                d.pop(k, None)
+        p = self._grab_targets_path()
+        if p:
+            try:
+                tmp = Path(p).with_suffix(".tmp")
+                tmp.write_text(json.dumps(d), encoding="utf-8")
+                tmp.replace(Path(p))
+            except OSError as exc:  # noqa: BLE001
+                logger.debug("grab targets: could not save: %s", exc)
+
+    def _grab_target_for_folder(self, folder: Path) -> Optional[Dict[str, Any]]:
+        """The album a folder's torrent was grabbed for, or None."""
+        q = self._get_qbt()
+        if q is None:
+            return None
+        d = self._grab_targets()
+        if not d:
+            return None
+        try:
+            fr = str(folder.resolve(strict=False)).replace("\\", "/").rstrip("/")
+            wr = str((self.cfg.watch_root or Path("/")).resolve(
+                strict=False)).replace("\\", "/").rstrip("/")
+            for t in q.torrents():
+                if not self._qbt_ours(t):
+                    continue
+                cp = str(t.get("content_path") or "").replace("\\", "/").rstrip("/")
+                sp = str(t.get("save_path") or "").replace("\\", "/").rstrip("/")
+                if not cp or cp == sp:
+                    continue
+                base = os.path.basename(cp)
+                mapped = f"{wr}/{base}" if base else ""
+                if (cp == fr or mapped == fr or fr.startswith(cp + "/")
+                        or (mapped and fr.startswith(mapped + "/"))):
+                    rec = d.get(str(t.get("hash") or "").lower())
+                    if rec:
+                        return rec
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("grab target lookup failed for %s: %s", folder, exc)
+        return None
+
+    def _import_grab_target(self, key_path: Path, folder: Path,
+                            audios: List[Path], rec: Dict[str, Any],
+                            reason: str) -> bool:
+        """Import `folder` into the album its torrent was grabbed for."""
+        try:
+            album_id = int(rec.get("album_id") or 0)
+        except (TypeError, ValueError):
+            return False
+        if not album_id:
+            return False
+        alb = self.lidarr.get_album(album_id)
+        if not alb:
+            return False
+        aid = int(rec.get("artist_id") or 0) or int(
+            alb.get("artistId") or (alb.get("artist") or {}).get("id") or 0)
+        if not aid:
+            return False
+        artist_name = str((alb.get("artist") or {}).get("artistName") or "")
+        try:
+            self._align_release_to_disk(
+                aid, artist_name, str(alb.get("title") or ""), audios,
+                album_rec=alb)
+            alb = self.lidarr.get_album(album_id) or alb
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("release align failed for %s: %s", folder, exc)
+        cmd = self._import_library_folder_by_tracknumber(alb, aid, audios)
+        if cmd is None:
+            return False
+        logger.info(
+            "Grab target: %s -> the album this torrent was grabbed for, "
+            "%s / %r (cmd=%s), %d file(s)", folder.name[:44], artist_name[:26],
+            str(alb.get("title"))[:40], cmd, len(audios))
+        self._rename_album_to_convention(aid, album_id, cmd)
+        self._record(
+            key_path, outcome="imported_via_manual", pre_split=True,
+            artist=artist_name, album=str(alb.get("title") or ""),
+            track_count=len(audios),
+            reason=f"grab target after: {reason}"[:300],
+        )
+        return True
+
     def _resolve_album_by_song_titles(
         self, artist_id: int, audios: List[Path],
     ) -> Optional[Dict[str, Any]]:
@@ -5387,6 +5514,12 @@ class Orchestrator:
                                 self._monitored_album_status(
                                     f_artist, f_ident))
             if verdict == "skip":
+                # Did WE grab this torrent, and for which album? That is a
+                # recorded fact, not a guess, so it outranks every name test.
+                tgt = self._grab_target_for_folder(folder)
+                if tgt and self._import_grab_target(
+                        key_path, folder, audios, tgt, reason):
+                    return
                 # LAST RESORT before writing the folder off: resolve it by its
                 # SONGS. Every test above compares NAMES, and a name the
                 # tracker spells differently defeats all of them -- the folder
@@ -10900,6 +11033,13 @@ class Orchestrator:
                                             paused=True)
             if not thash:
                 continue
+            # Remember WHAT this was grabbed for. The tracker may name the
+            # artist differently ("DJ Tiesto" for Tiësto), and without this the
+            # handoff has only the folder name to go on.
+            self.record_grab_target(
+                thash, aid,
+                alb.get("artistId") or (alb.get("artist") or {}).get("id"),
+                str(cand.get("title") or ""))
             verdict, info = self._verify_torrent(
                 qbt, thash, expected, label, album_id=aid)
             if verdict == "accept":
@@ -10989,6 +11129,10 @@ class Orchestrator:
                     "interactive search: %s -- grabbed but no queue hash "
                     "appeared; leaving it to download", label)
                 return True
+            self.record_grab_target(
+                thash, aid,
+                alb.get("artistId") or (alb.get("artist") or {}).get("id"),
+                str(cand.get("title") or ""))
             verdict, info = self._verify_torrent(
                 qbt, thash, expected, label, album_id=aid)
             if verdict == "accept":
