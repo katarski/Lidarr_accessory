@@ -5657,9 +5657,11 @@ class Orchestrator:
         if len(audios) < 2:
             return False
         try:
-            sizes = sorted((p.stat().st_size for p in audios), reverse=True)
+            by_size = sorted(((p.stat().st_size, p) for p in audios),
+                             key=lambda t: t[0], reverse=True)
         except OSError:
             return False
+        sizes = [s for s, _ in by_size]
         if not sizes or sizes[0] == 0:
             return False
         # Median of all non-zero sizes (skip empty partial downloads).
@@ -5669,11 +5671,51 @@ class Orchestrator:
         mid = non_zero[len(non_zero) // 2]
         if mid <= 0:
             return False
-        # If the biggest file is >= 3x the median, there's a plausible
-        # disc-image dominating the folder; let the normal pipeline handle it.
+        # A size RATIO alone does not make a disc image. This test was written
+        # for "one 400 MB image plus a few sample files", but any album holding
+        # one long track trips it, and a folder that fails here is dropped
+        # SILENTLY: it never reaches the sweep ledger, so there is no record
+        # anywhere of why it was skipped. `Nurse Jackie, Season One Soundtrack`
+        # (30 mp3 cues, longest 10.5 MB against a 2.6 MB median = 4.10x) sat in
+        # /downloads unimported for exactly this reason, and a scan of the live
+        # tree found 31 such folders -- seven Rolling Stones `Aftermath`
+        # pressings among them, all tripped by the 11-minute "Goin' Home".
+        #
+        # A real image is a WHOLE DISC, so confirm that before deferring: read
+        # the dominant file's PLAYING TIME, which is what actually separates a
+        # 50-minute rip from a long album track. Only when the length can't be
+        # read do we fall back to an absolute size floor -- a ratio on its own
+        # is never enough to skip a folder.
         if sizes[0] >= 3 * mid:
-            return False
+            secs = self._audio_duration_seconds(by_size[0][1])
+            if secs is not None:
+                return secs < self._DISC_IMAGE_MIN_SECONDS
+            return sizes[0] < self._DISC_IMAGE_MIN_BYTES
         return True
+
+    # A disc image is a whole CD side: ~20+ minutes of audio, and (when the
+    # duration is unreadable) far bigger than any single track. The longest
+    # legitimate album track seen in this library is ~19 min.
+    _DISC_IMAGE_MIN_SECONDS = 1200.0
+    _DISC_IMAGE_MIN_BYTES = 100 * 1024 * 1024
+
+    @staticmethod
+    def _audio_duration_seconds(path: Path) -> Optional[float]:
+        """Playing time of one audio file in seconds, or None if unreadable."""
+        try:
+            from mutagen import File as MutagenFile  # lazy
+        except Exception:  # noqa: BLE001
+            return None
+        try:
+            mf = MutagenFile(str(path))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("duration read failed for %s: %s", path.name, exc)
+            return None
+        try:
+            secs = float(getattr(getattr(mf, "info", None), "length", 0) or 0)
+        except (TypeError, ValueError):
+            return None
+        return secs if secs > 0 else None
 
     @staticmethod
     def _extract_embedded_cuesheet(path: Path) -> Optional[str]:

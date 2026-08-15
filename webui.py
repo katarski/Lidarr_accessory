@@ -1376,6 +1376,16 @@ function cvEnter(){
       var dc=CVDEF.concurrency||2;
       var cc=document.getElementById('cv-conc');
       cc.innerHTML=(j.concurrency||[1,2,3,4,5,6,7,8,9,10]).map(function(n){return '<option '+(n===dc?'selected':'')+'>'+n+'</option>';}).join('');
+      /* Apply the change to the RUNNING queue too. Without this the value is
+         only read when Convert is clicked, so changing it mid-run showed the
+         new number while the converter kept encoding at the old one. */
+      cc.addEventListener('change',function(){
+        fetch('/api/convert/concurrency',{method:'POST',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({concurrency:parseInt(cc.value||'2',10)})})
+         .then(function(r){return r.json();})
+         .then(function(j2){toast((j2&&j2.message)||'');cvPollOnce();})
+         .catch(function(e){toast('error: '+e);});
+      });
       var dst=document.getElementById('cv-dest');
       CVDEST=j.destinations||[];
       var _o=[];
@@ -2406,6 +2416,21 @@ def make_handler(store, actions: HeldActions):
                     cv.resume()
                     self._json(200, {"ok": True, "paused": False,
                                      "message": "Converter resumed"})
+                return
+            if path == "/api/convert/concurrency":
+                cv = getattr(actions, "converter", None)
+                if cv is None:
+                    self._json(503, {"ok": False, "message": "converter unavailable"})
+                    return
+                length = int(self.headers.get("Content-Length") or 0)
+                try:
+                    body = json.loads(self.rfile.read(length) or b"{}") or {}
+                except Exception:  # noqa: BLE001
+                    body = {}
+                now = cv.set_concurrency(int(body.get("concurrency") or 2))
+                self._json(200, {"ok": True, "concurrency": now,
+                                 "message": "Now converting %d file(s) at a "
+                                            "time" % now})
                 return
             if path == "/api/convert/start":
                 conv = getattr(actions, "converter", None)

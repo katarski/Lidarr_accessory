@@ -1690,9 +1690,20 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001
         logger.warning("Converter tab disabled: %s", exc)
 
+    # The harvest keep-folder is OUR OWN staging area: song_harvest consolidates
+    # still-wanted files there and owns their lifecycle. It must never be swept
+    # as if it were a downloaded album -- it holds loose songs from many
+    # different releases, so handing it to Lidarr as one folder is meaningless.
+    # It escaped the sweep until now only by accident (`_looks_pre_split`
+    # happened to reject it on the size ratio), so it needs a real exclusion.
+    _extra_excludes = list(watch_cfg.get("exclude_dirs", []) or [])
+    _keep_dir = str(orch_cfg.harvest_keep_dir or "").strip()
+    if _keep_dir:
+        _extra_excludes.append(_keep_dir)
+
     excluded_dirs = _resolve_exclude_dirs(
         watch_root,
-        watch_cfg.get("exclude_dirs", []),
+        _extra_excludes,
         staging_root,
         str(staging_cfg.get("mode", "in_place")).lower(),
     )

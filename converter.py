@@ -948,6 +948,27 @@ class ConvertManager:
     def is_paused(self) -> bool:
         return bool(self._paused)
 
+    def set_concurrency(self, n: int) -> int:
+        """
+        Change how many encodes run at once WHILE a queue is draining.
+
+        `_workers` was only ever assigned in `start()`, so the dropdown took
+        effect on the NEXT Convert click and never on the run already going:
+        picking 4 during a queue that started at 2 left it encoding 2 forever,
+        with the UI showing 4. `_pump` reads `_workers` live, so updating it
+        here and pumping starts the extra encodes immediately.
+        """
+        with self._lock:
+            was = self._workers
+            self._workers = max(1, min(10, int(n or 2)))
+            now = self._workers
+            active, waiting = self._active, len(self._queue)
+        if now != was:
+            logger.info("convert: concurrency %d -> %d (%d running, %d queued)",
+                        was, now, active, waiting)
+        self._pump()
+        return now
+
     def _pipeline_busy(self) -> bool:
         """Is the pipeline itself encoding right now?"""
         if self.busy_provider is None:
