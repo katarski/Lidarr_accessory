@@ -9193,7 +9193,9 @@ class Orchestrator:
         return re.sub(r"[^a-z0-9]+", " ", s).strip()
 
     @classmethod
-    def _title_relation(cls, want_norm: str, title_norm: str) -> float:
+    def _title_relation(cls, want_norm: str, title_norm: str,
+                        album_norm: Optional[str] = None,
+                        artist_norm: Optional[str] = None) -> float:
         """
         How well does a release title match "<artist> <album>"? Both inputs are
         already _norm_title'd.
@@ -9225,7 +9227,49 @@ class Orchestrator:
         if len([w for w in want if len(w) >= 2]) < 2:
             return seq
         have = set((title_norm or "").split())
-        return 1.0 if all(w in have for w in want) else seq
+        if not all(w in have for w in want):
+            return seq
+        # CONTAINMENT ALONE IS NOT ENOUGH FOR A SELF-TITLED ALBUM. `want` is
+        # "<artist> <album>", so when the album IS the artist's name every
+        # release by that artist contains every want-word and scores a perfect
+        # 1.0. Searching Frida's album "Frida" therefore matched
+        # "ABBA, Björn, Benny, Agnetha & Frida - Waterloo 2 lp - 1974, DSD 128"
+        # and grabbed it; the same made Kool & the Gang's self-titled album
+        # match "Kool & The Gang - Wild And Peaceful". Require the ALBUM to
+        # contribute at least one identifying word of its own -- when it does
+        # not, the sequence ratio decides, which a genuinely self-titled
+        # release still wins on.
+        if album_norm is not None and artist_norm is not None:
+            def _ident(s: str) -> set:
+                return {w for w in (s or "").split()
+                        if len(w) >= 2 and w not in cls._TITLE_STOPWORDS}
+            alb_tokens = _ident(album_norm)
+            art_tokens = _ident(artist_norm)
+            # Grammar is not identity: "Kool and the Gang" vs the artist
+            # "Kool & the Gang" differs only by the word "and", and treating
+            # that as distinctive let the self-titled album match
+            # "Kool & The Gang - Wild And Peaceful".
+            if alb_tokens and not (alb_tokens - art_tokens):
+                # SELF-TITLED. A correct release names the artist TWICE --
+                # "Kool & The Gang - Kool and the Gang - 1969" -- while a
+                # different album of theirs names it once and then something
+                # else: "Kool & The Gang - Wild And Peaceful". Counting is what
+                # separates them; the raw ratio cannot (0.57 for the wrong one
+                # against 0.43 for the right one).
+                toks = (title_norm or "").split()
+                if alb_tokens and min(toks.count(w) for w in alb_tokens) >= 2:
+                    return 1.0
+                # Named once: the title identifies a DIFFERENT album, and the
+                # raw ratio is inflated by the artist name it shares (0.57 for
+                # "Kool & The Gang - Wild And Peaceful" against a 0.45 floor).
+                # Score what is left after removing the artist instead.
+                rest = " ".join(w for w in toks if w not in art_tokens)
+                return difflib.SequenceMatcher(
+                    None, album_norm or "", rest).ratio()
+        return 1.0
+
+    _TITLE_STOPWORDS = frozenset(
+        "a an and the of on in at to for with by or from de la le les el".split())
 
     def _classify_torrent_files(
         self, files: List[Dict[str, Any]]
@@ -9485,7 +9529,10 @@ class Orchestrator:
             if seeders < min_seeders:
                 dropped_dead += 1
                 continue
-            ratio = self._title_relation(want, self._norm_title(title))
+            ratio = self._title_relation(
+                want, self._norm_title(title),
+                album_norm=self._norm_title(album),
+                artist_norm=artn)
             # (a) Swarm health is a first-class ranking signal now (was a token
             # seeders/10 nudge), so among releases of the right album the
             # healthiest wins.
