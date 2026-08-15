@@ -5387,6 +5387,20 @@ class Orchestrator:
                                 self._monitored_album_status(
                                     f_artist, f_ident))
             if verdict == "skip":
+                # LAST RESORT before writing the folder off: resolve it by its
+                # SONGS. Every test above compares NAMES, and a name the
+                # tracker spells differently defeats all of them -- the folder
+                # `DJ Tiesto - In My Memory (2001) {AVCD-11960} Japan Press`
+                # was skipped as unmonitored while Lidarr held that very album,
+                # monitored and empty, under `Tiësto`. The pipeline had just
+                # searched FOR that album and grabbed this torrent for it.
+                # The rescue resolves the artist through MusicBrainz aliases
+                # ("DJ Tiesto" -> Tiësto) and the album by track titles, then
+                # imports by explicit trackId.
+                if self._rescue_by_song_titles(
+                        key_path, folder, audios, artist_name, album_name,
+                        reason):
+                    return
                 logger.info(
                     "Pre-split: %s / %s has no monitored album in Lidarr "
                     "(compilation/live/best-of, or not in your metadata "

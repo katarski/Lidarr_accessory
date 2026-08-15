@@ -110,6 +110,13 @@ def _demojibake(value: str) -> str:
     return fixed if _cyr(fixed) > _cyr(value) else value
 
 
+# A performer prefix a tracker/tagger adds that the canonical name omits.
+# Anchored at the start and requires a separator, so "DJ Shadow" -> "Shadow"
+# is only ever OFFERED as a candidate; the caller demands a normalized-exact
+# hit on it, and "Djalma" / "MCartney" cannot match at all.
+_PERFORMER_PREFIX_RE = re.compile(r"(?i)^\s*(?:dj|mc|vj|dr)[\s.\-_]+")
+
+
 def _norm_artist(s: str) -> str:
     """Fold an artist name for tolerant equality: casefold, strip accents
     (NFKD, drop combining marks), '&' -> 'and', drop a leading 'the ', keep
@@ -931,6 +938,22 @@ class LidarrClient:
         if ntarget:
             for a in results:
                 if _norm_artist(a.get("artistName", "")) == ntarget:
+                    return a
+        # Stage prefix. Trackers and tags routinely carry a performer prefix
+        # Lidarr's canonical name does not: the torrent, the folder AND the
+        # file tags all said "DJ Tiesto" for an album Lidarr holds under
+        # "Tiësto", so every test here failed and an 11-of-11 track match was
+        # never even attempted. Only a NORMALIZED-EXACT match on the stripped
+        # name is accepted -- never a fuzzy one -- so this can add a correct
+        # match but not invent a wrong one.
+        stripped = _PERFORMER_PREFIX_RE.sub("", name).strip()
+        nstripped = _norm_artist(stripped) if stripped else ""
+        if nstripped and nstripped != ntarget:
+            for a in results:
+                if _norm_artist(a.get("artistName", "")) == nstripped:
+                    logger.info(
+                        "find_artist: %r matched %r after dropping the "
+                        "performer prefix", name, a.get("artistName"))
                     return a
         # Substring fallback.
         for a in results:
