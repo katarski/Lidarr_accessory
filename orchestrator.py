@@ -4954,6 +4954,37 @@ class Orchestrator:
             logger.debug("grab target lookup failed for %s: %s", folder, exc)
         return None
 
+    def _blocklist_redundant_download(self, folder: Path, artist_name: str,
+                                      album_name: str) -> None:
+        """
+        Blocklist the release behind a download we just deleted as redundant,
+        so the same release is never grabbed for the same album again.
+
+        Best-effort and never fatal: prefer Lidarr's queue (that also removes
+        the torrent), and fall back to removing the torrent ourselves.
+        """
+        try:
+            for rec in (self.lidarr.queue_list() or []):
+                aid = rec.get("albumId") or (rec.get("album") or {}).get("id")
+                title = str(rec.get("title") or "")
+                if title and title.lower() in str(folder).lower() and rec.get("id"):
+                    if self.lidarr.queue_remove(int(rec["id"]),
+                                                remove_from_client=True,
+                                                blocklist=True):
+                        logger.info(
+                            "Blocklisted redundant release %r for %s / %s -- "
+                            "it will not be grabbed again",
+                            title[:60], artist_name[:24], album_name[:30])
+                        return
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("blocklist of redundant download failed: %s", exc)
+        # No queue row (our own magnet grabs never make one) -- at least drop
+        # the torrent so it stops seeding data we deliberately deleted.
+        try:
+            self._remove_torrent_for_folder(folder)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("torrent removal for redundant download failed: %s", exc)
+
     def _queue_target_for_hash(self, thash: str) -> Optional[Dict[str, Any]]:
         """The album Lidarr's queue attributes to this download, or None."""
         if not thash:
@@ -5675,6 +5706,16 @@ class Orchestrator:
                         artist=artist_name, album=album_name,
                         reason=f"already in library ({have}/{total} tracks)",
                     )
+                    # AND STOP IT COMING BACK. Deleting the download without
+                    # telling Lidarr leaves the release perfectly grabbable, so
+                    # the next pass fetches it again: `Diane and David
+                    # Arkenstone - Music Inspired By Middle Earth ALAC` was
+                    # downloaded and deleted over and over -- 307 MB a time --
+                    # for an album already complete in ALAC under DAVID
+                    # Arkenstone. Blocklisting is the only thing that says
+                    # "never again"; we only download what we are missing.
+                    self._blocklist_redundant_download(folder, artist_name,
+                                                       album_name)
                     self._skip_seen.add(key_path)
                     if self.cfg.delete_source_folder_on_success:
                         sentinel = (
