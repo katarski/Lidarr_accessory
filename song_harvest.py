@@ -72,6 +72,18 @@ def norm_title(s: Any) -> str:
     t = re.sub(r"\(.*?\)|\[.*?\]|\{.*?\}", " ", str(s or ""))
     t = t.lower().replace("&", " and ")
     t = re.sub(r"^\s*the\s+", "", t)
+    # Expand the abbreviations a tagger and a metadata source disagree on.
+    # Punctuation is stripped below, so "Pt. 1" and "Part 1" collapse to
+    # DIFFERENT keys ("pt1" vs "part1") and a track that is plainly the same
+    # song never matches: `The Sweet Inspirations / Sweet Sweet Soul` sat at
+    # 8/10 with both halves of "(Gotta Find) A Brand New Lover" already on
+    # disk, invisible to the assembly because the files say "Pt." and Lidarr
+    # says "Part". Token-bounded, so a word merely starting with these letters
+    # is untouched.
+    t = re.sub(r"\bpts\b\.?", "parts", t)
+    t = re.sub(r"\bpt\b\.?", "part", t)
+    t = re.sub(r"\bvols\b\.?", "volumes", t)
+    t = re.sub(r"\bvol\b\.?", "volume", t)
     return re.sub(r"[^a-z0-9]", "", t)
 
 
