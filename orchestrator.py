@@ -5561,6 +5561,37 @@ class Orchestrator:
         the audio files alone so you can import them manually; the .cue
         (if any) is gone either way.
         """
+        # NEVER JUDGE A FOLDER MID-SPLIT. The splitter writes tracks one at a
+        # time into this folder, and a probe that lands halfway sees a partial
+        # album: `Frida / Shine` was probed at 20:17:46 with tracks 7-10 still
+        # being written, Lidarr answered artist=None album=None, and the album
+        # stayed 0/10 with all ten files on disk seconds later. Wait until the
+        # audio stops changing before asking anything about it.
+        try:
+            settle = max(int(getattr(self.cfg, "sweep_min_stable_seconds", 10)),
+                         20)
+            deadline = time.time() + 900
+            while time.time() < deadline:
+                here = self._audio_files_recursive(folder)
+                if not here:
+                    break
+                newest = 0.0
+                for a in here:
+                    try:
+                        newest = max(newest, a.stat().st_mtime)
+                    except OSError:
+                        newest = time.time()
+                        break
+                if (time.time() - newest) >= settle:
+                    break
+                logger.info(
+                    "handoff: %s is still being written (%d file(s), newest "
+                    "%.0fs ago) -- waiting before judging it",
+                    folder.name[:44], len(here), time.time() - newest)
+                time.sleep(min(30, settle))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("handoff settle check failed for %s: %s", folder, exc)
+
         # `key_path` stands in for cue_path in ledger + seen-tracking so
         # the CUE-less sweep path has something stable to key off of.
         key_path = cue_path if cue_path is not None else folder
@@ -6743,10 +6774,34 @@ class Orchestrator:
                     continue
 
             # Inside a .cue-owned tree (e.g. the main path's split staging)?
-            # Leave it to that path; os.walk is top-down so the ancestor's .cue
-            # was already seen.
+            # Leave it to that path -- UNLESS that path has finished and left
+            # the staging folder behind. `Frida / Shine` was split into
+            # `.../1984 - Shine (Discomate .../Shine (LP) (1984)/`, its handoff
+            # ran while tracks 7-10 were still being written and failed, and
+            # nothing could ever retry it: the cue owns the subtree so the
+            # sweep skipped it, and the cue itself was done. Ten perfectly
+            # named files, an album at 0/10, and no owner. So adopt an orphan:
+            # the split is quiet (every file older than min_stable) and no cue
+            # sits beside the audio.
             if any(anc in cue_dirs for anc in folder.parents):
-                continue
+                orphan = False
+                try:
+                    here = self._sibling_audio_files(folder)
+                    quiet = bool(here) and all(
+                        (now_ts - a.stat().st_mtime) >= max(min_stable, 60)
+                        for a in here)
+                    has_cue = any(f.lower().endswith(".cue")
+                                  for f in filenames)
+                    orphan = quiet and not has_cue and self._looks_pre_split(
+                        folder)
+                except OSError:
+                    orphan = False
+                if not orphan:
+                    continue
+                logger.info(
+                    "cueless sweep: adopting orphaned split output %r (%d "
+                    "settled file(s), its .cue has finished)",
+                    folder.name[:50], len(self._sibling_audio_files(folder)))
 
             # A lone disc-image file (e.g. .wv/.ape/.flac) may carry its
             # cuesheet EMBEDDED in itself with no sidecar .cue. Extract it to a
