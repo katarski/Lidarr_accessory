@@ -11560,6 +11560,21 @@ class Orchestrator:
                 if ratio > best_ratio:
                     best_ratio, best_match = ratio, (t, exp, aid)
             is_disco = info is not None
+            # A DISCOGRAPHY is judged on fill value alone, so it must really be
+            # THIS artist's -- not a record they guest on. `artistName` lists
+            # every credit, so a guest appearance passed the artist test and
+            # Etta James pulled "Hank Crawford (w. B.B. King, Etta James,
+            # Randy Brecker, Dr. John...)" and "Santana & Etta James & John Lee
+            # Hooker - Fillmore 1986". Require the FIRST credit for a disco.
+            if is_disco:
+                credits = self._credited_artists(
+                    str(raw.get("artistName") or "") or title)
+                if credits:
+                    lead = self._norm_title(self._ascii_fold(credits[0]))
+                    if lead and lead != self._norm_title(
+                            self._ascii_fold(artist)):
+                        dropped_wrong_artist += 1
+                        continue
             single_match = best_ratio >= floor
             if not (is_disco or single_match):
                 continue                      # nothing of value here
