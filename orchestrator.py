@@ -11488,12 +11488,25 @@ class Orchestrator:
 
         min_missing = max(0, int(cfg.interactive_search_min_missing_days)) * 86400
         cooldown = max(0, int(cfg.interactive_search_cooldown_seconds))
+        # Albums with a LIVE download in Lidarr's queue are left alone. A row
+        # that has finished downloading and FAILED to import is not a live
+        # download -- it will never progress on its own, and treating it as one
+        # silently retires the album from every future search. Measured on this
+        # queue: 227 of 249 rows were completed/importFailed/warning and only
+        # 21 were actually downloading, so 227 albums could never be searched
+        # again. `Tiësto / In My Memory` was one of them, held by a row from an
+        # unrelated discography torrent stuck on "Couldn't find similar album".
+        _DEAD_STATES = {"importfailed", "failed"}
         queued_ids: set = set()
         try:
             for rec in self.lidarr.queue_list():
                 aid = rec.get("albumId") or (rec.get("album") or {}).get("id")
-                if aid is not None:
-                    queued_ids.add(int(aid))
+                if aid is None:
+                    continue
+                tstate = str(rec.get("trackedDownloadState") or "").lower()
+                if tstate in _DEAD_STATES:
+                    continue
+                queued_ids.add(int(aid))
         except Exception:  # noqa: BLE001
             pass
 
