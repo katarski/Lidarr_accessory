@@ -8978,6 +8978,14 @@ class Orchestrator:
         "not close enough",
         "unmatched tracks",
         "missing tracks",
+        # Lidarr's PER-TRACK counterpart of "not close enough". It carries the
+        # same "N % vs N %" figure, so the configured floor can judge it, but
+        # it was the one rejection string the override did not recognise --
+        # Lidarr's hard 60% rule won and the album stayed empty.
+        # `Frida / Shine`: 10 files already in the library, filenames exactly
+        # the ten track titles, scoring 53.8% against a min_match_percent of
+        # 50. Blocked on the string alone.
+        "worst track match",
     )
 
     def _filter_acceptable(self, candidates: list) -> list:
