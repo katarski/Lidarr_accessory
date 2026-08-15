@@ -117,9 +117,18 @@ thing in a music library. The chain, in order:
    `Ms. Lauryn Hill`, and it covers stage names and misspellings. Only an exact
    normalised hit on a name, sort-name or alias is accepted; results are cached
    including misses, because MusicBrainz allows about one request a second.
+5b. **Stage prefixes** — `DJ Tiesto` → `Tiësto`, `MC`/`VJ`/`Dr` likewise.
+   Only a normalised-exact hit on the stripped name is accepted, never a fuzzy
+   one, so it can add a correct match but not invent a wrong one.
 7. **Song titles** — when no name test can work, compare the folder's songs to
-   each incomplete album's track list. Requires ≥60% of the album's tracks
-   present *and* a clear margin over the runner-up.
+   each incomplete album's track list. Accepted on *either* ≥60% of the album's
+   tracks being present, *or* essentially every FILE being a track of that
+   album — the second is what lets one disc of a two-disc set resolve, since it
+   can only ever cover half the album.
+8. **What the grab was FOR** — when the pipeline itself grabbed the torrent it
+   recorded which album it wanted (infohash → album), and that recorded fact
+   outranks every name test above. Lidarr's own queue attribution is used as a
+   fallback, but only when the folder's song titles agree with it.
 
 Some things that fall out of this:
 
@@ -134,6 +143,44 @@ Some things that fall out of this:
 - **Files are mapped to tracks by three indexes** — `(medium, track)`, ordered
   position, then title — because a multi-disc release numbers tracks both ways
   and files follow either convention.
+
+---
+
+## How a release is chosen
+
+Names are unreliable on the indexer side too, so a candidate has to survive all
+of this before it is grabbed:
+
+- **Whose record is it?** The indexer reports an artist (`artistName`); that is
+  asked first, and a release credited to someone else is refused outright. It
+  is the difference between Lidarr's `Allred` keeping 3 of 16 candidates
+  instead of all 16 — the rest were David, Loren, Daniel, John, Joseph, Nephi
+  and Jason Andrew Allred.
+- **A parenthetical is an alias, not a second artist.** `Tiësto (Tiesto)` and
+  `Tiësto (aka Tiesto)` are the same act; reading them whole rejected the
+  artist's own albums.
+- **When no artist is reported** — every free-text Prowlarr result — the artist
+  must at least appear in the title, or an "Artist - Album" query matches on
+  the album words alone (`Bellini - Festival` → `OperaCompactFestival03`).
+- **Self-titled albums need the artist named twice.** Otherwise every release
+  by that artist contains every word being matched and scores a perfect 1.0.
+- **The album has to be named, not just the artist.** At the artist scope a
+  long artist name alone could carry the score, so any album answered for any
+  gap: searching *The East Bay Sessions* grabbed *All Star Multitrack*.
+- **A discography must be the artist's own**, judged on its first credit — a
+  guest appearance is not a discography.
+- **Dead swarms are rejected.** No file list inside the metadata wait means no
+  peers, not "accept and hope".
+- **Seeders decide within a title band**, rather than being summed into one
+  score where 0.10 of title relation outweighed ten seeders.
+- **Cost and content ceilings**: a per-album GB cap, video payloads refused,
+  placeholder artists (VA/Soundtrack) never artist-searched.
+
+When Lidarr's own search finds nothing, the same indexers are queried directly
+through Prowlarr with the ASCII-folded `Artist - Album` — Lidarr can only ask
+in its own spelling, and a tracker holding the folded one answers nothing.
+`Tiësto - In My Memory` returned nothing; `Tiesto - In My Memory` returned the
+FLAC CD at 11 seeders on the same indexer, same moment.
 
 ---
 

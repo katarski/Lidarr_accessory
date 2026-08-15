@@ -216,3 +216,87 @@ Lidarr naming: `{Album Title} ({Release Year})/{Artist Name} - {Album Title} -
 **Standing instructions from the user:** fix things *in the pipeline*, never by
 hand — they will not open a session every time an import fails. Keep answers
 short. Always test your work.
+
+---
+
+## Session 2026-08-15 — search precision, multi-disc, and the queue
+
+Sixteen commits, all deployed and verified (last: `4a94d6c`). Albums fixed
+end to end this session: Nurse Jackie 30/30, Sweet Sweet Soul 10/10,
+Tiesto / In My Memory 11/11, ATB / neXt 25/25.
+
+### The one that mattered most
+`interactive_search` skipped any album with a row in Lidarr's queue
+("already downloading"). 227 of 249 rows were `completed/importFailed` --
+permanently stuck -- so **227 albums could never be searched again**. Only
+importFailed/failed are treated as dead now.
+
+### Import
+* `_looks_pre_split` classed any folder whose largest file was >=3x the
+  median as a disc image and skipped it SILENTLY (no ledger entry, no
+  record). 36 folders affected. Now confirms by playing time (>=20 min).
+* CUE queue is ordered CHEAP FIRST: a .cue beside split tracks is an
+  instant handoff, a real image takes minutes. ATB was 61st behind image
+  splits; after, it processed 1 second after startup.
+* Multi-disc on the CUE path hands off the album ROOT, not one handoff per
+  disc (CD2 of ATB was refused: "no release fits 12 files").
+* `_resolve_album_by_song_titles` scored only album-coverage, which caps at
+  12/25 for one disc. Now also scores file-coverage (12 of 12 belong).
+* Grab targets are remembered (infohash -> album) and consulted before any
+  name derivation. Lidarr's queue attribution is used too, but corroborated
+  by song titles first -- a Glee EP was queued against 5 cupcakKe albums.
+* `find_artist` accepts a stage prefix (DJ/MC/VJ/Dr), normalized-exact only.
+* `artist_key` folds diacritics instead of DELETING them ("Tiesto" -> tisto).
+* `norm_title` folds Pt./Vol. -> Part/Volume (3 collisions in 56,170 titles,
+  all true merges).
+* Artist refresh after the rescue/grab-target imports (album read 11/11
+  while the artist page still said 7/11).
+
+### Search precision -- all verified against live indexer output
+* Use the indexer's `artistName`, not the title, to decide whose record it
+  is. Allred 16->3 kept, Miguel 149->50, Tiesto 46->38.
+* Same guard on the ALBUM-level ranker (it only guarded artists <=4 chars,
+  so Bellini got OperaCompactFestival and Bowie got Original New York Cast).
+* Prowlarr results carry no artistName, so there the artist must appear in
+  the title.
+* Self-titled albums: containment gave 1.00 to every release by the artist
+  (Frida's "Frida" grabbed ABBA's Waterloo). Require the artist named twice.
+* Artist scope: the ALBUM must be named, not just the artist (Smash Mouth /
+  The East Bay Sessions grabbed "All Star Multitrack", 0 of 14 songs).
+* A discography must be the artist's OWN -- first credit, not a guest.
+* Dead swarms: no file list = reject, not "accept, no metadata".
+* Seeders decide within a title band, not summed into one score.
+* Prowlarr album fallback on the ASCII-folded "Artist - Album" when Lidarr
+  finds nothing (Tiesto vs Tiesto). `prowlarr.search(require_magnet=False)`
+  + `qbt.add_torrent_url()` -- RuTracker publishes neither magnet nor
+  infohash, so every result from it was being dropped.
+
+### DVD-Audio / redundancy
+* DVD-Audio path had no owned-album check (SACD did). Added.
+* The ripped-ISO ledger entry no longer expires on the 24h sweep TTL -- that
+  expiry re-ripped an owned disc every day.
+* A download deleted as redundant is now blocklisted, else it is re-grabbed
+  forever (Arkenstone Middle Earth, 307 MB a time, already owned in ALAC).
+
+### Indexers
+Lidarr went from 3 music indexers to 9: added Torrenting, 1337x, SkTorrent,
+BigFANGroup, P2PBG, BT.etree. BT.etree's 403 was bot protection -- it needed
+the `flaresolverr` tag and its baseUrl set, exactly like RuTracker. P2PBG is
+the only Bulgarian source Prowlarr ships besides Zamunda and it answers
+Cyrillic queries.
+
+### Done by hand, will recur without a fix
+* 159 stuck queue rows removed, and 9 wrong-artist downloads deleted
+  (6.63 GB) + 5 more in flight (2.48 GB). The legacy queue reaper is
+  DISABLED ("superseded by qBittorrent completed-torrent lifecycle") and
+  that lifecycle does not clear Lidarr rows, so they pile up again.
+
+### Still open
+1. Nothing checks `monitored` before grabbing: ABBA is unmonitored with
+   nothing wanted and a 6 GB Waterloo DSD was still grabbed.
+2. Outgoing queries never try MusicBrainz ALIASES. `Lana Del Ray` is only
+   findable as "Lizzy Grant"; all 9 indexers return 0 for its real name.
+3. EZTV is enabled for music searches with zero music categories.
+4. Klayton torrent: 84%, 0 seeders, fills no Celldweller gap.
+5. The unverified source-folder deletion from the previous session is still
+   open; `staging.delete_source_folder_on_success` remains false.
