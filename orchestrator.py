@@ -10690,7 +10690,15 @@ class Orchestrator:
             return "accept", {"note": "no qbit"}
         files = self._await_torrent_files(qbt, thash, label)
         if not files:
-            return "accept", {"note": "no metadata"}
+            # NO FILE LIST = DEAD SWARM. Metadata comes from peers, and with
+            # stopCondition=MetadataReceived a live swarm answers in seconds --
+            # so nothing arriving inside the whole wait means nobody is there.
+            # Accepting it here is how `Dj Tiesto - In My Memory` was grabbed
+            # and then sat at 0% in forcedMetaDL for a day, holding the album
+            # "in progress" while an 11-seeder FLAC of it was one indexer away.
+            # Reject instead, so the next candidate -- ranked by seeders -- is
+            # tried immediately.
+            return "reject:no-metadata(dead swarm)", {"note": "no metadata"}
         info = self._classify_torrent_files(files)
         ac = info["audio_count"]
         if info["is_dsd"] or info["is_iso"]:
