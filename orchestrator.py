@@ -11542,6 +11542,21 @@ class Orchestrator:
             best_ratio, best_match = 0.0, None
             for mn, t, exp, aid in m_norm:
                 ratio = self._title_relation(mn, tnorm)
+                # THE ALBUM HAS TO BE NAMED, not just the artist. `mn` is
+                # "<artist> <album>" and the artist is in every one of that
+                # artist's releases, so a long artist name alone can carry the
+                # ratio over the floor and any album matches any gap. Measured:
+                # searching `Smash Mouth / The East Bay Sessions` grabbed
+                # "Smash Mouth - All Star Multitrack" (0 of 14 songs), and
+                # `Lana Del Rey / Lana Del Ray` grabbed Honeymoon and NFR --
+                # both already owned at 14/14. Require at least one identifying
+                # word of the ALBUM itself to appear in the title.
+                alb_ident = {w for w in self._norm_title(t).split()
+                             if len(w) >= 2
+                             and w not in self._TITLE_STOPWORDS
+                             and w not in artn.split()}
+                if alb_ident and not (alb_ident & set(tnorm.split())):
+                    continue
                 if ratio > best_ratio:
                     best_ratio, best_match = ratio, (t, exp, aid)
             is_disco = info is not None
