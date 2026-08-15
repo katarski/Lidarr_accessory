@@ -4956,6 +4956,93 @@ class Orchestrator:
             logger.debug("grab target lookup failed for %s: %s", folder, exc)
         return None
 
+    def _folder_has_wanted_tracks(self, folder: Path) -> bool:
+        """
+        Does this folder hold ANY song Lidarr is still missing?
+
+        The last gate before anything is deleted. Cross-checks each audio
+        file's TAGS (title + artist) against every wanted track of every
+        monitored incomplete album, so a folder is never removed because its
+        NAME looked redundant while the songs inside were still needed.
+
+        Fails SAFE: any error, unreadable tags or empty wanted index returns
+        True (i.e. "keep it"). Only a folder proven to contain nothing wanted
+        can be deleted.
+        """
+        try:
+            from song_harvest import (build_wanted_index, norm_title,
+                                      artists_agree, scan_folder)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("delete guard: song_harvest unusable (%s) -- "
+                           "refusing to treat %s as disposable", exc, folder)
+            return True
+        try:
+            wanted = build_wanted_index(self.lidarr) or {}
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("delete guard: wanted index failed (%s) -- keeping "
+                           "%s", exc, folder)
+            return True
+        if not wanted:
+            return True
+        # NEVER judge content we cannot actually read yet.
+        #  * a partly-downloaded file has no reliable tags
+        #  * an .iso / an unsplit cue image hides its tracks entirely
+        #  * a torrent still downloading may yet produce the wanted song
+        try:
+            for dp, _dn, fn in os.walk(folder):
+                for f in fn:
+                    low = f.lower()
+                    if low.endswith((".iso", ".cue")):
+                        logger.info(
+                            "delete guard: KEEPING %s -- holds %s, whose "
+                            "tracks cannot be read until it is extracted/split",
+                            folder.name[:44], f[:40])
+                        return True
+                    if low.endswith((".!qb", ".part", ".tmp", ".downloading")):
+                        logger.info(
+                            "delete guard: KEEPING %s -- %s is still "
+                            "downloading", folder.name[:44], f[:40])
+                        return True
+        except OSError:
+            return True
+        q = self._get_qbt()
+        if q is not None:
+            try:
+                fr = str(folder.resolve(strict=False)).replace("\\", "/").rstrip("/")
+                for tor in q.torrents():
+                    cp = str(tor.get("content_path") or "").replace("\\", "/").rstrip("/")
+                    if not cp:
+                        continue
+                    if fr == cp or fr.startswith(cp + "/") or cp.startswith(fr + "/"):
+                        if float(tor.get("progress") or 0) < 0.999:
+                            logger.info(
+                                "delete guard: KEEPING %s -- its torrent is "
+                                "only %.0f%% complete", folder.name[:44],
+                                float(tor.get("progress") or 0) * 100)
+                            return True
+            except Exception:  # noqa: BLE001
+                return True
+        try:
+            srcs = scan_folder(str(folder)) or []
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("delete guard: cannot read %s (%s) -- keeping it",
+                           folder, exc)
+            return True
+        for sf in srcs:
+            if not getattr(sf, "title", ""):
+                # An untagged file might be anything -- never delete on a guess.
+                return True
+            for w in (wanted.get(norm_title(sf.title)) or []):
+                if not getattr(sf, "artist", "") or artists_agree(
+                        sf.artist, w.artist_name):
+                    logger.info(
+                        "delete guard: KEEPING %s -- it holds %r, still "
+                        "wanted by %s / %s", folder.name[:44],
+                        str(sf.title)[:40], str(w.artist_name)[:24],
+                        str(w.album_title)[:30])
+                    return True
+        return False
+
     def _blocklist_redundant_download(self, folder: Path, artist_name: str,
                                       album_name: str) -> None:
         """
@@ -5696,7 +5783,13 @@ class Orchestrator:
                 stats = existing.get("statistics") or {}
                 have = int(stats.get("trackFileCount") or 0)
                 total = int(stats.get("totalTrackCount") or 0)
-                if total >= len(audios):
+                if total >= len(audios) and self._folder_has_wanted_tracks(
+                        folder):
+                    logger.info(
+                        "Pre-split: %s / %s looks redundant, but the folder "
+                        "still holds song(s) Lidarr wants -- NOT deleting.",
+                        artist_name, album_name)
+                elif total >= len(audios):
                     logger.info(
                         "Pre-split: %s / %s already fully in library "
                         "(%d/%d tracks; download has %d) -- deleting download "

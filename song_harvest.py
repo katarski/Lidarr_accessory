@@ -104,6 +104,71 @@ def artist_key(s: Any) -> str:
     return re.sub(r"[^a-z0-9]", "", t.lower().replace("&", "and"))
 
 
+def artist_tokens(s: Any) -> frozenset:
+    """
+    Artist name as a set of WORDS, diacritics folded.
+
+    artist_key() strips spaces, so a substring test on it treats any name that
+    merely STARTS with the wanted one as a match: 'Frida' passed as
+    'Frida Leider' (the Wagner soprano) and 'Frida Boccara', because 'frida' is
+    a prefix of 'fridaleider'. Words cannot do that.
+    """
+    t = unicodedata.normalize("NFKD", str(s or ""))
+    t = "".join(c for c in t if not unicodedata.combining(c))
+    t = t.lower().replace("&", " and ")
+    return frozenset(w for w in re.split(r"[^a-z0-9]+", t) if w)
+
+
+def _credit_names(s: Any) -> List[frozenset]:
+    """
+    An artist string split into the individual acts it credits, each as a word
+    set with the decoration removed.
+
+    Parentheticals are aliases of the same act ("Frida (Anni-Frid Lyngstad)"),
+    anything after feat/with/presents is a guest, "&" and "/" join separate
+    acts, and a leading DJ/MC is a stage prefix.
+    """
+    raw = str(s or "")
+    raw = re.sub(r"[\(\[][^)\]]*[\)\]]", " ", raw)            # alias in parens
+    for _sep in (" feat", " featuring", " ft", " with", " presents", " pres",
+                 " vs"):
+        _i = raw.lower().find(_sep)
+        if _i > 0 and (len(raw) == _i + len(_sep)
+                       or not raw[_i + len(_sep)].isalpha()):
+            raw = raw[:_i]                                      # drop guests
+            break
+    out: List[frozenset] = []
+    for part in re.split(r"[&/,;]| and ", raw):
+        toks = artist_tokens(part)
+        toks = frozenset(w for w in toks if w not in _CREDIT_NOISE)
+        if toks:
+            out.append(toks)
+    return out
+
+
+def artists_agree(a: Any, b: Any) -> bool:
+    """
+    Do these two artist names refer to the same act?
+
+    EQUALITY per credited act, not containment. A substring/subset test made
+    'Frida' agree with 'Frida Leider' (a Wagner soprano) and 'Frida Boccara',
+    'Allred' with 'David Allred', 'Bellini' with 'Vincenzo Bellini' and 'Cher'
+    with 'Cher Lloyd' -- a shared first or last name is not the same person.
+    Decoration is removed first, so the real equivalences still hold:
+    'Frida (Anni-Frid Lyngstad)', 'DJ Tiesto feat. Kirsty Hawkshaw', and
+    'Cissy Drinkard & The Sweet Inspirations' matching one of its credits.
+    """
+    ca, cb = _credit_names(a), _credit_names(b)
+    if not ca or not cb:
+        return False
+    return any(x == y for x in ca for y in cb)
+
+
+_CREDIT_NOISE = frozenset(
+    "dj mc vj the a an of feat feats featuring ft with vs presents pres".split())
+
+
+
 def variant_markers(s: Any) -> frozenset:
     """Variant words present in the FULL string (brackets included)."""
     return frozenset(m.group(1).lower().strip()
@@ -314,8 +379,7 @@ def match_files(
             # (1) artist must agree -- a compilation is credited to someone
             # else, but the TRACK's artist tag still names the performer.
             if require_artist and sf.artist:
-                ak, wk = artist_key(sf.artist), artist_key(w.artist_name)
-                if wk and ak and wk not in ak and ak not in wk:
+                if not artists_agree(sf.artist, w.artist_name):
                     why.append("artist %r != %r" % (sf.artist, w.artist_name))
                     continue
             # (2) same performance? A "(take 2)" is not the master.
