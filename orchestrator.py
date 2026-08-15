@@ -987,11 +987,6 @@ class Orchestrator:
             )
             return None
 
-        # Nothing on this disc is wanted? Do not decode it.
-        if not self._cue_worth_splitting(cue_path):
-            self._skip_seen.add(cue_path)
-            return None
-
         candidates = self._find_companion_candidates(cue_path)
         if not candidates:
             # A CUE with no matching disc-image audio is almost always
