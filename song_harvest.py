@@ -45,6 +45,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -88,7 +89,19 @@ def norm_title(s: Any) -> str:
 
 
 def artist_key(s: Any) -> str:
-    return re.sub(r"[^a-z0-9]", "", str(s or "").lower().replace("&", "and"))
+    """
+    Comparison key for an artist name.
+
+    Diacritics are FOLDED, not dropped. Stripping [^a-z0-9] deleted them
+    outright, so Lidarr's "Tiësto" keyed to "tisto" while the file's "Tiesto"
+    keyed to "tiesto" -- the same artist, never equal, and every track of
+    `In My Memory` was skipped with "artist 'DJ Tiesto' != 'Tiësto'". Folding
+    first also lets the caller's substring test do its job, since "tiesto" IS
+    contained in "djtiesto".
+    """
+    t = unicodedata.normalize("NFKD", str(s or ""))
+    t = "".join(c for c in t if not unicodedata.combining(c))
+    return re.sub(r"[^a-z0-9]", "", t.lower().replace("&", "and"))
 
 
 def variant_markers(s: Any) -> frozenset:
