@@ -5109,20 +5109,41 @@ class Orchestrator:
                 if best_i >= 0 and best_s >= 0.72:
                     hits += 1
                     pool.pop(best_i)      # each file answers for one track
-            scored.append((hits / float(len(tracks)), a, hits))
+            scored.append((hits / float(len(tracks)), a, hits,
+                           hits / float(max(1, len(want)))))
         if not scored:
             return None
-        scored.sort(key=lambda x: x[0], reverse=True)
-        cov, alb, hits = scored[0]
+        scored.sort(key=lambda x: (x[0], x[3]), reverse=True)
+        cov, alb, hits, fcov = scored[0]
         runner = scored[1][0] if len(scored) > 1 else 0.0
-        if cov < 0.60 or (cov - runner) < 0.15:
-            if cov >= 0.30:
+        # TWO directions, and a PART of an album only has one of them.
+        # `cov` asks how much of the album these files cover -- it cannot reach
+        # 0.60 for one disc of a two-disc set (CD2 of `ATB / neXt`: 12 files
+        # against 25 tracks caps at 0.48, so the disc was abandoned with its
+        # tracks stranded). `fcov` asks the reverse: what fraction of THESE
+        # FILES are tracks of that album. 12 of 12 is decisive -- every file
+        # belongs to it -- so accept on that too, still requiring a clear
+        # margin over the runner-up so an ambiguous folder is left alone.
+        best_f = max((x[3] for x in scored), default=0.0)
+        runner_f = sorted((x[3] for x in scored), reverse=True)[1] if len(scored) > 1 else 0.0
+        by_album = cov >= 0.60 and (cov - runner) >= 0.15
+        by_files = (fcov >= 0.85 and hits >= 3 and fcov >= best_f
+                    and (fcov - runner_f) >= 0.15)
+        if not (by_album or by_files):
+            if cov >= 0.30 or fcov >= 0.50:
                 logger.info(
                     "audit: song-title resolve inconclusive for %s (best %r "
-                    "%.2f vs next %.2f) -- leaving it alone",
+                    "album-cov %.2f vs next %.2f; file-cov %.2f vs next %.2f) "
+                    "-- leaving it alone",
                     audios[0].parent.name[:40], str(alb.get("title"))[:40],
-                    cov, runner)
+                    cov, runner, fcov, runner_f)
             return None
+        if by_files and not by_album:
+            logger.info(
+                "audit: %s is PART of %r -- %d of %d file(s) are tracks of it "
+                "(album-cov only %.2f, so this is one disc/portion)",
+                audios[0].parent.name[:40], str(alb.get("title"))[:40],
+                hits, len(want), cov)
         logger.info(
             "audit: resolved %r to Lidarr album %r (id=%s) by SONG TITLES "
             "(%d/%d tracks present, next best %.2f) -- the names do not match, "
