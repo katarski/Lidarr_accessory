@@ -10761,6 +10761,131 @@ class Orchestrator:
                 logger.warning("could not remove rejected grab %s: %s",
                                thash[:12], exc)
 
+    @staticmethod
+    def _ascii_fold(s: str) -> str:
+        """'Tiësto' -> 'Tiesto'. Trackers index the folded spelling."""
+        s = unicodedata.normalize("NFKD", s or "")
+        return "".join(c for c in s if not unicodedata.combining(c))
+
+    def _isearch_prowlarr_album(self, alb: Dict[str, Any], artist: str,
+                                album: str, st: Dict[str, Any], qbt) -> bool:
+        """
+        Ask the indexers directly for "Artist - Album" when Lidarr's own
+        release search came back with nothing usable.
+
+        Lidarr queries the indexer with its OWN canonical spelling, so a
+        tracker holding the folded one answers nothing and the album looks
+        unavailable. Measured on the live indexers: `Tiësto - In My Memory`
+        returned 4 results, none of them the album; `Tiesto - In My Memory`
+        returned the exact `(Trance) [CD] Tiesto - In My Memory - 2001, FLAC
+        (tracks+.cue), lossless` at 11 seeders. Same indexer, same moment --
+        only the spelling differed.
+
+        Prowlarr is TRANSPORT only, pinned to the indexers Lidarr already has
+        enabled: the same net, asked in the spelling the tracker actually
+        stores. Free text is deliberate -- Prowlarr's structured `artist=` /
+        `album=` params returned 538 unrelated rows against 8 for the plain
+        query, and its results carry no artist/album attribute for these
+        indexers to verify against, so the title is all there is to match on.
+
+        Lives on the PER-ALBUM path, so it runs before the artist/discography
+        fallback (that only fires when no album filled) -- a precise album
+        grab always beats pulling a whole discography.
+        """
+        pro = self._get_prowlarr()
+        if pro is None:
+            return False
+        cfg = self.cfg
+        aid = int(alb["id"])
+        label = f"{artist} - {album}".strip(" -")
+        expected = int((alb.get("statistics") or {}).get("trackCount") or 0)
+
+        # Folded spelling first: it is the one Lidarr cannot produce itself.
+        queries: List[str] = []
+        for a, b in ((self._ascii_fold(artist), self._ascii_fold(album)),
+                     (artist, album)):
+            q = f"{a} - {b}".strip(" -")
+            if q and q not in queries:
+                queries.append(q)
+
+        results: List[Dict[str, Any]] = []
+        for q in queries:
+            # require_magnet=False: RuTracker (and other private-ish trackers)
+            # publish only a .torrent link, and dropping those made the indexer
+            # that HAS this album invisible.
+            found = pro.search(q, require_magnet=False) or []
+            logger.info("interactive search: %s -- Prowlarr %r -> %d result(s)",
+                        label, q, len(found))
+            if found:
+                results = found
+                break
+        if not results:
+            return False
+
+        cands = self._rank_releases(results, artist, album,
+                                    st.get("blocklisted") or [], album_rec=alb)
+        if not cands:
+            return False
+        floor = float(cfg.interactive_search_min_title_ratio)
+        if float(cands[0].get("_title_ratio") or 0) < floor:
+            logger.info(
+                "interactive search: %s -- Prowlarr best title match %.2f < "
+                "%.2f (%r); not grabbing", label,
+                cands[0].get("_title_ratio"), floor, cands[0].get("title"))
+            return False
+        if cfg.interactive_search_dry_run:
+            logger.info(
+                "interactive search (DRY RUN): %s -> would grab via Prowlarr "
+                "%r (seeders=%s title~%.2f)", label, cands[0].get("title"),
+                cands[0].get("_seeders"), cands[0].get("_title_ratio"))
+            return False
+
+        blocklisted = st.setdefault("blocklisted", [])
+        category = str(getattr(self.cfg, "qbt_category", "") or "")
+        for cand in cands[:max(1, int(cfg.interactive_search_max_candidates))]:
+            # A Prowlarr result has no Lidarr guid or indexer id, so pushing it
+            # through Lidarr can only 404 -- add it ourselves, PAUSED, stamped
+            # with OUR category. An uncategorised torrent escapes every
+            # category-scoped guard in this pipeline.
+            grab = str(cand.get("grab_url") or cand.get("magnet")
+                       or cand.get("guid") or "")
+            if not grab:
+                continue
+            if qbt is None:
+                logger.info("interactive search: %s -- no qBittorrent to add "
+                            "the release; skipping", label)
+                return False
+            logger.info(
+                "interactive search: %s -> grabbing via Prowlarr %r "
+                "(seeders=%s quality=%s)", label, cand.get("title"),
+                cand.get("_seeders"), cand.get("_quality"))
+            if grab.startswith("magnet:"):
+                thash = qbt.add_magnet(grab, category=category, paused=True)
+            else:
+                # No magnet published -- add the .torrent URL and learn the
+                # infohash from what appeared, since every check below needs it.
+                thash = qbt.add_torrent_url(grab, category=category,
+                                            paused=True)
+            if not thash:
+                continue
+            verdict, info = self._verify_torrent(
+                qbt, thash, expected, label, album_id=aid)
+            if verdict == "accept":
+                started = qbt.ensure_started(thash)
+                logger.info(
+                    "interactive search: %s -- ACCEPTED via Prowlarr %r "
+                    "(%s audio, Lidarr expects %d); %s", label,
+                    cand.get("title"), info.get("audio_count", "?"), expected,
+                    "force-started download" if started
+                    else "BUT IT IS NOT DOWNLOADING")
+                return True
+            logger.info(
+                "interactive search: %s -- rejected Prowlarr %r (%s); "
+                "blocklist + next", label, cand.get("title"), verdict)
+            self._reject_by_hash(thash, qbt)
+            blocklisted.append(cand.get("guid"))
+        return False
+
     def _isearch_one_album(self, alb: Dict[str, Any], st: Dict[str, Any], qbt) -> bool:
         """Search, rank, then grab+verify candidates for one album. True if a
         release was accepted (or grabbed but unverifiable)."""
@@ -10778,7 +10903,10 @@ class Orchestrator:
         if not cands:
             logger.info(
                 "interactive search: %s -- no torrent candidates", label)
-            return False
+            # Lidarr found nothing -- but it can only ask in its own spelling.
+            # Ask the same indexers directly for "Artist - Album" before
+            # giving up (and before the artist/discography fallback).
+            return self._isearch_prowlarr_album(alb, artist, album, st, qbt)
 
         # Title-relation floor: don't grab a weak/wrong match (short & numeric
         # album titles like "4" / "112" attract loosely-related releases).
@@ -10788,7 +10916,9 @@ class Orchestrator:
                 "interactive search: %s -- best title match %.2f < %.2f "
                 "(%r); skipping, needs manual attention", label,
                 cands[0].get("_title_ratio"), floor, cands[0].get("title"))
-            return False
+            # Everything Lidarr returned is a weak match, which is what a
+            # wrong-spelling query looks like -- try the direct search too.
+            return self._isearch_prowlarr_album(alb, artist, album, st, qbt)
 
         if cfg.interactive_search_dry_run:
             top = cands[0]
@@ -10851,7 +10981,9 @@ class Orchestrator:
         logger.warning(
             "interactive search: %s -- %d candidate(s) tried, none verified; "
             "needs manual attention", label, tried)
-        return False
+        # Every Lidarr candidate failed verification. The right release may
+        # still be on the same indexer under the folded spelling.
+        return self._isearch_prowlarr_album(alb, artist, album, st, qbt)
 
     # Discography / collection torrent detection (artist-level search).
     _DISCO_MARKER_RE = re.compile(

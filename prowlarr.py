@@ -321,7 +321,7 @@ class ProwlarrClient:
 
     def search(
         self, term: str, categories: Iterable[int] = AUDIO_CATEGORIES,
-        min_seeders: int = 1, limit: int = 0,
+        min_seeders: int = 1, limit: int = 0, require_magnet: bool = True,
     ) -> List[Dict[str, Any]]:
         """
         Free-text search, restricted to `self.indexer_ids` when set (i.e. to the
@@ -363,17 +363,30 @@ class ProwlarrClient:
             if seeders < int(min_seeders):
                 continue
             magnet = _bare_magnet(rec)
-            if not magnet:
+            # Some trackers publish NEITHER a magnet nor an infohash -- every
+            # RuTracker music result is like this, carrying only Prowlarr's own
+            # /download proxy link. Dropping those silently made a whole
+            # indexer invisible: the exact `Tiesto - In My Memory ... FLAC
+            # (tracks+.cue), lossless` at 11 seeders was discarded this way.
+            # qBittorrent's add endpoint takes an http .torrent URL in the very
+            # same `urls` field as a magnet, so with require_magnet=False the
+            # caller can still grab it -- it just has to learn the infohash
+            # after the add instead of parsing it from the URI.
+            grab_url = magnet or (str(rec.get("downloadUrl") or "")
+                                  if not require_magnet else "")
+            if not grab_url:
                 no_magnet += 1
                 continue
             ih = (_BTIH_RE.search(magnet).group(1).lower()
-                  if _BTIH_RE.search(magnet) else "")
+                  if magnet and _BTIH_RE.search(magnet) else "")
             if ih and ih in seen:
                 continue
             if ih:
                 seen.add(ih)
             out.append({
-                "guid": magnet,          # the assembly path reads magnets here
+                "guid": grab_url,        # the assembly path reads magnets here
+                "grab_url": grab_url,
+                "is_magnet": bool(magnet),
                 "indexerId": rec.get("indexerId"),
                 "indexer": rec.get("indexer"),
                 "title": str(rec.get("title") or ""),
@@ -381,7 +394,7 @@ class ProwlarrClient:
                 "leechers": int(rec.get("leechers") or 0),
                 "size": int(rec.get("size") or 0),
                 "protocol": "torrent",
-                "magnet": magnet,
+                "magnet": magnet or "",
                 "infoHash": ih,
                 "_source": "prowlarr",
             })

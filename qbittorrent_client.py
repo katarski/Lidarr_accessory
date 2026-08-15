@@ -223,6 +223,73 @@ class QbtClient:
             return None
         return ih
 
+    def add_torrent_url(self, url: str, category: str = "",
+                        paused: bool = True,
+                        stop_on_metadata: bool = True,
+                        tags: str = SELF_ADDED_TAG,
+                        timeout: int = 40) -> Optional[str]:
+        """
+        Add a torrent from an http(s) .torrent URL and return its infohash.
+
+        `add_magnet` refuses anything that is not a magnet URI, but a lot of
+        trackers publish no magnet and no infohash at all -- every RuTracker
+        music result is only a Prowlarr /download proxy link. qBittorrent takes
+        both forms in the same `urls` field, so the add is identical; what
+        differs is that the infohash CANNOT be known in advance, and every
+        verification step downstream is keyed on it.
+
+        So the hash is discovered after the fact: snapshot the client's hashes,
+        add, then watch for the new one. Matching on the diff (not on a title
+        guess) is what makes this reliable -- the tracker's torrent name and the
+        release title frequently disagree.
+        """
+        u = str(url or "").strip()
+        if not u.lower().startswith(("http://", "https://")):
+            logger.warning("add_torrent_url: not an http(s) URL, refusing")
+            return None
+        if not self._api_ok():
+            self.login()
+        try:
+            before = {str(t.get("hash") or "").lower()
+                      for t in (self.torrents() or [])}
+        except Exception:  # noqa: BLE001
+            before = set()
+        data: Dict[str, str] = {"urls": u}
+        if category:
+            data["category"] = category
+        if tags:
+            data["tags"] = tags
+        if paused and stop_on_metadata:
+            data["stopCondition"] = "MetadataReceived"
+        elif paused:
+            data["paused"] = "true"
+            data["stopped"] = "true"
+        try:
+            r = self.s.post(f"{self.base}/api/v2/torrents/add",
+                            data=data, timeout=60)
+            r.raise_for_status()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("add_torrent_url failed: %s", exc)
+            return None
+        # Fetching the .torrent through Prowlarr and parsing it takes a moment,
+        # so poll rather than reading once.
+        deadline = time.time() + max(5, int(timeout))
+        while time.time() < deadline:
+            try:
+                now = {str(t.get("hash") or "").lower()
+                       for t in (self.torrents() or [])}
+            except Exception:  # noqa: BLE001
+                now = set()
+            new = now - before
+            if new:
+                ih = sorted(new)[0]
+                logger.info("add_torrent_url: qBittorrent accepted %s", ih[:12])
+                return ih
+            time.sleep(2)
+        logger.warning("add_torrent_url: nothing new appeared in qBittorrent "
+                       "for %s", u[:80])
+        return None
+
     def torrent_by_hash(self, torrent_hash: str) -> Optional[Dict[str, Any]]:
         """The one torrent, or None if qBittorrent does not have it (which is
         how we verify a delete actually happened -- the delete endpoint answers
