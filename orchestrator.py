@@ -11011,6 +11011,69 @@ class Orchestrator:
             return None
         return {"marker": marker, "span": span, "count": count}
 
+    # A tracker title often opens with a genre tag, and Lidarr copies the whole
+    # string into artistName: "(Indie Rock / Folk) David Allred".
+    _GENRE_PREFIX_RE = re.compile(r"^\s*[\(\[][^)\]]{0,60}[\)\]]\s*")
+    # Separators that join several credits into one artistName.
+    _CREDIT_SPLIT_RE = re.compile(
+        r"\s*(?:,|/|&|;|\bfeat\.?\b|\bft\.?\b|\bwith\b|\bvs\.?\b|\band\b)\s*",
+        re.IGNORECASE)
+
+    def _credited_artists(self, artist_name: str) -> List[str]:
+        """
+        Every name a release's `artistName` can be read as.
+
+        A parenthetical inside a credit is an ALIAS of the same act, not a
+        second artist: RuTracker writes Tiësto as "Tiësto (Tiesto)" and
+        "Tiësto (aka Tiesto)". Treating that as one opaque string rejected the
+        artist's own albums -- `Tiësto (Tiesto) - Drive - 2023, FLAC` among
+        them -- so each credit also yields its bare form and its alias.
+        """
+        s = self._GENRE_PREFIX_RE.sub("", str(artist_name or ""))
+        out: List[str] = []
+        for part in self._CREDIT_SPLIT_RE.split(s):
+            p = part.strip(" -–—\t")
+            if not p:
+                continue
+            out.append(p)
+            bare = re.sub(r"[\(\[][^)\]]*[\)\]]", " ", p).strip()
+            if bare and bare != p:
+                out.append(bare)
+            for m in re.finditer(r"[\(\[]([^)\]]*)[\)\]]", p):
+                alias = re.sub(r"(?i)^\s*a[\.\s]*k[\.\s]*a[\.\s]*", "",
+                               m.group(1)).strip()
+                if alias:
+                    out.append(alias)
+        return out
+
+    def _release_artist_matches(self, artist: str, raw: Dict[str, Any]):
+        """
+        Is this release actually BY `artist`, per the indexer's own artist
+        field? True / False, or None when the release names no artist (then
+        the caller falls back to matching the title).
+
+        The title test alone cannot do this. A short-but-not-tiny artist name
+        is matched as a loose substring, so Lidarr's `Allred` swallowed the
+        whole family: of the 16 releases in its artist scope, 15 were by
+        someone else -- David Allred, Loren Allred, Daniel Allred, John Allred,
+        Joseph Allred, Nephi Clark Allred, Jason Andrew Allred. Every one of
+        them names its real artist in `artistName`, which Lidarr populates from
+        the indexer for 15 of those 16.
+        """
+        an = str(raw.get("artistName") or "").strip()
+        if not an:
+            return None
+        # Fold diacritics on BOTH sides: the same act is written 'Tiësto' by
+        # Lidarr and 'Tiesto' by the tracker, and that is a spelling, not a
+        # different artist.
+        want = self._norm_title(self._ascii_fold(artist))
+        if not want:
+            return None
+        for c in self._credited_artists(an):
+            if self._norm_title(self._ascii_fold(c)) == want:
+                return True
+        return False
+
     def _rank_artist_releases(self, releases, artist: str, missing, blocklisted):
         """
         Rank artist-scope torrent releases by how much MISSING music they fill.
@@ -11027,6 +11090,7 @@ class Orchestrator:
         m_norm = [(self._norm_title(f"{artist} {t}"), t, exp, aid)
                   for (t, exp, aid) in missing]
         dropped_video_a = 0
+        dropped_wrong_artist = 0
         scored: List[Dict[str, Any]] = []
         for raw in releases or []:
             if (raw.get("protocol") or "").lower() != "torrent":
@@ -11056,7 +11120,27 @@ class Orchestrator:
             # and grabbed that band's 2008-2014 discography. Dotted initialisms
             # are the very case the strict rule exists for; only the spaces
             # were hiding them. "mia" is 3 -> strict prefix -> no match.
-            if artn:
+            # Ask the indexer WHO this release is by before falling back to
+            # reading the artist out of the title. `artistName` is an explicit
+            # answer; a substring of the title is a guess, and the guess is
+            # what let 15 of 16 "Allred" candidates be someone else entirely.
+            by = self._release_artist_matches(artist, raw)
+            if by is False:
+                dropped_wrong_artist += 1
+                continue
+            if by is None and artn:
+                # No artist field -- fall back to the title. A short/numeric
+                # name ("112", "4") is too weak as a loose substring (it
+                # matched "Now That's What I Call Music (101 to 112)"), so
+                # require it to PREFIX the title; longer, distinctive names may
+                # match anywhere.
+                #
+                # The length is measured with the SPACES REMOVED. "M.I.A."
+                # normalizes to "m i a" -- 5 characters, so it used to escape
+                # the short-name rule and fall through to the loose substring
+                # test, where it matched the middle of "A.R.M.I.A" and grabbed
+                # that band's discography. Dotted initialisms are the very case
+                # the strict rule exists for; only the spaces were hiding them.
                 bare = artn.replace(" ", "")
                 if len(bare) <= 4 or bare.isdigit():
                     if not tnorm.startswith(artn):
@@ -11124,6 +11208,11 @@ class Orchestrator:
                 "interactive search: %s -- refused %d VIDEO release(s) at the "
                 "artist scope (concert film / rip, not audio)",
                 artist, dropped_video_a)
+        if dropped_wrong_artist:
+            logger.info(
+                "interactive search: %s -- refused %d release(s) the indexer "
+                "credits to a DIFFERENT artist (artistName says so)",
+                artist, dropped_wrong_artist)
         # COST vs BENEFIT. Everything above ranks a discography purely on how
         # many gaps it could close; nothing ever looked at its size. Measured
         # consequences, all live: 27.34 GB of '2PAC, Tupac' downloading to fill
