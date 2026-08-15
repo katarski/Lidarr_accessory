@@ -11196,7 +11196,10 @@ class Orchestrator:
 
     # A tracker title often opens with a genre tag, and Lidarr copies the whole
     # string into artistName: "(Indie Rock / Folk) David Allred".
-    _GENRE_PREFIX_RE = re.compile(r"^\s*[\(\[][^)\]]{0,60}[\)\]]\s*")
+    # Repeated: a title can open with several of them --
+    # "[16/44.1][LP] Ohio Players" stripped only "[16/44.1]" and the credit
+    # became "LP] Ohio Players", rejecting the artist's own release.
+    _GENRE_PREFIX_RE = re.compile(r"^\s*(?:[\(\[][^)\]]{0,60}[\)\]]\s*)+")
     # Separators that join several credits into one artistName.
     _CREDIT_SPLIT_RE = re.compile(
         r"\s*(?:,|/|&|;|\bfeat\.?\b|\bft\.?\b|\bwith\b|\bvs\.?\b|\band\b)\s*",
