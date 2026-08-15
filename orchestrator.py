@@ -12034,6 +12034,46 @@ class Orchestrator:
             " (DRY RUN -- nothing grabbed)" if cfg.interactive_search_dry_run else "")
         return grabbed
 
+    def clear_failed_queue_rows(self) -> int:
+        """
+        Remove Lidarr queue rows whose download finished and FAILED to import.
+
+        Non-destructive on purpose: the row only, never the client, never the
+        data, never a blocklist entry. Such a row will never progress on its
+        own, and left alone they accumulate without limit -- measured 227 of
+        249, then 197 again a few hours after clearing them by hand. They also
+        used to retire their album from every future search (see
+        interactive_search_pass), which is the real damage.
+
+        The legacy queue reaper is deliberately NOT used for this: it removes
+        torrents and their data, and cannot tell a failed import from one still
+        in progress.
+        """
+        removed = 0
+        try:
+            rows = self.lidarr.queue_list() or []
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("queue row cleanup: queue list failed: %s", exc)
+            return 0
+        for rec in rows:
+            if str(rec.get("trackedDownloadState") or "").lower() not in (
+                    "importfailed", "failed"):
+                continue
+            rid = rec.get("id")
+            if rid is None:
+                continue
+            try:
+                if self.lidarr.queue_remove(int(rid), remove_from_client=False,
+                                            blocklist=False):
+                    removed += 1
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("queue row cleanup: %s failed: %s", rid, exc)
+        if removed:
+            logger.info(
+                "queue cleanup: cleared %d dead queue row(s) (import had "
+                "failed; torrents and data untouched)", removed)
+        return removed
+
     def reap_lidarr_queue(self) -> int:
         """
         Remove fully-downloaded-but-stuck torrents from Lidarr's queue (and,

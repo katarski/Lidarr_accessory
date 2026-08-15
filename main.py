@@ -2096,9 +2096,30 @@ def main() -> int:
         )
 
     elif orch_cfg.queue_reaper_enabled and qbt_manage_on:
+        # The lifecycle handles the TORRENTS, but nothing clears Lidarr's dead
+        # QUEUE ROWS, and they accumulate without limit. Clear those -- rows
+        # only, never the client or the data.
+        def _queue_row_cleanup_loop(stop_evt, interval: int) -> None:
+            if stop_evt.wait(180):
+                return
+            while not stop_evt.is_set():
+                try:
+                    orch.clear_failed_queue_rows()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("queue row cleanup failed: %s", exc)
+                if stop_evt.wait(max(300, interval)):
+                    return
+
+        threading.Thread(
+            target=_queue_row_cleanup_loop,
+            args=(stop, orch_cfg.queue_reaper_interval_seconds),
+            daemon=True, name="cue-queue-rows").start()
         logger.info(
             "Queue reaper: superseded by qBittorrent completed-torrent "
-            "lifecycle (disk-aware) -- legacy reaper not started."
+            "lifecycle (disk-aware); clearing dead queue rows every %ds.",
+            max(300, orch_cfg.queue_reaper_interval_seconds))
+        logger.debug(
+            "legacy reaper not started."
         )
 
     # --- Interactive search + smart-grab (opt-in, backlog #10) ---------
