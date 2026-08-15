@@ -1426,8 +1426,13 @@ def main() -> int:
         # use. NOTE the config default for `category` is an empty string, which
         # would mean "touch nothing" -- so fall back to "lidarr", the category
         # Lidarr itself is configured to write.
-        qbt_category=str((cfg.get("qbittorrent") or {}).get("category", "")
-                         or "lidarr"),
+        # NEVER EMPTY. An empty category makes every torrent the pipeline adds
+        # itself invisible to every category-scoped guard -- 64 uncategorised
+        # torrents accumulated this way, including music the pipeline grabbed.
+        # The client is shared, so the category is also what tells our torrents
+        # apart from someone else's; falling back to the dataclass default.
+        qbt_category=(str((cfg.get("qbittorrent") or {}).get("category", "")
+                          or "").strip() or "lidarr"),
         log_file=(Path((cfg.get("logging") or {}).get("file"))
                   if (cfg.get("logging") or {}).get("file") else None),
         flac2mp3_log=str(
