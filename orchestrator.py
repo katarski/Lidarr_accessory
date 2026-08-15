@@ -9398,9 +9398,31 @@ class Orchestrator:
             if vid:
                 dropped_video.append(f"{title} [{vid}]")
                 continue
-            if guard_artist and not self._norm_title(title).startswith(artn):
+            # WHOSE RECORD IS THIS? Same test the artist-scope ranker uses.
+            # This ranker only ever guarded artists collapsing to <= 4 chars,
+            # so "Bellini" and "David Bowie" were unguarded and the album
+            # search grabbed `OperaCompactFestival03/04/08` and
+            # `DIVA - Soprano Festival` for Bellini's "Festival", and
+            # `Original New York Cast - Lazarus` for Bowie.
+            by = self._release_artist_matches(artist, raw)
+            if by is False:
                 dropped_artist += 1
                 continue
+            if by is None:
+                if guard_artist and not self._norm_title(title).startswith(artn):
+                    dropped_artist += 1
+                    continue
+                # No artist field at all -- every Prowlarr result is like this.
+                # A free-text "Artist - Album" search then matches on the ALBUM
+                # words alone, which is exactly how "Bellini - Festival" landed
+                # on "OperaCompactFestival03". Require the artist to appear in
+                # the title. Placeholder artists (VA / Soundtrack) are exempt:
+                # their releases are titled "VA - ..." and demanding the name
+                # would drop all of them.
+                if (artn and not self._is_placeholder_artist(artist)
+                        and artn not in self._norm_title(title)):
+                    dropped_artist += 1
+                    continue
             q = raw.get("quality") or {}
             qname = ((q.get("quality") or {}).get("name")
                      or q.get("name") or "")
