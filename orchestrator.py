@@ -2648,6 +2648,58 @@ class Orchestrator:
         self._remove_stray_cues(folder)
         return True
 
+    def _torrent_name_for_folder(self, folder: Path) -> str:
+        """
+        The NAME of the torrent this folder came from, or "".
+
+        A rip's payload folder often carries no identity at all -- a DVD-Audio
+        disc arrived as `Little Feat[torrents.ru]/UNNAMED.iso`, so every name
+        test produced album='torrents.ru' -- while the torrent it was grabbed
+        under says exactly what it is:
+        `[DVDA][OF] Little Feat - Kickin' It at the Barn - 2004 (...)`.
+        Matched the same way as `_remove_torrent_for_folder` (exact content
+        path, or a containing torrent), and category-guarded: the client is
+        shared, so another app's torrent must never name our album.
+        """
+        q = self._get_qbt()
+        if q is None:
+            return ""
+        try:
+            fr = str(folder.resolve(strict=False)).replace("\\", "/").rstrip("/")
+            wr = str((self.cfg.watch_root or Path("/")).resolve(
+                strict=False)).replace("\\", "/").rstrip("/")
+            best, best_len = "", -1
+            for t in q.torrents():
+                if not self._qbt_ours(t):
+                    continue
+                cp = str(t.get("content_path") or "").replace("\\", "/").rstrip("/")
+                sp = str(t.get("save_path") or "").replace("\\", "/").rstrip("/")
+                # A torrent whose content path IS its save directory covers the
+                # whole download root, so the ancestor test below would match
+                # EVERY folder and hand back an unrelated release. Tested live:
+                # this returned 'Sophie Barker - Seagull (2011) Flac' for the
+                # Little Feat folder. Same guard the removal path uses.
+                if not cp or cp == sp:
+                    continue
+                base = os.path.basename(cp)
+                mapped = f"{wr}/{base}" if base else ""
+                if (cp == fr or mapped == fr
+                        or fr.startswith(cp + "/")
+                        or (mapped and fr.startswith(mapped + "/"))):
+                    # Most SPECIFIC match wins, so a discography torrent can't
+                    # outrank the single-album torrent that really owns it.
+                    if len(cp) > best_len:
+                        best, best_len = str(t.get("name") or ""), len(cp)
+            if best:
+                return best
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("torrent-name lookup failed for %s: %s", folder, exc)
+        return ""
+
+    # "This exact disc image was already ripped" does not decay, so the shared
+    # 24h sweep TTL must not apply to it (10 years ~= never).
+    _RIPPED_ISO_TTL = 10 * 365 * 24 * 3600
+
     def _dvda_identity(self, folder: Path) -> Tuple[str, str]:
         """
         (artist, album) for a DVD-Audio folder. Prefer the 'Artist - Album'
@@ -2659,6 +2711,17 @@ class Orchestrator:
         artist, album = self._album_folder_identity(folder)
         if artist and album:
             return artist, album
+        # The folder said nothing usable. Ask the TORRENT it came from -- the
+        # release title survives even when the payload folder is a tracker
+        # stamp wrapped round an UNNAMED.iso.
+        tname = self._torrent_name_for_folder(folder)
+        if tname:
+            t_art, t_alb = self._album_folder_identity(Path(tname))
+            if t_art and t_alb:
+                logger.info(
+                    "DVD-Audio: identity from the TORRENT name %r -> "
+                    "artist=%r album=%r", tname[:70], t_art, t_alb)
+                return t_art, t_alb
         raw = re.sub(r"\s{2,}", " ", folder.name or "").strip(" -_.")
         if self.ollama is not None and getattr(self.ollama, "enabled", False):
             try:
@@ -2786,12 +2849,20 @@ class Orchestrator:
         return "%d:%d" % (len(audios), newest)
 
     def _sweep_ledger_skip(self, folder: Path, audios: List[Path],
-                           now_ts: float) -> bool:
+                           now_ts: float,
+                           ttl_seconds: Optional[int] = None) -> bool:
         """
         Has this folder already been handed off, unchanged, recently enough to
         skip? False whenever the ledger is off, the folder is unknown, its audio
         changed, or the entry has expired -- so a changed or long-untouched
         folder always gets another look.
+
+        `ttl_seconds` overrides the shared expiry for facts that do not decay.
+        The default TTL exists so a TRANSIENT failure is retried tomorrow, but
+        "this exact disc image was already ripped" never stops being true, and
+        letting it expire is what re-ripped an owned DVD-Audio disc every 24h.
+        The signature still keys on the ISO's own size/mtime, so a genuinely
+        replaced image is ripped again regardless of age.
         """
         if not getattr(self.cfg, "sweep_ledger_enabled", True):
             return False
@@ -2802,7 +2873,9 @@ class Orchestrator:
             sig, ts = rec[0], float(rec[1])
         except Exception:  # noqa: BLE001
             return False
-        ttl = max(300, int(getattr(self.cfg, "sweep_ledger_ttl_seconds", 86400)))
+        ttl = (int(ttl_seconds) if ttl_seconds
+               else max(300, int(getattr(
+                   self.cfg, "sweep_ledger_ttl_seconds", 86400))))
         if (now_ts - ts) >= ttl:
             return False
         return sig == self._folder_signature(audios)
@@ -3100,7 +3173,8 @@ class Orchestrator:
         # entry is keyed on the ISO itself (its own mtime/size), so a genuinely
         # replaced disc image is still ripped again.
         iso_key = Path(str(iso) + "#dvda")
-        if self._sweep_ledger_skip(iso_key, [iso], now_ts):
+        if self._sweep_ledger_skip(iso_key, [iso], now_ts,
+                                   ttl_seconds=self._RIPPED_ISO_TTL):
             logger.debug("DVD-Audio: %s already extracted previously -- skipping",
                          iso.name)
             return False
@@ -3108,6 +3182,33 @@ class Orchestrator:
             # Not a DVD-Audio disc -- let the SACD branch (or the leave-alone
             # path) handle it. Do NOT mark seen: the SACD branch still needs it.
             return False
+
+        # DO WE ALREADY OWN THIS RECORD? The SACD path has asked since the Macy
+        # Gray case; the DVD-Audio path never did, so a disc already complete in
+        # the library was re-ripped indefinitely: the rip costs minutes of CPU
+        # and GBs of FLAC, the redundancy branch then deletes the extracted
+        # audio, and the ISO ledger entry expires -- so it came round again the
+        # next day, forever. `Little Feat - Kickin' It at the Barn` was ripped
+        # this way against a library copy already complete at 11/11, in the SAME
+        # 6ch/48kHz/24-bit form the ISO holds.
+        who, what = self._dvda_identity(folder)
+        for a_name, b_name in ((who, what),
+                               self._album_folder_identity(Path(iso.stem))):
+            if not (a_name and b_name):
+                continue
+            try:
+                owned = self._album_already_in_library(a_name, b_name)
+            except Exception:  # noqa: BLE001
+                owned = None
+            if owned:
+                st = owned.get("statistics") or {}
+                logger.info(
+                    "DVD-Audio: %s is %s / %s, already complete in the library "
+                    "(%s/%s) -- not extracting.", iso.name, a_name, b_name,
+                    st.get("trackFileCount"), st.get("totalTrackCount"))
+                self._sweep_ledger_mark(iso_key, [iso], now_ts)
+                self._sweep_ledger_save()
+                return True
 
         tmp = folder / ".dvda_extract_tmp"
         # IN-PROGRESS LOCK. Ripping a DVD-Audio disc takes minutes, but the
