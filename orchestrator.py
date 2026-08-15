@@ -4826,6 +4826,10 @@ class Orchestrator:
             "Song-title rescue: %s -> Lidarr album %r (cmd=%s), %d file(s)",
             folder.name[:50], str(alb.get("title"))[:44], cmd, len(audios))
         self._rename_album_to_convention(aid, int(alb.get("id") or 0), cmd)
+        # Lidarr caches a per-album track count on the ARTIST, and a
+        # ManualImport does not recompute it: the album page read 11/11 while
+        # the artist page still showed 7/11 for the same record. Reconcile it.
+        self._trigger_artist_refresh(artist_name, artist_id=aid)
         self._record(
             key_path, outcome="imported_via_manual", pre_split=True,
             artist=artist_name, album=str(alb.get("title") or album_name),
@@ -4951,6 +4955,9 @@ class Orchestrator:
             "%s / %r (cmd=%s), %d file(s)", folder.name[:44], artist_name[:26],
             str(alb.get("title"))[:40], cmd, len(audios))
         self._rename_album_to_convention(aid, album_id, cmd)
+        # Same stale-statistic reconcile as the song-title rescue: without it
+        # the artist page keeps showing the pre-import count.
+        self._trigger_artist_refresh(artist_name, artist_id=aid)
         self._record(
             key_path, outcome="imported_via_manual", pre_split=True,
             artist=artist_name, album=str(alb.get("title") or ""),
