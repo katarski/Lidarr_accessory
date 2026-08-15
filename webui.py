@@ -1365,6 +1365,9 @@ buildColMenu();setTab('attention');refresh();setInterval(refresh,15000);
 
 /* ===================== Converter tab ===================== */
 var CVDEF={}, CVOPT=null, CVSEL=new Set(), CVINIT=false, CVPOLL=null, CVROOT='', CVDONE=new Set(), CVDEST=[], CVSORT='name';
+// Album folders whose per-file list is expanded in the Conversions section.
+// Survives the 3s re-render, so an open album stays open.
+var CVOPEN=new Set();
 function cvEnter(){
   if(!CVINIT){CVINIT=true;
     fetch('/api/convert/options').then(function(r){return r.json();}).then(function(j){
@@ -1571,6 +1574,35 @@ function cvLoadDir(rel,elId){
     });
     el.innerHTML=out||'<div class="empty">(no audio here)</div>';
   }).catch(function(e){var el=document.getElementById(elId);if(el)el.innerHTML='<div class="empty">error: '+h(''+e)+'</div>';});
+}
+function cvToggleAlbum(caret){
+  // The album's file list lives in the .cvkids div right after its row, so the
+  // album path never has to survive a trip through an onclick attribute.
+  var row=caret.parentNode;if(!row)return;
+  var box=row.nextElementSibling;
+  if(!box||box.className.indexOf('cvkids')<0)return;
+  var dir=box.getAttribute('data-dir')||'';
+  var open=!CVOPEN.has(dir);
+  if(open)CVOPEN.add(dir);else CVOPEN.delete(dir);
+  caret.textContent=open?'▾':'▸';
+  box.style.display=open?'':'none';
+  if(open){box.innerHTML='<span class="muted">loading…</span>';cvLoadAlbumEl(box);}
+  else box.innerHTML='';
+}
+function cvLoadAlbumEl(box){
+  var dir=box.getAttribute('data-dir')||'';
+  fetch('/api/convert/folder?dir='+encodeURIComponent(dir))
+   .then(function(r){return r.json();})
+   .then(function(j){
+     var jobs=(j&&j.jobs)||[];
+     box.innerHTML=jobs.length?jobs.map(function(x){
+       var st=x.state==='running'?'<span class="badge b-out">'+x.pct+'%</span>'
+             :x.state==='queued'?'<span class="muted">queued</span>'
+             :'<span class="muted">'+h(x.state||'')+(x.msg?(' '+h(x.msg)):'')+'</span>';
+       return '<div class="pline"><span class="plab" title="'+h(x.rel)+'">'+h(x.name)+'</span>'+st+'</div>';
+     }).join(''):'<div class="pline"><span class="muted">no files</span></div>';
+   })
+   .catch(function(e){box.innerHTML='<div class="pline"><span class="muted">error: '+h(''+e)+'</span></div>';});
 }
 function cvToggleDir(caret,rel,kidsId){
   var kids=document.getElementById(kidsId);if(!kids)return;
@@ -1828,9 +1860,15 @@ function cvPollOnce(){
       cl+='<div class="pline"><span class="plab"><b>'+nFD+' of '+nF+' album(s) complete</b></span></div>';
       fl.forEach(function(f){
         var col=f.pct>=100?'#3fb950':(f.running?'#58a6ff':'#8b949e');
-        cl+='<div class="pline"><span class="plab" title="'+h(f.dir)+'">'+h(f.dir||'(root)')+'</span>'
+        // Same disclosure caret as the file tree below and the Needs-attention
+        // rows: ▸ closed, ▾ open, per-file list fetched only when opened.
+        var op=CVOPEN.has(f.dir||'');
+        cl+='<div class="pline">'
+          +'<span class="cvcaret" onclick="cvToggleAlbum(this)">'+(op?'▾':'▸')+'</span>'
+          +'<span class="plab" title="'+h(f.dir)+'">'+h(f.dir||'(root)')+'</span>'
           +'<div class="pbar"><div class="pfill" style="width:'+(f.pct||0)+'%;background:'+col+'"></div></div>'
-          +'<span class="ppct">'+f.done+'/'+f.total+'</span></div>';
+          +'<span class="ppct">'+f.done+'/'+f.total+'</span></div>'
+          +'<div class="cvkids" data-dir="'+h(f.dir||'')+'" style="display:'+(op?'':'none')+'"></div>';
       });
       if(nF>fl.length)cl+='<div class="pline"><span class="plab muted">… and '+(nF-fl.length)+' more album(s) queued</span></div>';
     }else{
@@ -1838,6 +1876,11 @@ function cvPollOnce(){
     }
     (conv.done||[]).slice().reverse().forEach(function(jb){cl+='<div class="pline"><span class="plab">'+h(jb.rel)+'</span><span class="'+(jb.state==='done'?'muted':'badge b-lossy')+'">'+h(jb.state)+' '+h(jb.msg||'')+'</span></div>';});
     document.getElementById('cv-convlist').innerHTML=cl||'';
+    // The list re-renders every poll, so re-fill the albums that were open --
+    // same contract as the Needs-attention tab re-loading expanded trees.
+    document.querySelectorAll('#cv-convlist .cvkids').forEach(function(b){
+      if(CVOPEN.has(b.getAttribute('data-dir')||''))cvLoadAlbumEl(b);
+    });
     // Cue splits section.
     document.getElementById('cv-nsplit').textContent=splitqTotal;
     document.getElementById('cv-splitlist').innerHTML=splitq.length
@@ -2172,6 +2215,14 @@ def make_handler(store, actions: HeldActions):
             elif path == "/api/activity":
                 acts = actions.list_activity() if hasattr(actions, "list_activity") else []
                 self._json(200, {"items": acts})
+            elif path == "/api/convert/folder":
+                # One album's per-file jobs, fetched only when its caret is
+                # opened (status() ships albums, never files).
+                cv = getattr(actions, "converter", None)
+                qs = parse_qs(urlparse(self.path).query)
+                d = (qs.get("dir", [""]) or [""])[0]
+                self._json(200, {"dir": d,
+                                 "jobs": cv.jobs_for_dir(d) if cv else []})
             elif path == "/api/convert/folders":
                 cv = getattr(actions, "converter", None)
                 qs = parse_qs(urlparse(self.path).query)

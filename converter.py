@@ -791,6 +791,36 @@ class ConvertManager:
                 "paused": bool(self._paused),
                 "held_for_pipeline": self._pipeline_busy()}
 
+    def jobs_for_dir(self, d: str) -> List[Dict[str, Any]]:
+        """
+        Every job under ONE album folder, for the row's expand caret.
+
+        status() ships albums, never files -- a full-library run is ~86k jobs
+        and shipping them is what made the browser fall over. So the per-file
+        view is fetched on demand for the one album the user opened, the same
+        way the Needs-attention tab loads a folder tree lazily.
+        """
+        want = str(d or "")
+        out: List[Dict[str, Any]] = []
+        with self._lock:
+            for j in self._jobs.values():
+                rel = str(j.get("rel") or "")
+                parent = rel.rsplit("/", 1)[0] if "/" in rel else ""
+                if parent != want:
+                    continue
+                out.append({
+                    "rel": rel,
+                    "name": rel.rsplit("/", 1)[-1],
+                    "state": j.get("state"),
+                    "pct": round(float(j.get("pct") or 0.0), 1),
+                    "msg": j.get("msg") or "",
+                })
+        # Running first, then queued, then finished -- and stable by name so the
+        # list doesn't reshuffle under the pointer on every 3s poll.
+        order = {"running": 0, "queued": 1}
+        out.sort(key=lambda x: (order.get(x["state"], 2), x["name"]))
+        return out
+
     def clear_done(self) -> None:
         with self._lock:
             self._jobs = {k: j for k, j in self._jobs.items()
