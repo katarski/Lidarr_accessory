@@ -9212,12 +9212,22 @@ class Orchestrator:
                 "; ".join(dropped_video[:3])
                 + (" ..." if len(dropped_video) > 3 else ""))
         # Relevant (title >= floor) first; then lossless precedence (when
-        # preferring); then title/seeder score. So a lossless of the right album
-        # wins, but an irrelevant lossless never beats a relevant lossy.
+        # preferring); then SEEDERS, then the finer title relation.
+        #
+        # Seeders decide within a band rather than being added into one score.
+        # Summed, a 0.10 difference in title relation was worth 10 seeders, so a
+        # 1.00/2-seeder release outranked a 0.90/11-seeder one -- and the point
+        # of picking between releases of the SAME album is to get the one that
+        # will actually download. The ratio is banded to 0.05 so a genuinely
+        # better title match still wins, but near-identical matches are settled
+        # by swarm health, which is what "grab the one with the most seeders"
+        # means in practice.
         scored.sort(
             key=lambda x: (
                 x["_title_ratio"] >= floor,
                 x["_lossless"] if prefer_lossless else False,
+                round(float(x["_title_ratio"] or 0) / 0.05),
+                x["_seeders"],
                 x["_score"],
             ),
             reverse=True,
