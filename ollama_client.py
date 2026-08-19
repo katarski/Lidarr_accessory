@@ -110,6 +110,30 @@ _ALBUM_MATCH_SYSTEM = (
 )
 
 
+# Words in a DOWNLOAD name that mark a DIFFERENT KIND OF RECORD, not another
+# edition of the same one: an "Original Broadway Cast Recording" of Jagged Little
+# Pill is not Jagged Little Pill, and a karaoke or tribute version is nobody's
+# album but its own. Measured 2026-08-19 on 91 real cases: the abliterated 14B
+# matched exactly that Broadway case 3 times out of 3, which would deselect a
+# download of an album the user does NOT own.
+#
+# Deliberately narrow. "live", "remixes", "acoustic", "deluxe", "remaster" are
+# NOT here - those ARE editions of the same album and production has accepted
+# them ("Reprise - Remixes" -> "Reprise", "Live Upon A Blackstar" -> "Wish Upon
+# a Blackstar"). Adding one of those would turn good matches into misses.
+_RELEASE_TYPE_WORDS = frozenset({
+    "karaoke", "tribute", "instrumental", "instrumentals", "cast",
+    "broadway", "musical", "covers", "cover", "soundalike", "starring",
+})
+
+
+def _release_type_mismatch(download_name: str, owned_title: str) -> bool:
+    """True when the download carries a release-type word the owned album lacks."""
+    dw = set(re.findall(r"[a-z0-9]+", (download_name or "").lower()))
+    ow = set(re.findall(r"[a-z0-9]+", (owned_title or "").lower()))
+    return bool((dw & _RELEASE_TYPE_WORDS) - ow)
+
+
 def _clip(s: str, limit: int = 70) -> str:
     """One-line, length-capped rendering for log lines."""
     s = " ".join(str(s).split())
@@ -459,6 +483,17 @@ class OllamaClient:
         if not (dw & mw) and not contained:
             logger.info(
                 "AI album match rejected (no overlap): %r -> %r",
+                download_name, matched,
+            )
+            self._match_cache[cache_key] = None
+            return None
+        # SAFETY GUARD 2: a release-type word in the download that the owned
+        # title does not have means it is a different record, however similar
+        # the titles look. Same cost asymmetry as the overlap guard above:
+        # rejecting costs a duplicate download, accepting costs a deselect.
+        if _release_type_mismatch(download_name, matched):
+            logger.info(
+                "AI album match rejected (different release type): %r -> %r",
                 download_name, matched,
             )
             self._match_cache[cache_key] = None
