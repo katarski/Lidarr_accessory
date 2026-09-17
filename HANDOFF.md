@@ -1,302 +1,252 @@
 # cue_pipeline — handoff
 
-Written 2026-08-14, end of a long session. Everything marked SHIPPED is
-deployed and running on PARK. `README.md` describes what the pipeline does;
-this file is what a *fresh session* needs: how to deploy, what changed today,
-what is still open, and the mistakes worth not repeating.
-
-Read `NEXT_SESSION.md` too — the older gotchas in it still apply.
+Consolidated 17 Sep 2026. This file is rewritten, not appended to: everything
+below is current. `README.md` explains what the pipeline does; this is what a
+fresh session needs — how to deploy, what is true now, what is still open, and
+the mistakes worth not repeating.
 
 ---
 
 ## 1. Deployment (use exactly this)
 
-The container runs a **locally built image**. No registry. Every code change
-needs a rebuild AND a recreate — `docker restart` does not pick up new code.
+The image is **built locally on PARK and exists in no registry**. Every code
+change needs a rebuild AND a container replace — `docker restart` keeps the old
+image.
 
 | Location | Role |
 |---|---|
-| `C:\ESD\cue_pipeline` | Working copy. **NOT a git repo.** Edit here. |
-| `C:\Users\zvani\Documents\GitHub\cue_pipeline\Lidarr_accessory` | The only repo that can push (`main`). |
-| `/mnt/user/appdata/cue_pipeline_src` (PARK) | Checkout the build reads. |
-| `/mnt/cache/appdata/cue_pipeline` (PARK) | `/config` — state, logs, settings. |
+| `C:\Users\zvani\Documents\GitHub\cue_pipeline\Lidarr_accessory` | the repo that can push (`main`) |
+| `/mnt/cache/appdata/cue_pipeline_src` (PARK) | the checkout the build reads |
+| `/mnt/cache/appdata/cue_pipeline` (PARK) | `/config` — state, logs, settings |
+
+**PARK cannot push.** No `~/.git-credentials`, no helper; it reads the remote
+anonymously and push fails. Commit on PARK, then move the commits with a bundle:
 
 ```bash
-# 1. copy in, verify, push
-cd /c/ESD/cue_pipeline
-R="/c/Users/zvani/Documents/GitHub/cue_pipeline/Lidarr_accessory"
-cp <changed files> "$R/" && cd "$R" && git diff --stat   # confirm ONLY your change
-git add -A && git commit -m "..." && git push origin main
-
-# 2. build + recreate on PARK  (ssh -i C:\Users\zvani\.ssh\id_ed25519 root@192.168.1.200, bash)
-cd /mnt/user/appdata/cue_pipeline_src && git fetch -q origin && git reset -q --hard origin/main
-rm -rf /tmp/cuebuild && mkdir -p /tmp/cuebuild
-cp *.py /tmp/cuebuild/ && cp -r tools /tmp/cuebuild/
-printf 'FROM cue_pipeline:latest\nRUN find /app -maxdepth 1 -name "*.py" -delete && rm -rf /app/tools\nCOPY *.py /app/\nCOPY tools/ /app/tools/\n' > /tmp/cuebuild/Dockerfile.inc
-cd /tmp/cuebuild && DOCKER_BUILDKIT=1 docker build -f Dockerfile.inc -t cue_pipeline:latest .
-docker rm -f cue_pipeline && bash /tmp/gen2.cmd
+# on PARK (git needs safe.directory: the checkout is root-owned)
+D=/mnt/cache/appdata/cue_pipeline_src
+G="git -c safe.directory=$D -C $D -c user.name=park -c user.email=park"
+$G add <files> && $G commit -F /tmp/msg.txt        # -F a FILE: an apostrophe in
+$G bundle create /tmp/cue.bundle main              #    -m breaks ssh quoting
+# on Windows
+ssh root@192.168.1.200 'cat /tmp/cue.bundle' > cue.bundle
+cd "$REPO" && git fetch ../cue.bundle main:refs/remotes/park/x \
+  && git merge --ff-only park/x && git push origin main
+# back on PARK
+$G fetch -q origin && $G reset -q --hard origin/main
 ```
 
-**Traps, all of which have bitten:**
+`origin/master` is an abandoned branch (PARK was once 263 commits ahead of it).
+**`main` is the live one.**
 
-- A **full** `docker build` stalls (re-downloads ffmpeg's ~200-package tree).
-  Always build incrementally from `cue_pipeline:latest`.
-- **Never** use Unraid Docker UI → Edit → Apply: it tries to *pull* the local
-  tag and deletes it. `/tmp/gen2.cmd` is the known-good `docker run` (6 mounts,
-  `--user 99:100`, 3 labels). Regenerate with `tools/tpl2run.py` if lost.
-- The WebUI needs 30–60 s to bind. Poll until 200 before calling it broken.
-- **Verify every time:** mounts non-empty (an empty `/downloads` once removed 85
-  torrents), `--user 99:100`, dockerman label, WebUI 200, `grep -c Traceback` = 0.
-- A new setting needs **three** edits — dataclass field, settings-registry tuple
-  *and* group entry, `OrchestratorConfig(...)` in `main.py`. Miss the third and
-  the UI shows the saved value while the pipeline runs the default, silently.
-- `webui.py` holds the UI as a **raw** `r"""..."""` string. `py_compile` says
-  nothing about the JS inside. Extract the `<script>` blocks and `node --check`
-  them, every time.
-- Verifying against the LIVE library is not optional — see §4.
+Build incrementally — a full build stalls re-fetching ffmpeg's dependency tree:
 
----
+```bash
+rm -rf /tmp/cuebuild && mkdir -p /tmp/cuebuild && cp $D/<changed>.py /tmp/cuebuild/
+printf 'FROM cue_pipeline:latest\nCOPY <changed>.py /app/\n' > /tmp/cuebuild/Dockerfile
+docker build -q -t cue_pipeline:latest /tmp/cuebuild
+docker tag cue_pipeline:latest cue_pipeline:guard-$(date +%Y%m%d)   # see below
+```
 
-## 2. Shipped today (28 commits)
+**Never use the Unraid UI → Edit → Apply for this container** unless a second
+tag exists: Apply tries to *pull* `cue_pipeline:latest`, fails, and can drop the
+tag. Protection in place:
 
-### Identification
-- **Song-title album resolution.** When no name test can work, match the
-  folder's songs against each incomplete album's track list (≥60% + clear
-  margin). This is what finally imported the Cyrillic-titled albums.
-- **MusicBrainz aliases** in `find_artist` as a last resort — `Lauryn Hill` →
-  `Ms. Lauryn Hill`. Exact hit on name/sort-name/alias only; cached including
-  misses (MB allows ~1 req/s).
-- **`_norm_artist` fixed twice**: it ran `[^a-z0-9]` over un-folded text, so
-  `Лили Иванова` normalised to the **empty string** — every Cyrillic artist
-  collided. Now transliterates first; non-Latin names that still fold to nothing
-  fall back to codepoints. 733 artists → 733 distinct keys (was 732/1).
-- **`_demojibake`** — cp1251-read-as-latin1 tags (`Ëèëè Èâàíîâà`). Strict test:
-  ≥3 high-range chars AND ≥40% of letters, so `Beyoncé` is untouched.
-- **Honorifics** — leading Ms/Mrs/Miss/Mr folded. Deliberately not St./Dr./DJ.
-- **Same-titled albums told apart by year.** Weezer has seven albums called
-  *Weezer*; the complete Blue Album was answering for the missing Green one.
-- **Filenames parsed properly** — `{Artist} - {Album} - NN - {Title}` (Lidarr's
-  own scheme) previously yielded the whole 70-char stem as the "song title".
+- **two tags on every build** (`:latest` + a `guard-<date>`), so Apply cannot
+  orphan the image;
+- **an archive per build** in `/mnt/user/System Backups/docker-images/` via
+  `docker-image-backup.sh` (verify with `zstd -t`; its log line reports a bogus
+  "1.0K" size because `du` on shfs answers before the flush);
+- **`/mnt/user/appdata/scripts/cue_pipeline-restore-image.sh`** — re-tags from a
+  guard tag, else the newest dangling image, else loads the archive. Never
+  starts the container.
 
-### Audit / import
-- **Under-registered albums** are now a discrepancy. The audit only ever flagged
-  *zero-file* albums, and two guards bailed on anything with one file — so
-  16/24 with all 24 files present was skipped three times over. **121 albums /
-  ~869 tracks** library-wide; 70 repaired in the first pass.
-- **Quality probed per medium folder**, not just `audios[0].parent` — this alone
-  pinned TRON: Ares at exactly 16 of 24.
-- **Container folders expanded** (`Артист/Студийные альбомы/Альбом`), and
-  **medium folders kept whole** (`12 Vinyl 01`, `Enhanced CD 02`, `Hybrid SACD
-  (SACD layer, 2 channels) 02`).
-- **RenameFiles after an in-place import**, so a rescued album follows
-  `/config/naming` instead of staying at its old path.
-- **Cue ledger** (`cue_seen.json`) — a verdict per `.cue`, so a restart never
-  re-splits. One image had been decoded seven times in two days.
-- **Combined discs skipped** when every album on them is already complete.
-- **SACD ISOs** no longer extracted for an album already owned.
-- **Cue queue de-duplicated** — three code paths enqueued, one checked; the
-  queue held 48 entries for 19 cues.
+To replace the container **without starting it**, generate the run command from
+the flash template and turn it into a `create`:
 
-### Search / torrents
-- **Cost ceiling** `interactive_search_max_gb_per_album` (2.5). Nothing ever
-  looked at what a release *cost*: 27 GB of 2Pac for one album, 16 GB of Bon
-  Jovi, 8 GB of Little Feat.
-- **Placeholder artists skipped** (Various Artists/VA/Soundtrack/Unknown) — a
-  49-disc Genshin OST was grabbed against Various Artists.
-- **Video and non-audio payloads refused** by title (BDRip/720p/x264; 3D models,
-  ebooks, software). DVD-Audio / Blu-ray Audio / SACD exempt.
-- **Title containment** — tracker decoration no longer buries a good release
-  (`jewel 0304` was 0.26 against a 0.45 floor; now 1.00). Guarded so dotted
-  initialisms can't match letter soup (`M.I.A.` vs `A.R.M.I.A`).
-- **Metadata read before pausing** a magnet — a paused magnet never fetches it,
-  so *every* magnet grab had been "accepted, unverified".
-- **Forced attribution on grab** (`albumId`/`artistId`) — the UI's "Grab
-  Release" confirm. Bare POST 404s; with ids it's 200.
-- **Deselect resolves the artist by album title** when the folder isn't one
-  (`BJ_Discography` → Bon Jovi). 31 albums → 22 deselected.
+```bash
+docker run --rm --entrypoint python3 -v /boot/config/plugins/dockerMan/templates-user:/tpl:ro \
+  cue_pipeline:latest /app/tools/tpl2run.py /tpl/my-cue_pipeline.xml > /tmp/cue.run.sh
+# docker run -d  ->  docker create ; --restart no ; re-add the two labels
+# tpl2run omits (net.unraid.docker.icon and .webui) or the WebUI link disappears
+```
 
-### Converter
-- Skip already converted; destination **root folder** (picker + **+** to
-  create); **copy lossy instead of skipping**; **Convert / Cancel / Clear /
-  Pause**; queue **survives a restart** (`convert_queue.json`).
-- **Yields to the pipeline** — holds its queue while a split/extraction runs,
-  and runs `ionice -c 3 nice -n 15`. `CONVERT_NICE` overrides.
-- **Status payload bounded** — it shipped every queued job every 3 s; a
-  whole-library run is ~86,500 (8.5 MB → 3.7 KB). Queue is grouped **by album**.
-- Total progress bar measures the **batch**, not an average over the queue.
+Gate the `docker rm` on assertions about the generated text (6 mounts, 48 env
+vars, the image on the last line) and refuse if any `docker run` survived.
+**Build that transformation in Python, not sed** — a `\n` in a sed replacement,
+and backslashes through ssh→docker→`python -c`, both silently produced a literal
+`\n` that would have handed docker `n` as the image name.
 
-### Other
-- **Prefer lossless over lossy** — quarantines the lossy twin to
-  `<album>/_superseded_by_lossless/` and rescans. **60 albums / 604 files.**
-- **Assembly counts tracks already in the library** — it had no "present" state,
-  so owned songs were listed as missing.
-- **Clear log** button (truncates through the live handler, removes rotations).
+Apply also **starts** the container (there is no inert mode: `main.py` takes only
+`--config`) and injects `HOST_OS`/`HOST_HOSTNAME`/`HOST_CONTAINERNAME`, so a
+hand-created container shows 54 env vars where Apply gives 57.
 
 ---
 
-## 3. Open items
+## 2. Configuration: three layers, and the last one wins
 
-1. **Frida — Shine (1984) is GONE.** 12 FLACs + 12 MP3s destroyed by me (see
-   §4). Not recoverable on this box; the user was re-downloading it. Verify it
-   came back.
-2. **Lidarr's recycle bin is OFF** (`recycleBin: ''`, `recycleBinCleanupDays:
-   0`). Turning it on would have made that loss recoverable. Worth proposing.
-3. **`interactive_search_max_candidates` is 1000.** One bad artist match becomes
-   1000 grab attempts. Suggest 5–10. Not changed — it's the user's setting.
-4. **318 albums still partially imported.** The audit is working through them;
-   watch `under-registered` lines. Not all are fixable — many are genuinely
-   missing tracks or oversized monitored releases.
-5. **Torrents left over from before the guards**, still downloading: Little Feat
-   discography (7.8 GB, 88%), Barry Manilow, Natalie Cole. New grabs are
-   guarded; these predate it.
-6. **Orphan uncategorised torrents** in qBittorrent (two Simply Red concert
-   videos, a Judge Judy episode, a Hans Zimmer WavPack). Lidarr sent the Simply
-   Red ones — "Report sent to qBittorrent" — but they carry no category and have
-   **zero** history rows, which I could not explain. Worth chasing: uncategorised
-   torrents escape every category-scoped guard.
-7. **`.mkv` files sitting in the library** (`Bon Jovi/Jon Bon Jovi - Bonus
-   N-video.mkv`). Video in the music library.
-8. **Census watcher running on PARK** — `/tmp/census_watch.log`, re-censuses
-   `/music/Music` every 10 min for 4 h and reports only losses. Baseline
-   `/config/.file_census.json`: **7,567 albums / 91,203 files**. Re-run manually:
-   `docker exec cue_pipeline python3 /tmp/snap.py`.
-9. **Prefer-lossless has run 24 times** but the 604-file backlog is not
-   confirmed cleared. Check `_superseded_by_lossless` folders.
-10. **Cloud LLM** (`cloud_llm.py`, gemini-2.0-flash) is wired but unused. The
-    LLM now does only three things: `parse_artist_album`, `repair_cue`,
-    `confirm_album_match`. Suggested (not built): per-call fallback to the API
-    for `repair_cue` / `confirm_album_match` when the shared GPU is busy.
+`main.py` builds the config in this order (~line 1127):
 
----
+```
+load_config(config.yaml)  ->  apply_env_overrides()  ->  apply_webui_overrides()
+                              a template env var           webui_overrides.json
+                              BEATS config.yaml            BEATS both
+```
 
-## 4. Mistakes worth not repeating
+`put()` ignores an env var that is unset or empty, so an empty template field
+means "use the YAML".
 
-**I destroyed an album.** Building "prefer lossless over lossy", I called
-ManualImport with `importMode="move"` + `replaceExistingFiles=True` on files
-**already inside the library**. Lidarr moved each file onto itself and deleted
-the "existing" copy; with the recycle bin off that was permanent. Frida/Shine —
-24 files — gone. I ran it against the live library as the *first* test of a
-feature whose whole purpose is removing files.
+**Editing `config.yaml` alone is often a no-op.** Both of these were live traps:
 
-Consequences now baked in: `replace_existing` is **removed from
-`LidarrClient`** so no caller can reach that combination; the feature moves
-files to a quarantine folder and never deletes; it was re-tested on scratch
-files, verifying the file count before equals after.
+- `flac_compression_level: 5` in the YAML did nothing — `webui_overrides.json`
+  held `{"ffmpeg": {"flac_compression_level": 8}}`.
+- `ollama.base_url` in the YAML was dead text — the template's `LLM_BASE_URL`
+  overrode it, pointing at an address that no longer answered.
+- The **AcoustID key in `config.yaml` is the expired public TEST key and is not
+  what runs.** `ACOUSTID_KEY` in the template is a different, valid key. Do not
+  conclude the key is broken by reading the YAML.
 
-**Other things to carry forward:**
+**Always read the EFFECTIVE value**, without starting the pipeline:
 
-- Test destructive changes on **copies**. Every rule I invented and checked
-  against the live 733-artist / 9,049-album data caught a flaw the unit test
-  didn't — the honorific fold, the size guard, the title containment.
-- Prove a change doesn't regress: diff old vs new verdicts across the whole
-  library and *show the changed rows*. That is how the same-title fix was
-  justified (50 changes, all toward the safe direction).
-- Deploying **wipes the conversion queue** (fixed now — but check
-  `convert_queue.json` exists before assuming).
-- Don't guess at UI intent. Several rounds were spent rebuilding the Converter
-  layout because I inferred instead of looking at the screenshot or asking.
+```bash
+docker inspect cue_pipeline --format '{{range .Config.Env}}{{println .}}{{end}}' > /tmp/cue.env
+docker run --rm --env-file /tmp/cue.env -v /mnt/cache/appdata/cue_pipeline:/config:ro \
+  --entrypoint python cue_pipeline:latest -c 'import sys;sys.path.insert(0,"/app");import main;...'
+# load_config -> apply_env_overrides -> apply_webui_overrides, then print the field
+```
+
+**Never store a LAN address.** Daniel has moved between .32 and .45 and "it can
+be anything". PARK and its containers resolve `daniel` via the router, so every
+layer says `http://daniel:11434`.
 
 ---
 
-## 5. Environment
+## 3. What protects the library
+
+- **A source folder is never deleted while its audio is still in it.** A real
+  import MOVES the files out, so audio still present means nothing was imported.
+  `_delete_source_folder` refuses unless the caller supplies proof or
+  `_verify_library_reflects_album` confirms Lidarr holds the album; with no
+  evidence at all it refuses. Every automated caller funnels through it.
+  The two WebUI actions (resolve/discard) bypass it on purpose — a human
+  decided. This came from `Hans Zimmer/Crimson Tide`: 10 mp3s deleted seven
+  seconds after "content-identify 10/10", album left at 0/10.
+- **Nothing is grabbed for an unmonitored album or artist** — Lidarr will not
+  import into one either, so the download is wasted twice. Fails open: no id, or
+  a lookup error, and the grab proceeds.
+- **prefer-lossless quarantines, never deletes**, and cannot nest: quarantined
+  paths are excluded both at the audit and inside the mover. It once nested
+  `_superseded_by_lossless` 71 levels deep, which made a Jellyfin validation
+  worker spin a core for 13 h.
+- `replace_existing` **does not exist** on `LidarrClient` — see §5.
+
+---
+
+## 4. Performance: what actually costs, measured on PARK
+
+| operation | cost |
+|---|---|
+| `/api/v1/manualimport` for one folder | **10–20 s** (Lidarr parses every file first) |
+| `RefreshArtist` | **2.5 s**, and everything else queues behind it |
+| `mutagen.File(p)` **sniffing** a FLAC | **631 ms** → **264 ms** when the parser is named |
+| `fpcalc` fingerprint | ~0.37 s per file |
+| FLAC encode, level 8 → 5 | 2.1 s → 1.2 s per track, for 1.35% more size |
+| `list_albums_for_artist` | 0.02 s (already cached per artist) |
+| the whole on-disk library walk | under a minute |
+
+Everything above is now cached or deduped:
+
+- **`manual_import_candidates`** caches per (folder, artist hint), validated by a
+  cheap folder fingerprint (file count + total size + newest mtime) and a
+  15-minute TTL; `force=True` bypasses. An import moving files out changes the
+  fingerprint, so the cache cannot mask real work. Persisted to
+  `/config/manualimport_cache.json`, bounded (4 MB budget, newest first, writes
+  debounced to one per 30 s).
+- **`refresh_artist`** skips only while the previous command for that artist is
+  still queued or running (one cheap GET of `/api/v1/command/{id}`). A blanket
+  cooldown would be wrong: every call site is a post-import reconcile.
+- **AcoustID** results persist to `/config/acoustid_cache.json`. Only a real
+  answer is cached — `_lookup` returns `(status, data)` and an `"error"` is never
+  stored, or a spell of bad key/no network would be baked in as "no match"
+  forever. Misses expire after 30 days; after three rejected lookups the client
+  disables itself for the run.
+- **`audio_open.File`** is a drop-in for `mutagen.File` that names the parser
+  from the extension. `mutagen.File()` with no hint scores every parser it
+  knows; py-spy showed four of five worker threads inside
+  `mutagen/apev2.py:score` at one instant. Falls back to a full sniff when the
+  extension lies. Verified identical on 60 real files (same class, same tags,
+  same errors), 2.1× faster.
+
+**Profile before optimising.** Two things I was sure about were wrong: the
+library audit's Lidarr lookups were already batched (0.02 s each, 19 s for 758
+artists), and a duplicated directory scan I found cost 0.44 s per pass — 0.7% of
+one core, not worth a diff.
+
+---
+
+## 5. Mistakes worth not repeating
+
+**An album was destroyed.** Building "prefer lossless over lossy",
+ManualImport was called with `importMode="move"` + `replaceExistingFiles=True`
+on files *already inside the library*. Lidarr moved each file onto itself and
+deleted the "existing" copy; with the recycle bin off that was permanent.
+Frida/Shine — 24 files — gone, tested against the live library as the *first*
+test of a feature whose purpose is removing files.
+
+- Test destructive changes on **copies**, and prove the file count before equals
+  after.
+- Prove a change does not regress: diff old vs new verdicts across the whole
+  library and show the changed rows.
+- **Before caching anything, ask what the cached value means when the underlying
+  call FAILED.** A cache that cannot tell "no" from "I could not ask" turns an
+  outage into a permanent wrong answer.
+- **Do not read a rate off progress lines.** The gap between two
+  "[n/758] discrepancy" lines is filled with searches, imports and harvests, not
+  scanning — which is how the audit got blamed for 50 minutes of other work.
+
+---
+
+## 6. Open items
+
+1. **Lidarr's recycle bin is OFF** (`recycleBin: ''`). Turning it on would have
+   made the Frida loss recoverable. Still worth proposing.
+2. **`interactive_search_max_candidates` is 1000.** One bad artist match becomes
+   1000 grab attempts. 5–10 would be saner. The user's setting; not changed.
+3. **Albums still partially imported.** The audit works through them; watch
+   `under-registered` lines. Not all are fixable.
+4. **Orphan uncategorised torrents** in qBittorrent carry no category and no
+   history rows — they escape every category-scoped guard.
+5. **`.mkv` files in the music library.**
+6. **Cloud LLM** (`cloud_llm.py`) is wired but unused.
+7. **The Klayton torrent** (84%, 0 seeders, fills no gap) — a one-off cleanup.
+8. `staging.delete_source_folder_on_success` is **effectively false** via
+   `webui_overrides.json` while the YAML and env both say true. The guard in §3
+   means that override is no longer the only thing preventing data loss, so it
+   can be turned back on when wanted.
+
+---
+
+## 7. Environment
 
 | Thing | Value |
 |---|---|
 | PARK | `192.168.1.200`, key `C:\Users\zvani\.ssh\id_ed25519`, **bash over SSH** |
-| Lidarr | `http://192.168.1.200:8686` key `7488c03875234ab2b42a6c88ecee5553` |
-| Prowlarr | `http://192.168.1.200:9696` key `bb2822e6ba00457bb6d6582b14260c56` |
+| Lidarr | `http://192.168.1.200:8686` |
+| Prowlarr | `http://192.168.1.200:9696` |
 | qBittorrent | `http://192.168.1.200:8080`, category **`lidarr`** — never touch others |
-| Ollama | `http://192.168.1.32:11434` = the Windows dev box, `qwen2.5:14b`. GPU is **shared with the user's own work** |
+| LLM | `http://daniel:11434`, `huihui_ai/qwen2.5-abliterate:14b`. GPU **shared with the user's own work** — `keep_alive` is 5m and `warmup_on_start` is false on purpose |
 | WebUI | `http://192.168.1.200:8830` |
-| Windows python | `.venv\Scripts\python.exe`; set `PYTHONIOENCODING=utf-8` or non-Latin names crash the console |
+| Container limits | `--cpuset-cpus 1,3,7,9 --cpus 2.0 --cpu-shares 256 --memory 4g` |
 
-Lidarr naming: `{Album Title} ({Release Year})/{Artist Name} - {Album Title} -
-{track:00} - {Track Title}`, artist folder `{Artist Name}`.
+**PARK's CPU map is not what an Unraid template implies.** Only cores 1,3 (and
+their siblings 7,9) are free: BIT owns 2,8,4,10,5,11, Home Assistant owns
+4,10,5,11, CPU 0/6 serve the host and NVMe, and **CPU 1 carries the array's SATA
+interrupts**. Check `virsh dumpxml "<vm>" | grep vcpupin` (quote the name — the
+VM is called `Home Assistant`) and `/proc/interrupts` before pinning anything.
+Pinning without a quota is what took the whole box down on 31 Aug.
+
+Memory: `anon` sits near 1 GB and is flat; `docker stats` shows ~3 GB because
+page cache counts toward the cgroup and is reclaimable. `memory.events` oom = 0.
 
 **Standing instructions from the user:** fix things *in the pipeline*, never by
-hand — they will not open a session every time an import fails. Keep answers
-short. Always test your work.
-
----
-
-## Session 2026-08-15 — search precision, multi-disc, and the queue
-
-Sixteen commits, all deployed and verified (last: `4a94d6c`). Albums fixed
-end to end this session: Nurse Jackie 30/30, Sweet Sweet Soul 10/10,
-Tiesto / In My Memory 11/11, ATB / neXt 25/25.
-
-### The one that mattered most
-`interactive_search` skipped any album with a row in Lidarr's queue
-("already downloading"). 227 of 249 rows were `completed/importFailed` --
-permanently stuck -- so **227 albums could never be searched again**. Only
-importFailed/failed are treated as dead now.
-
-### Import
-* `_looks_pre_split` classed any folder whose largest file was >=3x the
-  median as a disc image and skipped it SILENTLY (no ledger entry, no
-  record). 36 folders affected. Now confirms by playing time (>=20 min).
-* CUE queue is ordered CHEAP FIRST: a .cue beside split tracks is an
-  instant handoff, a real image takes minutes. ATB was 61st behind image
-  splits; after, it processed 1 second after startup.
-* Multi-disc on the CUE path hands off the album ROOT, not one handoff per
-  disc (CD2 of ATB was refused: "no release fits 12 files").
-* `_resolve_album_by_song_titles` scored only album-coverage, which caps at
-  12/25 for one disc. Now also scores file-coverage (12 of 12 belong).
-* Grab targets are remembered (infohash -> album) and consulted before any
-  name derivation. Lidarr's queue attribution is used too, but corroborated
-  by song titles first -- a Glee EP was queued against 5 cupcakKe albums.
-* `find_artist` accepts a stage prefix (DJ/MC/VJ/Dr), normalized-exact only.
-* `artist_key` folds diacritics instead of DELETING them ("Tiesto" -> tisto).
-* `norm_title` folds Pt./Vol. -> Part/Volume (3 collisions in 56,170 titles,
-  all true merges).
-* Artist refresh after the rescue/grab-target imports (album read 11/11
-  while the artist page still said 7/11).
-
-### Search precision -- all verified against live indexer output
-* Use the indexer's `artistName`, not the title, to decide whose record it
-  is. Allred 16->3 kept, Miguel 149->50, Tiesto 46->38.
-* Same guard on the ALBUM-level ranker (it only guarded artists <=4 chars,
-  so Bellini got OperaCompactFestival and Bowie got Original New York Cast).
-* Prowlarr results carry no artistName, so there the artist must appear in
-  the title.
-* Self-titled albums: containment gave 1.00 to every release by the artist
-  (Frida's "Frida" grabbed ABBA's Waterloo). Require the artist named twice.
-* Artist scope: the ALBUM must be named, not just the artist (Smash Mouth /
-  The East Bay Sessions grabbed "All Star Multitrack", 0 of 14 songs).
-* A discography must be the artist's OWN -- first credit, not a guest.
-* Dead swarms: no file list = reject, not "accept, no metadata".
-* Seeders decide within a title band, not summed into one score.
-* Prowlarr album fallback on the ASCII-folded "Artist - Album" when Lidarr
-  finds nothing (Tiesto vs Tiesto). `prowlarr.search(require_magnet=False)`
-  + `qbt.add_torrent_url()` -- RuTracker publishes neither magnet nor
-  infohash, so every result from it was being dropped.
-
-### DVD-Audio / redundancy
-* DVD-Audio path had no owned-album check (SACD did). Added.
-* The ripped-ISO ledger entry no longer expires on the 24h sweep TTL -- that
-  expiry re-ripped an owned disc every day.
-* A download deleted as redundant is now blocklisted, else it is re-grabbed
-  forever (Arkenstone Middle Earth, 307 MB a time, already owned in ALAC).
-
-### Indexers
-Lidarr went from 3 music indexers to 9: added Torrenting, 1337x, SkTorrent,
-BigFANGroup, P2PBG, BT.etree. BT.etree's 403 was bot protection -- it needed
-the `flaresolverr` tag and its baseUrl set, exactly like RuTracker. P2PBG is
-the only Bulgarian source Prowlarr ships besides Zamunda and it answers
-Cyrillic queries.
-
-### Done by hand, will recur without a fix
-* 159 stuck queue rows removed, and 9 wrong-artist downloads deleted
-  (6.63 GB) + 5 more in flight (2.48 GB). The legacy queue reaper is
-  DISABLED ("superseded by qBittorrent completed-torrent lifecycle") and
-  that lifecycle does not clear Lidarr rows, so they pile up again.
-
-### Still open
-1. Nothing checks `monitored` before grabbing: ABBA is unmonitored with
-   nothing wanted and a 6 GB Waterloo DSD was still grabbed.
-2. Outgoing queries never try MusicBrainz ALIASES. `Lana Del Ray` is only
-   findable as "Lizzy Grant"; all 9 indexers return 0 for its real name.
-3. EZTV is enabled for music searches with zero music categories.
-4. Klayton torrent: 84%, 0 seeders, fills no Celldweller gap.
-5. The unverified source-folder deletion from the previous session is still
-   open; `staging.delete_source_folder_on_success` remains false.
+hand. Keep answers short. Always test your work, and check it.

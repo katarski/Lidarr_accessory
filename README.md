@@ -213,8 +213,14 @@ comes back queued, never resumed — a half-written output was never committed.
 
 These are load-bearing. Most exist because something went wrong once.
 
-- **Nothing is deleted without proof it's elsewhere.** A source folder is
-  removed only after the import is verified in Lidarr.
+- **A source folder is never deleted while its audio is still in it.** A real
+  import MOVES the files out, so audio still sitting there means nothing was
+  imported. `_delete_source_folder` -- which every automated caller goes
+  through -- refuses unless the caller supplies proof, or the library check
+  confirms Lidarr holds the album; with no evidence at all it refuses. The two
+  WebUI actions (resolve, discard) bypass it on purpose: a human has decided.
+  This exists because 10 mp3s were deleted seven seconds after a 10/10
+  content-identify, leaving the album at 0/10 and no audio anywhere.
 - **A bigger source is never deleted.** If the disc image holds more tracks than
   Lidarr's edition, the source stays.
 - **`replaceExistingFiles` is not available.** Combined with `importMode=move`
@@ -223,6 +229,10 @@ These are load-bearing. Most exist because something went wrong once.
   it destroyed an album. The capability is gone from the client entirely.
 - **Prefer-lossless quarantines, it doesn't delete.** The redundant lossy twin
   is moved to `<album>/_superseded_by_lossless/` and Lidarr is asked to rescan.
+- **The quarantine cannot nest inside itself.** Quarantined paths are excluded
+  both when the audit collects an album's files and inside the mover, so no
+  caller can reintroduce it. It once reached 71 levels deep, with ~1.9k
+  character paths, and made a Jellyfin validation worker spin a core for 13h.
 - **A lossy file with no lossless twin is kept.**
 - **Ambiguity favours downloading.** Two artists with the same album title, a
   title matching several albums, an unreadable folder — all resolve to "keep".
@@ -231,6 +241,10 @@ These are load-bearing. Most exist because something went wrong once.
 
 ### What it refuses to grab
 
+- **Anything for an unmonitored album or artist.** Lidarr will not import into
+  an unmonitored album either, so the download is paid for and then sits there
+  -- an unmonitored ABBA took a 6 GB DSD that way. Fails open: with no id to
+  check, or a lookup that errors, the grab proceeds.
 - **Video releases** — BDRip, Blu-ray, HDTV, x264, 720p/1080p, mkv. DVD-Audio,
   Blu-ray Audio and SACD are exempt: those are music.
 - **Non-audio payloads** — 3D model packs, ebooks, software.
@@ -343,6 +357,8 @@ All under `/config`, all safe to delete (they rebuild).
 | `library_audit.csv` | Last audit report. |
 | `external_album_audit.json` | Albums MusicBrainz has that Lidarr doesn't. |
 | `ledger.csv` | Every outcome, appended. |
+| `manualimport_cache.json` | Lidarr's answer per download folder, keyed on a folder fingerprint. A probe costs Lidarr 10-20s. |
+| `acoustid_cache.json` | Fingerprint identifications. Only real answers are stored, never a failed lookup. |
 | `pipeline.log` | Rotating log (5 MB × 4). |
 
 ---
@@ -387,6 +403,32 @@ yields.
 
 ---
 
+## Performance
+
+Measured on the live box, because the obvious guesses were wrong twice.
+
+| operation | cost |
+|---|---|
+| `/api/v1/manualimport` for one folder | 10-20 s -- Lidarr parses every file before answering |
+| `RefreshArtist` | 2.5 s, and everything else queues behind it |
+| `mutagen.File(p)` sniffing a FLAC | 631 ms, versus 264 ms when the parser is named |
+| `fpcalc` fingerprint | ~0.37 s per file |
+| FLAC encode at level 8 vs 5 | 2.1 s vs 1.2 s per track, for 1.35% more size |
+| `list_albums_for_artist` | 0.02 s -- already cached per artist |
+| the whole on-disk library walk | under a minute |
+
+So: the probe is cached per folder (invalidated by a fingerprint of file count,
+total size and newest mtime), a RefreshArtist is skipped only while the previous
+one for that artist is still running, AcoustID results persist, and every
+mutagen open names its parser via `audio_open`. The library audit was NOT the
+bottleneck -- its Lidarr lookups were already batched.
+
+Profile before optimising: `py-spy dump --pid <pid>` from a throwaway container
+with `--pid=host --cap-add SYS_PTRACE` is what showed four of five worker
+threads sitting in mutagen's format scorer.
+
+---
+
 ## Layout
 
 ```
@@ -401,6 +443,7 @@ splitter.py         cue splitting
 cue_parser.py       cue parsing (+ optional LLM repair)
 song_harvest.py     per-track harvesting
 musicbrainz.py      MusicBrainz client (aliases, release groups)
+audio_open.py       mutagen opener that names the parser instead of sniffing
 prowlarr.py         indexer search
 webui.py            the web UI and HTTP API
 ```
