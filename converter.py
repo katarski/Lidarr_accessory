@@ -288,7 +288,7 @@ class LibraryTree:
             return cached
         det: Dict[str, Any] = {"sig": sig, "size": st.st_size}
         try:
-            from mutagen import File as MutagenFile
+            from audio_open import File as MutagenFile
             mf = MutagenFile(str(abs_path))
             info = getattr(mf, "info", None)
             if info is not None:
@@ -438,7 +438,7 @@ class LibraryTree:
         out["detail"] = self._file_detail(p, rel.strip("/"))
         tags: Dict[str, str] = {}
         try:
-            from mutagen import File as MutagenFile
+            from audio_open import File as MutagenFile
             mf = MutagenFile(str(p))
             if mf is not None and mf.tags:
                 for k, v in mf.tags.items():
@@ -1076,7 +1076,7 @@ class ConvertManager:
         LLM. Only returns keys that are MISSING in the file."""
         have: Dict[str, str] = {}
         try:
-            from mutagen import File as MutagenFile
+            from audio_open import File as MutagenFile
             mf = MutagenFile(str(path))
             if mf is not None and mf.tags:
                 def _first(keys):

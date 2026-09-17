@@ -310,7 +310,7 @@ def read_tags(path: str) -> SourceFile:
     """Tags + duration for one file. Never raises."""
     sf = SourceFile(path=path)
     try:
-        from mutagen import File as MutagenFile
+        from audio_open import File as MutagenFile
         mf = MutagenFile(path, easy=True)
         if mf is None:
             return sf

@@ -2019,7 +2019,7 @@ def _player_info(p: Path) -> Dict[str, Any]:
     # first regardless of container: FLAC uses "artist", ID3 uses TPE1, MP4 uses
     # \xa9ART. Reading raw tag keys alone would make that guesswork.
     try:
-        from mutagen import File as _MF
+        from audio_open import File as _MF
         emf = _MF(str(p), easy=True)
         if emf is not None and emf.tags:
             def _first(k):
@@ -2038,7 +2038,7 @@ def _player_info(p: Path) -> Dict[str, Any]:
     except Exception:  # noqa: BLE001
         pass
     try:
-        from mutagen import File as MutagenFile
+        from audio_open import File as MutagenFile
         mf = MutagenFile(str(p))
         if mf is not None:
             info = getattr(mf, "info", None)

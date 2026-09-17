@@ -1688,7 +1688,7 @@ class Orchestrator:
         file a pre-split download folder might contain.
         """
         try:
-            from mutagen import File as MutagenFile  # lazy import
+            from audio_open import File as MutagenFile  # lazy import
         except Exception:  # noqa: BLE001
             MutagenFile = None  # type: ignore
         artist = album = ""
@@ -1752,7 +1752,7 @@ class Orchestrator:
         out = {"artist": "", "albumartist": "", "album": "",
                "title": "", "track": "", "tracktotal": ""}
         try:
-            from mutagen import File as MutagenFile  # lazy
+            from audio_open import File as MutagenFile  # lazy
         except Exception:  # noqa: BLE001
             return out
         try:
@@ -3628,7 +3628,7 @@ class Orchestrator:
         """Channel count of an audio file via mutagen (.info.channels); 0 on
         failure. Works for .dsf/.dff/flac/etc. (header read, not a decode)."""
         try:
-            from mutagen import File as MutagenFile  # lazy
+            from audio_open import File as MutagenFile  # lazy
             mf = MutagenFile(str(path))
             return int(getattr(getattr(mf, "info", None), "channels", 0) or 0)
         except Exception:  # noqa: BLE001
@@ -5453,7 +5453,7 @@ class Orchestrator:
     def _tag_title(path: Path) -> str:
         """The title a file claims in its own tags, or ""."""
         try:
-            from mutagen import File as MutagenFile
+            from audio_open import File as MutagenFile
             m = MutagenFile(str(path), easy=True)
             return str((m.get("title") or [""])[0]) if m else ""
         except Exception:  # noqa: BLE001
@@ -5469,7 +5469,7 @@ class Orchestrator:
             except (TypeError, ValueError):
                 return 0
         try:
-            from mutagen import File as MutagenFile
+            from audio_open import File as MutagenFile
             m = MutagenFile(str(path), easy=True)
             if not m:
                 return 0, 0
@@ -6336,7 +6336,7 @@ class Orchestrator:
     def _audio_duration_seconds(path: Path) -> Optional[float]:
         """Playing time of one audio file in seconds, or None if unreadable."""
         try:
-            from mutagen import File as MutagenFile  # lazy
+            from audio_open import File as MutagenFile  # lazy
         except Exception:  # noqa: BLE001
             return None
         try:
@@ -6360,7 +6360,7 @@ class Orchestrator:
         (has TRACK + INDEX), so a stray tag can't produce a bogus split.
         """
         try:
-            from mutagen import File as MutagenFile
+            from audio_open import File as MutagenFile
         except Exception:  # noqa: BLE001
             return None
         try:
@@ -9132,7 +9132,7 @@ class Orchestrator:
         segment of a '<Artist> - <Album> - NN - <Title>' filename.
         """
         try:
-            from mutagen import File as MutagenFile  # lazy import
+            from audio_open import File as MutagenFile  # lazy import
         except Exception:  # noqa: BLE001
             MutagenFile = None  # type: ignore
         title = ""
@@ -9983,7 +9983,7 @@ class Orchestrator:
             return hit
         title = artist = album = ""
         try:
-            from mutagen import File as MutagenFile  # lazy
+            from audio_open import File as MutagenFile  # lazy
             mf = MutagenFile(str(path))
             if mf is not None and mf.tags is not None:
                 def _first(keys: Tuple[str, ...]) -> str:
@@ -10896,7 +10896,7 @@ class Orchestrator:
         """Stamp the target album's identity onto an assembled file. Uses
         mutagen's `easy` interface so it works for FLAC/MP3/M4A/Ogg alike."""
         try:
-            from mutagen import File as MutagenFile
+            from audio_open import File as MutagenFile
             mf = MutagenFile(str(path), easy=True)
             if mf is None:
                 return
@@ -13034,7 +13034,7 @@ class Orchestrator:
     def _audio_stream_info(path: Path) -> Tuple[int, int, int]:
         """(channels, sample_rate, bits) via mutagen header read; 0s on failure."""
         try:
-            from mutagen import File as MutagenFile  # lazy
+            from audio_open import File as MutagenFile  # lazy
             info = getattr(MutagenFile(str(path)), "info", None)
             return (
                 int(getattr(info, "channels", 0) or 0),

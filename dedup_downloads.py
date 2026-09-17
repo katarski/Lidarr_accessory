@@ -121,7 +121,7 @@ def read_tags(path: Path) -> tuple[str, str]:
     """(artist, album) from a file's tags, filename fallback. Empty on failure."""
     artist = album = ""
     try:
-        from mutagen import File as MutagenFile
+        from audio_open import File as MutagenFile
         mf = MutagenFile(str(path))
         if mf is not None and mf.tags:
             def first(keys):
