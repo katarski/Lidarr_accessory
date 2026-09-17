@@ -177,6 +177,7 @@ class LidarrClient:
     # Only bother asking whether an earlier RefreshArtist is still running if
     # it was recent; beyond this it has certainly finished.
     _REFRESH_RECHECK = 600.0
+    _MONITORED_TTL = 120.0
 
     def __init__(self, cfg: LidarrConfig, session: Optional[requests.Session] = None):
         self.cfg = cfg
@@ -198,6 +199,9 @@ class LidarrClient:
         # artistId -> (when, command id) of the last RefreshArtist we asked for.
         self._refresh_seen: Dict[int, Tuple[float, Optional[int]]] = {}
         self._refresh_skipped = 0
+        # (kind, id) -> (when, monitored?, description). One lookup covers a
+        # whole candidate loop for the same album.
+        self._monitored_seen: Dict[Tuple[str, int], Tuple[float, bool, str]] = {}
         self._load_mi_cache()
 
     # ---- Path translation ------------------------------------------------
@@ -439,12 +443,68 @@ class LidarrClient:
                 "artist release search failed for artist %s: %s", artist_id, exc)
             return []
 
+    def _target_monitored(
+        self, album_id: Optional[int], artist_id: Optional[int],
+    ) -> Tuple[bool, str]:
+        """Is the thing we are about to grab actually wanted?
+
+        Returns (ok, why-not). False ONLY when Lidarr positively says the
+        album or its artist is unmonitored -- if the lookup fails or there is
+        no id to check, the answer is yes, because a grab must not be blocked
+        by a hiccup. Cached briefly so a loop over candidates for one album
+        costs a single lookup.
+        """
+        now = time.time()
+        for kind, ident in (("album", album_id), ("artist", artist_id)):
+            if ident is None:
+                continue
+            try:
+                key = (kind, int(ident))
+            except (TypeError, ValueError):
+                continue
+            hit = self._monitored_seen.get(key)
+            if hit and (now - hit[0]) < self._MONITORED_TTL:
+                if not hit[1]:
+                    return False, hit[2]
+                return True, ""
+            try:
+                if kind == "album":
+                    rec = self.get_album(int(ident)) or {}
+                    art = rec.get("artist") or {}
+                    if rec.get("monitored") is False:
+                        why = "album %s (%r) is not monitored" % (
+                            ident, rec.get("title"))
+                        self._monitored_seen[key] = (now, False, why)
+                        return False, why
+                    if art.get("monitored") is False:
+                        why = "artist %r is not monitored" % art.get("artistName")
+                        self._monitored_seen[key] = (now, False, why)
+                        return False, why
+                    if rec:
+                        self._monitored_seen[key] = (now, True, "")
+                        return True, ""
+                else:
+                    rec = self.get_artist(int(ident)) or {}
+                    if rec.get("monitored") is False:
+                        why = "artist %r is not monitored" % rec.get("artistName")
+                        self._monitored_seen[key] = (now, False, why)
+                        return False, why
+                    if rec:
+                        self._monitored_seen[key] = (now, True, "")
+                        return True, ""
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("monitored check failed for %s %s: %s",
+                             kind, ident, exc)
+                return True, ""
+        return True, ""
+
     def release_grab(
         self,
         guid: str,
         indexer_id: int,
         album_id: Optional[int] = None,
         artist_id: Optional[int] = None,
+        allow_unmonitored: bool = False,
     ) -> bool:
         """
         Grab one specific release (interactive push): POST /api/v1/release
@@ -464,6 +524,16 @@ class LidarrClient:
         attribute the release to that album instead of re-parsing the title --
         the same thing clicking "Grab" does.
         """
+        if not allow_unmonitored:
+            ok, why = self._target_monitored(album_id, artist_id)
+            if not ok:
+                logger.warning(
+                    "Grab REFUSED -- %s. Lidarr does not import into an "
+                    "unmonitored album, so the download would be paid for and "
+                    "then sit there: an unmonitored ABBA took a 6 GB Waterloo "
+                    "DSD this way.", why,
+                )
+                return False
         payload: Dict[str, Any] = {"guid": guid, "indexerId": int(indexer_id)}
         if album_id is not None:
             payload["albumId"] = int(album_id)
