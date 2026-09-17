@@ -174,6 +174,9 @@ class LidarrClient:
     # Ceiling for the on-disk probe cache, and how often it may be written.
     _MI_FILE_BUDGET = 4 * 1024 * 1024
     _MI_SAVE_EVERY = 30.0
+    # Only bother asking whether an earlier RefreshArtist is still running if
+    # it was recent; beyond this it has certainly finished.
+    _REFRESH_RECHECK = 600.0
 
     def __init__(self, cfg: LidarrConfig, session: Optional[requests.Session] = None):
         self.cfg = cfg
@@ -192,6 +195,9 @@ class LidarrClient:
                     "/config/manualimport_cache.json"))
         self._mi_cache: Dict[str, Dict[str, Any]] = {}
         self._mi_last_save = 0.0
+        # artistId -> (when, command id) of the last RefreshArtist we asked for.
+        self._refresh_seen: Dict[int, Tuple[float, Optional[int]]] = {}
+        self._refresh_skipped = 0
         self._load_mi_cache()
 
     # ---- Path translation ------------------------------------------------
@@ -1395,12 +1401,58 @@ class LidarrClient:
                 album_id, release_id, exc)
             return []
 
-    def refresh_artist(self, artist_id: int) -> Optional[int]:
-        payload = {"name": "RefreshArtist", "artistId": artist_id}
+    def _command_active(self, cmd_id: Optional[int]) -> bool:
+        """True while a Lidarr command is still queued or running. One
+        cheap GET, versus a POST that may start real work."""
+        if not cmd_id:
+            return False
+        try:
+            r = self.session.get(
+                self._url("/api/v1/command/%d" % int(cmd_id)), timeout=10)
+            r.raise_for_status()
+            return (r.json() or {}).get("status") in ("queued", "started")
+        except Exception:  # noqa: BLE001
+            return False
+
+    def refresh_artist(self, artist_id: int, force: bool = False) -> Optional[int]:
+        """Ask Lidarr to reconcile an artist against disk.
+
+        One refresh costs Lidarr ~2.5s (more for a big discography) and it
+        serialises against everything else we ask of it -- including the
+        10-20s /manualimport probes -- so redundant refreshes slow the whole
+        pipeline, not just themselves. The log showed 566 calls covering 69
+        artists: one refreshed 100 times, another four times inside eight
+        seconds.
+
+        The skip is deliberately narrow: only while the PREVIOUS refresh for
+        that artist is still queued or running, which is exactly when Lidarr
+        collapses the duplicate itself (the log shows one command id handed
+        back to four calls). Once it has finished, a new request always goes
+        through -- so an import that lands later still gets its own reconcile,
+        and nothing is left stale. force=True skips the check entirely.
+        """
+        try:
+            aid = int(artist_id)
+        except (TypeError, ValueError):
+            return None
+        now = time.time()
+        if not force:
+            seen = self._refresh_seen.get(aid)
+            if (seen and (now - seen[0]) < self._REFRESH_RECHECK
+                    and self._command_active(seen[1])):
+                self._refresh_skipped += 1
+                logger.info(
+                    "RefreshArtist for artistId=%s skipped: command %s from "
+                    "%.0fs ago is still running (%d skipped so far)",
+                    aid, seen[1], now - seen[0], self._refresh_skipped,
+                )
+                return seen[1]
+        payload = {"name": "RefreshArtist", "artistId": aid}
         try:
             resp = self._post("/api/v1/command", payload)
             cmd_id = resp.get("id") if isinstance(resp, dict) else None
-            logger.info("Triggered RefreshArtist id=%s for artistId=%s", cmd_id, artist_id)
+            self._refresh_seen[aid] = (now, cmd_id)
+            logger.info("Triggered RefreshArtist id=%s for artistId=%s", cmd_id, aid)
             return cmd_id
         except Exception as exc:
             logger.error("RefreshArtist failed: %s", exc)
