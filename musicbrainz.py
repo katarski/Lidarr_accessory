@@ -33,6 +33,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -89,16 +90,41 @@ class MusicBrainzClient:
     _rate_lock = threading.Lock()
     _last_call = 0.0
 
+    # Answers are shared by every instance, like the rate limiter. MusicBrainz
+    # asks clients to cache, and this client pays 1.1s of enforced silence per
+    # call -- serialised across ALL threads -- so a repeat query costs every
+    # other thread that is waiting, not just the caller.
+    _cache: Dict[str, Any] = {}
+    _cache_file = Path("/config/musicbrainz_cache.json")
+    _cache_loaded = False
+    _cache_saved = 0.0
+    _cache_hits = 0
+    _CACHE_TTL = 7 * 24 * 3600.0
+    _CACHE_MAX = 5000
+    _CACHE_SAVE_EVERY = 60.0
+
     def __init__(self, min_interval: float = 1.1, timeout: int = 30,
                  user_agent: str = _UA, retries: int = 1) -> None:
         self.min_interval = max(1.0, float(min_interval))
         self.timeout = int(timeout)
         self.user_agent = user_agent or _UA
         self.retries = max(0, int(retries))
+        self._load_cache()
 
     def _get(self, path: str, **params: Any) -> Optional[Dict[str, Any]]:
         params.setdefault("fmt", "json")
         url = f"{_MB_BASE}{path}?{urllib.parse.urlencode(params)}"
+
+        hit = MusicBrainzClient._cache.get(url)
+        if hit and (time.time() - float(hit.get("at") or 0)) < self._CACHE_TTL:
+            MusicBrainzClient._cache_hits += 1
+            if MusicBrainzClient._cache_hits % 25 == 0:
+                logger.info(
+                    "musicbrainz cache: %d answer(s) reused -- that is %.0f "
+                    "seconds of rate-limited waiting not spent",
+                    MusicBrainzClient._cache_hits,
+                    MusicBrainzClient._cache_hits * self.min_interval)
+            return hit.get("data")
         # Serialise ALL callers so the 1 req/s courtesy limit holds even when
         # several pipeline threads ask at once. One retry covers the odd slow
         # response; a still-failing call returns None and the caller must treat
@@ -115,7 +141,13 @@ class MusicBrainzClient:
                         url, headers={"User-Agent": self.user_agent,
                                       "Accept": "application/json"})
                     with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                        return json.loads(resp.read().decode("utf-8", "replace"))
+                        data = json.loads(
+                            resp.read().decode("utf-8", "replace"))
+                    # Only a real answer is remembered. A failure returns None
+                    # below and is never stored: "could not ask" must not be
+                    # replayed for a week as "there is nothing there".
+                    self._remember(url, data)
+                    return data
                 except Exception as exc:  # noqa: BLE001
                     last = str(exc)
                 finally:
@@ -150,6 +182,49 @@ class MusicBrainzClient:
             if any(_norm_name(n) == want for n in names):
                 return a.get("id")
         return None
+
+    def _load_cache(self) -> None:
+        """Once per process. Dropping anything already expired keeps the
+        file from growing without bound."""
+        if MusicBrainzClient._cache_loaded:
+            return
+        MusicBrainzClient._cache_loaded = True
+        try:
+            raw = json.loads(
+                MusicBrainzClient._cache_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(raw, dict):
+            return
+        now = time.time()
+        live = {k: v for k, v in raw.items()
+                if isinstance(v, dict)
+                and now - float(v.get("at") or 0) < MusicBrainzClient._CACHE_TTL}
+        MusicBrainzClient._cache = live
+        if live:
+            logger.info(
+                "musicbrainz cache: %d answer(s) restored -- up to %.0f "
+                "seconds of rate-limited waiting already paid for",
+                len(live), len(live) * 1.1)
+
+    def _remember(self, url: str, data: Any) -> None:
+        now = time.time()
+        MusicBrainzClient._cache[url] = {"at": now, "data": data}
+        if now - MusicBrainzClient._cache_saved < self._CACHE_SAVE_EVERY:
+            return
+        cache = MusicBrainzClient._cache
+        if len(cache) > self._CACHE_MAX:
+            for k in sorted(cache, key=lambda x: float(
+                    (cache[x] or {}).get("at") or 0))[:len(cache) - self._CACHE_MAX]:
+                cache.pop(k, None)
+        try:
+            tmp = MusicBrainzClient._cache_file.with_suffix(".json.tmp")
+            tmp.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(json.dumps(cache), encoding="utf-8")
+            tmp.replace(MusicBrainzClient._cache_file)
+            MusicBrainzClient._cache_saved = now
+        except OSError as exc:  # noqa: BLE001
+            logger.debug("musicbrainz cache save failed: %s", exc)
 
     def artist_aliases(self, name: str, limit: int = 6) -> List[str]:
         """Other names this artist is filed under, for asking an indexer
