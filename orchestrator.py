@@ -11443,6 +11443,35 @@ class Orchestrator:
         s = unicodedata.normalize("NFKD", s or "")
         return "".join(c for c in s if not unicodedata.combining(c))
 
+    def _artist_search_aliases(self, artist: str) -> List[str]:
+        """Alternative names to ask an indexer for, cached per artist.
+
+        Empty when MusicBrainz is unavailable or does not recognise the name:
+        this only ever ADDS attempts after the normal spellings failed, so a
+        miss here costs nothing and must never raise.
+        """
+        name = " ".join(str(artist or "").split())
+        if not name:
+            return []
+        cache = getattr(self, "_alias_cache", None)
+        if cache is None:
+            cache = self._alias_cache = {}
+        if name in cache:
+            return cache[name]
+        out: List[str] = []
+        try:
+            mb = self._get_mb()
+            if mb is not None:
+                out = mb.artist_aliases(name) or []
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("alias lookup failed for %r: %s", name, exc)
+            out = []
+        if out:
+            logger.info("interactive search: %r is also filed as %s",
+                        name, ", ".join(repr(a) for a in out))
+        cache[name] = out
+        return out
+
     def _isearch_prowlarr_album(self, alb: Dict[str, Any], artist: str,
                                 album: str, st: Dict[str, Any], qbt) -> bool:
         """
@@ -11495,6 +11524,20 @@ class Orchestrator:
             if found:
                 results = found
                 break
+        if not results:
+            # Still nothing: the tracker may simply file this artist under
+            # another name. Only asked for once the canonical and folded
+            # spellings have both come back empty, so the MusicBrainz lookup
+            # (rate limited to ~1/s) costs nothing on the normal path.
+            for alias in self._artist_search_aliases(artist):
+                q = f"{alias} - {album}".strip(" -")
+                found = pro.search(q, require_magnet=False) or []
+                logger.info(
+                    "interactive search: %s -- Prowlarr alias %r -> %d "
+                    "result(s)", label, q, len(found))
+                if found:
+                    results = found
+                    break
         if not results:
             return False
 

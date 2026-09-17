@@ -151,6 +151,49 @@ class MusicBrainzClient:
                 return a.get("id")
         return None
 
+    def artist_aliases(self, name: str, limit: int = 6) -> List[str]:
+        """Other names this artist is filed under, for asking an indexer
+        in a spelling it actually holds.
+
+        Lidarr and MusicBrainz agree on one canonical name; trackers do not.
+        "Lana Del Rey" is on some of them only as "Lizzy Grant", and a search
+        for the canonical name returns 0 from every indexer -- the album looks
+        unavailable when it is simply filed elsewhere.
+
+        Matching is as strict as artist_mbid_for_name: the artist is used only
+        when `name` exactly equals (normalized) its name or one of its
+        aliases, because searching under the WRONG artist's alias is worse
+        than not searching at all. Latin-script aliases only -- a release
+        filed as the Japanese spelling is not what this is for -- and the
+        canonical name itself is never returned, the caller has already tried
+        it.
+        """
+        want = _norm_name(name)
+        if not want:
+            return []
+        data = self._get("/artist", query='artist:"%s"' % name.replace('"', ""),
+                         limit=10, inc="aliases")
+        for a in ((data or {}).get("artists") or []):
+            alias_names = [al.get("name") or ""
+                           for al in (a.get("aliases") or [])]
+            identity = [a.get("name") or "", a.get("sort-name") or ""]
+            if not any(_norm_name(n) == want
+                       for n in identity + alias_names):
+                continue
+            out: List[str] = []
+            for cand in [a.get("name") or ""] + alias_names:
+                cand = " ".join(str(cand).split())
+                if not cand or _norm_name(cand) == want:
+                    continue
+                if any(ord(ch) > 0x24F for ch in cand):
+                    continue
+                if cand not in out:
+                    out.append(cand)
+                if len(out) >= limit:
+                    break
+            return out
+        return []
+
     def release_groups(
         self, artist_mbid: str, studio_only: bool = True,
         include_eps: bool = False, page_limit: int = 100,
