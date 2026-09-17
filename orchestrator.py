@@ -7806,7 +7806,7 @@ class Orchestrator:
         Artists with empty names are skipped.
         """
         try:
-            artists = self.lidarr._get("/api/v1/artist")  # noqa: SLF001
+            artists = self.lidarr.artists()
         except Exception as exc:  # noqa: BLE001
             logger.warning("audit: /api/v1/artist fetch failed: %s", exc)
             return {}

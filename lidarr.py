@@ -178,6 +178,9 @@ class LidarrClient:
     # it was recent; beyond this it has certainly finished.
     _REFRESH_RECHECK = 600.0
     _MONITORED_TTL = 120.0
+    # Long enough to collapse a burst of find_artist calls, short enough that
+    # an artist added in Lidarr shows up on the next pass.
+    _ARTISTS_TTL = 60.0
 
     def __init__(self, cfg: LidarrConfig, session: Optional[requests.Session] = None):
         self.cfg = cfg
@@ -202,6 +205,10 @@ class LidarrClient:
         # (kind, id) -> (when, monitored?, description). One lookup covers a
         # whole candidate loop for the same album.
         self._monitored_seen: Dict[Tuple[str, int], Tuple[float, bool, str]] = {}
+        # The whole artist list is 8.1 MB of JSON and ~1.3s on this box, and
+        # find_artist fetched it EVERY call from 15 call sites.
+        self._artists_at = 0.0
+        self._artists: List[Dict[str, Any]] = []
         self._load_mi_cache()
 
     # ---- Path translation ------------------------------------------------
@@ -1106,11 +1113,9 @@ class LidarrClient:
     def list_artists(self) -> List[Dict[str, Any]]:
         """Every artist in Lidarr's library (each carries `foreignArtistId`, the
         MusicBrainz artist id, used by the external album audit)."""
-        try:
-            return self._get("/api/v1/artist") or []
-        except Exception as exc:
-            logger.warning("list_artists failed: %s", exc)
-            return []
+        # Same list, same cache: song_harvest and the external audit both
+        # ask for it, and it is 8.1 MB of JSON.
+        return self.artists()
 
     def get_artist(self, artist_id: int) -> Optional[Dict[str, Any]]:
         """One artist record by Lidarr id. Wanted for `foreignArtistId` -- the
@@ -1122,14 +1127,35 @@ class LidarrClient:
             logger.warning("get_artist(%s) failed: %s", artist_id, exc)
             return None
 
+    def artists(self, force: bool = False) -> List[Dict[str, Any]]:
+        """Lidarr's artist list, cached briefly.
+
+        It is 761 artists / 8.1 MB of JSON here, about 1.3s to fetch and parse,
+        and `find_artist` asked for the whole thing on every single call --
+        py-spy caught it in 6 of 10 samples of active threads. The list only
+        changes when an artist is added or removed, so a short TTL collapses a
+        burst of lookups into one fetch. force=True when freshness matters.
+        """
+        now = time.time()
+        if (not force and self._artists
+                and (now - self._artists_at) < self._ARTISTS_TTL):
+            return self._artists
+        try:
+            fetched = self._get("/api/v1/artist")
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Artist list fetch failed: %s", exc)
+            return self._artists or []
+        if isinstance(fetched, list):
+            self._artists = fetched
+            self._artists_at = now
+        return self._artists or []
+
     def find_artist(self, name: str) -> Optional[Dict[str, Any]]:
         """Search Lidarr's local library for an artist by (fuzzy) name match."""
         if not name:
             return None
-        try:
-            results = self._get("/api/v1/artist")
-        except Exception as exc:
-            logger.error("Artist list fetch failed: %s", exc)
+        results = self.artists()
+        if not results:
             return None
 
         target = name.strip().lower()
