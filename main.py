@@ -1228,6 +1228,11 @@ def main() -> int:
             enabled=True,
             max_rps=float(ac_cfg.get("max_rps", 3.0)),
             timeout=int(ac_cfg.get("timeout_seconds", 20)),
+            # Without this the result cache is a dict that dies with the
+            # process, so every restart re-runs fpcalc (~0.37s of CPU per
+            # file) over music it has already identified.
+            cache_file=str(ac_cfg.get(
+                "cache_file", "/config/acoustid_cache.json")),
         )
         if acoustid_client._have_fpcalc():
             logger.info("AcoustID fingerprint identify: enabled (%.1f req/s)",

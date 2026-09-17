@@ -29,7 +29,8 @@ import subprocess
 import threading
 import time
 from collections import Counter
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -66,6 +67,7 @@ class AcoustIDClient:
         max_rps: float = 3.0,
         timeout: int = 20,
         cache: Optional[dict] = None,
+        cache_file: Optional[str] = None,
     ):
         self.api_key = (api_key or "").strip()
         self.fpcalc = fpcalc or "fpcalc"
@@ -73,7 +75,14 @@ class AcoustIDClient:
         self.timeout = timeout
         self._rl = _RateLimiter(1.0 / max_rps if max_rps and max_rps > 0 else 0.0)
         self._cache: dict = cache if cache is not None else {}
+        self._cache_file = Path(cache_file) if cache_file else None
+        self._cache_dirty_since = 0.0
+        # Consecutive hard auth/client errors. fpcalc costs ~0.37s of CPU per
+        # file, so once AcoustID has told us the key is bad there is no point
+        # fingerprinting anything else this run.
+        self._auth_failures = 0
         self._fpcalc_ok: Optional[bool] = None
+        self._load_cache()
         self._session = requests.Session()
 
     # ---- fpcalc -------------------------------------------------------
@@ -110,7 +119,13 @@ class AcoustIDClient:
 
     # ---- AcoustID lookup ----------------------------------------------
 
-    def _lookup(self, duration: int, fingerprint: str) -> Optional[dict]:
+    def _lookup(self, duration: int, fingerprint: str) -> Tuple[str, Optional[dict]]:
+        """Returns (status, data) where status is "ok" when AcoustID
+        actually answered -- including a perfectly good "no match" -- and
+        "error" when it did not (bad key, network, 5xx). The caller must not
+        cache an "error": a None from an expired key would otherwise be
+        remembered as "this file has no match" for ever.
+        """
         params = {
             "client": self.api_key,
             "duration": duration,
@@ -147,21 +162,32 @@ class AcoustIDClient:
                         "ACOUSTID_ENABLED=false to disable fingerprinting.",
                         resp.status_code, msg or "bad request",
                     )
-                    return None
+                    self._auth_failures += 1
+                    if self._auth_failures >= 3 and self.enabled:
+                        self.enabled = False
+                        logger.warning(
+                            "AcoustID DISABLED for this run after %d rejected "
+                            "lookups -- every further fingerprint would burn "
+                            "~0.4s of CPU for an answer AcoustID will not "
+                            "give. Fix the key and restart.",
+                            self._auth_failures,
+                        )
+                    return ("error", None)
                 resp.raise_for_status()
                 data = resp.json()
                 if data.get("status") != "ok":
                     logger.warning("AcoustID status=%s error=%s",
                                    data.get("status"),
                                    (data.get("error") or {}))
-                    return None
-                return data
+                    return ("error", None)
+                self._auth_failures = 0
+                return ("ok", data)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("AcoustID lookup failed (attempt %d/4): %s",
                                attempt + 1, exc)
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 30)
-        return None
+        return ("error", None)
 
     @staticmethod
     def _best(data: dict) -> Optional[Dict[str, Any]]:
@@ -197,17 +223,91 @@ class AcoustIDClient:
             key = (path, st.st_size, int(st.st_mtime))
         except OSError:
             pass
-        if key is not None and key in self._cache:
-            return self._cache[key]
+        ckey = self._ckey(key)
+        if ckey is not None and ckey in self._cache:
+            entry = self._cache[ckey]
+            if not self._expired(entry):
+                return entry.get("result")
+            del self._cache[ckey]
         result = None
+        answered = False
         fp = self._fingerprint(path)
         if fp:
-            data = self._lookup(fp[0], fp[1])
+            status, data = self._lookup(fp[0], fp[1])
+            answered = status == "ok"
             if data:
                 result = self._best(data)
-        if key is not None:
-            self._cache[key] = result
+        # Only a real answer is remembered. A failed fingerprint or a rejected
+        # lookup must NOT be stored, or a spell of bad key / no network would
+        # be baked in as "no match" for every file it touched.
+        if ckey is not None and answered:
+            self._cache[ckey] = {"result": result, "at": time.time()}
+            self._save_cache()
         return result
+
+    # ---- persistent result cache -----------------------------------------
+
+    # A miss is re-tried after this long: a track AcoustID does not know today
+    # may well be in its database next month. A hit never expires, because the
+    # key already carries the file size and mtime.
+    _MISS_TTL = 30 * 24 * 3600.0
+    _MAX_ENTRIES = 50000
+    _SAVE_EVERY = 30.0
+
+    @staticmethod
+    def _ckey(key: Optional[tuple]) -> Optional[str]:
+        """JSON has no tuple keys, so (path, size, mtime) becomes text."""
+        if key is None:
+            return None
+        return "%s|%s|%s" % key
+
+    def _expired(self, entry: Any) -> bool:
+        if not isinstance(entry, dict):
+            return True
+        if entry.get("result"):
+            return False
+        return (time.time() - float(entry.get("at") or 0)) > self._MISS_TTL
+
+    def _load_cache(self) -> None:
+        if self._cache_file is None:
+            return
+        try:
+            raw = json.loads(self._cache_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(raw, dict):
+            return
+        live = {k: v for k, v in raw.items() if not self._expired(v)}
+        self._cache.update(live)
+        if live:
+            hits = sum(1 for v in live.values() if v.get("result"))
+            logger.info(
+                "AcoustID cache: %d identification(s) restored (%d matched, "
+                "%d known-unmatched) -- that many fingerprints not re-run",
+                len(live), hits, len(live) - hits,
+            )
+
+    def _save_cache(self, force: bool = False) -> None:
+        """Checkpointed during the run (temp file + replace, so a kill
+        cannot truncate it), debounced, and bounded by entry count.
+        """
+        if self._cache_file is None:
+            return
+        now = time.time()
+        if not force and (now - self._cache_dirty_since) < self._SAVE_EVERY:
+            return
+        items = [(k, v) for k, v in self._cache.items() if not self._expired(v)]
+        if len(items) > self._MAX_ENTRIES:
+            items.sort(key=lambda kv: -float((kv[1] or {}).get("at") or 0))
+            items = items[:self._MAX_ENTRIES]
+        try:
+            tmp = self._cache_file.with_suffix(self._cache_file.suffix + ".tmp")
+            tmp.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(json.dumps(dict(items)), encoding="utf-8")
+            tmp.replace(self._cache_file)
+            self._cache_dirty_since = now
+        except OSError as exc:
+            logger.debug("AcoustID cache: could not save: %s", exc)
 
     def identify_folder(self, files: List[str]) -> Dict[str, Any]:
         """
