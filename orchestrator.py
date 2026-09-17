@@ -1150,7 +1150,12 @@ class Orchestrator:
                     if self.cfg.delete_originals_on_success:
                         self._delete_originals(cue_path, audio_path)
                     if self.cfg.delete_source_folder_on_success:
-                        self._delete_source_folder(cue_path)
+                        # Lidarr's own stats just showed the album complete,
+                        # so this download is redundant: proof in hand.
+                        self._delete_source_folder(
+                            cue_path, verified=True, artist_name=artist_name,
+                            album_name=album_name,
+                            context="already in Lidarr library")
                 self._skip_seen.add(cue_path)
                 self._record(
                     cue_path, outcome="already_in_lidarr", pre_split=False,
@@ -1339,7 +1344,12 @@ class Orchestrator:
                 # verified success, so its absence is our confirmation -- never
                 # delete the source before the import is verified (backlog #6).
                 if not clean.exists():
-                    self._delete_source_folder(cue_path)
+                    # `clean` is gone == the handoff verified the import, so
+                    # the proof is in hand; the source still holds the .wav
+                    # image, which the audio guard would otherwise refuse on.
+                    self._delete_source_folder(
+                        cue_path, verified=True,
+                        context="dts-cd 5.1 handoff verified")
                 return clean
             except Exception as exc:  # noqa: BLE001
                 logger.exception(
@@ -1563,7 +1573,9 @@ class Orchestrator:
         if self.cfg.delete_source_folder_on_success:
             # Nuke the whole folder that held the CUE + all siblings
             # (scans/, .log, .nfo, cover art, the disc image, etc.).
-            self._delete_source_folder(cue_path)
+            self._delete_source_folder(
+                cue_path, artist_name=artist_name, album_name=album_name,
+                context="import succeeded")
         elif self.cfg.delete_originals_on_success:
             # Keep the folder, but remove the now-redundant disc image + .cue.
             self._delete_originals(cue_path, audio_path)
@@ -2209,7 +2221,10 @@ class Orchestrator:
                 sentinel = (
                     cue_path if cue_path is not None else folder / ".cueless_sweep"
                 )
-                self._delete_source_folder(sentinel)
+                self._delete_source_folder(
+                    sentinel, artist_name=artist_name, album_name=album_name,
+                    artist_id=aid, expected_tracks=len(audios),
+                    context="force-import")
             elif self.cfg.delete_originals_on_success:
                 for a in audios:
                     try:
@@ -5853,7 +5868,12 @@ class Orchestrator:
                             cue_path if cue_path is not None
                             else folder / ".cueless_sweep"
                         )
-                        self._delete_source_folder(sentinel)
+                        # have/total from Lidarr already proved the album is
+                        # complete in the library: the download is redundant.
+                        self._delete_source_folder(
+                            sentinel, verified=True, artist_name=artist_name,
+                            album_name=album_name,
+                            context="already in library (sweep)")
                     else:
                         if self.cfg.delete_originals_on_success:
                             for a in audios:
@@ -6059,16 +6079,19 @@ class Orchestrator:
             # that our disk re-match can't always reproduce -- which was
             # wrongly retaining folders whose tracks had really been imported.
             final_outcome = "imported_via_manual"
+            lib_confirms: Optional[bool] = None
             if self.cfg.verify_library_after_import:
-                if not self._verify_library_reflects_album(
+                lib_confirms = self._verify_library_reflects_album(
                     artist_name, album_name, len(audios),
                     imported_artist_id=aid,
-                ):
+                )
+                if not lib_confirms:
                     final_outcome = "imported_unverified"
                     logger.info(
                         "Pre-split handoff for %s / %s: Lidarr moved the files "
-                        "but its library view didn't confirm by name -- cleaning "
-                        "up the source anyway (files were moved).",
+                        "but its library view didn't confirm by name -- the "
+                        "source is removed ONLY if the audio really did move "
+                        "out of it; if it is still there, it is kept.",
                         artist_name, album_name,
                     )
             self._record(
@@ -6081,7 +6104,11 @@ class Orchestrator:
                 # .parent -- for the CUE-less sweep, synthesize a fake
                 # child path so the correct folder is targeted.
                 sentinel = cue_path if cue_path is not None else folder / ".cueless_sweep"
-                self._delete_source_folder(sentinel)
+                self._delete_source_folder(
+                    sentinel, verified=lib_confirms, artist_name=artist_name,
+                    album_name=album_name, artist_id=aid,
+                    expected_tracks=len(audios),
+                    context="pre-split handoff")
             else:
                 self._delete_orphan_cue(cue_path, reason)
             return
@@ -6115,7 +6142,11 @@ class Orchestrator:
             )
             if self.cfg.delete_source_folder_on_success:
                 sentinel = cue_path if cue_path is not None else folder / ".cueless_sweep"
-                self._delete_source_folder(sentinel)
+                self._delete_source_folder(
+                    sentinel, verified=True, artist_name=artist_name,
+                    album_name=album_name, artist_id=aid,
+                    expected_tracks=len(audios),
+                    context="verified after wait timeout")
             else:
                 self._delete_orphan_cue(cue_path, reason)
             return
@@ -14566,13 +14597,64 @@ class Orchestrator:
         )
         return None
 
-    def _delete_source_folder(self, cue_path: Path) -> None:
+    def _delete_source_folder(
+        self,
+        cue_path: Path,
+        *,
+        verified: Optional[bool] = None,
+        artist_name: str = "",
+        album_name: str = "",
+        artist_id: Optional[int] = None,
+        expected_tracks: Optional[int] = None,
+        context: str = "",
+    ) -> bool:
         """
         Recursively remove the folder that contained the source CUE.
         Thin wrapper over _delete_folder_under_watch(cue_path.parent);
         only intended to run in the success branch (caller sequences it).
+
+        REFUSES when audio is STILL IN THE FOLDER and Lidarr cannot confirm it
+        holds the album. A real import MOVES the files out, so audio still
+        sitting here means nothing was imported, and deleting it destroys the
+        only copy. That is exactly how
+        /downloads/Hans Zimmer/Crimson Tide/Expanded Score lost 10 mp3s seven
+        seconds after "content-identify 10/10": Lidarr then threw
+        FileNotFoundException and the album sits at 0/10 with no audio left
+        anywhere. Every caller funnels through here, so no future call site
+        can reintroduce that.
+
+        `verified=True` is how a caller says it already holds proof (e.g.
+        Lidarr's own stats showed the album complete, so the download is
+        redundant). Returns True when the folder was removed.
         """
-        self._delete_folder_under_watch(cue_path.parent)
+        folder = cue_path.parent
+        try:
+            leftover = [q for q in folder.rglob("*")
+                        if q.is_file() and q.suffix.lower() in _ALL_AUDIO_EXTS]
+        except OSError:
+            leftover = []
+
+        if leftover:
+            if verified is None and (artist_name or album_name):
+                verified = self._verify_library_reflects_album(
+                    artist_name,
+                    album_name,
+                    expected_tracks if expected_tracks is not None
+                    else len(leftover),
+                    imported_artist_id=artist_id,
+                )
+            if not verified:
+                logger.error(
+                    "REFUSING to delete %s -- %d audio file(s) are still in "
+                    "it, so nothing was imported, and Lidarr does not confirm "
+                    "holding %s / %s%s. Source preserved; it is the only copy.",
+                    folder, len(leftover), artist_name or "?",
+                    album_name or "?", f" [{context}]" if context else "",
+                )
+                return False
+
+        self._delete_folder_under_watch(folder)
+        return True
 
     def _delete_folder_under_watch(self, folder: Path) -> bool:
         """
@@ -14582,7 +14664,13 @@ class Orchestrator:
         album was cleaned out), stopping at the watch root which is never
         touched. Returns True if the folder is gone afterwards.
 
-        Safety: refuses to operate on
+        Safety: this is the PATH check only. The "is the audio still here"
+        check lives in _delete_source_folder, which every automated caller
+        goes through. The two WebUI actions (resolve / discard) call this
+        directly on purpose: a human has already decided, having either
+        copied the files in or asked to throw them away.
+
+        Refuses to operate on
           * a path that does not resolve under the configured watch
             root (prevents a spooky Path somehow escaping the tree),
           * the watch root itself,
