@@ -359,6 +359,7 @@ All under `/config`, all safe to delete (they rebuild).
 | `ledger.csv` | Every outcome, appended. |
 | `manualimport_cache.json` | Lidarr's answer per download folder, keyed on a folder fingerprint. A probe costs Lidarr 10-20s. |
 | `acoustid_cache.json` | Fingerprint identifications. Only real answers are stored, never a failed lookup. |
+| `embedded_cue_cache.json` | Whether each audio file carries an embedded cuesheet. The sweep asks this about thousands of files every 60s. |
 | `pipeline.log` | Rotating log (5 MB × 4). |
 
 ---
@@ -416,6 +417,7 @@ Measured on the live box, because the obvious guesses were wrong twice.
 | FLAC encode at level 8 vs 5 | 2.1 s vs 1.2 s per track, for 1.35% more size |
 | `list_albums_for_artist` | 0.02 s -- already cached per artist |
 | the whole on-disk library walk | under a minute |
+| the sweep's embedded-cuesheet check | 3,515 files x ~42 ms = 149 s per pass, on a 60 s timer -- now cached to ~1 s |
 
 So: the probe is cached per folder (invalidated by a fingerprint of file count,
 total size and newest mtime), a RefreshArtist is skipped only while the previous

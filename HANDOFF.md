@@ -170,6 +170,13 @@ Everything above is now cached or deduped:
   stored, or a spell of bad key/no network would be baked in as "no match"
   forever. Misses expire after 30 days; after three rejected lookups the client
   disables itself for the run.
+- **`_extract_embedded_cuesheet`** caches its answer per (path, size, mtime).
+  The cueless sweep asks it about every audio file in every pre-split folder on
+  a 60 second timer -- measured here, 3,515 files, ~42 ms each: **149 seconds of
+  parsing per pass, on a 60 second timer**, re-deriving an answer that cannot
+  change unless the file does. Cached, an unchanged pass costs ~1 s. An
+  unreadable file is deliberately NOT cached, so a half-written download is
+  re-read once it settles. Persisted beside the sweep ledger.
 - **`audio_open.File`** is a drop-in for `mutagen.File` that names the parser
   from the extension. `mutagen.File()` with no hint scores every parser it
   knows; py-spy showed four of five worker threads inside
