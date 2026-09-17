@@ -4591,6 +4591,11 @@ class Orchestrator:
         """
         if not bool(getattr(self.cfg, "prefer_lossless_over_lossy", True)):
             return 0
+        # Never reason about files that are already quarantined: a file from
+        # inside QUARANTINE_DIR would make `folder` below the quarantine
+        # itself, and the move would nest one level deeper every pass.
+        audios = [p for p in (audios or [])
+                  if self.QUARANTINE_DIR not in p.parts]
         album_id = int((album_rec or {}).get("id") or 0)
         if not album_id or not audios:
             return 0
@@ -8114,6 +8119,18 @@ class Orchestrator:
                         ]
                     except OSError:
                         audios = []
+                # Files already set aside by prefer-lossless are no longer part
+                # of the album. Letting them back in is what built a 71-level
+                # _superseded_by_lossless nest in Tina Turner/Break Every Rule:
+                # this album has no audio at its top level, so the rglob
+                # fallback above swept up the quarantine folder too, and
+                # _prefer_lossless_in_album then quarantined a quarantined file
+                # INSIDE the quarantine -- one level deeper on every pass.
+                # Jellyfin walked the result and a validation worker span a
+                # core for 13h with every scheduled task Idle (17 Sep 2026).
+                # It also kept the disk/Lidarr file counts below honest.
+                audios = [p for p in audios
+                          if self.QUARANTINE_DIR not in p.parts]
                 if not audios:
                     continue
                 scanned_albums += 1

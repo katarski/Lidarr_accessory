@@ -708,7 +708,7 @@ class ConvertManager:
                 # defaults live in CODEC_OPTIONS above.
                 "defaults": {"codec": "aac", "bitrate": 320,
                              "sample_rate": "keep", "channels": "keep",
-                             "concurrency": 2},
+                             "concurrency": 4},
                 # Library root, so the WebUI can turn a tree-relative path into
                 # the absolute path the audio player streams from.
                 "root": str(self.root),
@@ -827,12 +827,12 @@ class ConvertManager:
                           if j["state"] in ("running", "queued")}
 
     def start(self, rels: List[str], codec: str, opts: Dict[str, Any],
-              concurrency: int = 2) -> Tuple[int, List[str]]:
+              concurrency: int = 4) -> Tuple[int, List[str]]:
         """Queue conversions. Returns (queued, errors)."""
         spec = CODEC_OPTIONS.get(codec)
         if spec is None:
             return 0, [f"unknown codec {codec}"]
-        self._workers = max(1, min(10, int(concurrency or 2)))
+        self._workers = max(1, min(10, int(concurrency or 4)))
         queued = 0
         errors: List[str] = []
         root_r = self.root.resolve()
