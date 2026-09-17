@@ -19,7 +19,9 @@ The `path_mapping` config handles that translation.
 from __future__ import annotations
 
 import difflib
+import json
 import logging
+import os
 import re
 import time
 import unicodedata
@@ -169,12 +171,28 @@ class LidarrConfig:
 
 
 class LidarrClient:
+    # Ceiling for the on-disk probe cache, and how often it may be written.
+    _MI_FILE_BUDGET = 4 * 1024 * 1024
+    _MI_SAVE_EVERY = 30.0
+
     def __init__(self, cfg: LidarrConfig, session: Optional[requests.Session] = None):
         self.cfg = cfg
         self.session = session or requests.Session()
         self.session.headers.update({"X-Api-Key": cfg.api_key})
         self.manualimport_timeout = int(
             getattr(cfg, "manualimport_timeout", 180) or 180)
+        # /manualimport costs ~20s per folder because Lidarr parses every
+        # file before replying, and the same folder gets probed 3-5 times
+        # within half a minute of one pass. Cache answers, keyed on a cheap
+        # folder fingerprint so a folder that really changed is re-probed.
+        self.manualimport_cache_seconds = int(
+            getattr(cfg, "manualimport_cache_seconds", 900) or 0)
+        self._mi_cache_file = Path(
+            getattr(cfg, "manualimport_cache_file",
+                    "/config/manualimport_cache.json"))
+        self._mi_cache: Dict[str, Dict[str, Any]] = {}
+        self._mi_last_save = 0.0
+        self._load_mi_cache()
 
     # ---- Path translation ------------------------------------------------
 
@@ -602,8 +620,98 @@ class LidarrClient:
             time.sleep(poll_interval)
         return last
 
+    # ---- manual-import probe cache ---------------------------------------
+
+    def _folder_signature(self, folder_path: str) -> Optional[str]:
+        """File count, total size and newest mtime for a folder: ~10ms
+        against an album folder, versus a ~20s /manualimport probe. Returns
+        None when the path is not visible from here (then nothing is cached,
+        which is the safe answer).
+        """
+        root = Path(folder_path)
+        try:
+            if not root.is_dir():
+                return None
+        except OSError:
+            return None
+        count = 0
+        total = 0
+        newest = 0.0
+        stack = [str(root)]
+        try:
+            while stack:
+                with os.scandir(stack.pop()) as it:
+                    for entry in it:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                            continue
+                        st = entry.stat(follow_symlinks=False)
+                        count += 1
+                        total += st.st_size
+                        if st.st_mtime > newest:
+                            newest = st.st_mtime
+        except OSError:
+            return None
+        return "%d:%d:%.0f" % (count, total, newest)
+
+    def _load_mi_cache(self) -> None:
+        """Load at startup and drop anything already expired, so a
+        restart mid-pass does not re-pay for probes it already made.
+        """
+        if self.manualimport_cache_seconds <= 0:
+            return
+        try:
+            raw = json.loads(self._mi_cache_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        now = time.time()
+        kept = {k: v for k, v in (raw or {}).items()
+                if isinstance(v, dict)
+                and now - float(v.get("at") or 0) < self.manualimport_cache_seconds}
+        self._mi_cache = kept
+        if kept:
+            logger.info("manualimport cache: %d live entry(ies) restored",
+                        len(kept))
+
+    def _save_mi_cache(self, force: bool = False) -> None:
+        """Checkpoint during the pass (temp file + replace, so a kill
+        cannot truncate it), pruned by age and bounded by BYTES: one probe of
+        a 47-file folder serialises to ~270 KB, so an unbounded file would
+        reach tens of MB in a pass and be rewritten on every probe. Newest
+        entries are kept up to the budget; the rest stay in memory only.
+        Writes are debounced so a burst of probes costs one write.
+        """
+        if self.manualimport_cache_seconds <= 0:
+            return
+        now = time.time()
+        self._mi_cache = {
+            k: v for k, v in self._mi_cache.items()
+            if now - float(v.get("at") or 0) < self.manualimport_cache_seconds
+        }
+        if not force and (now - self._mi_last_save) < self._MI_SAVE_EVERY:
+            return
+        budget = self._MI_FILE_BUDGET
+        keep: Dict[str, Any] = {}
+        for k, v in sorted(self._mi_cache.items(),
+                           key=lambda kv: -float(kv[1].get("at") or 0)):
+            blob = json.dumps({k: v})
+            if len(blob) > budget:
+                continue
+            budget -= len(blob)
+            keep[k] = v
+        try:
+            tmp = self._mi_cache_file.with_suffix(
+                self._mi_cache_file.suffix + ".tmp")
+            tmp.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(json.dumps(keep), encoding="utf-8")
+            tmp.replace(self._mi_cache_file)
+            self._mi_last_save = now
+        except OSError as exc:
+            logger.debug("manualimport cache: could not save: %s", exc)
+
     def manual_import_candidates(
         self, folder_path: str, artist_id: Optional[int] = None,
+        force: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Ask Lidarr what it would do with the given folder via its manual
@@ -620,6 +728,23 @@ class LidarrClient:
         params = {"folder": folder_path, "filterExistingFiles": "false"}
         if artist_id:
             params["artistId"] = int(artist_id)
+
+        key = "%s|%s" % (folder_path, artist_id or "")
+        sig = (self._folder_signature(folder_path)
+               if self.manualimport_cache_seconds > 0 and not force else None)
+        if sig is not None:
+            hit = self._mi_cache.get(key)
+            if (hit and hit.get("sig") == sig
+                    and (time.time() - float(hit.get("at") or 0))
+                    < self.manualimport_cache_seconds):
+                data = hit.get("data") or []
+                logger.info(
+                    "manualimport: %s -> %d candidates (cached %ds ago, "
+                    "folder unchanged -- saved a ~20s probe)",
+                    folder_path, len(data),
+                    int(time.time() - float(hit.get("at") or 0)),
+                )
+                return data
         try:
             # Lidarr scans and match-parses EVERY file in the folder before it
             # answers, so a multi-disc box (Pet Shop Boys "SMASH", the Maria
@@ -648,6 +773,10 @@ class LidarrClient:
                     len(c.get("tracks") or []),
                     [r.get("reason") for r in (c.get("rejections") or [])],
                 )
+            if sig is not None:
+                self._mi_cache[key] = {"sig": sig, "at": time.time(),
+                                       "data": data}
+                self._save_mi_cache()
             return data
         except Exception as exc:
             logger.warning("manualimport query failed for %s: %s", folder_path, exc)
