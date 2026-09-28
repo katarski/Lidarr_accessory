@@ -13,6 +13,8 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
+import claims
+
 logger = logging.getLogger("qbittorrent")
 
 # Lidarr hands out release guids shaped "<indexerId>_magnet:?xt=urn:btih:...".
@@ -388,7 +390,19 @@ class QbtClient:
         )
 
     def remove(self, torrent_hash: str, delete_files: bool = True) -> bool:
-        """Delete a torrent. delete_files=True also removes its data on disk."""
+        """Delete a torrent. delete_files=True also removes its data on disk.
+        Refused while another worker is processing a folder of it (claims):
+        every remover in the process goes through here."""
+        try:
+            info = self.torrent_by_hash(torrent_hash) or {}
+        except Exception:  # noqa: BLE001
+            info = {}
+        hit = claims.busy_torrent(str(info.get("content_path") or ""))
+        if hit:
+            logger.info("qBittorrent: not removing %s yet -- %s is being "
+                        "processed right now", str(info.get("name") or torrent_hash)[:60],
+                        hit)
+            return False
         try:
             r = self.s.post(
                 f"{self.base}/api/v2/torrents/delete",

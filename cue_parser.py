@@ -19,7 +19,14 @@ from typing import List, Optional
 
 import chardet
 
+from ollama_client import UNAVAILABLE
+
 logger = logging.getLogger(__name__)
+
+
+class LLMUnavailableError(ValueError):
+    """The CUE needs an LLM repair and the LLM could not be asked. Not a
+    verdict on the CUE: the caller must retry it once the LLM can answer."""
 
 
 # --- Data shapes --------------------------------------------------------
@@ -338,6 +345,10 @@ def parse_cue(
 
     repaired_text = ollama.repair_cue(text)
     if not repaired_text:
+        if repaired_text is UNAVAILABLE:
+            raise LLMUnavailableError(
+                f"CUE {cue_path} needs the LLM to repair it and the LLM cannot "
+                f"be asked right now")
         raise ValueError(f"Ollama returned empty repair for {cue_path}")
 
     cue = parse_cue_text(repaired_text)

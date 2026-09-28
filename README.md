@@ -57,6 +57,23 @@ only three places — cue repair, artist/album parsing, and confirming an album
 match. Everything else is deterministic. With the LLM off, every one of those
 paths still works.
 
+**The LLM shares a GPU politely.** Point it at the same model and `num_ctx` as
+your Home Assistant agent and one runner in VRAM serves both. A question is
+asked only while the GPU is idle (read from Home Assistant's sensors for the
+PC that runs Ollama); if Home Assistant is not answering at all, the model is
+ours to load. A question that cannot be asked comes back *unavailable* — it is
+**deferred**, never recorded as a "no": the folder, CUE or torrent waits and is
+re-examined the moment the LLM can answer, while everything that does not need
+the LLM carries on. A model this container loaded is released early when the
+GPU is wanted elsewhere. See `llm_gate.py`.
+
+**Titles in any script.** One fold (`titlematch.py`) is used wherever names
+are compared: accents stripped where they are decoration and kept where they
+change the letter (kana voicing, Indic vowel signs), Cyrillic and Greek
+transliterated, and the letters of every other script kept rather than
+deleted — an `[a-z0-9]` filter once made every Japanese, Arabic and Korean
+title the empty string, so they all compared equal.
+
 ---
 
 ## Web UI
@@ -238,6 +255,25 @@ These are load-bearing. Most exist because something went wrong once.
   title matching several albums, an unreadable folder — all resolve to "keep".
 - **Mis-parses err toward KEEP**, never toward deselecting something you don't
   have.
+- **"Redundant" means Lidarr said so, file by file.** A download is thrown
+  away as already-owned only when Lidarr's ManualImport maps EVERY file to a
+  track and rejects each as "Not an upgrade for existing track file(s)". A
+  track count is never enough: it deleted a song Lidarr did not know, and a
+  lossless copy of an album the library held as MP3. The pipeline's pre-split
+  check and the imported-downloads purge share this one test.
+- **One redundant album never takes its neighbours.** A single-album torrent
+  is blocklisted by its download id; an album inside a discography is
+  deselected, and the release is never blocklisted.
+- **One worker per folder.** A folder being processed is claimed
+  (`claims.py`); nothing else in the process deletes it or removes its
+  torrent until the claim is released.
+- **Nothing concluded during an outage is recorded.** Lidarr's client counts
+  its own failures; a hand-off in which a Lidarr call failed records only
+  facts (an import, a proven redundancy) and is tried again later.
+- **An encode only ever appears complete.** FLAC is written to `.partial`,
+  verified and tagged, then renamed; a DVD-Audio disc is published whole or
+  not at all.
+- **An unanswered LLM question is not a "no".** See the GPU gate above.
 
 ### What it refuses to grab
 
@@ -443,6 +479,11 @@ converter.py        library tree + transcoder
 assembly.py         album assembly planner
 splitter.py         cue splitting
 cue_parser.py       cue parsing (+ optional LLM repair)
+llm_gate.py         GPU gate + LLM client factory (ask only when the GPU is idle)
+ollama_client.py    the LLM questions; UNAVAILABLE is never a "no"
+titlematch.py       one fold and one set of word rules for every script
+claims.py           in-process claims: one worker per folder
+tests/              unit tests (run in the image, see Deploying a code change)
 song_harvest.py     per-track harvesting
 musicbrainz.py      MusicBrainz client (aliases, release groups)
 audio_open.py       mutagen opener that names the parser instead of sniffing

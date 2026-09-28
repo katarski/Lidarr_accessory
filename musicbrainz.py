@@ -29,6 +29,8 @@ import json
 import logging
 import re
 import unicodedata
+
+import titlematch
 import threading
 import time
 import urllib.parse
@@ -60,16 +62,12 @@ COLLECTION_SECONDARY = frozenset({"compilation", "soundtrack", "live"})
 # Lucene metacharacters that would change the meaning of a quoted phrase.
 _LUCENE_ESCAPE_RE = re.compile(r'(["\\])')
 _NORM_BRACKETS_RE = re.compile(r"\(.*?\)|\[.*?\]")
-_NORM_KEEP_RE = re.compile(r"[^a-z0-9]+")
 
 
 def _norm_name(s: Any) -> str:
-    """Casefold + strip accents + keep [a-z0-9], for comparing artist names
-    and their aliases. Same shape as the Lidarr-side key, kept local so this
-    module stays free of that import."""
-    t = unicodedata.normalize("NFKD", str(s or "").casefold())
-    t = "".join(c for c in t if not unicodedata.combining(c))
-    return re.sub(r"[^a-z0-9]+", "", t)
+    """titlematch.key: the folded letters of any script, for comparing
+    artist names and their aliases -- the same key the Lidarr side uses."""
+    return titlematch.key(str(s or ""))
 
 
 def norm_release_title(s: Any) -> str:
@@ -80,8 +78,7 @@ def norm_release_title(s: Any) -> str:
     the same compilation reached via twenty different recordings is counted
     once.
     """
-    s = _NORM_BRACKETS_RE.sub(" ", str(s or "").lower())
-    return " ".join(_NORM_KEEP_RE.sub(" ", s).split())
+    return " ".join(titlematch.words(_NORM_BRACKETS_RE.sub(" ", str(s or ""))))
 
 
 class MusicBrainzClient:

@@ -32,9 +32,10 @@ per-instance, because main.py and qbt_deselect.py each construct their own
 client while sharing one API quota.
 
 Pacing never blocks a worker for long: if the queue is deeper than
-max_wait_seconds, the call is skipped and returns "" -- which every caller
-already treats as "fall back to the deterministic path". Slow-and-degraded
-beats stalling the import threads.
+max_wait_seconds, the call is skipped and returns UNAVAILABLE -- which every
+caller treats as "not asked": it falls back to the deterministic path and asks
+again later, and never records it as a "no". Slow-and-degraded beats stalling
+the import threads.
 """
 
 from __future__ import annotations
@@ -44,7 +45,7 @@ import threading
 import time
 from typing import Optional
 
-from ollama_client import OllamaClient, _clip
+from ollama_client import OllamaClient, UNAVAILABLE, _clip
 
 logger = logging.getLogger("cloud_llm")
 
@@ -158,10 +159,10 @@ class CloudLLMClient(OllamaClient):
         label: str = "generate", subject: str = "",
     ) -> str:
         if not self.enabled:
-            return ""
+            return UNAVAILABLE
         if not self._acquire_slot():
             logger.info("LLM %s: SKIPPED (rate limit / quota)", label)
-            return ""
+            return UNAVAILABLE
         started = time.monotonic()
         body = {
             "model": self.model,
@@ -201,10 +202,10 @@ class CloudLLMClient(OllamaClient):
                     # retrying and trip the breaker immediately.
                     if "per day" in detail.lower() or "PerDay" in detail:
                         self._trip_breaker(detail)
-                        return ""
+                        return UNAVAILABLE
                     if attempt >= self.max_retries:
                         self._trip_breaker(detail)
-                        return ""
+                        return UNAVAILABLE
                     backoff = self._retry_after(r) or (2.0 ** attempt) * 2.0
                     logger.info(
                         "Cloud LLM 429 -- backing off %.1fs (attempt %d/%d)",
@@ -224,11 +225,11 @@ class CloudLLMClient(OllamaClient):
                     _clip(out) if out else "EMPTY",
                     time.monotonic() - started,
                 )
-                return out
+                return out or UNAVAILABLE   # an empty reply is not an answer
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Cloud LLM generate failed: %s", exc)
-                return ""
-        return ""
+                return UNAVAILABLE
+        return UNAVAILABLE
 
     # ---------- diagnostics ---------------------------------------------
 

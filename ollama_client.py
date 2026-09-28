@@ -7,6 +7,14 @@ Two jobs:
 
 Both calls are best-effort: if Ollama is down or returns garbage, callers
 fall back to the deterministic path.
+
+UNAVAILABLE is not "no". When the model could not be asked -- the GPU gate is
+closed (see llm_gate.py), the PC is asleep, the call timed out, the model is not
+installed, the reply came back empty -- every method returns the UNAVAILABLE
+sentinel instead of an answer. It is falsy and equal to "", so a caller that only
+falls back keeps working unchanged; a caller that REMEMBERS answers (a cache, a
+ledger, a persisted verdict) must test `is_unavailable()` and defer instead of
+recording a negative, then ask again on its next pass.
 """
 
 from __future__ import annotations
@@ -14,17 +22,68 @@ from __future__ import annotations
 import json
 import logging
 import re
-import threading
 import time
 from dataclasses import asdict, replace
 from typing import List, Optional, TYPE_CHECKING
 
 import requests
 
+import titlematch
+
 if TYPE_CHECKING:
     from tagger import TagPlan
 
 logger = logging.getLogger(__name__)
+
+
+class _Unavailable(str):
+    """The model could not be asked. Falsy, equal to "", and one object."""
+    _one = None
+
+    def __new__(cls):
+        if cls._one is None:
+            cls._one = super().__new__(cls, "")
+        return cls._one
+
+    def __repr__(self) -> str:
+        return "UNAVAILABLE"
+
+
+UNAVAILABLE = _Unavailable()
+
+
+def is_unavailable(x) -> bool:
+    """True when an LLM result means "could not ask", not "the answer is no"."""
+    if x is UNAVAILABLE:
+        return True
+    if isinstance(x, tuple):
+        return any(v is UNAVAILABLE for v in x)
+    return False
+
+
+def keep_alive_seconds(value) -> float:
+    """Ollama keep_alive (seconds, or a Go duration like "10m", "2h", "-1")
+    as seconds; negative means forever."""
+    if value is None or value == "":
+        return 600.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = str(value).strip().lower()
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    total, num = 0.0, ""
+    units = {"h": 3600.0, "m": 60.0, "s": 1.0}
+    for ch in s:
+        if ch.isdigit() or ch in ".-":
+            num += ch
+        elif ch in units and num:
+            total += float(num) * units[ch]
+            num = ""
+        else:
+            return 600.0
+    return total if not num else total + float(num)
 
 
 # Keys a JSON-forcing LLM is likely to use when it wraps an array in an
@@ -129,8 +188,8 @@ _RELEASE_TYPE_WORDS = frozenset({
 
 def _release_type_mismatch(download_name: str, owned_title: str) -> bool:
     """True when the download carries a release-type word the owned album lacks."""
-    dw = set(re.findall(r"[a-z0-9]+", (download_name or "").lower()))
-    ow = set(re.findall(r"[a-z0-9]+", (owned_title or "").lower()))
+    dw = set(titlematch.tokens(download_name or ""))
+    ow = set(titlematch.tokens(owned_title or ""))
     return bool((dw & _RELEASE_TYPE_WORDS) - ow)
 
 
@@ -147,42 +206,68 @@ class OllamaClient:
         model: str,
         timeout: int = 300,
         enabled: bool = True,
-        keep_alive: str = "2h",
+        keep_alive="10m",
         num_ctx: int = 8192,
+        think: Optional[bool] = False,
+        gate=None,
+        load_timeout: float = 180.0,
     ):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout = timeout
         self.enabled = enabled
-        # Context window to load the model with. Ollama otherwise defaults
-        # to the model's max (32k for qwen2.5), whose KV cache costs ~6 GB
-        # on a 14B model. Our prompts are a single CUE sheet or track list
-        # -- a few thousand tokens -- so a small window slashes VRAM with
-        # no quality loss. 8192 tokens -> ~1.5 GB KV (vs ~6 GB at 32768).
+        # Context window to load the model with. It must be the SAME as every
+        # other client of this Ollama (Home Assistant's agent): a runner loaded
+        # at another num_ctx is reloaded on the next request that differs, and
+        # a 27B reload costs both sides the model for several seconds and the
+        # prompt cache for good. When the model is already resident, the call
+        # adopts the resident runner's context instead (see _generate).
         self.num_ctx = int(num_ctx)
-        # Tell Ollama to keep the model resident in VRAM between calls.
-        # Accepts Go-duration strings ("30m", "2h", "-1" for forever).
-        # This is the single biggest latency win for a ~20 GB model like
-        # qwen2.5:32b -- without it, every cold call pays the load cost.
-        # Default is generous (2h) because pipeline idle gaps during big
-        # backlogs can easily exceed 30 minutes between LLM calls.
+        # How long Ollama keeps the model resident after a call, in seconds
+        # (Go duration strings are accepted). A LONGER residency somebody else
+        # set -- Home Assistant pins the voice model with -1 -- is never
+        # shortened by our calls; see _keep_alive_for.
+        self.keep_alive_s = keep_alive_seconds(keep_alive)
         self.keep_alive = keep_alive
+        # Thinking models (qwen3.x) spend a short num_predict entirely on
+        # hidden reasoning and return an EMPTY answer, so every call says
+        # think:false. None leaves it out (a model or server that rejects it).
+        self.think = think
+        self._think_rejected = False
+        # Decides whether the model may be asked right now (llm_gate.GpuGate).
+        # None: always ask.
+        self.gate = gate
+        # Read timeout when the call has to load the model first.
+        self.load_timeout = float(load_timeout)
         self.session = requests.Session()
-        # Guard against stacking re-warm threads if timeouts cluster.
-        self._rewarm_lock = threading.Lock()
         # "Model not installed" is a permanent condition until someone pulls it,
         # so it is reported ONCE with the fix rather than per call.
         self._missing_model_logged = False
-        self._rewarm_in_flight = False
+        self._ctx_adopt_logged = 0
+        self._empty_logged = False
         # Session-lifetime answer cache for album matching: the deselect
         # re-check and lifecycle passes ask the SAME (download, owned-albums)
         # question every cycle, so without this the model re-runs -- and the
-        # log re-spams "AI album match rejected" -- forever. Caches positive
-        # AND negative answers; cleared only by restart (library growth that
-        # changes the owned list changes the key, so staleness self-heals).
+        # log re-spams "AI album match rejected" -- forever. Caches ANSWERS,
+        # positive and negative -- never an UNAVAILABLE, which is asked again.
+        # Cleared only by restart (library growth changes the owned list and so
+        # the key, so staleness self-heals).
         self._match_cache: dict = {}
 
     # ---------- low-level ------------------------------------------------
+
+    def _keep_alive_for(self, verdict) -> int:
+        """Our keep_alive, but never shorter than what the resident model has
+        left: a keep_alive on a request REPLACES the runner's expiry, so a
+        plain 600 would cut Home Assistant's forever-pinned voice model down
+        to ten minutes."""
+        mine = self.keep_alive_s
+        if mine < 0:
+            return -1
+        left = getattr(verdict, "expires_in", 0.0) if verdict is not None else 0.0
+        if left == float("inf"):
+            return -1
+        return int(max(mine, left or 0.0))
 
     def _generate(
         self,
@@ -195,15 +280,34 @@ class OllamaClient:
         subject: str = "",
     ) -> str:
         if not self.enabled:
-            return ""
+            return UNAVAILABLE
+        verdict = None
+        if self.gate is not None:
+            verdict = self.gate.check()
+            if not verdict.open:
+                self.gate.note_deferred()
+                logger.debug("LLM %s: %s -> DEFERRED (%s)", label,
+                             _clip(subject) if subject else "(no subject)",
+                             verdict.reason)
+                return UNAVAILABLE
+        resident = bool(verdict is not None and verdict.resident)
         # Always cap output so a runaway (e.g. qwen getting stuck emitting
         # nested JSON structure under format=json) can't consume the entire
         # HTTP timeout. Callers may tighten further.
         options = {"temperature": 0.1}
         options["num_predict"] = num_predict if num_predict is not None else 2048
-        # Pin the context window so Ollama doesn't load the model at its
-        # full 32k max (huge KV cache). Keeps VRAM close to the weight size.
-        options["num_ctx"] = self.num_ctx
+        num_ctx = self.num_ctx
+        if resident and verdict.ctx and verdict.ctx != num_ctx:
+            # Someone (Home Assistant) loaded this model at another context.
+            # Asking at ours would reload it under them; ask at theirs.
+            if self._ctx_adopt_logged != verdict.ctx:
+                self._ctx_adopt_logged = verdict.ctx
+                logger.info("LLM: %s is resident at num_ctx %d (configured %d) -- "
+                            "using the resident context so it is not reloaded",
+                            self.model, verdict.ctx, num_ctx)
+            num_ctx = verdict.ctx
+        if num_ctx:
+            options["num_ctx"] = num_ctx
 
         payload = {
             "model": self.model,
@@ -211,25 +315,43 @@ class OllamaClient:
             "prompt": prompt,
             "stream": False,
             "options": options,
-            "keep_alive": self.keep_alive,
+            "keep_alive": self._keep_alive_for(verdict),
         }
+        if self.think is not None and not self._think_rejected:
+            payload["think"] = bool(self.think)
         if format_json:
             payload["format"] = "json"
-        # Per-call timeout can be shorter than self.timeout (which is the
-        # warmup/cold-load budget). Tag normalization is best-effort: we
-        # don't want the pipeline blocked for 5 minutes on it.
-        http_timeout = timeout if timeout is not None else self.timeout
+        # Per-call read timeout; a call that must load the model first gets the
+        # load budget on top. Connecting gets 3 s: a PC that is asleep does not
+        # answer at all, and waiting the whole read budget to learn that held a
+        # worker for minutes.
+        read = timeout if timeout is not None else self.timeout
+        if self.gate is not None and not resident:
+            read = max(read, self.load_timeout)
+        http_timeout = (3.05, read)
         # Every LLM call gets ONE log line. Without this a successful call is
         # completely invisible (only failures used to log), so there was no way
         # to tell "the LLM answered" apart from "the LLM was never asked" --
         # which made the fallback impossible to reason about in production.
         started = time.monotonic()
+        ok = False
+        if self.gate is not None:
+            self.gate.begin()
         try:
             r = self.session.post(
                 f"{self.base_url}/api/generate",
                 json=payload,
                 timeout=http_timeout,
             )
+            if (r.status_code == 400 and "think" in payload
+                    and "think" in (r.text or "").lower()):
+                # This model/server does not take the think flag at all.
+                self._think_rejected = True
+                payload.pop("think", None)
+                logger.info("LLM: %s does not accept 'think'; asking without it",
+                            self.model)
+                r = self.session.post(f"{self.base_url}/api/generate",
+                                      json=payload, timeout=http_timeout)
             r.raise_for_status()
             data = r.json()
             out = (data.get("response") or "").strip()
@@ -239,20 +361,32 @@ class OllamaClient:
                 _clip(out) if out else "EMPTY",
                 time.monotonic() - started,
             )
+            ok = True
+            if not out:
+                # An empty reply is not an answer. The usual cause is a thinking
+                # model that spent num_predict on hidden reasoning.
+                if not self._empty_logged:
+                    self._empty_logged = True
+                    logger.warning(
+                        "LLM %s returned an empty reply%s -- treated as "
+                        "unavailable, never as 'no'", self.model,
+                        " (it produced only hidden thinking)"
+                        if data.get("thinking") else "")
+                return UNAVAILABLE
             return out
-        except requests.exceptions.ReadTimeout as exc:
-            # With keep_alive=2h and a warmup at startup, a ReadTimeout on
-            # a warm model almost always means runaway generation rather
-            # than cold-loading. Re-warm is still cheap insurance in case
-            # Ollama dropped the model under memory pressure. The pipeline
-            # falls back to deterministic rules regardless.
+        except requests.exceptions.ConnectTimeout:
+            logger.info("LLM %s: Ollama at %s is not answering -- deferred",
+                        label, self.base_url)
+            return UNAVAILABLE
+        except requests.exceptions.ReadTimeout:
+            # The model is busy (one request at a time: Home Assistant's voice
+            # turn queues ahead of us) or still loading. Not an answer; the
+            # caller asks again later. No re-warm: loading the model is the
+            # gate's decision, never a side effect of a timeout.
             logger.warning(
-                "Ollama /api/generate timed out after %ss (best-effort; "
-                "falling back to deterministic path). %s",
-                http_timeout, exc,
-            )
-            self._schedule_rewarm()
-            return ""
+                "LLM %s: no reply within %ss -- deferred (not treated as 'no')",
+                label, read)
+            return UNAVAILABLE
         except Exception as exc:
             # A 404 from Ollama means THE MODEL IS NOT INSTALLED, not that the
             # endpoint or the server is missing -- and the bare
@@ -269,49 +403,39 @@ class OllamaClient:
                     "Ollama at %s has no model %r -- it is running but that model "
                     "is not installed, so every LLM call will fail. Installed "
                     "models: %s. Fix with: ollama pull %s   (the pipeline keeps "
-                    "working; it falls back to its deterministic paths)",
+                    "working; LLM decisions wait until the model is there)",
                     self.base_url, self.model,
                     ", ".join(have) if have else "NONE",
                     self.model)
             elif status != 404 or not self._missing_model_logged:
                 logger.warning("Ollama /api/generate failed: %s", exc)
-            return ""
+            return UNAVAILABLE
+        finally:
+            if self.gate is not None:
+                self.gate.end(loaded_by_us=ok and not resident,
+                              ha_on=bool(verdict is not None and verdict.ha_on))
 
     def _installed_models(self) -> List[str]:
         """Model names Ollama actually has, for the missing-model diagnostic.
         Empty on any failure -- this only ever decorates an error message."""
         try:
-            r = self.session.get("%s/api/tags" % self.base_url, timeout=10)
+            r = self.session.get("%s/api/tags" % self.base_url, timeout=(3.05, 10))
             r.raise_for_status()
             return [str(m.get("name") or "") for m in (r.json().get("models") or [])]
         except Exception:  # noqa: BLE001
             return []
 
-    def _schedule_rewarm(self) -> None:
-        """
-        Fire a background warmup. Idempotent: if a re-warm is already in
-        flight, we skip. Never raises into the caller.
-        """
-        with self._rewarm_lock:
-            if self._rewarm_in_flight:
-                return
-            self._rewarm_in_flight = True
-
-        def _run():
-            try:
-                self.warmup()
-            finally:
-                with self._rewarm_lock:
-                    self._rewarm_in_flight = False
-
-        t = threading.Thread(target=_run, name="ollama-rewarm", daemon=True)
-        t.start()
+    def available(self) -> bool:
+        """May the model be asked right now? (The gate's verdict, cached.)"""
+        if not self.enabled:
+            return False
+        return True if self.gate is None else self.gate.check().open
 
     def ping(self) -> bool:
         if not self.enabled:
             return False
         try:
-            r = self.session.get(f"{self.base_url}/api/tags", timeout=5)
+            r = self.session.get(f"{self.base_url}/api/tags", timeout=(3.05, 5))
             r.raise_for_status()
             return True
         except Exception as exc:
@@ -320,12 +444,17 @@ class OllamaClient:
 
     def warmup(self) -> bool:
         """
-        Force Ollama to load the model into VRAM and pin it there via
-        keep_alive. Uses a trivial prompt so the load cost is paid up
-        front at service startup rather than in the middle of the first
-        real call. Returns True if the model is now loaded.
+        Load the model now -- only when the gate is open, so a warmup can never
+        load it onto a GPU somebody else is using. Nothing calls this by
+        default any more: the model is loaded by the first question that needs
+        it (load on demand), and a warmup at startup held VRAM on a shared PC
+        for work that might never come. Returns True if the model is loaded.
         """
         if not self.enabled:
+            return False
+        verdict = self.gate.check(force=True) if self.gate is not None else None
+        if verdict is not None and not verdict.open:
+            logger.info("LLM warmup skipped: %s", verdict.reason)
             return False
         payload = {
             "model": self.model,
@@ -334,24 +463,33 @@ class OllamaClient:
             # Load at the SAME num_ctx the real calls use, so warmup doesn't
             # load a 32k-context model that the first real call then reloads.
             "options": {"num_predict": 1, "temperature": 0.0, "num_ctx": self.num_ctx},
-            "keep_alive": self.keep_alive,
+            "keep_alive": self._keep_alive_for(verdict),
         }
+        if self.think is not None and not self._think_rejected:
+            payload["think"] = bool(self.think)
+        if self.gate is not None:
+            self.gate.begin()
+        ok = False
         try:
-            # Generous timeout -- this is specifically the cold-load path.
             r = self.session.post(
                 f"{self.base_url}/api/generate",
                 json=payload,
-                timeout=max(self.timeout, 600),
+                timeout=(3.05, max(self.timeout, self.load_timeout)),
             )
             r.raise_for_status()
+            ok = True
             logger.info(
                 "Ollama warmup succeeded; model %s is resident (keep_alive=%s)",
-                self.model, self.keep_alive,
+                self.model, payload["keep_alive"],
             )
             return True
         except Exception as exc:
             logger.warning("Ollama warmup failed: %s", exc)
             return False
+        finally:
+            if self.gate is not None:
+                self.gate.end(loaded_by_us=ok and not (verdict and verdict.resident),
+                              ha_on=bool(verdict is not None and verdict.ha_on))
 
     # ---------- CUE repair ----------------------------------------------
 
@@ -363,7 +501,7 @@ class OllamaClient:
         )
         out = self._generate(_CUE_REPAIR_SYSTEM, prompt, label="repair_cue")
         if not out:
-            return ""
+            return out          # "" or UNAVAILABLE -- the caller tells them apart
         # Some models wrap in code fences despite instructions; strip them.
         out = out.strip()
         if out.startswith("```"):
@@ -385,8 +523,10 @@ class OllamaClient:
         returns must appear in the folder name, else we return ("","") -- so it
         can't invent an unrelated artist/album.
         """
-        if not self.enabled or not folder_name:
+        if not folder_name:
             return "", ""
+        if not self.enabled:
+            return UNAVAILABLE, UNAVAILABLE
         prompt = (
             f"Album folder name with no separators:\n  {folder_name}\n\n"
             "Split it into the recording ARTIST and the ALBUM title. Ignore "
@@ -396,6 +536,8 @@ class OllamaClient:
         out = self._generate(_IDENTITY_SPLIT_SYSTEM, prompt,
                              num_predict=64, timeout=60.0,
                              label="parse_artist_album", subject=folder_name)
+        if is_unavailable(out):
+            return UNAVAILABLE, UNAVAILABLE
         ans = (out or "").strip().strip("`").strip()
         if "|" not in ans:
             return "", ""
@@ -404,8 +546,11 @@ class OllamaClient:
         artist, album = parts[0], parts[1]
         if not (artist and album):
             return "", ""
-        folder_words = set(re.findall(r"[a-z0-9]+", folder_name.lower()))
-        ret_words = set(re.findall(r"[a-z0-9]+", f"{artist} {album}".lower()))
+        # Words in any script (titlematch): the [a-z0-9] sets this used were
+        # EMPTY for a Cyrillic, Greek or CJK folder, so every such split was
+        # rejected however right it was.
+        folder_words = set(titlematch.tokens(folder_name))
+        ret_words = set(titlematch.tokens(artist)) | set(titlematch.tokens(album))
         if not ret_words or not ret_words <= folder_words:
             logger.info(
                 "AI identity split rejected (words not all in folder): "
@@ -421,8 +566,10 @@ class OllamaClient:
         `owned_titles`, or None. Hallucination-safe: the answer must map back
         to one of the supplied titles (exact or normalized) or we return None.
         """
-        if not self.enabled or not download_name or not owned_titles:
+        if not download_name or not owned_titles:
             return None
+        if not self.enabled:
+            return UNAVAILABLE
         cache_key = ("owned", download_name.strip().lower(),
                      frozenset(t.strip().lower() for t in owned_titles))
         if cache_key in self._match_cache:
@@ -437,6 +584,8 @@ class OllamaClient:
         out = self._generate(_ALBUM_MATCH_SYSTEM, prompt, num_predict=64,
                              timeout=60.0, label="pick_owned_album",
                              subject=f"{download_name} vs {len(owned_titles)} owned")
+        if is_unavailable(out):
+            return UNAVAILABLE      # not asked -- never cached as "none"
         ans = (out or "").strip().strip("`").strip().strip('"').strip("'").strip()
         if not ans or ans.upper() == "NONE":
             self._match_cache[cache_key] = None
@@ -464,25 +613,18 @@ class OllamaClient:
             )
             self._match_cache[cache_key] = None
             return None
-        # SAFETY GUARD: reject a match with no meaningful word overlap. A weak
-        # model, forced to pick from a list, will sometimes pair two unrelated
-        # albums by the same artist (e.g. "Before I Self Destruct" ->
-        # "Get Rich or Die Tryin'"). A legit edition/rename shares the core
-        # title words; a wrong pairing shares none. False positives here are
-        # costly (we'd skip an album you DON'T own), so err toward rejecting.
-        def _sig_words(s: str) -> set:
-            return {w for w in re.findall(r"[a-z0-9]+", (s or "").lower())
-                    if len(w) >= 4}
-        dw, mw = _sig_words(download_name), _sig_words(matched)
-        try:
-            from dedup_downloads import norm_title
-            nd, nm = norm_title(download_name), norm_title(matched)
-        except Exception:  # noqa: BLE001
-            nd = nm = ""
-        contained = bool(nd) and bool(nm) and (nd in nm or nm in nd)
-        if not (dw & mw) and not contained:
+        # SAFETY GUARD: reject a pick the two titles themselves contradict. A
+        # model forced to choose from a list will sometimes pair two unrelated
+        # albums by the same artist ("Before I Self Destruct" -> "Get Rich or
+        # Die Tryin'"), or take a lone letter for a title ("A" -> "The
+        # Album"), or one half of a two-in-one release for the whole. The rule
+        # is titlematch.same_record_evidence -- words of any script, judged by
+        # shape, not by a list of titles. False positives cost an album you
+        # DON'T own being skipped, so err toward rejecting.
+        why = titlematch.same_record_evidence(download_name, matched)
+        if not why:
             logger.info(
-                "AI album match rejected (no overlap): %r -> %r",
+                "AI album match rejected (titles share no evidence): %r -> %r",
                 download_name, matched,
             )
             self._match_cache[cache_key] = None
@@ -498,7 +640,8 @@ class OllamaClient:
             )
             self._match_cache[cache_key] = None
             return None
-        logger.info("AI album match ACCEPTED: %r -> %r", download_name, matched)
+        logger.info("AI album match ACCEPTED (%s): %r -> %r", why,
+                    download_name, matched)
         self._match_cache[cache_key] = matched
         return matched
 
@@ -518,8 +661,10 @@ class OllamaClient:
         match the album title; the caller re-verifies the pick against the
         album's track count before acting on it.
         """
-        if not self.enabled or not context or not candidate_titles:
+        if not context or not candidate_titles:
             return None
+        if not self.enabled:
+            return UNAVAILABLE
         cache_key = ("confirm", context.strip().lower()[:500],
                      frozenset(t.strip().lower() for t in candidate_titles))
         if cache_key in self._match_cache:
@@ -537,6 +682,8 @@ class OllamaClient:
             label="confirm_album",
             subject=f"{context.splitlines()[0] if context else ''} "
                     f"vs {len(candidate_titles)} candidates")
+        if is_unavailable(out):
+            return UNAVAILABLE      # not asked -- never cached as "none"
         ans = (out or "").strip().strip("`").strip().strip('"').strip("'").strip()
         result = None
         if ans and ans.upper() != "NONE":
@@ -609,28 +756,75 @@ class OllamaClient:
                 "keeping original tags. Preview: %s", preview.replace("\n", " "),
             )
             return None
-        if len(parsed) != len(plans):
-            # #7: ragged output is common with small local models. Don't throw
-            # the whole normalization away -- align by POSITION (extra items are
-            # ignored; a missing tail keeps the original tags). Quiet (debug) so
-            # it never spams the log.
-            logger.debug(
-                "Ollama tag normalize: ragged output (got %d, expected %d) -- "
-                "aligning by position, keeping originals for the remainder.",
-                len(parsed), len(plans),
-            )
+        return _merge_cosmetic(plans, parsed)
 
-        normalized: List[TagPlan] = []
-        for i, original in enumerate(plans):
-            patched = parsed[i] if i < len(parsed) else None
-            if not isinstance(patched, dict):
-                normalized.append(original)
-                continue
-            # Only accept string values for the fields we know; anything else
-            # falls back to the original.
-            safe = {}
-            for field_name in original.__dataclass_fields__:
-                val = patched.get(field_name, getattr(original, field_name))
-                safe[field_name] = val if isinstance(val, str) else getattr(original, field_name)
-            normalized.append(replace(original, **safe))
-        return normalized
+
+# Fields the LLM may touch, and only cosmetically (see _merge_cosmetic). Track
+# numbers, totals, dates, ISRCs, genres and comments are facts it cannot know
+# better than the CUE -- they are never taken from it.
+_COSMETIC_FIELDS = ("title", "album", "artist", "albumartist")
+
+# Bracketed rip/format junk the prompt asks the model to remove.
+_TAG_JUNK_RE = re.compile(
+    r"[\[\(\{][^\]\)\}]*\b(?:\d{2,4}\s*kbps|kbps|flac|mp3|ape|wav|lossless|"
+    r"cd\s*rip|web|vinyl\s*rip|\d+\s*cd|remaster(?:ed)?\s+bonus)\b[^\]\)\}]*[\]\)\}]",
+    re.I)
+_FEAT_RE = re.compile(r"\b(?:featuring|feat\.?|ft\.?)(?=\s)", re.I)
+
+
+def _tag_core(s: str) -> str:
+    """What a tag SAYS, with case, punctuation and 'feat.' spelling removed."""
+    s = _FEAT_RE.sub("feat", s or "")
+    return "".join(ch for ch in s.casefold() if ch.isalnum())
+
+
+def _is_cosmetic(before: str, after: str) -> bool:
+    """`after` is `before` re-cased/re-punctuated, or with junk tags removed."""
+    if not isinstance(after, str) or not after.strip():
+        return False
+    core = _tag_core(after)
+    return core == _tag_core(before) or core == _tag_core(_TAG_JUNK_RE.sub("", before))
+
+
+def _merge_cosmetic(plans, parsed):
+    """
+    Take the model's cosmetic fixes and nothing else. Output is paired with
+    input by TRACK NUMBER, never by position: a model that drops one element of
+    twelve used to shift every later title and number onto the wrong file.
+    Unless the numbers pair one to one, the whole normalization is discarded.
+    """
+    def key(v) -> str:
+        return str(v or "").strip().lstrip("0") or "0"
+
+    by_no = {}
+    for item in parsed:
+        if not isinstance(item, dict):
+            return None
+        k = key(item.get("tracknumber"))
+        if k in by_no:
+            logger.debug("Ollama tag normalize: duplicate track %s -- ignored", k)
+            return None
+        by_no[k] = item
+    want = [key(p.tracknumber) for p in plans]
+    if len(set(want)) != len(want) or set(by_no) != set(want):
+        logger.debug("Ollama tag normalize: track numbers do not pair one to one "
+                     "(got %d, expected %d) -- keeping original tags",
+                     len(by_no), len(plans))
+        return None
+    merged: List[TagPlan] = []
+    changed = 0
+    for original in plans:
+        item = by_no[key(original.tracknumber)]
+        fix = {}
+        for f in _COSMETIC_FIELDS:
+            before = getattr(original, f)
+            after = item.get(f, before)
+            if isinstance(after, str) and after != before and _is_cosmetic(before, after):
+                fix[f] = after.strip()
+        if fix:
+            changed += 1
+        merged.append(replace(original, **fix) if fix else original)
+    if changed:
+        logger.info("Ollama tag normalize: cosmetic fixes on %d of %d track(s)",
+                    changed, len(plans))
+    return merged

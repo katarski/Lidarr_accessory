@@ -46,6 +46,8 @@ import logging
 import os
 import re
 import unicodedata
+
+import titlematch
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -71,7 +73,7 @@ def norm_title(s: Any) -> str:
     handles that separately and deliberately.
     """
     t = re.sub(r"\(.*?\)|\[.*?\]|\{.*?\}", " ", str(s or ""))
-    t = t.lower().replace("&", " and ")
+    t = titlematch.fold(t)
     t = re.sub(r"^\s*the\s+", "", t)
     # Expand the abbreviations a tagger and a metadata source disagree on.
     # Punctuation is stripped below, so "Pt. 1" and "Part 1" collapse to
@@ -85,7 +87,9 @@ def norm_title(s: Any) -> str:
     t = re.sub(r"\bpt\b\.?", "part", t)
     t = re.sub(r"\bvols\b\.?", "volumes", t)
     t = re.sub(r"\bvol\b\.?", "volume", t)
-    return re.sub(r"[^a-z0-9]", "", t)
+    # Letters of any script: [^a-z0-9] turned every CJK/Greek/Arabic title
+    # into "" and so into the same key.
+    return "".join(titlematch._runs(t))
 
 
 def artist_key(s: Any) -> str:
@@ -99,9 +103,7 @@ def artist_key(s: Any) -> str:
     first also lets the caller's substring test do its job, since "tiesto" IS
     contained in "djtiesto".
     """
-    t = unicodedata.normalize("NFKD", str(s or ""))
-    t = "".join(c for c in t if not unicodedata.combining(c))
-    return re.sub(r"[^a-z0-9]", "", t.lower().replace("&", "and"))
+    return titlematch.key(str(s or ""))
 
 
 def artist_tokens(s: Any) -> frozenset:
@@ -113,10 +115,7 @@ def artist_tokens(s: Any) -> frozenset:
     'Frida Leider' (the Wagner soprano) and 'Frida Boccara', because 'frida' is
     a prefix of 'fridaleider'. Words cannot do that.
     """
-    t = unicodedata.normalize("NFKD", str(s or ""))
-    t = "".join(c for c in t if not unicodedata.combining(c))
-    t = t.lower().replace("&", " and ")
-    return frozenset(w for w in re.split(r"[^a-z0-9]+", t) if w)
+    return frozenset(titlematch.words(str(s or "")))
 
 
 def _credit_names(s: Any) -> List[frozenset]:

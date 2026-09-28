@@ -29,6 +29,10 @@ from typing import Any, Dict
 
 import yaml
 
+import claims
+import titlematch
+from ollama_client import is_unavailable
+
 # Windows consoles default to cp1252 and choke on album names with curly
 # quotes, accents, emoji, etc. Force UTF-8 so printing paths never crashes.
 for _s in (sys.stdout, sys.stderr):
@@ -49,7 +53,8 @@ def is_disc_folder(name: str) -> bool:
     cd/disc/disk token only counts when the whole folder name is short
     (<=3 tokens), i.e. the name's whole purpose is naming a disc.
     """
-    toks = [t for t in re.split(r"[^a-z0-9]+", (name or "").lower()) if t]
+    # Folded words of any script, so a Cyrillic "Диск 2" reads as "disk 2".
+    toks = titlematch.words(name or "")
     for tok in toks:
         if re.match(r"^(cd|disc|disk)\d+$", tok):   # cd1, disc2, disk3
             return True
@@ -58,16 +63,23 @@ def is_disc_folder(name: str) -> bool:
     return False
 
 
+_BRACKETS_RE = re.compile(r"[\(\[][^)\]]*[\)\]]")
+
+
 def norm_title(s: str) -> str:
     """
-    Aggressively normalize an album title for EQUALITY comparison:
-    lowercase, & -> and, drop ()/[] edition tags, strip all non-alphanumerics.
-    So "Traveler's Blues" == "Travelers Blues", "Up!" == "Up", and
-    "Rare Pearls" != "Pearl", "Congratulations Remixes [EP]" != "Congratulations".
+    Aggressively normalize an album title for EQUALITY comparison: folded
+    (titlematch.fold -- case, accents, '&' -> 'and', Cyrillic/Greek
+    transliterated), ()/[] edition tags dropped, everything but the letters
+    and digits of ANY script removed. So "Traveler's Blues" == "Travelers
+    Blues", "Up!" == "Up", and "Rare Pearls" != "Pearl",
+    "Congratulations Remixes [EP]" != "Congratulations".
+
+    The old [^a-z0-9] filter deleted every non-Latin letter: all Japanese,
+    Greek, Arabic and Korean titles keyed to "" and so equalled each other.
     """
-    s = (s or "").lower().replace("&", " and ")
-    s = re.sub(r"[\(\[][^)\]]*[\)\]]", " ", s)   # drop (Deluxe), [EP], (Japan)...
-    return re.sub(r"[^a-z0-9]+", "", s)
+    t = _BRACKETS_RE.sub(" ", titlematch.fold(s))
+    return "".join(titlematch._runs(t))
 
 
 # Edition / format / filler words that an UNBRACKETED download title may carry on
@@ -160,6 +172,46 @@ def _album_full(a: Dict[str, Any]) -> bool:
     return f > 0 and t > 0 and f >= t
 
 
+def _pick_among_same_title(same_title, album: str, folder_hint):
+    """
+    The album a download names, from the albums that share its title, as
+    (album or None, verdict or None). A verdict is returned instead of an album
+    when they cannot be told apart and one of them is incomplete.
+
+    SEVERAL ALBUMS, ONE TITLE. Weezer has seven records all called "Weezer" --
+    Blue, Green, Red, White, Teal, Black, Gold -- separated only by year and
+    Lidarr's `disambiguation`. Taking the first hit meant the complete Blue
+    Album answered for all of them, so a discography grab deselected the GREEN
+    album folder (2/10) as "already owned" and the torrent was left with
+    nothing to download.
+    """
+    if not same_title:
+        return None, None
+    if len(same_title) == 1:
+        return same_title[0], None
+    year = _year_of(folder_hint or album)
+    by_year = [a for a in same_title
+               if year and str(a.get("releaseDate") or "")[:4] == year]
+    if len(by_year) == 1:
+        return by_year[0], None
+    # Cannot tell them apart. If ANY of them is still incomplete, answer "not
+    # complete" -- deselecting on a coin flip is how the one album actually
+    # missing stops downloading.
+    incomplete = [a for a in same_title if not _album_full(a)]
+    if not incomplete:
+        return same_title[0], None
+    st = (incomplete[0].get("statistics") or {})
+    logger.info(
+        "  %r matches %d albums by that name (%s) -- %d still "
+        "incomplete, so NOT treating it as owned",
+        album[:40], len(same_title),
+        ", ".join(filter(None, (a.get("disambiguation")
+                                for a in same_title)))[:60],
+        len(incomplete))
+    return None, (False, int(st.get("trackFileCount") or 0),
+                  int(st.get("totalTrackCount") or 0))
+
+
 def album_complete_in_library(
     lidarr: LidarrClient, artist: str, album: str, _cache: dict = None, llm=None,
     out: dict = None, folder_hint: str = "",
@@ -172,7 +224,11 @@ def album_complete_in_library(
     `out`, when given, receives the matched Lidarr album record under "album"
     (however it was matched -- exact, word-subset or LLM). Callers that need to
     ask a follow-up question about the album should use it rather than redo the
-    matching, which is the delicate part.
+    matching, which is the delicate part. It also receives "artist" (the Lidarr
+    artist record, or None when Lidarr does not know the artist) and
+    "llm_deferred" = True when the answer hinged on the LLM and the LLM could
+    not be asked: the (False, 0, 0) that comes back then means "not decided",
+    and must not be remembered as "not in the library".
 
     Matching is EXACT on a normalized title against the artist's full album
     list -- not Lidarr's fuzzy find_album substring search, which both
@@ -195,39 +251,16 @@ def album_complete_in_library(
             arec = lidarr.find_artist(artist)
             albums = lidarr.list_albums_for_artist(arec["id"]) if arec else []
             _cache[akey] = (arec, albums)
+        if out is not None:
+            out["artist"] = arec
         if not arec:
             return False, 0, 0
         target = norm_title(album)
-        same_title = [a for a in albums if norm_title(a.get("title")) == target]
-        alb = same_title[0] if same_title else None
-        # SEVERAL ALBUMS, ONE TITLE. Weezer has seven records all called
-        # "Weezer" -- Blue, Green, Red, White, Teal, Black, Gold -- separated
-        # only by year and Lidarr's `disambiguation`. Taking the first hit
-        # meant the complete Blue Album answered for all of them, so a
-        # discography grab deselected the GREEN album folder (2/10) as
-        # "already owned" and the torrent was left with nothing to download.
-        if len(same_title) > 1:
-            year = _year_of(folder_hint or album)
-            by_year = [a for a in same_title
-                       if year and str(a.get("releaseDate") or "")[:4] == year]
-            if len(by_year) == 1:
-                alb = by_year[0]
-            else:
-                # Cannot tell them apart. If ANY of them is still incomplete,
-                # answer "not complete" -- deselecting on a coin flip is how
-                # the one album actually missing stops downloading.
-                incomplete = [a for a in same_title if not _album_full(a)]
-                if incomplete:
-                    st = (incomplete[0].get("statistics") or {})
-                    logger.info(
-                        "  %r matches %d albums by that name (%s) -- %d still "
-                        "incomplete, so NOT treating it as owned",
-                        album[:40], len(same_title),
-                        ", ".join(filter(None, (a.get("disambiguation")
-                                                for a in same_title)))[:60],
-                        len(incomplete))
-                    return (False, int(st.get("trackFileCount") or 0),
-                            int(st.get("totalTrackCount") or 0))
+        alb, verdict = _pick_among_same_title(
+            [a for a in albums if norm_title(a.get("title")) == target],
+            album, folder_hint)
+        if verdict is not None:
+            return verdict
         def _owned(a: Dict[str, Any]) -> bool:
             st = a.get("statistics") or {}
             f = int(st.get("trackFileCount") or 0)
@@ -243,18 +276,17 @@ def album_complete_in_library(
         # don't have. Prefer the owned album with the most words matched, so a
         # generic 1-word title can't win over a more specific fit.
         if alb is None:
-            dl_words = set(re.findall(r"[a-z0-9]+", album.lower()))
+            dl_words = set(titlematch.tokens(album))
             # A self-titled album's words ARE the artist name, which appears in
             # virtually every download by that artist -- so it must NOT be
             # eligible for the fuzzy word-subset match (it can still match
             # EXACTLY above). Without this, owning "Elton John" (self-titled)
             # would deselect "Elton John - <anything>".
-            artist_words = set(re.findall(r"[a-z0-9]+", artist.lower()))
+            artist_words = set(titlematch.tokens(artist))
             if dl_words:
                 best = None
                 for a in albums:
-                    ow_words = set(re.findall(
-                        r"[a-z0-9]+", (a.get("title") or "").lower()))
+                    ow_words = set(titlematch.tokens(a.get("title") or ""))
                     if ow_words and ow_words <= artist_words:
                         continue  # self-titled / artist-named -> exact-only
                     if (ow_words and ow_words <= dl_words and _owned(a)
@@ -272,11 +304,22 @@ def album_complete_in_library(
                             if a.get("title") and _owned(a)})
             if owned:
                 picked = llm.pick_owned_album(album, owned)
+                if is_unavailable(picked):
+                    if out is not None:
+                        out["llm_deferred"] = True
+                    return False, 0, 0
                 if picked:
-                    for a in albums:
-                        if a.get("title") == picked:
-                            alb = a
-                            break
+                    # The owned list is a SET of titles, so the answer names
+                    # a title, not an album. Several albums may carry it (a
+                    # complete 2011 "Evanescence" and a missing 1998 EP); the
+                    # same resolver as the exact match picks among them, or
+                    # answers "not complete" when it cannot tell.
+                    np_ = norm_title(picked)
+                    alb, verdict = _pick_among_same_title(
+                        [a for a in albums if norm_title(a.get("title")) == np_],
+                        album, folder_hint)
+                    if verdict is not None:
+                        return verdict
         if not alb:
             return False, 0, 0
         if out is not None:
@@ -348,6 +391,10 @@ def robust_rmtree(folder: Path, emit=print, attempts: int = 5) -> bool:
     attempts it does a manual bottom-up unlink and lets the share catch up.
     Returns True once the folder is gone.
     """
+    hit = claims.busy(folder)
+    if hit:
+        emit(f"  not deleting {folder} yet -- {hit} is being processed right now")
+        return False
     for i in range(attempts):
         try:
             shutil.rmtree(folder)
@@ -373,6 +420,55 @@ def robust_rmtree(folder: Path, emit=print, attempts: int = 5) -> bool:
                 pass
             time.sleep(1.5)
     return not folder.exists()
+
+
+# Lidarr's per-file verdict that a file is owned at the same or a better
+# quality -- the only proof that deleting a download loses nothing.
+NOT_AN_UPGRADE = "not an upgrade"
+_PARTIAL_EXTS = (".part", ".!qb", ".crdownload")
+
+
+def folder_fully_owned(lidarr, folder: Path, audios, artist_id=None):
+    """
+    Is EVERY audio file in `folder` already in the library at the same or a
+    better quality? (True, why) only when Lidarr's ManualImport maps each file
+    to a track AND rejects it as "Not an upgrade for existing track file(s)" --
+    Lidarr's own ownership-and-quality verdict, per file. (False, why) for
+    anything else: an unmapped file, a file Lidarr would import (a FLAC over
+    the library's MP3 is an upgrade), a Lidarr error. (None, why) when the
+    folder is gone. The ONE redundancy test: the pipeline's pre-split check
+    and the imported-downloads purge both ask it, instead of comparing track
+    COUNTS -- which deleted a song Lidarr did not know at all, and lossless
+    copies of albums the library holds as MP3.
+    """
+    folder = Path(folder)
+    if not folder.exists():
+        return None, "the folder is gone"
+    try:
+        partial = [f for f in folder.rglob("*") if f.suffix.lower() in _PARTIAL_EXTS]
+    except OSError as exc:
+        return False, "the folder cannot be read (%s)" % exc
+    if partial:
+        return False, "it is still downloading (%s)" % partial[0].name
+    if not audios:
+        return False, "it holds no audio"
+    if not artist_id:
+        return False, "Lidarr does not know the artist"
+    cands = lidarr.manual_import_candidates(
+        lidarr.windows_to_lidarr(folder), artist_id=int(artist_id))
+    if not cands:
+        return False, "Lidarr's import check returned nothing (or failed)"
+    by_path = {str(c.get("path") or ""): c for c in cands}
+    for f in audios:
+        c = by_path.get(lidarr.windows_to_lidarr(f))
+        if c is None or not c.get("tracks"):
+            return False, "%s matches no track in the library" % Path(f).name
+        reasons = [str(r.get("reason") or "").lower()
+                   for r in (c.get("rejections") or [])]
+        if not any(NOT_AN_UPGRADE in r for r in reasons):
+            return False, ("%s would be imported (Lidarr: %s)"
+                           % (Path(f).name, "; ".join(reasons) or "accepted"))
+    return True, "all %d file(s) are owned at the same or better quality" % len(audios)
 
 
 def purge_imported_downloads(
@@ -463,11 +559,19 @@ def purge_imported_downloads(
             artist, album = read_tags(a)
             if artist and album:
                 break
+        found: dict = {}
         complete, have, total = album_complete_in_library(
-            lidarr, artist, album, _cache=cache, llm=llm
+            lidarr, artist, album, _cache=cache, llm=llm, out=found
         )
-        if complete and total >= len(audios):
+        if not complete:
+            continue
+        owned, why = folder_fully_owned(
+            lidarr, folder, audios, (found.get("artist") or {}).get("id"))
+        if owned:
             dupes.append((folder, dir_size(folder), have, total))
+        else:
+            emit(f"purge: {folder.name}: album is complete in the library, but "
+                 f"{why} -- keeping it")
 
     # Delete each parent once -- drop any dupe nested under another dupe.
     dupe_paths = {f for f, *_ in dupes}
@@ -695,6 +799,8 @@ def main() -> int:
         removed = freed = 0
         for row in rows:
             f, s = row[0], row[1]
+            if claims.busy(f):
+                continue          # a worker is on it; the next pass decides
             try:
                 shutil.rmtree(f)
                 removed += 1

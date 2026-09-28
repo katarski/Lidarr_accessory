@@ -169,15 +169,35 @@ lidarr:
   # then set this false to actually reclaim the space.
   purge_imported_dry_run: true
   purge_imported_min_stable_seconds: 300
+# The LLM. Local Ollama is the default: set model AND num_ctx to exactly what
+# your Home Assistant agent uses, so the one runner in VRAM serves both (a
+# different num_ctx makes Ollama reload the model).
+#
+# GPU gate (llm_gate.py): a question is only asked while the GPU is idle, read
+# from Home Assistant's sensors for the PC that runs Ollama. A question that
+# cannot be asked is DEFERRED -- never recorded as a "no" -- and only the work
+# that needs the LLM waits; everything else carries on. Home Assistant not
+# answering at all means the model is ours to load. A model this container
+# loaded is released early (keep_alive 0) when the GPU is wanted elsewhere and
+# the voice switch is off.
 ollama:
-  base_url: https://generativelanguage.googleapis.com/v1beta/openai
-  model: gemini-2.0-flash
-  timeout_seconds: 300
-  keep_alive: 30m
-  num_ctx: 8192
-  warmup_on_start: true
   enabled: true
-  provider: openai
+  provider: ollama              # or openai (Gemini/OpenAI/Groq...: base_url + api_key)
+  base_url: http://daniel:11434
+  model: huihui_ai/Qwen3.6-abliterated:27b
+  num_ctx: 16384
+  keep_alive: 600               # seconds; never shortens what HA set on a resident model
+  think: false                  # thinking models spend the output budget on hidden text
+  timeout_seconds: 120          # per question; a model that must load first gets load_timeout
+  load_timeout_seconds: 180
+  warmup_on_start: false        # the first question loads the model, only when the GPU is idle
+  gpu_gate: true
+  ha_url: ''                    # e.g. https://homeassistant.example:8123 (env HA_URL)
+  ha_token: ''                  # long-lived token (env HA_TOKEN)
+  gpu_load_entity: sensor.daniel_gpuload
+  gpu_memory_entity: sensor.daniel_gpu_memory   # attribute `free` in MB
+  voice_switch_entity: input_boolean.voice_use_daniel
+  gpu_busy_load_pct: 50
   api_key: ''
 logging:
   level: INFO

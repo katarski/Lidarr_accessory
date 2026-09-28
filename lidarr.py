@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import unicodedata
 from dataclasses import dataclass
@@ -34,82 +35,12 @@ import requests
 logger = logging.getLogger(__name__)
 
 
-# Cyrillic -> Latin transliteration (Bulgarian/Russian/Ukrainian covered).
-# Needed so folder "Azis" matches Lidarr artist "Азис", folder "Bolka"
-# matches Lidarr album "Болка", etc. NFKD alone won't do this -- Cyrillic
-# letters are distinct code points, not Latin-with-diacritics.
-_CYRILLIC_TO_LATIN = {
-    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e",
-    "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l",
-    "м": "m", "н": "n", "о": "o", "п": "p", "р": "r", "с": "s",
-    "т": "t", "у": "u", "ф": "f", "х": "h", "ц": "ts", "ч": "ch",
-    "ш": "sh", "щ": "sht", "ъ": "a", "ь": "y", "ю": "yu", "я": "ya",
-    "ы": "y", "э": "e", "ё": "yo",
-    # Ukrainian extras
-    "є": "ye", "і": "i", "ї": "yi", "ґ": "g",
-    # Serbian / Macedonian extras (phonetic Latin)
-    "ј": "j", "љ": "lj", "њ": "nj", "ћ": "c", "ђ": "dj", "џ": "dz",
-    "ѕ": "dz", "ѓ": "g", "ќ": "k", "ѐ": "e", "ѝ": "i", "ѣ": "e",
-}
-
-
-def _translit_cyrillic(value: str) -> str:
-    """
-    Fold any Cyrillic characters in `value` to a rough Latin
-    transliteration. ASCII letters pass through untouched. Used as a
-    best-effort equalizer for cross-script name matching: the folder on
-    disk is often Latin ("Azis") while Lidarr stores the canonical
-    Cyrillic ("Азис"), or vice-versa.
-    """
-    if not value:
-        return value
-    # Fast path: no Cyrillic, nothing to do.
-    if not any("\u0400" <= ch <= "\u04ff" for ch in value):
-        return value
-    out = []
-    for ch in value:
-        lower = ch.lower()
-        rep = _CYRILLIC_TO_LATIN.get(lower)
-        if rep is None:
-            out.append(ch)
-        elif ch == lower:
-            out.append(rep)
-        else:
-            out.append(rep.capitalize() if len(rep) > 1 else rep.upper())
-    return "".join(out)
-
-
-def _demojibake(value: str) -> str:
-    """
-    Repair Cyrillic text that was written as cp1251 bytes and read back as
-    latin-1: 'Ëèëè Èâàíîâà' -> 'Лили Иванова', 'Òàíãî' -> 'Танго'.
-
-    Endemic in older Eastern-European rips -- most files in the Lili Ivanova
-    discography carry tags in this state, which is why Lidarr's manualimport
-    reported `artist=None album=None` for them.
-
-    The test is deliberately strict, because a naive "did this produce any
-    Cyrillic?" check mangles ordinary accented Latin: 'Beyoncé' round-trips to
-    'Beyoncй' (é is 0xE9, which is 'й' in cp1251) and then transliterates to
-    "beyoncy". Real mojibake is high-range almost throughout, so require at
-    least 3 such characters AND at least 40% of the letters. 'Ëèëè Èâàíîâà' is
-    11 of 11; 'Beyoncé' is 1 of 7 and is left alone.
-    """
-    if not value:
-        return value
-    letters = [c for c in value if c.isalpha()]
-    suspect = [c for c in letters if "À" <= c <= "ÿ"]
-    if len(suspect) < 3 or len(suspect) < 0.4 * len(letters):
-        return value
-
-    def _cyr(s: str) -> int:
-        return sum(1 for c in s if "Ѐ" <= c <= "ӿ")
-
-    try:
-        fixed = value.encode("latin-1").decode("windows-1251")
-    except (UnicodeEncodeError, UnicodeDecodeError):
-        return value
-    return fixed if _cyr(fixed) > _cyr(value) else value
+# The fold primitives live in titlematch (one fold for every matcher); they are
+# re-exported here under their old names for the modules that import them.
+from titlematch import (  # noqa: E402,F401
+    _CYRILLIC_TO_LATIN, _demojibake, _runs as _word_runs, _translit_cyrillic,
+    fold as _fold_text,
+)
 
 
 # A performer prefix a tracker/tagger adds that the canonical name omits.
@@ -120,17 +51,12 @@ _PERFORMER_PREFIX_RE = re.compile(r"(?i)^\s*(?:dj|mc|vj|dr)[\s.\-_]+")
 
 
 def _norm_artist(s: str) -> str:
-    """Fold an artist name for tolerant equality: casefold, strip accents
-    (NFKD, drop combining marks), '&' -> 'and', drop a leading 'the ', keep
-    [a-z0-9]. So 'Sigur Ros' == 'Sigur Rós', 'Motorhead' == 'Motörhead',
-    'AC and DC' == 'AC & DC', 'The Cure' == 'Cure'."""
-    # Fold script BEFORE the [^a-z0-9] filter, which deletes rather than
-    # ignores anything non-Latin: "Лили Иванова" normalized to the EMPTY
-    # string, so find_artist could never match a Cyrillic artist by its
-    # romanized name -- and every Cyrillic artist folded to the same "".
-    s = _translit_cyrillic(_demojibake(s or "")).casefold().replace("&", " and ")
-    s = "".join(c for c in unicodedata.normalize("NFKD", s)
-                if not unicodedata.combining(c))
+    """Fold an artist name for tolerant equality (titlematch.fold: case,
+    accents, '&' -> 'and', Cyrillic/Greek transliterated), drop a leading
+    'the ', keep the letters and digits of any script. So 'Sigur Ros' ==
+    'Sigur Rós', 'Motorhead' == 'Motörhead', 'AC and DC' == 'AC & DC',
+    'The Cure' == 'Cure', 'Lili Ivanova' == 'Лили Иванова'."""
+    s = _fold_text(s)
     s = re.sub(r"^\s*the\s+", "", s)
     # Drop a leading HONORIFIC. Lidarr/MusicBrainz carry the legal-ish name
     # ("Ms. Lauryn Hill") while every torrent and tag says "Lauryn Hill", so
@@ -144,15 +70,42 @@ def _norm_artist(s: str) -> str:
     # titles that are never themselves the name are removed, and only when
     # something follows them.
     s = re.sub(r"^\s*(?:ms|mrs|miss|mr)\.?\s+(?=\S)", "", s)
-    key = re.sub(r"[^a-z0-9]+", "", s)
-    # A name written in a script this filter cannot represent -- Arabic, CJK --
-    # folds to the EMPTY string, so every such artist collides with every
-    # other: 'عمرو دياب' and '北川保昌' shared one key. Cyrillic is handled by
-    # the transliteration above; for the rest, fall back to the codepoints so
-    # each name keeps a distinct, stable key of its own.
-    if not key and s.strip():
-        key = "u" + "".join("%x" % ord(c) for c in s.strip() if not c.isspace())
-    return key
+    # Letters of EVERY script are kept. The old [^a-z0-9] filter deleted
+    # them: an Arabic or CJK name folded to "" and every such artist collided
+    # with every other; "Røyksopp" lost its ø and never met "Royksopp".
+    return "".join(_word_runs(s))
+
+
+class LidarrUnavailable(requests.ConnectionError):
+    """Lidarr is not answering. Raised at once, without a request, while the
+    client's breaker is open (see LidarrClient._send)."""
+
+
+class _TrackedSession:
+    """The client's session, with every request passed through
+    LidarrClient._send so a failure is counted wherever it happens."""
+
+    def __init__(self, owner: "LidarrClient", inner: requests.Session):
+        self._owner, self._inner = owner, inner
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def request(self, method, url, **kw):
+        return self._owner._send(self._inner.request, method, url, **kw)
+
+    def get(self, url, **kw):
+        kw.setdefault("allow_redirects", True)
+        return self.request("GET", url, **kw)
+
+    def post(self, url, data=None, json=None, **kw):
+        return self.request("POST", url, data=data, json=json, **kw)
+
+    def put(self, url, data=None, **kw):
+        return self.request("PUT", url, data=data, **kw)
+
+    def delete(self, url, **kw):
+        return self.request("DELETE", url, **kw)
 
 
 @dataclass
@@ -184,7 +137,17 @@ class LidarrClient:
 
     def __init__(self, cfg: LidarrConfig, session: Optional[requests.Session] = None):
         self.cfg = cfg
-        self.session = session or requests.Session()
+        # Every read method here answers [] / None when Lidarr fails, which a
+        # caller cannot tell from "Lidarr has nothing": a 13-hour outage turned
+        # folders into `skipped_unmonitored` and CUEs into "gave up". So the
+        # session counts failures: `failure_generation` goes up on every
+        # transport failure or 5xx, and a caller that read it before its work
+        # knows whether what it saw can be trusted.
+        self.failure_generation = 0
+        self._down_until = 0.0
+        self._down_backoff = 0.0
+        self._down_lock = threading.Lock()
+        self.session = _TrackedSession(self, session or requests.Session())
         self.session.headers.update({"X-Api-Key": cfg.api_key})
         self.manualimport_timeout = int(
             getattr(cfg, "manualimport_timeout", 180) or 180)
@@ -221,8 +184,19 @@ class LidarrClient:
         if norm.lower().startswith(src.lower()):
             remainder = norm[len(src):].lstrip("/")
             return f"{dst}/{remainder}" if remainder else dst
-        # No mapping match -- return as-is; Lidarr will likely reject it.
-        logger.warning("Path %s is not under mapped prefix %s", norm, src)
+        # The LIBRARY is the other root both sides know: a library path maps
+        # through library_root_windows -> library_root_lidarr (the same path
+        # when the mounts agree). It used to fall through to the warning below
+        # -- 1,612 false warnings for /music paths Lidarr accepted fine.
+        lsrc = str(getattr(self.cfg, "library_root_windows", "") or "").replace("\\", "/").rstrip("/")
+        ldst = str(getattr(self.cfg, "library_root_lidarr", "") or "").rstrip("/")
+        if lsrc and ldst and (norm.lower() == lsrc.lower()
+                              or norm.lower().startswith(lsrc.lower() + "/")):
+            remainder = norm[len(lsrc):].lstrip("/")
+            return f"{ldst}/{remainder}" if remainder else ldst
+        # Under no known root -- return as-is; Lidarr will likely reject it.
+        logger.warning("Path %s is not under mapped prefix %s (nor the library "
+                       "root %s)", norm, src, lsrc or "(unset)")
         return norm
 
     # ---- HTTP helpers ----------------------------------------------------
@@ -1127,6 +1101,61 @@ class LidarrClient:
             logger.warning("get_artist(%s) failed: %s", artist_id, exc)
             return None
 
+    # ---- failure accounting (see __init__) ------------------------------
+
+    _BACKOFF_FIRST = 5.0
+    _BACKOFF_MAX = 60.0
+
+    def _send(self, fn, method, url, **kw):
+        """One request. While Lidarr is known down, fail at once -- the first
+        call after the backoff is the probe (no timer). A connection failure
+        or 5xx opens the breaker; a read timeout only counts (Lidarr is slow,
+        not gone -- a ManualImport can take minutes)."""
+        now = time.monotonic()
+        with self._down_lock:
+            down = now < self._down_until
+            if down:
+                self.failure_generation += 1
+        if down:
+            raise LidarrUnavailable("Lidarr is not answering (breaker open)")
+        try:
+            r = fn(method, url, **kw)
+        except requests.exceptions.ReadTimeout:
+            with self._down_lock:
+                self.failure_generation += 1
+            raise
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            self._went_down(exc)
+            raise
+        if r.status_code >= 500:
+            self._went_down("HTTP %d" % r.status_code)
+        else:
+            self._answered()
+        return r
+
+    def _went_down(self, why) -> None:
+        with self._down_lock:
+            self.failure_generation += 1
+            first = self._down_backoff == 0.0
+            self._down_backoff = (self._BACKOFF_FIRST if first
+                                  else min(self._BACKOFF_MAX, self._down_backoff * 2))
+            self._down_until = time.monotonic() + self._down_backoff
+        if first:
+            logger.warning("Lidarr is not answering (%s) -- Lidarr work waits, and "
+                           "nothing decided while it fails is recorded", why)
+
+    def _answered(self) -> None:
+        with self._down_lock:
+            was_down = self._down_backoff != 0.0
+            self._down_backoff = 0.0
+            self._down_until = 0.0
+        if was_down:
+            logger.info("Lidarr is answering again")
+
+    def available(self) -> bool:
+        """False while the breaker is open. Never probes."""
+        return time.monotonic() >= self._down_until
+
     def artists(self, force: bool = False) -> List[Dict[str, Any]]:
         """Lidarr's artist list, cached briefly.
 
@@ -1143,7 +1172,11 @@ class LidarrClient:
         try:
             fetched = self._get("/api/v1/artist")
         except Exception as exc:  # noqa: BLE001
-            logger.error("Artist list fetch failed: %s", exc)
+            # One line per outage (from _went_down), not one per lookup: the
+            # 27 Sep outage wrote 25,427 of these.
+            (logger.debug
+             if isinstance(exc, (requests.ConnectionError, requests.Timeout))
+             else logger.error)("Artist list fetch failed: %s", exc)
             return self._artists or []
         if isinstance(fetched, list):
             self._artists = fetched

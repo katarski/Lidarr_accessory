@@ -35,6 +35,8 @@ import re
 import threading
 import time
 import unicodedata
+
+import titlematch
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -66,9 +68,9 @@ _TRAIL_DISC_RE = re.compile(
 
 
 def _fold(s: str) -> str:
-    """Accent-fold + lowercase."""
-    s = unicodedata.normalize("NFKD", s or "")
-    return "".join(c for c in s if not unicodedata.combining(c)).lower()
+    """titlematch.fold: the one fold every matcher shares (case, accents,
+    '&' -> 'and', Cyrillic/Greek transliterated, kana voicing kept)."""
+    return titlematch.fold(s)
 
 
 def norm_title(s: str) -> str:

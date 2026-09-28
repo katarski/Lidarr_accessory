@@ -27,7 +27,7 @@ from watchdog.observers import Observer
 from watchdog.observers.polling import PollingObserver
 
 from lidarr import LidarrClient, LidarrConfig
-from ollama_client import OllamaClient
+from llm_gate import build_llm
 from orchestrator import Orchestrator, OrchestratorConfig
 
 logger = logging.getLogger("cue_pipeline")
@@ -43,6 +43,12 @@ def load_config(path: Path) -> Dict[str, Any]:
 
 def _as_bool(v: str) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+
+# (section, key) -> the container variable that set it, so a Settings-tab value
+# silently beating a template variable can be reported (see
+# apply_webui_overrides).
+_ENV_SET: Dict[Any, str] = {}
 
 
 def apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
@@ -66,6 +72,7 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
             return
         try:
             cfg[section][key] = cast(v)
+            _ENV_SET[(section, key)] = env
         except (TypeError, ValueError):
             logger.warning("Ignoring bad env %s=%r", env, v)
 
@@ -79,6 +86,20 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     put("ollama", "base_url", "LLM_BASE_URL")
     put("ollama", "model", "LLM_MODEL")
     put("ollama", "api_key", "LLM_API_KEY")
+    # Same model AND same context window as Home Assistant's agent, so the one
+    # runner in VRAM serves both (a different num_ctx reloads the model).
+    put("ollama", "num_ctx", "LLM_NUM_CTX", int)
+    put("ollama", "keep_alive", "LLM_KEEP_ALIVE")
+    put("ollama", "think", "LLM_THINK", _as_bool)
+    # GPU gate (llm_gate.py): the LLM is only asked while the GPU is idle,
+    # read from Home Assistant's sensors for the PC that runs Ollama.
+    put("ollama", "gpu_gate", "LLM_GPU_GATE", _as_bool)
+    put("ollama", "ha_url", "HA_URL")
+    put("ollama", "ha_token", "HA_TOKEN")
+    put("ollama", "gpu_load_entity", "GPU_LOAD_ENTITY")
+    put("ollama", "gpu_memory_entity", "GPU_MEMORY_ENTITY")
+    put("ollama", "voice_switch_entity", "VOICE_SWITCH_ENTITY")
+    put("ollama", "gpu_busy_load_pct", "GPU_BUSY_LOAD_PCT", float)
     # Cleanup behavior (destructive -- nice to see/toggle in the UI)
     put("staging", "delete_source_folder_on_success", "DELETE_SOURCE_FOLDER", _as_bool)
     put("staging", "delete_originals_on_success", "DELETE_ORIGINALS", _as_bool)
@@ -264,7 +285,9 @@ def _save_deselect_ledger(path: Optional[Path], planned: Dict[str, float],
         data = dict(planned)
         if max_age_days > 0:
             cutoff = time.time() - max_age_days * 86400.0
-            data = {h: ts for h, ts in data.items() if ts >= cutoff}
+            # A negative stamp is a torrent waiting for the LLM (see
+            # qbt_deselect.auto_deselect_pass); its age is its magnitude.
+            data = {h: ts for h, ts in data.items() if abs(ts) >= cutoff}
         p = Path(path)
         tmp = p.with_suffix(p.suffix + ".tmp")
         tmp.write_text(json.dumps(data), encoding="utf-8")
@@ -292,6 +315,18 @@ def apply_webui_overrides(cfg: Dict[str, Any], path: Path) -> Dict[str, Any]:
             if isinstance(kv, dict):
                 cfg.setdefault(section, {})
                 for k, v in kv.items():
+                    env = _ENV_SET.get((section, k))
+                    if env and cfg[section].get(k) != v:
+                        # The Settings tab wins, silently: a stale saved
+                        # ollama.model once overrode LLM_MODEL for weeks and the
+                        # template showed a model that was never used.
+                        secret = any(w in k.lower() for w in ("key", "token", "pass"))
+                        logging.getLogger("cue_pipeline").warning(
+                            "Settings tab value for %s.%s%s overrides the container "
+                            "variable %s%s -- clear it in the Settings tab to use "
+                            "the variable", section, k,
+                            "" if secret else " (%r)" % (v,), env,
+                            "" if secret else " (%r)" % (cfg[section].get(k),))
                     cfg[section][k] = v
     except Exception as exc:  # noqa: BLE001
         logging.getLogger("cue_pipeline").warning(
@@ -488,16 +523,19 @@ def cueless_sweep_loop(
     Minimum cadence is 60s to keep SMB happy. 0 means startup-only and
     this thread never runs.
     """
+    # ONE thread: its first pass is the startup pass, then the cadence. A
+    # separate startup thread ran beside this loop's first tick (60 s later,
+    # while a pass takes the better part of an hour) and every folder was
+    # handed off twice.
     cadence = max(60, interval)
-    # Small stagger so the first sweep doesn't fight the startup scan
-    # for SMB I/O.
-    first_delay = min(cadence, 120)
-    delay = first_delay
+    delay = 0
     while not stop.wait(delay):
         try:
             orch.sweep_cueless_pre_split_folders(watch_root, excluded)
         except Exception as exc:  # noqa: BLE001
             logger.exception("cueless sweep thread: %s", exc)
+        if interval <= 0:
+            return                 # startup-only
         delay = cadence
 
 
@@ -1167,54 +1205,28 @@ def main() -> int:
         )
     )
 
-    ollama_client = None
-    if ollama_cfg.get("enabled", True):
-        provider = str(ollama_cfg.get("provider", "ollama")).lower()
-        if provider in ("openai", "gemini", "cloud", "openai-compatible"):
-            from cloud_llm import CloudLLMClient
-            ollama_client = CloudLLMClient(
-                base_url=ollama_cfg["base_url"],
-                model=ollama_cfg["model"],
-                api_key=str(ollama_cfg.get("api_key", "")),
-                timeout=int(ollama_cfg.get("timeout_seconds", 60)),
-                enabled=True,
-                rpm=int(ollama_cfg.get("rpm", 10)),
-                max_wait_seconds=float(ollama_cfg.get("max_wait_seconds", 30)),
-                max_retries=int(ollama_cfg.get("max_retries", 3)),
-                cooldown_seconds=float(ollama_cfg.get("cooldown_seconds", 900)),
-            )
-            label = (f"cloud LLM ({provider}, model={ollama_cfg['model']}, "
-                     f"{ollama_cfg.get('rpm', 10)} req/min)")
-        else:
-            ollama_client = OllamaClient(
-                base_url=ollama_cfg["base_url"],
-                model=ollama_cfg["model"],
-                timeout=int(ollama_cfg.get("timeout_seconds", 300)),
-                enabled=True,
-                keep_alive=str(ollama_cfg.get("keep_alive", "30m")),
-                num_ctx=int(ollama_cfg.get("num_ctx", 8192)),
-            )
-            label = f"Ollama ({ollama_cfg['base_url']}, model={ollama_cfg['model']})"
+    # One client for the whole process (see llm_gate.build_llm): it asks only
+    # while the GPU gate is open, and a question it cannot ask comes back
+    # UNAVAILABLE -- deferred by the caller, never recorded as a "no".
+    ollama_client, label = build_llm(ollama_cfg)
+    if ollama_client is not None:
         if ollama_client.ping():
             logger.info("LLM reachable: %s", label)
-            # Local Ollama benefits from a warmup (VRAM preload); cloud is
-            # a no-op. IN A BACKGROUND THREAD, because it is not fatal but it
-            # IS slow and it was running inline on the startup path: when the
-            # GPU is already busy with somebody else's model (seen live --
-            # a 27B occupying 16.7 GB while this asks for a 14B) Ollama simply
-            # does not answer, and the whole pipeline hung there. The WebUI
-            # never bound its port, the watcher never started, and the only
-            # symptom was a log that stopped after "LLM reachable".
-            if ollama_cfg.get("warmup_on_start", True):
-                threading.Thread(
-                    target=ollama_client.warmup, daemon=True,
-                    name="cue-llm-warmup",
-                ).start()
-                logger.info(
-                    "LLM warmup started in the background -- startup continues "
-                    "regardless of how long the model takes to load")
         else:
-            logger.warning("LLM unreachable (%s) -- continuing without LLM fallback", label)
+            # Not fatal and not final: the PC running Ollama may simply be
+            # asleep. Every question waits for it through the gate.
+            logger.warning("LLM not reachable yet (%s) -- LLM decisions wait "
+                           "until it is; everything else carries on", label)
+        # Warmup is OFF by default: the model is loaded by the first question
+        # that needs it, and only when the GPU is idle. A startup warmup held
+        # VRAM on a shared PC for work that might never come. When enabled it
+        # still goes through the gate, in the background (it once hung the
+        # whole startup behind somebody else's model).
+        if _as_bool(ollama_cfg.get("warmup_on_start", False)):
+            threading.Thread(
+                target=ollama_client.warmup, daemon=True,
+                name="cue-llm-warmup",
+            ).start()
 
     # Optional AcoustID fingerprint identifier (best-effort; identifies a
     # pre-split folder whose tags can't, so it can still be imported).
@@ -1754,6 +1766,11 @@ def main() -> int:
     cue_seen: set = set()
     handler = CueEventHandler(q, excluded_dirs, seen=cue_seen)
 
+    def _requeue_cue(cue: Path) -> None:
+        cue_seen.discard(str(cue))
+        enqueue_cue(q, cue, cue_seen)
+    orch.requeue_cue = _requeue_cue
+
     # Watchdog's default Observer uses ReadDirectoryChangesW on Windows.
     # Over a UNC share (\\host\share\...), change notifications depend on
     # the SMB server forwarding them -- which is unreliable in practice
@@ -1824,40 +1841,21 @@ def main() -> int:
             orch_cfg.sweep_interval_seconds,
         )
 
-        def _startup_cueless_sweep() -> None:
-            try:
-                orch.sweep_cueless_pre_split_folders(watch_root, excluded_dirs)
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("cueless sweep (startup): %s", exc)
-
-        # Run as a daemon thread: with a large download backlog this pass can
-        # take a very long time (each ManualImport may wait for Lidarr), and it
-        # used to run synchronously here -- which delayed the queue reaper and
-        # qBit auto-deselect threads (started further down) from ever starting.
-        threading.Thread(
-            target=_startup_cueless_sweep,
-            daemon=True,
-            name="cue-cueless-startup",
-        ).start()
-
-        if orch_cfg.sweep_interval_seconds > 0:
-            sweep_thread = threading.Thread(
-                target=cueless_sweep_loop,
-                args=(
-                    orch,
-                    watch_root,
-                    excluded_dirs,
-                    stop,
-                    orch_cfg.sweep_interval_seconds,
-                ),
-                daemon=True,
-                name="cue-cueless-sweep",
-            )
-            sweep_thread.start()
-            logger.info(
-                "Cueless sweep: periodic thread started (interval=%ds)",
+        # Startup pass first, then every interval -- in the background, so it
+        # never delays the queue reaper and qBit threads started below.
+        sweep_thread = threading.Thread(
+            target=cueless_sweep_loop,
+            args=(
+                orch,
+                watch_root,
+                excluded_dirs,
+                stop,
                 orch_cfg.sweep_interval_seconds,
-            )
+            ),
+            daemon=True,
+            name="cue-cueless-sweep",
+        )
+        sweep_thread.start()
 
     # --- Reconcile: import monitored gaps still sitting in downloads ---
     # Catch-all safety net so a downloaded album can never stay un-merged

@@ -33,16 +33,19 @@ import subprocess
 import threading
 import time
 import unicodedata
+
+import claims
+import titlematch
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from cue_parser import Cue, parse_cue
+from cue_parser import Cue, LLMUnavailableError, parse_cue
 from dedup_downloads import _EDITION_WORDS as _EDITION_NOISE_WORDS
 from held_store import HeldStore
 from lidarr import LidarrClient, _demojibake, _translit_cyrillic
-from ollama_client import OllamaClient
+from ollama_client import OllamaClient, is_unavailable
 from splitter import SplitResult, probe_duration, repair_leadin, split_cue
 from tagger import TagPlan, album_folder_name, tag_splits
 
@@ -58,7 +61,6 @@ _FS_INVALID = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 # cosmetic punctuation differences (e.g. disk must use "-" where Lidarr
 # stores ":", trailing year suffixes, "The "/"A " prefixes, commas,
 # ampersands vs "and", etc.).
-_MATCH_NON_ALNUM = re.compile(r"[^a-z0-9]+")
 _MATCH_LEADING_ARTICLE = re.compile(r"^(the|a|an)\s+")
 # Only strip year when it's bracketed at the end -- "Album (2006)" or
 # "Album [2006]". A bare trailing "3121" must NOT be eaten, because
@@ -106,23 +108,22 @@ def _match_key(value: str) -> str:
       * Trailing "(2019)" year suffix on disk
       * Leading "The "/"A "/"An " articles
       * Accented characters -> ascii
-      * Cyrillic -> Latin (Азис == Azis, Болка == Bolka)
+      * Cyrillic/Greek -> Latin (Азис == Azis, Болка == Bolka); other
+        scripts kept as they are, never deleted
       * Double/extra whitespace
     """
     s = _demojibake((value or "").strip()).lower()
     if not s:
         return ""
-    # Fold accents: "Beyoncé" -> "beyonce", "Motörhead" -> "motorhead".
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    # Transliterate Cyrillic to Latin so cross-script names collide.
-    s = _translit_cyrillic(s)
-    # Normalize "&" to "and" before stripping punctuation so they match.
-    s = s.replace("&", " and ")
+    # The shared fold (titlematch): accents ("Beyoncé" -> "beyonce"),
+    # Cyrillic/Greek transliterated so cross-script names collide, "&" read
+    # as "and", kana voicing marks kept.
+    s = titlematch.fold(s)
     # Strip trailing (YYYY) / [YYYY] / YYYY album-folder year suffix.
     s = _MATCH_YEAR_SUFFIX.sub("", s)
-    # Collapse everything non-alphanumeric to single spaces.
-    s = _MATCH_NON_ALNUM.sub(" ", s).strip()
+    # Words of ANY script, single-spaced. The [^a-z0-9] collapse this used
+    # deleted every Greek, CJK, Arabic or Hangul letter and 'ø'.
+    s = " ".join(titlematch._runs(s))
     # Drop leading article.
     s = _MATCH_LEADING_ARTICLE.sub("", s).strip()
     # Collapse whitespace to single spaces.
@@ -174,6 +175,77 @@ def _is_pre_split_reason(reason: str) -> bool:
         return False
     r = reason.lower()
     return any(m in r for m in _PRE_SPLIT_REASON_MARKERS)
+
+
+class _SeenSet:
+    """
+    "Already looked at this" -- remembered for a while, and only for the
+    content it had then.
+
+    It was a plain set that never forgot anything: a folder skipped once (a
+    failure, an unknown, a download still arriving) was ignored until the
+    container restarted -- nine days, once -- although the persistent sweep
+    ledger beside it was built to retry a changed folder at once and the rest
+    daily, and main.py grew a purge loop to work around it. An entry now stops
+    counting when its TTL passes or when the path's content (file names, sizes
+    and mtimes, two levels deep) is no longer what it was when added.
+    """
+
+    def __init__(self, ttl_seconds: float):
+        self.ttl = float(ttl_seconds)
+        self._d: Dict[Any, Tuple[float, Optional[int]]] = {}
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _sig(p) -> Optional[int]:
+        try:
+            p = Path(p)
+            st = p.stat()
+        except (OSError, ValueError):
+            return None
+        if not p.is_dir():
+            return hash((st.st_size, st.st_mtime_ns))
+        out = []
+        base = len(str(p).rstrip(os.sep).split(os.sep))
+        try:
+            for root, dirs, files in os.walk(p):
+                if len(root.rstrip(os.sep).split(os.sep)) - base >= 2:
+                    dirs[:] = []
+                for f in files:
+                    full = os.path.join(root, f)
+                    try:
+                        fs = os.stat(full)
+                    except OSError:
+                        continue
+                    out.append((full, fs.st_size, fs.st_mtime_ns))
+        except OSError:
+            return None
+        return hash(tuple(sorted(out)))
+
+    def add(self, p) -> None:
+        entry = (time.monotonic(), self._sig(p))
+        with self._lock:
+            self._d[p] = entry
+
+    def discard(self, p) -> None:
+        with self._lock:
+            self._d.pop(p, None)
+
+    def __contains__(self, p) -> bool:
+        with self._lock:
+            e = self._d.get(p)
+        if e is None:
+            return False
+        at, sig = e
+        if (time.monotonic() - at) < self.ttl and (sig is None or self._sig(p) == sig):
+            return True
+        with self._lock:
+            if self._d.get(p) is e:
+                del self._d[p]
+        return False
+
+    def __len__(self) -> int:
+        return len(self._d)
 
 
 @dataclass
@@ -834,11 +906,26 @@ class Orchestrator:
         # recover artist/album for a pre-split folder whose tags can't
         # identify it. None = disabled.
         self.acoustid = acoustid
-        # Remember CUEs we've already classified as non-disc-images so we
-        # don't spam INFO logs every time the watcher re-enqueues them on
-        # startup. In-memory only; a restart re-parses (cheap).
-        self._skip_seen: set = set()
+        # CUEs and folders already looked at, so a re-enqueue or the next sweep
+        # pass does not redo them. Forgets an entry when its content changes
+        # or after the sweep ledger's TTL (see _SeenSet).
+        self._skip_seen = _SeenSet(max(300, int(getattr(
+            cfg, "sweep_ledger_ttl_seconds", 86400) or 86400)))
         self._ledger_lock = threading.Lock()
+        # Folders whose decision needed the LLM while it could not be asked
+        # (gate closed, PC asleep): {folder: what it waits for}. They are NOT
+        # written off -- the first sweep after the gate opens forgets their
+        # skip/ledger/negative-cache entries so they are looked at again. See
+        # _llm_wait and _release_llm_waiting.
+        self._llm_waiting: Dict[str, str] = {}
+        self._llm_wait_lock = threading.Lock()
+        # Per-thread: the Lidarr failure generation a hand-off started at (see
+        # _handoff_pre_split_to_lidarr / _record).
+        self._tl = threading.local()
+        self._sweep_pass_lock = threading.Lock()
+        # Set by main.py: put a .cue back on the work queue (a CUE that waited
+        # for the LLM is already in the enqueue-once set, so no scan re-finds it).
+        self.requeue_cue = None
         # MusicBrainz cross-check client (requirement c). None when disabled --
         # built lazily-but-once so the audit pass can be a no-op without it.
         self._mb = None
@@ -885,6 +972,11 @@ class Orchestrator:
     def process(self, cue_path: Path) -> None:
         staging_dir: Optional[Path] = None
         self._repair_temps = set()
+        # The CUE's folder is this job's for its whole run: nothing else in the
+        # process deletes it or removes its torrent meanwhile (see claims). If
+        # a sweep hand-off holds it, wait for that to finish.
+        folder = Path(cue_path).parent
+        claims.claim(folder, wait=True)
         try:
             staging_dir = self._process(cue_path)
         except Exception as exc:
@@ -907,6 +999,7 @@ class Orchestrator:
                 except OSError as exc:  # noqa: BLE001
                     logger.debug("could not remove repair temp %s: %s", tmp, exc)
             self._repair_temps = set()
+            claims.release(folder)
 
     def _process(self, cue_path: Path) -> Optional[Path]:
         """
@@ -1079,6 +1172,14 @@ class Orchestrator:
         self._heal_cue_file_reference(cue_path, audio_path)
         try:
             cue = parse_cue(cue_path, duration, ollama=self.ollama)
+        except LLMUnavailableError:
+            # Not a verdict on the CUE -- only the model can repair it and it
+            # cannot be asked now. Recording it "skipped" wrote it off for 90
+            # days, out of sight of the WebUI (three real CUEs went that way).
+            # It is queued again the moment the LLM can answer.
+            self._llm_wait(cue_path, "CUE repair")
+            self._skip_seen.add(cue_path)
+            return None
         except ValueError as exc:
             # Unparseable CUE and no (working) Ollama to repair it.
             # Skip gracefully instead of raising a traceback.
@@ -1676,7 +1777,30 @@ class Orchestrator:
             return "", ""
         artist, album = name.split(" - ", 1)
         album = re.sub(r"(?i)\bCD\s*\d+\b", "", album).strip(" -_.")
-        return artist.strip(" -_."), album.strip(" -_.")
+        artist = artist.strip(" -_.")
+        if re.fullmatch(r"(?:19|20)\d{2}", artist) and not self._is_lidarr_artist(artist):
+            # "2011 - To Memphis With Love" inside a discography folder: the
+            # left side is the YEAR. It went out as artist='2011' -- a wasted
+            # force-import retry each time, and on DVD-A extraction it was
+            # written into the ARTIST tags. The artist is the parent's.
+            up = p.parent
+            pa = ""
+            if up != p and up.name:
+                pa, _ = self._album_folder_identity(up)
+                if not pa:
+                    cand = re.sub(r"[\(\[\{][^)\]\}]*[)\]\}]", " ", up.name)
+                    cand = re.sub(r"\s{2,}", " ", cand).strip(" -_.")
+                    pa = cand if cand and self._is_lidarr_artist(cand) else ""
+            return pa, album
+        return artist, album
+
+    def _is_lidarr_artist(self, name: str) -> bool:
+        """Lidarr knows an artist by exactly this (folded) name."""
+        try:
+            rec = self.lidarr.find_artist(name)
+        except Exception:  # noqa: BLE001
+            return False
+        return bool(rec) and _match_key(rec.get("artistName") or "") == _match_key(name)
 
     def _read_audio_tags(self, path: Path) -> tuple[str, str]:
         """
@@ -2034,6 +2158,25 @@ class Orchestrator:
                 )
                 return False
 
+            # The release's REAL track rows, not its `trackCount` -- and never
+            # the plain /track list, which is the SELECTED release's tracks: the
+            # Seether flip paired 18 files against 14 stale rows.
+            rel_rows = self.lidarr.list_tracks_for_release(album_id, target_rid) or []
+            if mode == "exact" and len(rel_rows) != n:
+                logger.info(
+                    "Force-import: release %s of %s / %s lists %d track rows, "
+                    "not %d -- not forcing.", target_rid, artist_name,
+                    album_name, len(rel_rows), n)
+                return False
+            prev_rid = next((r.get("id") for r in releases if r.get("monitored")),
+                            None)
+            if prev_rid != target_rid and not self._release_switch_safe(
+                    full, album_id, target_rid, rel_rows):
+                logger.info(
+                    "Force-import: %s / %s already holds files on release %s; "
+                    "switching it to release %s would unmap them -- not forcing.",
+                    artist_name, album_name, prev_rid, target_rid)
+                return False
             logger.info(
                 "Force-import (%s): %s / %s -- %d files vs release %s "
                 "(%d tracks); flipping release and importing.",
@@ -2041,29 +2184,27 @@ class Orchestrator:
             )
             # If the flip fails we would positionally import against whatever
             # release Lidarr still points at -- i.e. the wrong track list.
-            if not self.lidarr.set_album_monitored_release(album_id, target_rid):
+            flipped = prev_rid != target_rid
+            if flipped and not self.lidarr.set_album_monitored_release(album_id, target_rid):
                 logger.warning(
                     "Force-import: could not switch %s / %s to release %s -- "
                     "aborting rather than importing against the wrong release.",
                     artist_name, album_name, target_rid)
-                return False
+                return self._force_abort(album_id, prev_rid, flipped)
             rcmd = self.lidarr.refresh_artist(aid)
             if rcmd:
                 self.lidarr.wait_for_command(
                     rcmd, timeout_seconds=45, poll_interval=1.5,
                 )
             lidarr_path = self.lidarr.windows_to_lidarr(folder)
-            cands = self.lidarr.manual_import_candidates(lidarr_path, artist_id=aid)
+            # force=True: a probe cached before the flip maps files to the OLD
+            # release's tracks.
+            cands = self.lidarr.manual_import_candidates(
+                lidarr_path, artist_id=aid, force=True)
 
             if mode == "exact":
-                tracks_all = self.lidarr.list_tracks_for_album(album_id)
-                tracks_rel = [
-                    t for t in tracks_all
-                    if t.get("albumReleaseId") == target_rid
-                    or not t.get("albumReleaseId")
-                ]
                 cmd = self.lidarr.manual_import_positional(
-                    cands, tracks_rel, album_id, target_rid, aid,
+                    cands, rel_rows, album_id, target_rid, aid,
                 )
             else:
                 # superset / partial: keep Lidarr's own per-file title matches
@@ -2090,7 +2231,7 @@ class Orchestrator:
                             "not forcing.",
                             len(matched_track_ids), T,
                         )
-                        return False
+                        return self._force_abort(album_id, prev_rid, flipped)
                     cmd = self.lidarr.manual_import_apply(importable)
                 elif 100 * len(importable) >= pmin * T:   # partial, enough matched
                     cmd = self.lidarr.manual_import_apply(importable)
@@ -2104,12 +2245,8 @@ class Orchestrator:
                     disc = self._disc_number_from_folder(folder)
                     disc_tracks = []
                     if disc is not None:
-                        disc_tracks = [
-                            t for t in self.lidarr.list_tracks_for_album(album_id)
-                            if (t.get("albumReleaseId") == target_rid
-                                or not t.get("albumReleaseId"))
-                            and t.get("mediumNumber") == disc
-                        ]
+                        disc_tracks = [t for t in rel_rows
+                                       if t.get("mediumNumber") == disc]
                     if disc_tracks and len(disc_tracks) == n:
                         logger.info(
                             "Force-import (partial): Lidarr mapped only %d/%d; "
@@ -2128,10 +2265,10 @@ class Orchestrator:
                             "disc-positional fit; not forcing.",
                             len(importable), T, pmin,
                         )
-                        return False
+                        return self._force_abort(album_id, prev_rid, flipped)
 
             if not cmd:
-                return False
+                return self._force_abort(album_id, prev_rid, flipped)
             # Only EXACT should fully clear staging. Superset and PARTIAL both
             # legitimately leave files behind (extras / unmatched), so requiring
             # a cleared staging would reject every partial as "not trusted" --
@@ -2141,9 +2278,11 @@ class Orchestrator:
                 require_cleared=(mode == "exact"),
                 staging_exts=_ALL_AUDIO_EXTS,
             ):
-                return False
+                return self._force_abort(album_id, prev_rid, flipped)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Force-import failed for %s: %s", folder, exc)
+            if locals().get("flipped"):
+                self._force_abort(album_id, locals().get("prev_rid"), True)
             return False
 
         # Import landed. In superset mode Lidarr moved the matched tracks out
@@ -2152,7 +2291,11 @@ class Orchestrator:
         # find the library folder or a move fails, keep the source rather than
         # risk losing the extras.
         ok_to_delete = True
-        remaining = self._sibling_audio_files(folder)
+        # Exactly the files handed in that are still here. A multi-disc album
+        # is handed off at its PARENT with audio in CD1/CD2; the folder
+        # listing this used was not recursive, so "nothing left" was always
+        # true and un-imported discs were then deleted as originals.
+        remaining = [a for a in audios if a.exists()]
         if mode == "partial":
             # Lidarr MOVES the tracks it imports out of the folder, so whatever
             # audio is still here is exactly what Lidarr did NOT take -- extras
@@ -2174,6 +2317,13 @@ class Orchestrator:
                     artist_name, album_name,
                 )
                 ok_to_delete = True
+        elif remaining and mode == "exact":
+            # Every file had a track; one still here was not taken.
+            logger.warning(
+                "Force-import (exact): %d file(s) of %s / %s were not imported "
+                "-- leaving the source in place.", len(remaining), artist_name,
+                album_name)
+            ok_to_delete = False
         elif remaining:
             album_dir, _existing = self._find_album_on_disk(artist_name, album_name)
             if album_dir is None:
@@ -2187,8 +2337,22 @@ class Orchestrator:
             else:
                 moved = 0
                 for f in remaining:
+                    # Keep the disc subfolder (CD1/01.flac and CD2/01.flac
+                    # would collide) and never overwrite: across the mounts a
+                    # move is a copy that silently replaces the destination.
                     try:
-                        shutil.move(str(f), str(album_dir / f.name))
+                        rel = f.relative_to(folder)
+                    except ValueError:
+                        rel = Path(f.name)
+                    dest = album_dir / rel
+                    if dest.exists():
+                        logger.warning(
+                            "Force-import: extra %s already exists in the "
+                            "library folder -- not overwriting.", rel)
+                        continue
+                    try:
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.move(str(f), str(dest))
                         moved += 1
                     except OSError as exc:
                         logger.warning(
@@ -2226,13 +2390,38 @@ class Orchestrator:
                     artist_id=aid, expected_tracks=len(audios),
                     context="force-import")
             elif self.cfg.delete_originals_on_success:
-                for a in audios:
-                    try:
-                        if a.exists():
-                            a.unlink()
-                    except OSError as exc:
-                        logger.warning("Could not delete %s: %s", a, exc)
+                # Lidarr imports by MOVING, so audio still here is audio it did
+                # not take -- never "an original". Only the orphan .cue goes.
+                self._delete_orphan_cue(cue_path, reason)
         return True
+
+    def _release_switch_safe(self, full: Dict[str, Any], album_id: int,
+                             target_rid, rel_rows: List[Dict[str, Any]]) -> bool:
+        """May the album's monitored release become `target_rid`? Always for
+        an album with no files. With files, only when every track that holds
+        one is also on the target release (by recording id), so no mapped file
+        is orphaned by the switch."""
+        st = full.get("statistics") or {}
+        if int(st.get("trackFileCount") or 0) == 0:
+            return True
+        want = {t.get("foreignRecordingId") for t in rel_rows
+                if t.get("foreignRecordingId")}
+        held = [t for t in (self.lidarr.list_tracks_for_album(album_id) or [])
+                if t.get("hasFile")]
+        return bool(held) and bool(want) and all(
+            t.get("foreignRecordingId") in want for t in held)
+
+    def _force_abort(self, album_id: int, prev_rid, flipped: bool) -> bool:
+        """Undo a release flip on an import that did not happen. Always False."""
+        if flipped and prev_rid:
+            try:
+                if self.lidarr.set_album_monitored_release(album_id, prev_rid):
+                    logger.info("Force-import: restored the monitored release "
+                                "of album %s to %s", album_id, prev_rid)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Force-import: could not restore release %s of "
+                               "album %s: %s", prev_rid, album_id, exc)
+        return False
 
     _DTS_MARKER_RE = re.compile(
         r"(?i)[\s\-_.\(\[]*\bdts(?:[\s\-_.]?cd)?\b[\s\-_.\)\]]*"
@@ -2259,6 +2448,10 @@ class Orchestrator:
         if self.ollama is not None and getattr(self.ollama, "enabled", False):
             try:
                 a, b = self.ollama.parse_artist_album(raw)
+                if is_unavailable((a, b)):
+                    self._llm_wait(folder, "DTS-CD")
+                    return "", ""
+                self._llm_answered(folder)
                 if a and b:
                     logger.info(
                         "DTS-CD: LLM parsed identity from %r -> artist=%r album=%r",
@@ -2397,6 +2590,61 @@ class Orchestrator:
         rest = re.sub(r"(?i)[\s\-_.]*dts\s*$", "", rest)
         return tno, (rest.strip(" -_.") or stem)
 
+    _PARTIAL = ".partial"
+
+    @classmethod
+    def _clear_partials(cls, folder: Path) -> None:
+        """A '<name>.flac.partial' is an encode that never finished (the
+        container was recreated mid-way). It is never a result."""
+        try:
+            for f in folder.glob("*.flac" + cls._PARTIAL):
+                f.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _encode_flac(self, src_args: List[str], out: Path, label: str, *,
+                     min_seconds: float = 1.0, plan=None,
+                     publish: bool = True) -> Optional[Path]:
+        """
+        Encode so that `out` only ever exists COMPLETE. ffmpeg writes
+        '<out>.partial', which is probed and (with `plan`) tagged before it is
+        renamed onto `out`. The converters delete their only source on the
+        proof "the .flac exists"; with ffmpeg writing straight to the final
+        name, a container recreated mid-encode left a truncated, untagged
+        .flac that the next pass trusted -- and the DSF/DTS/APE was deleted.
+        `src_args` is everything between the ffmpeg options and the output.
+        Returns `out` (or the verified partial when publish=False, for a
+        caller that publishes a whole album at once), or None on failure.
+        """
+        part = out.with_name(out.name + self._PARTIAL)
+        cmd = [self.cfg.ffmpeg_binary, "-hide_banner", "-loglevel", "warning",
+               "-y", *src_args, "-f", "flac", str(part)]
+        done = False
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            if not ((probe_duration(self.cfg.ffmpeg_binary, part) or 0) > min_seconds):
+                logger.warning("%s: %s encoded but is unreadable.", label, out.name)
+                return None
+            if plan is not None:
+                from tagger import _apply  # lazy: needs mutagen (present in image)
+                try:
+                    _apply(part, plan)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("%s: tag write failed for %s: %s",
+                                   label, out.name, exc)
+            if not publish:
+                done = True
+                return part
+            os.replace(part, out)
+            done = True
+            return out
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("%s: flac encode failed for %s: %s", label, out.name, exc)
+            return None
+        finally:
+            if not done:
+                part.unlink(missing_ok=True)
+
     def _transcode_dts_folder(self, folder: Path) -> List[Path]:
         """
         Transcode a DTS-CD folder's raw .dts surround streams into
@@ -2432,9 +2680,17 @@ class Orchestrator:
             return []
         if not sources:
             return []
+        if self._llm_blocked(folder):
+            return []
         artist, album = self._dts_identity(folder)
+        if not (artist and album) and self._llm_blocked(folder):
+            # Only the LLM can name this disc. Transcoding it nameless would
+            # tag every track with no artist or album and delete the source
+            # streams -- so wait for the model instead.
+            return []
         total = str(len(sources))
         made: List[Path] = []
+        self._clear_partials(folder)
         for p, rng in sources:
             out = p.with_suffix(".flac")
             if out.exists() and out.resolve() != p.resolve():
@@ -2477,37 +2733,22 @@ class Orchestrator:
                 if tmpwav.exists():
                     tmpwav.unlink(missing_ok=True)
                 continue
-            cmd = [
-                self.cfg.ffmpeg_binary, "-hide_banner", "-loglevel", "warning",
-                "-y", "-i", str(tmpwav),
-                "-c:a", "flac",
-                "-compression_level", str(self.cfg.flac_compression_level),
-                "-map_metadata", "-1",
-                str(out),
-            ]
+            tno, title = self._track_title_from_name(p.stem, artist)
             try:
-                subprocess.run(cmd, check=True, capture_output=True, text=True)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("DTS: flac encode failed on %s: %s", p.name, exc)
-                if out.exists():
-                    out.unlink(missing_ok=True)
-                continue
+                got = self._encode_flac(
+                    ["-i", str(tmpwav), "-c:a", "flac",
+                     "-compression_level", str(self.cfg.flac_compression_level),
+                     "-map_metadata", "-1"],
+                    out, "DTS", plan=TagPlan(
+                        tracknumber=tno, tracktotal=total, title=title,
+                        artist=artist, albumartist=artist, album=album,
+                        date="", genre="", comment="DTS 5.1 (transcoded)",
+                        isrc=""))
             finally:
                 if tmpwav.exists():
                     tmpwav.unlink(missing_ok=True)
-            if not ((probe_duration(self.cfg.ffmpeg_binary, out) or 0) > 1.0):
-                logger.warning("DTS: %s transcoded but is unreadable.", p.name)
-                out.unlink(missing_ok=True)
+            if got is None:
                 continue
-            tno, title = self._track_title_from_name(p.stem, artist)
-            try:
-                _apply(out, TagPlan(
-                    tracknumber=tno, tracktotal=total, title=title,
-                    artist=artist, albumartist=artist, album=album,
-                    date="", genre="", comment="DTS 5.1 (transcoded)", isrc="",
-                ))
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("DTS: tag write failed for %s: %s", out.name, exc)
             if p.suffix.lower() != ".flac":
                 try:
                     p.unlink()   # drop the DTS source; the FLAC replaces it
@@ -2767,6 +3008,10 @@ class Orchestrator:
         if self.ollama is not None and getattr(self.ollama, "enabled", False):
             try:
                 a, b = self.ollama.parse_artist_album(raw)
+                if is_unavailable((a, b)):
+                    self._llm_wait(folder, "DVD-Audio")
+                    return "", ""
+                self._llm_answered(folder)
                 if a and b:
                     logger.info(
                         "DVD-Audio: LLM parsed identity from %r -> artist=%r "
@@ -2836,6 +3081,66 @@ class Orchestrator:
         return None
 
     # ---- persistent sweep ledger ---------------------------------------
+    # ---- work waiting for the LLM ----------------------------------------
+    # The owner's rule: when the GPU is not idle the LLM waits, and only the
+    # item that needs it waits with it. Such an item used to be written off
+    # exactly like a real "no match" -- added to _skip_seen (until restart),
+    # the sweep ledger (24 h) or the reconcile negative cache -- so an answer
+    # the model could have given ten minutes later came a day later, or never.
+
+    def _llm_wait(self, folder, why: str) -> None:
+        key = str(folder)
+        with self._llm_wait_lock:
+            new = key not in self._llm_waiting
+            self._llm_waiting[key] = why
+        if new:
+            logger.info("%s: %s needs the LLM, which cannot be asked right now "
+                        "-- it will be looked at again when it can",
+                        why, Path(key).name)
+
+    def _llm_answered(self, folder) -> None:
+        with self._llm_wait_lock:
+            self._llm_waiting.pop(str(folder), None)
+
+    def _llm_blocked(self, folder) -> bool:
+        """This folder waits for the LLM and the LLM still cannot be asked."""
+        with self._llm_wait_lock:
+            waiting = str(folder) in self._llm_waiting
+        return waiting and not (self.ollama is not None and self.ollama.available())
+
+    def _release_llm_waiting(self) -> int:
+        """Gate open again: forget every write-off of a waiting folder."""
+        with self._llm_wait_lock:
+            if not self._llm_waiting:
+                return 0
+        if self.ollama is None or not self.ollama.available():
+            return 0
+        with self._llm_wait_lock:
+            keys = list(self._llm_waiting)
+            self._llm_waiting.clear()
+        requeue = getattr(self, "requeue_cue", None)
+        led = self._sweep_ledger()
+        cache = getattr(self, "_reconcile_cache", None) or {}
+        for k in keys:
+            p = Path(k)
+            for q in (p, Path(k + "#dvda")):
+                self._skip_seen.discard(q)
+                try:
+                    self._skip_seen.discard(q.resolve(strict=False))
+                except OSError:
+                    pass
+                if led.pop(str(q), None) is not None:
+                    self._sweep_led_dirty = True
+            cache.pop(k, None)
+            if k.lower().endswith(".cue") and callable(requeue):
+                try:
+                    requeue(p)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("re-queue of %s failed: %s", p, exc)
+        logger.info("LLM can be asked again -- re-examining %d folder(s) that "
+                    "waited for it", len(keys))
+        return len(keys)
+
     def _sweep_ledger(self) -> Dict[str, Any]:
         """Lazily load the on-disk sweep ledger ({folder: [sig, ts]})."""
         led = getattr(self, "_sweep_led", None)
@@ -3232,7 +3537,13 @@ class Orchestrator:
         # next day, forever. `Little Feat - Kickin' It at the Barn` was ripped
         # this way against a library copy already complete at 11/11, in the SAME
         # 6ch/48kHz/24-bit form the ISO holds.
+        if self._llm_blocked(folder):
+            return True
         who, what = self._dvda_identity(folder)
+        if not (who and what) and self._llm_blocked(folder):
+            # Only the LLM can name this disc; ripping it now would produce a
+            # nameless album and skip the "already own it?" check. Wait.
+            return True
         for a_name, b_name in ((who, what),
                                self._album_folder_identity(Path(iso.stem))):
             if not (a_name and b_name):
@@ -3365,6 +3676,8 @@ class Orchestrator:
         total = str(len(wavs))
         made = 0
         n_wavs = len(wavs)
+        staged: List[Tuple[Path, Path]] = []
+        self._clear_partials(folder)
         for idx, w in enumerate(wavs, start=1):
             title = f"Track {idx:02d}"
             out = folder / f"{idx:02d} - {title}.flac"
@@ -3374,35 +3687,17 @@ class Orchestrator:
                 act_key, "DVD-Audio",
                 f"{iso.name} — encoding FLAC track {idx}/{n_wavs}",
                 55.0 + 45.0 * ((idx - 1) / float(max(1, n_wavs))))
-            cmd = [
-                self.cfg.ffmpeg_binary, "-hide_banner", "-loglevel", "warning",
-                "-y", "-i", str(w),
-                "-c:a", "flac",
-                "-compression_level", str(self.cfg.flac_compression_level),
-                "-map_metadata", "-1",
-                str(out),
-            ]
-            try:
-                subprocess.run(cmd, check=True, capture_output=True, text=True)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("DVD-Audio: flac encode failed on %s: %s",
-                               w.name, exc)
-                out.unlink(missing_ok=True)
-                continue
-            if not ((probe_duration(self.cfg.ffmpeg_binary, out) or 0) > 1.0):
-                logger.warning("DVD-Audio: %s transcoded but is unreadable.",
-                               w.name)
-                out.unlink(missing_ok=True)
-                continue
-            try:
-                _apply(out, TagPlan(
+            part = self._encode_flac(
+                ["-i", str(w), "-c:a", "flac",
+                 "-compression_level", str(self.cfg.flac_compression_level),
+                 "-map_metadata", "-1"],
+                out, "DVD-Audio", publish=False, plan=TagPlan(
                     tracknumber=str(idx), tracktotal=total, title=title,
                     artist=artist, albumartist=artist, album=album,
-                    date="", genre="", comment="DVD-Audio (transcoded)", isrc="",
-                ))
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("DVD-Audio: tag write failed for %s: %s",
-                               out.name, exc)
+                    date="", genre="", comment="DVD-Audio (transcoded)", isrc=""))
+            if part is None:
+                continue
+            staged.append((part, out))
             # Drop the giant intermediate WAV as soon as its FLAC is written --
             # a 5.1/24-bit track is ~300MB, so keeping all of them plus the
             # extracted AOBs would balloon peak disk on the download share.
@@ -3410,12 +3705,20 @@ class Orchestrator:
             made += 1
 
         shutil.rmtree(tmp, ignore_errors=True)
-        if made == 0:
+        if made < n_wavs or made == 0:
+            # The whole album or nothing. Publishing the tracks that did encode
+            # made the folder look "already extracted" (any .flac counts) and
+            # recorded the disc as ripped, so a partial album stood forever.
+            for part, _ in staged:
+                part.unlink(missing_ok=True)
             logger.warning(
-                "DVD-Audio: no FLAC produced from %s -- leaving ISO alone.",
-                iso.name)
+                "DVD-Audio: %d of %d track(s) encoded from %s -- nothing "
+                "published; the disc is ripped again on a later pass.",
+                made, n_wavs, iso.name)
             self._skip_seen.add(folder)
             return True
+        for part, out in staged:
+            os.replace(part, out)
         self._remove_stray_cues(folder)
         # Record the DISC as done so it is never re-ripped, even if the extracted
         # folder is later removed (imported, or deleted as redundant).
@@ -3703,6 +4006,7 @@ class Orchestrator:
                     folder.name, len(kept), len(sources), maxch)
                 sources = kept
         made: List[Path] = []
+        self._clear_partials(folder)
         for p in sources:
             out = p.with_suffix(".flac")
             if out.exists() and out.resolve() != p.resolve():
@@ -3712,27 +4016,12 @@ class Orchestrator:
                 except OSError:
                     pass
                 continue
-            cmd = [
-                self.cfg.ffmpeg_binary, "-hide_banner", "-loglevel", "warning",
-                "-y", "-i", str(p),
-                "-af", "lowpass=24000",
-                "-ar", "48000",
-                "-sample_fmt", "s16",
-                "-c:a", "flac",
-                "-compression_level", str(self.cfg.flac_compression_level),
-                "-map_metadata", "0",
-                str(out),
-            ]
-            try:
-                subprocess.run(cmd, check=True, capture_output=True, text=True)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("DSD: flac encode failed on %s: %s", p.name, exc)
-                if out.exists():
-                    out.unlink(missing_ok=True)
-                continue
-            if not ((probe_duration(self.cfg.ffmpeg_binary, out) or 0) > 1.0):
-                logger.warning("DSD: %s transcoded but is unreadable.", p.name)
-                out.unlink(missing_ok=True)
+            if self._encode_flac(
+                    ["-i", str(p), "-af", "lowpass=24000", "-ar", "48000",
+                     "-sample_fmt", "s16", "-c:a", "flac",
+                     "-compression_level", str(self.cfg.flac_compression_level),
+                     "-map_metadata", "0"],
+                    out, "DSD") is None:
                 continue
             try:
                 p.unlink()   # drop the DSD source; the FLAC replaces it
@@ -4040,17 +4329,33 @@ class Orchestrator:
             if cov1 >= min_cov and m1 >= 2 and clear_margin:
                 winner, via = alb1, f"titles {m1}/{len(keys)} ({cov1:.0f}%)"
             elif cov1 >= min_cov and m1 >= 2:
-                # Ambiguous between top candidates -> let the LLM break the
-                # tie among ONLY the plausible ones (never invents a title).
-                top = [r[2] for r in results[:5] if r[1] >= min_cov]
-                pick = self._llm_confirm_album(
-                    folder, audios, titled, [t.get("title") or "" for t in top])
-                if pick:
-                    for r in results[:5]:
-                        if (r[2].get("title") or "") == pick:
-                            winner, via = r[2], (
-                                f"titles ambiguous, LLM pick ({r[0]}/{len(keys)})")
-                            break
+                # Ambiguous: let the LLM break the tie among EVERY result the
+                # margin rule could not separate from the leader. Filtering
+                # those by min_cov left the leader alone whenever it only just
+                # cleared the floor, so the "tie-break" was one option long and
+                # could only rubber-stamp it. Each option is labelled with its
+                # year and track count, so same-titled albums stay apart, and
+                # the label maps back to the album record, not to a title.
+                tied = [r for r in results[:5] if r[0] >= m1 - 1]
+                labels: Dict[str, Tuple[int, float, Dict[str, Any]]] = {}
+                for r in tied:
+                    a = r[2]
+                    year = str(a.get("releaseDate") or "")[:4]
+                    tracks = int((a.get("statistics") or {}).get("totalTrackCount") or 0)
+                    label = "%s (%s, %d tracks)" % (a.get("title") or "?",
+                                                    year or "no year", tracks)
+                    while label in labels:
+                        label += " *"
+                    labels[label] = r
+                pick = self._llm_confirm_album(folder, audios, titled, list(labels))
+                r = labels.get(pick) if pick else None
+                if r is not None and r[1] >= min_cov:
+                    winner, via = r[2], (
+                        f"titles ambiguous, LLM pick ({r[0]}/{len(keys)})")
+                elif r is not None:
+                    logger.info(
+                        "content-identify: LLM picked %r, below the %d%% "
+                        "coverage floor (%.0f%%) -- undecided.", pick, min_cov, r[1])
 
         if winner is None and not keys:
             # No usable titles anywhere: LLM on folder/file/sidecar context,
@@ -4202,10 +4507,15 @@ class Orchestrator:
                     continue
                 break
         try:
-            return self.ollama.confirm_album_match("\n".join(lines), cand)
+            pick = self.ollama.confirm_album_match("\n".join(lines), cand)
         except Exception as exc:  # noqa: BLE001
             logger.debug("content-identify: LLM confirm failed: %s", exc)
             return None
+        if is_unavailable(pick):
+            self._llm_wait(folder, "content-identify")
+            return None
+        self._llm_answered(folder)
+        return pick
 
     def _multidisc_audio_files(self, folder: Path) -> List[Path]:
         """Every audio file under `folder`'s disc subfolders (CD1/Disc 2/...),
@@ -4417,6 +4727,8 @@ class Orchestrator:
                 seen.add(rp)
                 out.append(p)
 
+        for d in {a.parent for a in audios}:
+            self._clear_partials(d)
         for a in audios:
             ext = a.suffix.lower()
             if ext == ".flac":
@@ -4446,24 +4758,14 @@ class Orchestrator:
                                    a.name, exc)
                 _add(flac)
                 continue
-            cmd = [
-                self.cfg.ffmpeg_binary, "-hide_banner", "-loglevel", "warning",
-                "-y", "-i", str(a),
-                "-map", "0:a:0", "-c:a", "flac",
-                "-compression_level", str(self.cfg.flac_compression_level),
-                "-map_metadata", "0",   # keep the source's artist/album/title tags
-                "-vn",
-                str(flac),
-            ]
-            try:
-                subprocess.run(cmd, check=True, capture_output=True, text=True)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "lossless->flac: could not convert %s (%s) -- keeping original.",
-                    a.name, exc,
-                )
-                if flac.exists():
-                    flac.unlink(missing_ok=True)
+            if self._encode_flac(
+                    ["-i", str(a), "-map", "0:a:0", "-c:a", "flac",
+                     "-compression_level", str(self.cfg.flac_compression_level),
+                     "-map_metadata", "0",   # keep the source's tags
+                     "-vn"],
+                    flac, "lossless->flac", min_seconds=0.5) is None:
+                logger.warning("lossless->flac: could not convert %s -- keeping "
+                               "original.", a.name)
                 _add(a)
                 continue
             if not ((probe_duration(self.cfg.ffmpeg_binary, flac) or 0) > 0.5):
@@ -4592,8 +4894,10 @@ class Orchestrator:
     def _same_song_key(p: Path) -> str:
         """Filename identity ignoring extension and apostrophe style -- Lidarr
         writes "Don't Do It.mp3" and "Don’t Do It.flac" for one song."""
-        s = p.stem.lower().replace("’", "'").replace("‘", "'")
-        return re.sub(r"[^a-z0-9]+", "", s)
+        # Letters of any script: the [^a-z0-9] key this used was "" for every
+        # Cyrillic or CJK file name, so every such MP3 "matched" any lossless
+        # file in its folder and was quarantined as superseded.
+        return titlematch.key(p.stem)
 
     def _prefer_lossless_in_album(
         self, album_rec: Dict[str, Any], artist_id: int, audios: List[Path],
@@ -4976,123 +5280,108 @@ class Orchestrator:
             logger.debug("grab target lookup failed for %s: %s", folder, exc)
         return None
 
-    def _folder_has_wanted_tracks(self, folder: Path) -> bool:
-        """
-        Does this folder hold ANY song Lidarr is still missing?
-
-        The last gate before anything is deleted. Cross-checks each audio
-        file's TAGS (title + artist) against every wanted track of every
-        monitored incomplete album, so a folder is never removed because its
-        NAME looked redundant while the songs inside were still needed.
-
-        Fails SAFE: any error, unreadable tags or empty wanted index returns
-        True (i.e. "keep it"). Only a folder proven to contain nothing wanted
-        can be deleted.
-        """
+    def _folder_fully_owned(self, folder: Path, artist_name: str,
+                            audios: List[Path]) -> Tuple[Optional[bool], str]:
+        """dedup_downloads.folder_fully_owned for this artist: (True, why)
+        only when Lidarr rejects EVERY file as "not an upgrade"."""
+        from dedup_downloads import folder_fully_owned
         try:
-            from song_harvest import (build_wanted_index, norm_title,
-                                      artists_agree, scan_folder)
+            art = self.lidarr.find_artist(artist_name) if artist_name else None
         except Exception as exc:  # noqa: BLE001
-            logger.warning("delete guard: song_harvest unusable (%s) -- "
-                           "refusing to treat %s as disposable", exc, folder)
-            return True
-        try:
-            wanted = build_wanted_index(self.lidarr) or {}
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("delete guard: wanted index failed (%s) -- keeping "
-                           "%s", exc, folder)
-            return True
-        if not wanted:
-            return True
-        # NEVER judge content we cannot actually read yet.
-        #  * a partly-downloaded file has no reliable tags
-        #  * an .iso / an unsplit cue image hides its tracks entirely
-        #  * a torrent still downloading may yet produce the wanted song
-        try:
-            for dp, _dn, fn in os.walk(folder):
-                for f in fn:
-                    low = f.lower()
-                    if low.endswith((".iso", ".cue")):
-                        logger.info(
-                            "delete guard: KEEPING %s -- holds %s, whose "
-                            "tracks cannot be read until it is extracted/split",
-                            folder.name[:44], f[:40])
-                        return True
-                    if low.endswith((".!qb", ".part", ".tmp", ".downloading")):
-                        logger.info(
-                            "delete guard: KEEPING %s -- %s is still "
-                            "downloading", folder.name[:44], f[:40])
-                        return True
-        except OSError:
-            return True
+            return False, "Lidarr could not be asked (%s)" % exc
+        return folder_fully_owned(self.lidarr, folder, audios,
+                                  (art or {}).get("id"))
+
+    def _our_torrent_for_folder(self, folder: Path):
+        """(torrent, exact) for the torrent of OUR category holding `folder`:
+        exact when its content IS this folder (a single-album torrent), not
+        exact when the folder sits inside it (a discography). (None, False)
+        when there is none."""
         q = self._get_qbt()
-        if q is not None:
-            try:
-                fr = str(folder.resolve(strict=False)).replace("\\", "/").rstrip("/")
-                for tor in q.torrents():
-                    cp = str(tor.get("content_path") or "").replace("\\", "/").rstrip("/")
-                    if not cp:
-                        continue
-                    if fr == cp or fr.startswith(cp + "/") or cp.startswith(fr + "/"):
-                        if float(tor.get("progress") or 0) < 0.999:
-                            logger.info(
-                                "delete guard: KEEPING %s -- its torrent is "
-                                "only %.0f%% complete", folder.name[:44],
-                                float(tor.get("progress") or 0) * 100)
-                            return True
-            except Exception:  # noqa: BLE001
-                return True
+        if q is None:
+            return None, False
+        fr = str(folder.resolve(strict=False)).replace("\\", "/").rstrip("/")
+        wr = str((self.cfg.watch_root or Path("/")).resolve(strict=False)).replace("\\", "/").rstrip("/")
+        for t in q.torrents():
+            if not self._qbt_ours(t):
+                continue
+            cp = str(t.get("content_path") or "").replace("\\", "/").rstrip("/")
+            sp = str(t.get("save_path") or "").replace("\\", "/").rstrip("/")
+            name = os.path.basename(cp) if cp else (t.get("name") or "")
+            mapped = f"{wr}/{name}" if name else ""
+            if cp and (cp == fr or mapped == fr) and cp != sp:
+                return t, True
+            if cp and (fr.startswith(cp + "/") or (mapped and fr.startswith(mapped + "/"))):
+                return t, False
+        return None, False
+
+    def _dispose_redundant_download(self, folder: Path, cue_path: Optional[Path],
+                                    audios: List[Path], artist_name: str,
+                                    album_name: str, reason: str) -> None:
+        """
+        The ONE owner of throwing away a download proven redundant by
+        _folder_fully_owned. Before this, a Lidarr queue row was matched by
+        "its title appears somewhere in the path" and removed WITH its data, so
+        one redundant leaf album took the whole `Blue Stahli Discography`
+        torrent -- and the album next to it that was still missing -- with it.
+
+          * Local files first, and only as the delete flags allow.
+          * The torrent is resolved by content path, category-checked, never
+            by title. Its queue row is found by downloadId == its hash.
+          * A single-album torrent: blocklisted through Lidarr so the same
+            release is never grabbed again (the Arkenstone re-grab loop), and
+            taken out of the client only when deleting is allowed.
+          * A folder inside a bigger torrent: this album's files are
+            deselected; the release is never blocklisted and sibling albums
+            are never touched.
+        """
+        deleting = bool(self.cfg.delete_source_folder_on_success
+                        or self.cfg.delete_originals_on_success)
+        if self.cfg.delete_source_folder_on_success:
+            sentinel = cue_path if cue_path is not None else folder / ".cueless_sweep"
+            self._delete_source_folder(
+                sentinel, verified=True, artist_name=artist_name,
+                album_name=album_name, context="already in library (sweep)")
+        else:
+            if self.cfg.delete_originals_on_success:
+                for a in audios:
+                    try:
+                        a.unlink()
+                    except OSError as exc:
+                        logger.warning("Could not delete %s: %s", a, exc)
+            self._delete_orphan_cue(cue_path, reason)
         try:
-            srcs = scan_folder(str(folder)) or []
+            t, exact = self._our_torrent_for_folder(folder)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("delete guard: cannot read %s (%s) -- keeping it",
-                           folder, exc)
-            return True
-        for sf in srcs:
-            if not getattr(sf, "title", ""):
-                # An untagged file might be anything -- never delete on a guess.
-                return True
-            for w in (wanted.get(norm_title(sf.title)) or []):
-                if not getattr(sf, "artist", "") or artists_agree(
-                        sf.artist, w.artist_name):
-                    logger.info(
-                        "delete guard: KEEPING %s -- it holds %r, still "
-                        "wanted by %s / %s", folder.name[:44],
-                        str(sf.title)[:40], str(w.artist_name)[:24],
-                        str(w.album_title)[:30])
-                    return True
-        return False
-
-    def _blocklist_redundant_download(self, folder: Path, artist_name: str,
-                                      album_name: str) -> None:
-        """
-        Blocklist the release behind a download we just deleted as redundant,
-        so the same release is never grabbed for the same album again.
-
-        Best-effort and never fatal: prefer Lidarr's queue (that also removes
-        the torrent), and fall back to removing the torrent ourselves.
-        """
+            logger.debug("torrent lookup for redundant download failed: %s", exc)
+            return
+        if t is None:
+            return
+        thash = str(t.get("hash") or "")
+        if not exact:
+            self._deselect_album_in_torrent(t, folder)
+            return
         try:
             for rec in (self.lidarr.queue_list() or []):
-                aid = rec.get("albumId") or (rec.get("album") or {}).get("id")
-                title = str(rec.get("title") or "")
-                if title and title.lower() in str(folder).lower() and rec.get("id"):
+                if (str(rec.get("downloadId") or "").lower() == thash.lower()
+                        and rec.get("id") is not None):
                     if self.lidarr.queue_remove(int(rec["id"]),
-                                                remove_from_client=True,
+                                                remove_from_client=deleting,
                                                 blocklist=True):
                         logger.info(
                             "Blocklisted redundant release %r for %s / %s -- "
                             "it will not be grabbed again",
-                            title[:60], artist_name[:24], album_name[:30])
+                            str(t.get("name") or "")[:60], artist_name[:24],
+                            album_name[:30])
                         return
         except Exception as exc:  # noqa: BLE001
             logger.debug("blocklist of redundant download failed: %s", exc)
-        # No queue row (our own magnet grabs never make one) -- at least drop
-        # the torrent so it stops seeding data we deliberately deleted.
-        try:
-            self._remove_torrent_for_folder(folder)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("torrent removal for redundant download failed: %s", exc)
+        if deleting:
+            # No queue row (our own magnet grabs never make one): stop seeding
+            # data we deliberately deleted. The data is already gone locally.
+            q = self._get_qbt()
+            if q is not None and self._qbt_ours_by_hash(q, thash):
+                q.remove(thash, delete_files=False)
 
     def _queue_target_for_hash(self, thash: str) -> Optional[Dict[str, Any]]:
         """The album Lidarr's queue attributes to this download, or None."""
@@ -5552,7 +5841,52 @@ class Orchestrator:
                          artist_name, album_name, exc)
             return False
 
-    def _handoff_pre_split_to_lidarr(
+    # Outcomes that are facts whatever else failed: the files were imported, or
+    # Lidarr itself proved them redundant, file by file.
+    _OUTCOMES_REAL_UNDER_FAILURE = frozenset({"imported_via_manual",
+                                              "already_in_lidarr"})
+
+    def _lidarr_generation(self) -> int:
+        return int(getattr(self.lidarr, "failure_generation", 0) or 0)
+
+    def _handoff_pre_split_to_lidarr(self, *args, **kwargs) -> None:
+        """
+        One hand-off, watched for Lidarr failing under it. Lidarr's read
+        methods answer [] / None on failure, so a hand-off during an outage
+        concluded "no monitored album" and recorded `skipped_unmonitored` --
+        a WebUI attention row, a CUE retry spent, the folder parked for a day.
+        A hand-off in which any Lidarr call failed records nothing but facts
+        (see _record) and is not remembered by the sweep: it is simply tried
+        again on a later pass.
+        """
+        tl = self._tl
+        folder = args[1] if len(args) > 1 else kwargs.get("folder")
+        if folder is not None and not claims.claim(folder):
+            # Another worker is on this folder right now (the startup and the
+            # periodic sweep once handed the same 27 folders off together).
+            logger.info("Pre-split handoff: %s is being processed by another "
+                        "worker -- skipped this time", Path(folder).name)
+            tl.lidarr_failed_last = True
+            return
+        outer = getattr(tl, "gen", None)
+        tl.gen = self._lidarr_generation()
+        tl.lidarr_failed = False
+        try:
+            self._handoff_inner(*args, **kwargs)
+        finally:
+            tl.lidarr_failed_last = (tl.lidarr_failed
+                                     or self._lidarr_generation() != tl.gen)
+            tl.gen = outer
+            if folder is not None:
+                claims.release(folder)
+
+    def _lidarr_failed_in_last_handoff(self) -> bool:
+        """The last hand-off on this thread was not conclusive: Lidarr failed
+        under it, or another worker held the folder."""
+        tl = getattr(self, "_tl", None)
+        return bool(tl is not None and getattr(tl, "lidarr_failed_last", False))
+
+    def _handoff_inner(
         self,
         cue_path: Optional[Path],
         folder: Path,
@@ -5824,71 +6158,45 @@ class Orchestrator:
             #           before, so a transient Lidarr hiccup never drops audio.
 
         # 2b) Space-saving dedup: if Lidarr already has this album fully in
-        #     the library, this download is redundant -- delete it instead
-        #     of re-importing. Guarded by a track-count check so we never
-        #     delete a LARGER edition (e.g. a 14-track deluxe download) just
-        #     because a smaller standard album is complete in the library.
+        #     the library AND rejects every file of this download as "not an
+        #     upgrade", the download is redundant -- remove it instead of
+        #     re-importing. Anything else (a larger edition, a song Lidarr
+        #     does not know, a lossless copy of an MP3 album) is imported.
         if self.cfg.pre_check_lidarr_library:
             existing = self._album_already_in_library(artist_name, album_name)
             if existing:
                 stats = existing.get("statistics") or {}
                 have = int(stats.get("trackFileCount") or 0)
                 total = int(stats.get("totalTrackCount") or 0)
-                if total >= len(audios) and self._folder_has_wanted_tracks(
-                        folder):
+                owned, why = self._folder_fully_owned(folder, artist_name, audios)
+                if owned is None:
+                    logger.info("Pre-split: %s -- %s; nothing to decide.",
+                                folder.name, why)
+                    return
+                if not owned:
                     logger.info(
-                        "Pre-split: %s / %s looks redundant, but the folder "
-                        "still holds song(s) Lidarr wants -- NOT deleting.",
-                        artist_name, album_name)
-                elif total >= len(audios):
+                        "Pre-split: %s / %s is in the library (%d/%d), but %s "
+                        "-- NOT deleting; importing instead.",
+                        artist_name, album_name, have, total, why)
+                else:
                     logger.info(
-                        "Pre-split: %s / %s already fully in library "
-                        "(%d/%d tracks; download has %d) -- deleting download "
-                        "to reclaim space.",
-                        artist_name, album_name, have, total, len(audios),
-                    )
+                        "Pre-split: %s / %s already in library (%d/%d tracks): "
+                        "%s -- removing the download to reclaim space.",
+                        artist_name, album_name, have, total, why)
                     self._record(
                         key_path, outcome="already_in_lidarr", pre_split=True,
                         artist=artist_name, album=album_name,
-                        reason=f"already in library ({have}/{total} tracks)",
+                        reason=f"already in library ({why})",
                     )
-                    # AND STOP IT COMING BACK. Deleting the download without
-                    # telling Lidarr leaves the release perfectly grabbable, so
-                    # the next pass fetches it again: `Diane and David
-                    # Arkenstone - Music Inspired By Middle Earth ALAC` was
-                    # downloaded and deleted over and over -- 307 MB a time --
-                    # for an album already complete in ALAC under DAVID
-                    # Arkenstone. Blocklisting is the only thing that says
-                    # "never again"; we only download what we are missing.
-                    self._blocklist_redundant_download(folder, artist_name,
-                                                       album_name)
+                    # AND STOP IT COMING BACK: `Diane and David Arkenstone -
+                    # Music Inspired By Middle Earth ALAC` was downloaded and
+                    # deleted over and over -- 307 MB a time -- for an album
+                    # already complete in ALAC. The disposal blocklists a
+                    # single-album release so it is never grabbed again.
+                    self._dispose_redundant_download(
+                        folder, cue_path, audios, artist_name, album_name, reason)
                     self._skip_seen.add(key_path)
-                    if self.cfg.delete_source_folder_on_success:
-                        sentinel = (
-                            cue_path if cue_path is not None
-                            else folder / ".cueless_sweep"
-                        )
-                        # have/total from Lidarr already proved the album is
-                        # complete in the library: the download is redundant.
-                        self._delete_source_folder(
-                            sentinel, verified=True, artist_name=artist_name,
-                            album_name=album_name,
-                            context="already in library (sweep)")
-                    else:
-                        if self.cfg.delete_originals_on_success:
-                            for a in audios:
-                                try:
-                                    a.unlink()
-                                except OSError as exc:
-                                    logger.warning("Could not delete %s: %s", a, exc)
-                        self._delete_orphan_cue(cue_path, reason)
                     return
-                logger.info(
-                    "Pre-split: %s / %s is in library but with fewer tracks "
-                    "(%d) than this download (%d) -- NOT deleting (likely a "
-                    "larger edition); proceeding with import.",
-                    artist_name, album_name, total, len(audios),
-                )
 
         # 3) Queue-correlation (best-effort).
         download_client_id: Optional[str] = None
@@ -6576,6 +6884,7 @@ class Orchestrator:
         # expensive Lidarr tag-parse happens once per folder) while staying
         # self-healing -- so this scales to a whole library of any genre, not
         # just one artist. Lives on the Orchestrator, surviving across passes.
+        self._release_llm_waiting()
         cache = getattr(self, "_reconcile_cache", None)
         if cache is None:
             cache = {}
@@ -6686,7 +6995,7 @@ class Orchestrator:
                             if did:
                                 imported += len(audios)
                                 cache.pop(key, None)
-                if not did:
+                if not did and not self._llm_blocked(folder):
                     cache[key] = (mtime, now_ts)
         if imported:
             logger.info("reconcile: imported %d file(s) this pass "
@@ -6696,6 +7005,22 @@ class Orchestrator:
         return imported
 
     def sweep_cueless_pre_split_folders(
+        self,
+        watch_root: Path,
+        excluded: Optional[List[Path]] = None,
+    ) -> int:
+        """One cueless sweep pass -- never two at once (a pass takes the
+        better part of an hour; a second one started beside it handed every
+        folder off twice). A tick that finds a pass running is skipped."""
+        if not self._sweep_pass_lock.acquire(blocking=False):
+            logger.info("cueless sweep: a pass is already running -- skipping this tick")
+            return 0
+        try:
+            return self._sweep_cueless_pass(watch_root, excluded)
+        finally:
+            self._sweep_pass_lock.release()
+
+    def _sweep_cueless_pass(
         self,
         watch_root: Path,
         excluded: Optional[List[Path]] = None,
@@ -6739,6 +7064,7 @@ class Orchestrator:
 
         min_stable = max(0, int(self.cfg.sweep_min_stable_seconds))
         now_ts = time.time()
+        self._release_llm_waiting()
         # Remembered for the ISO branch: a loose .iso sitting in the watch ROOT
         # needs its own album folder rather than extracting into the root.
         self._sweep_watch_root = watch_root
@@ -6909,10 +7235,14 @@ class Orchestrator:
                     orphan = False
                 if not orphan:
                     continue
-                logger.info(
-                    "cueless sweep: adopting orphaned split output %r (%d "
-                    "settled file(s), its .cue has finished)",
-                    folder.name[:50], len(self._sibling_audio_files(folder)))
+                # Announced once per content: the ledger skip further down
+                # drops an orphan already handed off, but this line came first
+                # and was logged every pass (841 times for one Frida disc).
+                if not self._sweep_ledger_skip(folder, here, now_ts):
+                    logger.info(
+                        "cueless sweep: adopting orphaned split output %r (%d "
+                        "settled file(s), its .cue has finished)",
+                        folder.name[:50], len(here))
 
             # A lone disc-image file (e.g. .wv/.ape/.flac) may carry its
             # cuesheet EMBEDDED in itself with no sidecar .cue. Extract it to a
@@ -7128,6 +7458,9 @@ class Orchestrator:
                     artist_override=artist_ov, album_override=album_ov,
                 )
                 handed_off += 1
+                if self._lidarr_failed_in_last_handoff():
+                    # Not remembered: a later pass tries it again.
+                    continue
                 # Remember it at its CURRENT content, so a restart doesn't redo
                 # it but a later change (more files arriving) still will.
                 self._sweep_ledger_mark(folder, audios, now_ts)
@@ -9198,8 +9531,9 @@ class Orchestrator:
 
     @staticmethod
     def _title_key(s: str) -> str:
-        """Normalize a title for fuzzy comparison: lowercase, alnum only."""
-        return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+        """Normalize a title for fuzzy comparison: folded letters and digits
+        of any script (titlematch.key)."""
+        return titlematch.key(s or "")
 
     def _read_audio_title(self, path: Path) -> str:
         """
@@ -9537,7 +9871,7 @@ class Orchestrator:
     def _norm_title(s: str) -> str:
         """
         Normalize a title for comparison. Script-folding FIRST, because the
-        `[^a-z0-9]` collapse below is an ASCII filter: it does not merely
+        `[^a-z0-9]` collapse this used was an ASCII filter: it did not merely
         ignore other scripts, it DELETES them. 'Георги Христов' normalized to
         the empty string, so every release for a Cyrillic-titled artist scored
         a 0.0 title relation and was dropped as irrelevant -- the same for
@@ -9549,10 +9883,9 @@ class Orchestrator:
         Hristov'). This is the same folding _match_key already applied to
         artist/album equality -- the search ranking simply never got it.
         """
-        s = unicodedata.normalize("NFKD", (s or "").lower())
-        s = "".join(ch for ch in s if not unicodedata.combining(ch))
-        s = _translit_cyrillic(s)
-        return re.sub(r"[^a-z0-9]+", " ", s).strip()
+        # titlematch.fold, then the words of ANY script: the [^a-z0-9] this
+        # ended in still deleted Greek, CJK, Arabic, Hangul and 'ø'.
+        return " ".join(titlematch.words(s))
 
     @classmethod
     def _title_relation(cls, want_norm: str, title_norm: str,
@@ -12660,6 +12993,17 @@ class Orchestrator:
         track_count: int = 0,
     ) -> None:
         """Append one row to the ledger CSV. Safe if ledger is disabled."""
+        tl = getattr(self, "_tl", None)
+        gen = getattr(tl, "gen", None) if tl is not None else None
+        if (gen is not None and outcome not in self._OUTCOMES_REAL_UNDER_FAILURE
+                and self._lidarr_generation() != gen):
+            # Lidarr failed during this hand-off: what it concluded may be
+            # the outage talking. Not a verdict; tried again later.
+            tl.lidarr_failed = True
+            logger.info("Lidarr failed during the hand-off of %s -- not "
+                        "recording %r; it is tried again when Lidarr answers",
+                        Path(cue_path).name, outcome)
+            return
         path = self.cfg.ledger_file
         if not path:
             return
@@ -14308,6 +14652,51 @@ class Orchestrator:
             return False
         return bool(q.remove(thash, delete_files=True))
 
+    def _deselect_album_in_torrent(self, t: Dict[str, Any], folder: Path,
+                                   reap_if_last: bool = False) -> str:
+        """
+        Deselect this album's files in a bigger (discography) torrent so qBit
+        won't download them, leaving the torrent for its other albums. With
+        reap_if_last (a user's Discard), a torrent with no other wanted audio
+        left is removed and blocklisted instead. Returns a message suffix.
+        """
+        q = self._get_qbt()
+        if q is None or not self._qbt_ours(t):
+            return ""
+        fr = str(folder.resolve(strict=False)).replace("\\", "/").rstrip("/")
+        seg = "/" + os.path.basename(fr) + "/"  # this album's folder segment
+        files = q.files(t.get("hash")) or []
+        desel: List[int] = []
+        other_audio = 0
+        for f in files:
+            fn = "/" + str(f.get("name") or "").replace("\\", "/")
+            idx = f.get("index")
+            if seg in fn:                       # belongs to this album
+                if idx is not None:
+                    desel.append(int(idx))
+            elif (os.path.splitext(fn)[1].lower() in _ALL_AUDIO_EXTS
+                  and int(f.get("priority", 1)) != 0):
+                other_audio += 1               # another still-wanted album
+        if other_audio == 0 and reap_if_last:
+            if self._reap_torrent(t.get("hash"), blocklist=True):
+                return " and removed + blocklisted the discography torrent (no other wanted albums left)"
+            return ""
+        if desel:
+            # Never claim a deselect that did not happen: qBit can refuse
+            # (auth expired, hash gone) and the message below would otherwise
+            # tell the user it worked.
+            if not q.set_file_priority(t.get("hash"), desel, 0):
+                logger.warning(
+                    "deselect of %d file(s) FAILED for torrent %s",
+                    len(desel), str(t.get("name"))[:60])
+                return (" (tried to deselect this album in the "
+                        "torrent but qBittorrent refused -- see log)")
+            logger.info("Deselected %d file(s) of %s in torrent %s; %d other "
+                        "album track(s) kept", len(desel), folder.name,
+                        str(t.get("name"))[:60], other_audio)
+        return (f" (deselected this album in the torrent; "
+                f"{other_audio} other album track(s) kept)")
+
     def _discard_torrent_for_folder(self, folder: Path) -> str:
         """
         Torrent cleanup for a DISCARD:
@@ -14340,37 +14729,7 @@ class Orchestrator:
                         return " and removed + blocklisted the torrent (Lidarr will try a different release)"
                     return ""
                 if contains:
-                    files = q.files(t.get("hash")) or []
-                    desel: List[int] = []
-                    other_audio = 0
-                    for f in files:
-                        fn = "/" + str(f.get("name") or "").replace("\\", "/")
-                        idx = f.get("index")
-                        if seg in fn:                       # belongs to this album
-                            if idx is not None:
-                                desel.append(int(idx))
-                        elif (os.path.splitext(fn)[1].lower() in _ALL_AUDIO_EXTS
-                              and int(f.get("priority", 1)) != 0):
-                            other_audio += 1               # another still-wanted album
-                    if other_audio == 0:
-                        # last wanted album -> drop + blocklist the whole
-                        # discography torrent (Lidarr will re-search differently).
-                        if self._reap_torrent(t.get("hash"), blocklist=True):
-                            return " and removed + blocklisted the discography torrent (no other wanted albums left)"
-                        return ""
-                    # Keep the torrent; just stop this album from downloading.
-                    if desel:
-                        # Never claim a deselect that did not happen: qBit can
-                        # refuse (auth expired, hash gone) and the message below
-                        # would otherwise tell the user it worked.
-                        if not q.set_file_priority(t.get("hash"), desel, 0):
-                            logger.warning(
-                                "deselect of %d file(s) FAILED for torrent %s",
-                                len(desel), str(t.get("name"))[:60])
-                            return (" (tried to deselect this album in the "
-                                    "torrent but qBittorrent refused -- see log)")
-                    return (f" (deselected this album in the torrent; "
-                            f"{other_audio} other album track(s) kept)")
+                    return self._deselect_album_in_torrent(t, folder, reap_if_last=True)
         except Exception as exc:  # noqa: BLE001
             logger.debug("WebUI: discard torrent cleanup skipped: %s", exc)
         return ""

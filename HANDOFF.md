@@ -1,6 +1,6 @@
 # cue_pipeline — handoff
 
-Consolidated 17 Sep 2026. This file is rewritten, not appended to: everything
+Consolidated 29 Sep 2026. This file is rewritten, not appended to: everything
 below is current. `README.md` explains what the pipeline does; this is what a
 fresh session needs — how to deploy, what is true now, what is still open, and
 the mistakes worth not repeating.
@@ -83,6 +83,25 @@ hand-created container shows 54 env vars where Apply gives 57.
 
 ---
 
+### Tests
+
+`tests/` is plain `unittest`; run it **in the image** (mutagen, ffmpeg):
+
+```bash
+# Windows: ship the working tree
+tar -cf - --exclude=__pycache__ --exclude=.git . | ssh root@192.168.1.200 'rm -rf /tmp/cue_test && mkdir /tmp/cue_test && tar -xmf - -C /tmp/cue_test'
+# PARK
+docker run --rm -v /tmp/cue_test:/src -w /src --entrypoint python cue_pipeline:latest -m unittest discover -s tests -t .
+```
+
+Green tests are not a deploy check: `tests/test_startup.py` exists because a
+class inserted above `OrchestratorConfig` took its `@dataclass` and the
+container crash-looped while every other test passed. And never build from a
+context copied under `umask 077` — the files become root-only and the
+container (uid 99) cannot read `/app/main.py`.
+
+---
+
 ## 2. Configuration: three layers, and the last one wins
 
 `main.py` builds the config in this order (~line 1127):
@@ -105,6 +124,12 @@ means "use the YAML".
 - The **AcoustID key in `config.yaml` is the expired public TEST key and is not
   what runs.** `ACOUSTID_KEY` in the template is a different, valid key. Do not
   conclude the key is broken by reading the YAML.
+
+- A **stale `ollama.model` in `webui_overrides.json`** (the 14B, from an old
+  "switch models via overrides" trick) beat the template's `LLM_MODEL` for
+  weeks: the LLM asked for a model that was gone. Removed 29 Sep. `main.py`
+  now WARNS at startup whenever a Settings-tab value overrides a container
+  variable — read that line after every deploy.
 
 **Always read the EFFECTIVE value**, without starting the pipeline:
 
@@ -139,6 +164,24 @@ layer says `http://daniel:11434`.
   `_superseded_by_lossless` 71 levels deep, which made a Jellyfin validation
   worker spin a core for 13 h.
 - `replace_existing` **does not exist** on `LidarrClient` — see §5.
+- **"Redundant" is Lidarr's per-file verdict**, never a track count:
+  `dedup_downloads.folder_fully_owned` — every file mapped AND rejected "Not an
+  upgrade". Used by the pre-split check and the purge. A count deleted a song
+  Lidarr did not know, and a FLAC download of an album held as MP3.
+- **One redundant album never takes its neighbours**
+  (`_dispose_redundant_download`): torrent found by content path in our
+  category, queue row by downloadId, a discography leaf only deselected.
+- **One worker per folder** (`claims.py`): the CUE job and each hand-off claim
+  their folder; `QbtClient.remove` and `robust_rmtree` refuse a claimed one.
+  The sweep is one thread and one pass at a time.
+- **Nothing concluded during an outage is recorded**: LidarrClient counts
+  failures (`failure_generation`, fail-fast breaker); a hand-off in which one
+  happened records only facts and is not remembered by the sweep.
+- **An unanswered LLM question is not a "no"** (`UNAVAILABLE`, `llm_gate.py`):
+  the item waits and is re-examined when the gate reopens.
+- **Encodes appear only complete** (`_encode_flac`: `.partial`, verify, tag,
+  rename); DVD-Audio publishes the whole disc or nothing.
+- **Titles compare in any script** (`titlematch.py`) — see README.
 
 ---
 
@@ -207,6 +250,10 @@ test of a feature whose purpose is removing files.
 - **Before caching anything, ask what the cached value means when the underlying
   call FAILED.** A cache that cannot tell "no" from "I could not ask" turns an
   outage into a permanent wrong answer.
+- **Unavailable is not "no" — anywhere.** The same bug came back in four
+  places (LLM answers, Lidarr lookups, a partial Lidarr index, an in-memory
+  skip set that never expired). Each is fixed at the source now; any new
+  "could not ask" path must say so distinctly.
 - **Do not read a rate off progress lines.** The gap between two
   "[n/758] discrepancy" lines is filled with searches, imports and harvests, not
   scanning — which is how the audit got blamed for 50 minutes of other work.
@@ -215,21 +262,24 @@ test of a feature whose purpose is removing files.
 
 ## 6. Open items
 
-1. **Lidarr's recycle bin is OFF** (`recycleBin: ''`). Turning it on would have
-   made the Frida loss recoverable. Still worth proposing.
-2. **`interactive_search_max_candidates` is 1000.** One bad artist match becomes
-   1000 grab attempts. 5–10 would be saner. The user's setting; not changed.
-3. **Albums still partially imported.** The audit works through them; watch
-   `under-registered` lines. Not all are fixable.
-4. **Orphan uncategorised torrents** in qBittorrent carry no category and no
-   history rows — they escape every category-scoped guard.
-5. **`.mkv` files in the music library.**
-6. **Cloud LLM** (`cloud_llm.py`) is wired but unused.
-7. **The Klayton torrent** (84%, 0 seeders, fills no gap) — a one-off cleanup.
-8. `staging.delete_source_folder_on_success` is **effectively false** via
-   `webui_overrides.json` while the YAML and env both say true. The guard in §3
-   means that override is no longer the only thing preventing data loss, so it
-   can be turned back on when wanted.
+1. **Audit pairs 3 (qbt/loops, orchestrator tail) were still running** at the
+   29 Sep deploy; pairs 1-2 are fixed. Fix what pair 3 confirms, same way.
+2. **Content-identify returns a TITLE**; callers re-find the album by name, so
+   among same-titled albums the first wins. The pick itself is now labelled by
+   year and track count; passing the album id through the name-based hand-off
+   is the remaining refactor.
+3. **Interactive search passes finish in ~60 ms with 0 accepted** over 583
+   missing albums — something skips them all (cooldown state?). Lidarr's own
+   AlbumSearch for 9 missing albums (Cyrillic, Arabic, Japanese, Latin with
+   curly quotes) found 0 reports: indexer coverage.
+4. **CUE ledger "gave up" rows** from before 29 Sep may be outage artefacts
+   (Lidarr down -> `skipped_unmonitored` x3). Replace/edit the .cue to retry.
+5. **Lidarr's recycle bin is OFF** (`recycleBin: ''`). Still worth proposing.
+6. **`interactive_search_max_candidates` is 1000.** The user's setting.
+7. **Orphan uncategorised torrents** escape every category-scoped guard.
+8. **`.mkv` files in the music library.** **Cloud LLM** wired but unused.
+9. `staging.delete_source_folder_on_success` is **effectively false** via
+   `webui_overrides.json` (`delete_originals_on_success` true).
 
 ---
 
@@ -241,7 +291,7 @@ test of a feature whose purpose is removing files.
 | Lidarr | `http://192.168.1.200:8686` |
 | Prowlarr | `http://192.168.1.200:9696` |
 | qBittorrent | `http://192.168.1.200:8080`, category **`lidarr`** — never touch others |
-| LLM | `http://daniel:11434`, `huihui_ai/qwen2.5-abliterate:14b`. GPU **shared with the user's own work** — `keep_alive` is 5m and `warmup_on_start` is false on purpose |
+| LLM | `http://daniel:11434`, **HA's own** `huihui_ai/Qwen3.6-abliterated:27b`, `num_ctx 16384`, `think false` — one runner serves both. Asked only when the GPU gate is open (HA sensors via `HA_URL`/`HA_TOKEN`); `keep_alive` 600 never shortens HA's; `warmup_on_start` false |
 | WebUI | `http://192.168.1.200:8830` |
 | Container limits | `--cpuset-cpus 1,3,7,9 --cpus 2.0 --cpu-shares 256 --memory 4g` |
 

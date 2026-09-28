@@ -31,8 +31,8 @@ from typing import Callable, List, Dict, Any, Iterable, Optional, Tuple
 
 import yaml
 
+import titlematch
 from lidarr import LidarrClient, LidarrConfig, _norm_artist as norm_artist
-from ollama_client import OllamaClient
 from qbittorrent_client import QbtClient
 from dedup_downloads import (AUDIO_EXTS, album_complete_in_library, human,
                               norm_title)
@@ -373,10 +373,26 @@ def plan_torrent(
         # Wet` gave artist="BJ_Discography", every Lidarr lookup missed, and
         # all 16 Bon Jovi albums -- every one of them complete in the library
         # -- were reported "not in library" and left selected. 16 GB of music
-        # already owned. So when the folder name resolves to nothing, ask the
-        # FILES: their tags carry the real artist.
-        if total == 0 and not forced_artist:
+        # already owned. So when the folder name resolves to nothing, ask
+        # the library who owns an album of that title.
+        #
+        # But only when the folder does not name an artist Lidarr KNOWS -- or
+        # when the path itself names the owner (`ABBA®/Agnetha Fältskog/1983 -
+        # Wrap Your Arms Around Me` is Agnetha's). Otherwise a title shared by
+        # two unrelated artists swaps them: the single `Treasure` in `Bruno
+        # Mars - Discography - 2010-2013` was resolved to Cocteau Twins'
+        # "Treasure" (10/10 owned) and deselected as already in the library.
+        deferred = bool(matched.get("llm_deferred"))
+        if total == 0 and not forced_artist and not deferred:
             owner = _artist_owning_album(lidarr, album, _cache=lib_cache)
+            folder_is_artist = matched.get("artist") is not None
+            if (owner and folder_is_artist
+                    and not _path_names_artist(parts, owner)):
+                logger.info(
+                    "  %r: %r also exists as an album by %r, but this folder "
+                    "belongs to %r -- not borrowing it", album[:40], album[:40],
+                    owner, artist)
+                owner = ""
             if owner and norm_artist(owner) != norm_artist(artist):
                 c2, h2, t2 = album_complete_in_library(
                     lidarr, owner, album, _cache=lib_cache, llm=llm,
@@ -386,7 +402,13 @@ def plan_torrent(
                         "  folder %r is not an artist -- %r is owned by %r "
                         "(%d/%d)", raw_artist[:40], album[:40], owner, h2, t2)
                     artist, complete, have, total = owner, c2, h2, t2
-        if _is_noise_category(key) or _album_looks_unofficial(album):
+            deferred = bool(matched.get("llm_deferred"))
+        if deferred and total == 0:
+            # Only the LLM could say whether this is an album already owned
+            # under another name, and it cannot be asked right now. Keep it
+            # downloading and decide when it can -- never "not in library".
+            deselect = False
+        elif _is_noise_category(key) or _album_looks_unofficial(album):
             # Noise-category folder (bootlegs/live/singles/...): deselect by
             # default. Keep ONLY if Lidarr explicitly tracks a matching album
             # (total > 0) that is still missing (not complete) -- i.e. Lidarr
@@ -429,8 +451,30 @@ def plan_torrent(
             "all_files": allf,     # every file in the folder (what we deselect)
             "size": sum(int(x.get("size") or 0) for x in allf),
             "have": deselect, "have_count": have, "total": total,
+            "deferred": bool(deferred and total == 0),
         })
     return plan
+
+
+def _llm_available(llm) -> bool:
+    """Can the LLM be asked now? A client without a gate always can."""
+    probe = getattr(llm, "available", None)
+    try:
+        return bool(probe()) if callable(probe) else True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _path_names_artist(parts: List[str], artist: str) -> bool:
+    """Does any folder on this path carry the artist's whole name? Words, not
+    a substring of a squashed key: "X" is inside "xrayspex", "Frida" inside
+    "fridaboccara". See titlematch.names_artist."""
+    return titlematch.names_artist(parts, artist)
+
+
+def plan_is_deferred(plan: Optional[List[Dict[str, Any]]]) -> bool:
+    """Some album in this plan waits for the LLM -- the plan is not final."""
+    return any(a.get("deferred") for a in (plan or []))
 
 
 def assembly_keep_tails(needed_paths: Iterable[str]) -> set:
@@ -468,9 +512,11 @@ def process_torrent(
     emit: Callable[[str], None] = logger.info,
     files: Optional[List[Dict[str, Any]]] = None,
     llm=None, deselect_video: bool = True, reap_useless: bool = False,
-    assembly_keep: Optional[set] = None,
+    assembly_keep: Optional[set] = None, out: Optional[dict] = None,
 ) -> tuple:
-    """Plan + (optionally) deselect one torrent. Returns (deselected, kept)."""
+    """Plan + (optionally) deselect one torrent. Returns (deselected, kept).
+    `out`, when given, receives "deferred": how many albums wait for the LLM
+    (kept downloading for now; the torrent must be planned again)."""
     thash = torrent.get("hash")
     tname = torrent.get("name") or "?"
     if files is None:
@@ -479,6 +525,8 @@ def process_torrent(
     # no owned albums (or no audio-album grouping) should drop its video files.
     video_idx = _video_file_indices(files) if deselect_video else []
     plan = plan_torrent(lidarr, tname, files, forced_artist, llm=llm)
+    if out is not None:
+        out["deferred"] = sum(1 for a in plan if a.get("deferred"))
     if not plan and not video_idx:
         return 0, 0
     emit(f"Torrent: {tname}")
@@ -499,7 +547,9 @@ def process_torrent(
                     else ""))
         else:
             kept += 1
-            why = "not in library" if a["total"] == 0 else f"library {a['have_count']}/{a['total']}"
+            why = ("waiting for the LLM" if a.get("deferred")
+                   else "not in library" if a["total"] == 0
+                   else f"library {a['have_count']}/{a['total']}")
             emit(f"  KEEP  [{human(a['size']):>9}]  {a['artist']} / {a['album']} ({why})")
     # Merge in video files (VIDEO_TS/BDMV/containers, AUDIO_TS kept) -- always
     # dropped for a music torrent, on top of any already-have album folders.
@@ -623,6 +673,11 @@ def auto_deselect_pass(
     apply is idempotent and only touches not-yet-deselected files), so a
     long-running download isn't disturbed. Without `planned` the old
     plan-once/`seen` behaviour is unchanged.
+
+    WAITING FOR THE LLM: a torrent with an album only the LLM can decide, while
+    the LLM cannot be asked, is recorded in `planned` with a NEGATIVE stamp. It
+    is planned again on the first pass where the LLM can be asked -- not after
+    the recheck window, and not every pass while it still cannot.
     """
     if now is None:
         now = time.time()
@@ -651,12 +706,18 @@ def auto_deselect_pass(
             continue
         first_sight = h not in seen
         if not first_sight:
-            # Already handled once. Re-plan only if the recheck window is
-            # enabled and has elapsed; otherwise skip (cheap steady state).
-            if planned is None or recheck_seconds <= 0:
-                continue
-            if (now - planned.get(h, 0.0)) < recheck_seconds:
-                continue
+            stamp = planned.get(h, 0.0) if planned is not None else 0.0
+            if stamp < 0:
+                # Waiting for the LLM: re-plan as soon as it can be asked.
+                if llm is None or not _llm_available(llm):
+                    continue
+            else:
+                # Already handled once. Re-plan only if the recheck window is
+                # enabled and has elapsed; otherwise skip (cheap steady state).
+                if planned is None or recheck_seconds <= 0:
+                    continue
+                if (now - stamp) < recheck_seconds:
+                    continue
         # Capture the torrent's original start-state so we restore EXACTLY what
         # Lidarr/you set -- never impose one.
         state = (t.get("state") or "").lower()
@@ -676,14 +737,15 @@ def auto_deselect_pass(
                 # without the file list -- retry next pass, don't mark seen.
                 # (The finally-block restores the original state meanwhile.)
                 continue
+            info: Dict[str, Any] = {}
             d, _k = process_torrent(
                 qbt, lidarr, t, apply=True, emit=emit, files=files, llm=llm,
                 deselect_video=deselect_video, reap_useless=reap_useless,
-                assembly_keep=assembly_keep,
+                assembly_keep=assembly_keep, out=info,
             )
             seen.add(h)
             if planned is not None:
-                planned[h] = now
+                planned[h] = -now if info.get("deferred") else now
             if d:
                 acted += 1
             # Checkpoint the caller's ledger DURING the walk. A full pass over a
@@ -1179,6 +1241,9 @@ def torrent_lifecycle_pass(
                 if (prev and prev[0] == sig
                         and now - prev[1] < max(60, recheck_seconds)):
                     continue
+                if (prev and prev[0] == sig and prev[1] < 0
+                        and (llm is None or not _llm_available(llm))):
+                    continue        # still waiting for the LLM
             if (remove_when_library_complete and lidarr is not None
                     and now - newest_mtime >= max(0, min_stable_seconds)):
                 try:
@@ -1186,10 +1251,18 @@ def torrent_lifecycle_pass(
                 except Exception as exc:  # noqa: BLE001
                     plan = None
                     emit(f"lifecycle: library check failed for {name!r}: {exc}")
+                waiting = plan_is_deferred(plan)
                 if plan and checked is not None:
                     # Only a SUCCESSFUL plan is throttled -- a Lidarr hiccup
-                    # keeps retrying every pass as before.
-                    checked[h] = ((on_disk, int(newest_mtime)), now)
+                    # keeps retrying every pass as before. A plan with an
+                    # album the LLM could not be asked about is stamped -1:
+                    # planned again as soon as the LLM can answer.
+                    checked[h] = ((on_disk, int(newest_mtime)),
+                                  -1.0 if waiting else now)
+                if plan and waiting:
+                    # Halt, don't guess: nothing is removed while an album's
+                    # ownership is undecided.
+                    plan = None
                 if plan:
                     def _blocks(a):
                         return int(a.get("total") or 0) > 0 and not a.get("have")
@@ -1273,36 +1346,17 @@ def main() -> int:
         print("qBittorrent login failed -- check base_url/username/password.")
         return 1
 
-    # Optional LLM client for the library-match fallback (mirrors main.py).
+    # Optional LLM client for the library-match fallback -- built exactly as
+    # the pipeline builds it (llm_gate.build_llm), gate included.
     llm = None
     if not args.no_ai:
         oc = cfg.get("ollama") or {}
         if oc.get("enabled", True):
-            provider = str(oc.get("provider", "ollama")).lower()
             try:
-                if provider in ("openai", "gemini", "cloud", "openai-compatible"):
-                    from cloud_llm import CloudLLMClient
-                    llm = CloudLLMClient(
-                        base_url=oc.get("base_url", ""), model=oc.get("model", ""),
-                        api_key=oc.get("api_key", ""),
-                        timeout=int(oc.get("timeout_seconds", 60)),
-                        enabled=True,
-                        rpm=int(oc.get("rpm", 10)),
-                        max_wait_seconds=float(oc.get("max_wait_seconds", 30)),
-                        max_retries=int(oc.get("max_retries", 3)),
-                        cooldown_seconds=float(oc.get("cooldown_seconds", 900)),
-                    )
-                else:
-                    llm = OllamaClient(
-                        base_url=oc.get("base_url", "http://127.0.0.1:11434"),
-                        model=oc.get("model", "qwen2.5:14b"),
-                        timeout=int(oc.get("timeout_seconds", 300)),
-                        enabled=True,
-                        keep_alive=str(oc.get("keep_alive", "30m")),
-                        num_ctx=int(oc.get("num_ctx", 8192)),
-                    )
+                from llm_gate import build_llm
+                llm, label = build_llm(oc)
                 if llm and not llm.ping():
-                    print(f"LLM ({provider}) unreachable -- AI match disabled for this run.")
+                    print(f"LLM unreachable ({label}) -- AI match disabled for this run.")
                     llm = None
             except Exception as exc:  # noqa: BLE001
                 print(f"LLM init failed ({exc}); AI match disabled.")
