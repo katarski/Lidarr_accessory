@@ -53,6 +53,10 @@ class FakeQbt:
         self.gone.append((h, delete_files))
         return True
 
+    def lookup(self, h):
+        return True, next((t for t in self.t
+                           if str(t.get("hash")).lower() == str(h).lower()), None)
+
 
 def orch(root, lidarr, qbt, delete_folder=False, delete_originals=False):
     s = SimpleNamespace(
@@ -66,8 +70,10 @@ def orch(root, lidarr, qbt, delete_folder=False, delete_originals=False):
     s._delete_source_folder = lambda sentinel, **kw: s.deleted.append(sentinel.parent)
     s._delete_orphan_cue = lambda cue, reason: s.orphan.append(cue)
     s._reap_torrent = lambda h, blocklist=True: s.deleted.append(("reap", h))
+    s._lidarr_generation = lambda: 0
     for name in ("_folder_fully_owned", "_our_torrent_for_folder",
-                 "_dispose_redundant_download", "_deselect_album_in_torrent"):
+                 "_dispose_redundant_download", "_deselect_album_in_torrent",
+                 "_remove_torrent"):
         setattr(s, name, getattr(Orchestrator, name).__get__(s))
     return s
 
@@ -138,10 +144,12 @@ class Owned(unittest.TestCase):
         o._dispose_redundant_download(self.album, None, self.files, "A", "Album", "r")
         self.assertEqual(lid.removed, [(5, False, True)])   # no delete flags: data stays
         self.assertEqual(o.deleted, [])
-        lid = FakeLidarr([], queue=queue)
-        o = orch(self.root, lid, FakeQbt([t]), delete_folder=True)
+        # Deleting: blocklisted by its row, but taken out of the client by us
+        # (category + claims checked), never by Lidarr's unchecked delete.
+        lid, q = FakeLidarr([], queue=queue), FakeQbt([t])
+        o = orch(self.root, lid, q, delete_folder=True)
         o._dispose_redundant_download(self.album, None, self.files, "A", "Album", "r")
-        self.assertEqual(lid.removed, [(5, True, True)])
+        self.assertEqual((lid.removed, q.gone), ([(5, False, True)], [("h", True)]))
 
     def test_other_categories_are_never_touched(self):
         t = {"hash": "H", "category": "movies", "content_path": str(self.album),

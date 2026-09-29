@@ -4760,7 +4760,7 @@ class Orchestrator:
                 # both "X.ape" and "X.flac" and reject the album on the phantom
                 # extra tracks. If it can't be removed, still prefer the FLAC.
                 try:
-                    a.unlink()
+                    a.unlink(missing_ok=True)
                     logger.info("lossless->flac: removed duplicate %s (FLAC exists)",
                                 a.name)
                 except OSError as exc:
@@ -5356,7 +5356,7 @@ class Orchestrator:
             if self.cfg.delete_originals_on_success:
                 for a in audios:
                     try:
-                        a.unlink()
+                        a.unlink(missing_ok=True)  # gone is the goal
                     except OSError as exc:
                         logger.warning("Could not delete %s: %s", a, exc)
             self._delete_orphan_cue(cue_path, reason)
@@ -5371,27 +5371,16 @@ class Orchestrator:
         if not exact:
             self._deselect_album_in_torrent(t, folder)
             return
-        try:
-            for rec in (self.lidarr.queue_list() or []):
-                if (str(rec.get("downloadId") or "").lower() == thash.lower()
-                        and rec.get("id") is not None):
-                    if self.lidarr.queue_remove(int(rec["id"]),
-                                                remove_from_client=deleting,
-                                                blocklist=True):
-                        logger.info(
-                            "Blocklisted redundant release %r for %s / %s -- "
-                            "it will not be grabbed again",
-                            str(t.get("name") or "")[:60], artist_name[:24],
-                            album_name[:30])
-                        return
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("blocklist of redundant download failed: %s", exc)
-        if deleting:
-            # No queue row (our own magnet grabs never make one): stop seeding
-            # data we deliberately deleted. The data is already gone locally.
-            q = self._get_qbt()
-            if q is not None and self._qbt_ours_by_hash(q, thash):
-                q.remove(thash, delete_files=False)
+        # Blocklisted by its queue row so the same release is never grabbed
+        # again; out of the client (with what is left of its data) only when
+        # deleting is allowed. Our own magnet grabs have no queue row.
+        if self._remove_torrent(thash, delete_files=True, blocklist=True,
+                                from_client=deleting,
+                                why=" (redundant: %s / %s)"
+                                % (artist_name[:24], album_name[:30])):
+            logger.info("Redundant release %r for %s / %s dropped -- it will "
+                        "not be grabbed again", str(t.get("name") or "")[:60],
+                        artist_name[:24], album_name[:30])
 
     def _queue_target_for_hash(self, thash: str) -> Optional[Dict[str, Any]]:
         """The album Lidarr's queue attributes to this download, or None."""
@@ -11615,20 +11604,28 @@ class Orchestrator:
         # SHARED-FILE GUARD: only a source whose song Lidarr has filed, and
         # that no other assembly needs.
         still_needed = set(store.needed_files(exclude=album_id).keys())
-        freed = 0
+        freed = busy_kept = 0
         for t in done:
             sp = sources[t]
             if sp in still_needed:
                 continue
-            try:
-                q = Path(sp)
-                if q.is_file():
-                    q.unlink()
-                    freed += 1
-            except OSError:
-                continue
+            q = Path(sp)
+            # Never under a worker importing from that folder right now.
+            with claims.held(q.parent) as ok:
+                if not ok:
+                    busy_kept += 1
+                    continue
+                try:
+                    if q.is_file():
+                        q.unlink()
+                        freed += 1
+                except OSError:
+                    continue
         tail = ("; removed %d source file(s) no other assembly needs" % freed
                 if freed else "; sources kept")
+        if busy_kept:
+            tail += ("; %d kept because their folder is being processed"
+                     % busy_kept)
         if len(done) < len(items):
             state = str((rec or {}).get("status") or "no answer")
             return False, ("Lidarr filed %d of %d song(s) (import %s: %s); the "
@@ -12019,37 +12016,15 @@ class Orchestrator:
         return "reject:no-audio", info
 
     def _reject_grab(self, artist: str, album: str, thash: str, qbt) -> None:
-        """Blocklist + remove THIS grab (its hash) from Lidarr's queue and
-        qBit. The queue row is the one whose downloadId is the hash, never one
-        found by artist/album name."""
-        try:
-            rec = next((r for r in (self.lidarr.queue_list() or [])
-                        if thash and str(r.get("downloadId") or "").lower()
-                        == str(thash).lower()), None)
-            if rec and rec.get("id") is not None:
-                if not self.lidarr.queue_remove(
-                        int(rec["id"]), remove_from_client=True, blocklist=True):
-                    # the release is NOT on Lidarr's blocklist, so the next
-                    # search can hand us the same bad release again
-                    logger.warning(
-                        "rejected %s / %s but Lidarr did not blocklist it -- "
-                        "it may be grabbed again", artist, album)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("interactive search: queue_remove failed for "
-                           "%s / %s: %s", artist, album, exc)
-        if qbt is not None and thash:
-            try:
-                if not self._qbt_ours_by_hash(qbt, thash):
-                    logger.info("rejected grab %s: already gone, or not in "
-                                "our category -- nothing more removed",
-                                thash[:12])
-                elif not qbt.remove(thash, delete_files=True):
-                    logger.warning(
-                        "rejected grab %s but qBittorrent did not remove it -- "
-                        "torrent and data are still there", thash[:12])
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("could not remove rejected grab %s: %s",
-                               thash[:12], exc)
+        """Blocklist + remove THIS grab: the queue rows whose downloadId is its
+        hash (never one found by artist/album name), then the torrent with its
+        data -- all through _remove_torrent (category, claims, outage)."""
+        if not self._remove_torrent(thash, delete_files=True, blocklist=True,
+                                    qbt=qbt, why=" (rejected grab for %s / %s)"
+                                    % (artist[:24], album[:30])):
+            logger.warning("rejected %s / %s, but its torrent %s is not "
+                           "removed -- see above", artist, album,
+                           str(thash or "?")[:12])
 
     @staticmethod
     def _ascii_fold(s: str) -> str:
@@ -12697,38 +12672,14 @@ class Orchestrator:
         return ("accept", n) if n >= 2 else ("reject:single-album", n)
 
     def _reject_by_hash(self, thash: str, qbt, blocklist: bool = True) -> None:
-        """Remove every Lidarr queue row for this torrent (blocklisting) and
-        delete it + its data from qBittorrent."""
-        rows = took = 0
-        try:
-            for rec in self.lidarr.queue_list():
-                if (str(rec.get("downloadId") or "").lower() == thash
-                        and rec.get("id") is not None):
-                    rows += 1
-                    if self.lidarr.queue_remove(
-                            int(rec["id"]), remove_from_client=True,
-                            blocklist=blocklist):
-                        took += 1
-            # a 404 on some rows is normal (removing one row of a grouped
-            # download collapses its siblings); none taking is not
-            if blocklist and rows and not took:
-                logger.warning(
-                    "reject-by-hash %s: none of the %d queue row(s) accepted "
-                    "the blocklist -- Lidarr may re-grab this release",
-                    thash[:12], rows)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("interactive search: reject-by-hash failed for %s: %s",
-                           thash[:12], exc)
-        if qbt is not None and thash:
-            try:
-                if not qbt.remove(thash, delete_files=True):
-                    logger.warning(
-                        "interactive search: rejected %s but qBittorrent did "
-                        "not remove it -- torrent and data are still there",
-                        thash[:12])
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("interactive search: could not remove %s: %s",
-                               thash[:12], exc)
+        """Drop this torrent's Lidarr queue rows (blocklisting) and remove it
+        with its data -- through _remove_torrent (category, claims, outage)."""
+        if not self._remove_torrent(thash, delete_files=True,
+                                    blocklist=blocklist, qbt=qbt,
+                                    why=" (interactive search reject)"):
+            logger.warning("interactive search: rejected %s, but it is not "
+                           "removed -- torrent and data are still there",
+                           str(thash or "?")[:12])
 
     # Not artists -- placeholders Lidarr uses for compilations and soundtracks.
     # Their names appear in the title of a huge share of releases, so an
@@ -13126,16 +13077,21 @@ class Orchestrator:
                 dlid[:16], len(rows), label,
                 self.cfg.queue_reaper_remove_from_client,
             )
-            for r in rows:
-                qid = r.get("id")
-                if qid is None:
-                    continue
-                if self.lidarr.queue_remove(
-                    qid,
-                    remove_from_client=self.cfg.queue_reaper_remove_from_client,
+            if dlid.startswith("__row_"):
+                # No download id: nothing in the client to check or remove.
+                for r in rows:
+                    if r.get("id") is not None and self.lidarr.queue_remove(
+                            r["id"], remove_from_client=False,
+                            blocklist=self.cfg.queue_reaper_blocklist):
+                        removed += 1
+            elif self._remove_torrent(
+                    dlid, delete_files=True,
                     blocklist=self.cfg.queue_reaper_blocklist,
-                ):
-                    removed += 1
+                    from_client=self.cfg.queue_reaper_remove_from_client,
+                    why=" (stuck in Lidarr's queue)"):
+                removed += len(rows)
+            else:
+                continue          # deferred: its clock stays, next pass retries
             new_state.pop(dlid, None)  # gone -- drop its clock
 
         self._save_reaper_state(new_state)
@@ -14890,36 +14846,90 @@ class Orchestrator:
             logger.debug("WebUI: torrent removal skipped: %s", exc)
         return ""
 
-    def _reap_torrent(self, thash: str, blocklist: bool = True) -> bool:
+    def _remove_torrent(self, thash: str, *, delete_files: bool = True,
+                        blocklist: bool = False, from_client: bool = True,
+                        qbt=None, why: str = "") -> bool:
         """
-        Remove a torrent. When blocklist=True, prefer removing it via Lidarr's
-        queue with blocklist=on -- so Lidarr won't re-grab this exact (bad)
-        release and instead searches for a DIFFERENT one -- falling back to a
-        plain qBit removal if there's no matching queue row.
+        The ONE way this process takes a torrent away (CLAIMS-1). Lidarr's
+        queue delete with removeFromClient=true removes the torrent and its
+        data itself, checking neither our category nor the claims, so it is
+        never used for that:
+
+          * qBittorrent is asked first. No answer -> nothing is done: an
+            outage is not an answer.
+          * Only our category (_qbt_ours); another app's torrent is refused.
+          * Never while another worker holds a folder of it
+            (claims.busy_torrent); the caller's next pass retries.
+          * Its Lidarr queue rows -- downloadId == hash, never a name match --
+            are dropped with removeFromClient=false, blocklisting when asked.
+            A queue that could not be read defers a blocklist rather than
+            skip it, so a bad release is not grabbed again.
+          * from_client: then QbtClient.remove, which re-checks the claims.
+
+        Returns True when done: the torrent is out of the client -- or, with
+        from_client=False, its queue rows are dropped.
         """
-        if blocklist and thash:
-            try:
-                for r in (self.lidarr.queue_list() or []):
-                    if (str(r.get("downloadId") or "").lower() == str(thash).lower()
-                            and r.get("id") is not None):
-                        if self.lidarr.queue_remove(
-                                r["id"], remove_from_client=True, blocklist=True):
-                            return True
-            except Exception:  # noqa: BLE001
-                pass
-        q = self._get_qbt()
+        thash = str(thash or "").strip().lower()
+        if not thash:
+            return False
+        q = qbt if qbt is not None else self._get_qbt()
         if q is None:
+            logger.info("not removing torrent %s%s -- qBittorrent is not "
+                        "reachable", thash[:12], why)
             return False
-        # Category check even here, where we were handed a bare hash: a caller
-        # that resolved the hash by content-path match could hand us another
-        # app's torrent, and this deletes its DATA.
-        if not self._qbt_ours_by_hash(q, thash):
-            logger.info("refusing to remove torrent %s -- it is not in the %r "
-                        "category, so it is not ours to touch",
-                        str(thash)[:12],
-                        getattr(self.cfg, "qbt_category", "") or "(unset)")
+        answered, t = q.lookup(thash)
+        if not answered:
+            logger.info("not removing torrent %s%s -- qBittorrent did not "
+                        "answer", thash[:12], why)
             return False
-        return bool(q.remove(thash, delete_files=True))
+        name = str((t or {}).get("name") or thash)[:60]
+        if t is not None:
+            if not self._qbt_ours(t):
+                logger.info("refusing to remove torrent %r%s -- it is not in "
+                            "the %r category, so it is not ours to touch",
+                            name, why,
+                            getattr(self.cfg, "qbt_category", "") or "(unset)")
+                return False
+            hit = claims.busy_torrent(str(t.get("content_path") or ""))
+            if hit:
+                logger.info("not removing torrent %r%s yet -- %s is being "
+                            "processed right now", name, why, hit)
+                return False
+        gen = self._lidarr_generation()
+        rows = [r for r in (self.lidarr.queue_list() or [])
+                if str(r.get("downloadId") or "").lower() == thash
+                and r.get("id") is not None]
+        if blocklist and self._lidarr_generation() != gen:
+            logger.info("not removing torrent %r%s yet -- Lidarr's queue could "
+                        "not be read, so it could not be blocklisted", name, why)
+            return False
+        took = 0
+        for r in rows:
+            if self.lidarr.queue_remove(int(r["id"]), remove_from_client=False,
+                                        blocklist=blocklist):
+                took += 1
+        # a 404 on some rows is normal (removing one row of a grouped download
+        # collapses its siblings); none taking is not
+        if blocklist and rows and not took:
+            logger.warning("torrent %r%s: none of its %d queue row(s) accepted "
+                           "the blocklist -- Lidarr may grab it again",
+                           name, why, len(rows))
+        if not from_client:
+            return took > 0
+        if t is None:
+            return True                          # not in the client (any more)
+        ok = bool(q.remove(thash, delete_files=delete_files))
+        if ok:
+            logger.info("removed torrent %r%s%s%s", name,
+                        " with its data" if delete_files else "",
+                        " (blocklisted)" if blocklist and took else "", why)
+        return ok
+
+    def _reap_torrent(self, thash: str, blocklist: bool = True) -> bool:
+        """Remove a torrent with its data. blocklist=True also blocklists the
+        release through Lidarr's queue, so Lidarr searches for a DIFFERENT one
+        instead of re-grabbing this bad one. See _remove_torrent."""
+        return self._remove_torrent(thash, delete_files=True, blocklist=blocklist)
 
     def _deselect_album_in_torrent(self, t: Dict[str, Any], folder: Path,
                                    reap_if_last: bool = False) -> str:
@@ -15181,17 +15191,37 @@ class Orchestrator:
         return (True, f"{verb} {copied} track(s) into {target.name}{extra}; "
                       f"Lidarr rescanning to populate the album{tmsg}")
 
+    def _claimed(self, entry: Dict[str, Any], act) -> Tuple[bool, str]:
+        """Run a WebUI action on a held download while holding its folder's
+        claim. A worker importing from it (a move-mode ManualImport) would
+        otherwise lose the source half-way, and no worker starts on it while
+        the action copies, removes the torrent and deletes the folder."""
+        src = entry.get("source_path")
+        if not src:
+            return act()
+        with claims.held(Path(src)) as ok:
+            if not ok:
+                return (False, "%s is being processed right now -- try again "
+                               "in a few minutes" % Path(src).name)
+            return act()
+
     def keep_existing(self, entry: Dict[str, Any]) -> Tuple[bool, str]:
         """WebUI 'Add to library': copy the held music in WITHOUT overwriting
         what the library already has (keep existing, add the rest)."""
-        return self._apply_to_library(entry, overwrite=False)
+        return self._claimed(
+            entry, lambda: self._apply_to_library(entry, overwrite=False))
 
     def move_held(self, entry: Dict[str, Any]) -> Tuple[bool, str]:
         """WebUI 'Overwrite': copy the held music in, replacing colliding
         library files."""
-        return self._apply_to_library(entry, overwrite=True)
+        return self._claimed(
+            entry, lambda: self._apply_to_library(entry, overwrite=True))
 
     def discard(self, entry: Dict[str, Any]) -> Tuple[bool, str]:
+        """WebUI 'Discard' (_discard) under the held folder's claim."""
+        return self._claimed(entry, lambda: self._discard(entry))
+
+    def _discard(self, entry: Dict[str, Any]) -> Tuple[bool, str]:
         """
         WebUI 'Discard': the library copy is fine -- throw the held download
         away WITHOUT importing. Deletes the source folder + removes the source
@@ -15453,8 +15483,7 @@ class Orchestrator:
                 )
                 return False
 
-        self._delete_folder_under_watch(folder)
-        return True
+        return bool(self._delete_folder_under_watch(folder))
 
     def _delete_folder_under_watch(self, folder: Path) -> bool:
         """
@@ -15474,7 +15503,12 @@ class Orchestrator:
           * a path that does not resolve under the configured watch
             root (prevents a spooky Path somehow escaping the tree),
           * the watch root itself,
-          * a drive root or UNC share root (no parent -> bail).
+          * a drive root or UNC share root (no parent -> bail),
+          * a folder another thread is processing right now (claims): a
+            move-mode import half done there would be left partial, with no
+            source. It stays for a later pass.
+
+        Every return is a bool: True only when the folder is gone.
         """
         watch_root = self.cfg.watch_root
 
@@ -15487,7 +15521,7 @@ class Orchestrator:
             logger.warning(
                 "Source-folder cleanup skipped: watch_root is not configured."
             )
-            return
+            return False
 
         try:
             watch_root_r = watch_root.resolve(strict=False)
@@ -15502,7 +15536,7 @@ class Orchestrator:
                 "Source-folder cleanup skipped: CUE is at the watch root. "
                 "Deleting originals only.",
             )
-            return
+            return False
 
         try:
             if watch_root_r not in folder_r.parents:
@@ -15510,19 +15544,25 @@ class Orchestrator:
                     "Source-folder cleanup skipped: %s is not under watch root %s.",
                     folder_r, watch_root_r,
                 )
-                return
+                return False
         except OSError:
             logger.warning(
                 "Source-folder cleanup skipped: could not verify %s is under %s.",
                 folder_r, watch_root_r,
             )
-            return
+            return False
 
         if folder_r.parent == folder_r:
             logger.warning(
                 "Source-folder cleanup skipped: %s has no parent.", folder_r,
             )
-            return
+            return False
+
+        hit = claims.busy(folder_r)
+        if hit:
+            logger.info("Source-folder cleanup deferred: %s is being processed "
+                        "right now (%s) -- left in place", folder_r, hit)
+            return False
 
         if not folder.exists():
             logger.info(
@@ -15569,7 +15609,7 @@ class Orchestrator:
                         "leaving it; it will be retried on the next pass.",
                         folder_r, last_exc,
                     )
-                    return
+                    return False
                 logger.info("Removed source folder (lenient): %s", folder_r)
 
         # Walk up and remove any empty parent folders (e.g. artist dir

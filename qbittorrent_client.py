@@ -11,7 +11,7 @@ import re
 import threading
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -371,20 +371,25 @@ class QbtClient:
         except Exception as exc:  # noqa: BLE001
             logger.debug("could not drop tag %s: %s", tag, exc)
 
-    def torrent_by_hash(self, torrent_hash: str) -> Optional[Dict[str, Any]]:
-        """The one torrent, or None if qBittorrent does not have it (which is
-        how we verify a delete actually happened -- the delete endpoint answers
-        200 OK for a hash it has never heard of)."""
+    def lookup(self, torrent_hash: str) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        """(answered, torrent). answered is False when qBittorrent could not be
+        asked -- an outage, which is neither "it has the torrent" nor "it is
+        gone", so no delete is verified and no removal decided on it."""
         try:
             r = self.s.get(f"{self.base}/api/v2/torrents/info",
                            params={"hashes": torrent_hash}, timeout=20)
             r.raise_for_status()
             rows = r.json() or []
-            return rows[0] if rows else None
+            return True, (rows[0] if rows else None)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("torrent_by_hash(%s) failed: %s",
-                           torrent_hash[:12], exc)
-            return None
+            logger.warning("torrent lookup (%s) failed: %s",
+                           str(torrent_hash)[:12], exc)
+            return False, None
+
+    def torrent_by_hash(self, torrent_hash: str) -> Optional[Dict[str, Any]]:
+        """The one torrent, or None if qBittorrent does not have it -- or could
+        not be asked; lookup() tells the two apart where that matters."""
+        return self.lookup(torrent_hash)[1]
 
     def _running(self, torrent_hash: str) -> Optional[bool]:
         """True if qBittorrent has this torrent and it is not paused/stopped;
@@ -470,12 +475,20 @@ class QbtClient:
 
     def remove(self, torrent_hash: str, delete_files: bool = True) -> bool:
         """Delete a torrent. delete_files=True also removes its data on disk.
-        Refused while another worker is processing a folder of it (claims):
-        every remover in the process goes through here."""
-        try:
-            info = self.torrent_by_hash(torrent_hash) or {}
-        except Exception:  # noqa: BLE001
-            info = {}
+        Refused while another worker is processing a folder of it (claims),
+        and when qBittorrent cannot say what the torrent is. The orchestrator
+        removes through Orchestrator._remove_torrent, which also checks the
+        category and drops Lidarr's queue rows; the lifecycle and the harvest
+        check the category themselves. True only once qBittorrent confirms
+        the torrent is gone: the delete endpoint answers 200 for any hash, and
+        a lookup that failed is not a confirmation."""
+        answered, info = self.lookup(torrent_hash)
+        if not answered:
+            logger.info("qBittorrent: not removing %s -- it could not be read",
+                        str(torrent_hash)[:12])
+            return False
+        if info is None:
+            return True                       # it is not there
         hit = claims.busy_torrent(str(info.get("content_path") or ""))
         if hit:
             logger.info("qBittorrent: not removing %s yet -- %s is being "
@@ -495,12 +508,11 @@ class QbtClient:
         except Exception as exc:  # noqa: BLE001
             logger.warning("qBittorrent delete(%s) failed: %s", torrent_hash, exc)
             return False
-        # the delete endpoint answers 200 for an unknown hash, so the only real
-        # confirmation is that qBittorrent no longer lists it
         for _ in range(3):
-            if self.torrent_by_hash(torrent_hash) is None:
+            answered, info = self.lookup(torrent_hash)
+            if answered and info is None:
                 return True
             time.sleep(1)
-        logger.warning("qBittorrent still lists %s after delete -- not removed",
-                       torrent_hash[:12])
+        logger.warning("qBittorrent still lists %s after delete (or cannot say) "
+                       "-- not counted as removed", str(torrent_hash)[:12])
         return False

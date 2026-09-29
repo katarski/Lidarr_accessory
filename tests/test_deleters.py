@@ -33,6 +33,10 @@ class _Qbt:
         self.removed.append((h, delete_files))
         return True
 
+    def lookup(self, h):
+        return True, next((t for t in self._t
+                           if str(t.get("hash")).lower() == str(h).lower()), None)
+
     def set_file_priority(self, h, idx, prio):
         return True
 
@@ -227,9 +231,11 @@ class GrabBinding(unittest.TestCase):
         rows = [{"id": 1, "downloadId": "AAA", "title": "Other - La La La"},
                 {"id": 2, "downloadId": "BBB", "title": "Mine"}]
         o, removed = self.orch(rows)
-        o._qbt_ours_by_hash = lambda q, h: False
-        o._reject_grab("Priscilla Ahn", "La La La", "bbb", None)
-        self.assertEqual(removed, [2])
+        o.cfg = type("C", (), {"qbt_category": "lidarr"})()
+        q = _Qbt([{"hash": "bbb", "category": "lidarr", "name": "Mine",
+                   "content_path": "/downloads/Mine"}])
+        o._reject_grab("Priscilla Ahn", "La La La", "bbb", q)
+        self.assertEqual((removed, q.removed), ([2], [("bbb", True)]))
 
 
 class AssemblyAdd(unittest.TestCase):
@@ -345,6 +351,155 @@ class WebuiResolve(unittest.TestCase):
     def test_overwrite_never_force_imports_a_replaced_file(self):
         self.assertEqual(self.resolve({"01.flac": b"new!"}, {"01.flac": b"old"},
                                       overwrite=True), (True, [], True))
+
+
+class _ElsewhereClaim:
+    """Another thread claims `path` for the duration of the with-block."""
+
+    def __init__(self, path):
+        import threading
+        self.path, self.got, self.done = path, threading.Event(), threading.Event()
+        self.th = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self):
+        import claims
+        claims.claim(self.path)
+        self.got.set()
+        self.done.wait(10)
+        claims.release(self.path)
+
+    def __enter__(self):
+        self.th.start()
+        self.got.wait(5)
+        return self
+
+    def __exit__(self, *a):
+        self.done.set()
+        self.th.join(5)
+
+
+class ClaimsFunnel(unittest.TestCase):
+    """CLAIMS-1: no folder is deleted, and no torrent removed, while another
+    worker is processing it; every torrent removal is one checked route."""
+
+    def orch(self, torrents, rows, gen_bump=False):
+        from types import SimpleNamespace
+        from orchestrator import Orchestrator
+        o = Orchestrator.__new__(Orchestrator)
+        o.cfg = SimpleNamespace(qbt_category="lidarr")
+        lid = SimpleNamespace(failure_generation=0, removed=[])
+
+        def queue_list():
+            if gen_bump:
+                lid.failure_generation += 1
+                return []
+            return rows
+
+        def queue_remove(i, remove_from_client=False, blocklist=False):
+            lid.removed.append((i, remove_from_client, blocklist))
+            return True
+        lid.queue_list, lid.queue_remove = queue_list, queue_remove
+        o.lidarr = lid
+        q = _Qbt(torrents)
+        o._get_qbt = lambda: q
+        return o, lid, q
+
+    def test_folder_is_not_deleted_while_another_worker_holds_it(self):
+        from types import SimpleNamespace
+        from orchestrator import Orchestrator
+        with tempfile.TemporaryDirectory() as root:
+            f = Path(root) / "Artist - Album"
+            f.mkdir()
+            (f / "01.flac").write_bytes(b"x")
+            o = Orchestrator.__new__(Orchestrator)
+            o.cfg = SimpleNamespace(watch_root=Path(root))
+            with _ElsewhereClaim(f):
+                self.assertFalse(o._delete_folder_under_watch(f))
+                self.assertTrue((f / "01.flac").exists())
+            self.assertTrue(o._delete_folder_under_watch(f))
+            self.assertFalse(f.exists())
+
+    def test_claimed_torrent_keeps_its_rows_and_its_data(self):
+        t = {"hash": "abc", "category": "lidarr", "name": "Album",
+             "content_path": "/downloads/Album"}
+        o, lid, q = self.orch([t], [{"id": 9, "downloadId": "ABC"}])
+        with _ElsewhereClaim("/downloads/Album"):
+            self.assertFalse(o._reap_torrent("ABC", blocklist=True))
+        self.assertEqual((lid.removed, q.removed), ([], []))
+
+    def test_lidarr_never_deletes_from_the_client(self):
+        t = {"hash": "abc", "category": "lidarr", "name": "Album",
+             "content_path": "/downloads/Album"}
+        o, lid, q = self.orch([t], [{"id": 9, "downloadId": "ABC"},
+                                    {"id": 8, "downloadId": "OTHER"}])
+        self.assertTrue(o._reap_torrent("ABC", blocklist=True))
+        self.assertEqual((lid.removed, q.removed), ([(9, False, True)],
+                                                    [("abc", True)]))
+
+    def test_another_apps_torrent_is_refused_rows_and_all(self):
+        t = {"hash": "abc", "category": "tv", "content_path": "/downloads/Show"}
+        o, lid, q = self.orch([t], [{"id": 9, "downloadId": "abc"}])
+        self.assertFalse(o._reap_torrent("abc"))
+        self.assertEqual((lid.removed, q.removed), ([], []))
+
+    def test_qbittorrent_outage_removes_nothing(self):
+        o, lid, q = self.orch([], [{"id": 9, "downloadId": "abc"}])
+        q.lookup = lambda h: (False, None)
+        self.assertFalse(o._reap_torrent("abc"))
+        self.assertEqual((lid.removed, q.removed), ([], []))
+
+    def test_unreadable_queue_defers_a_blocklisting_removal(self):
+        t = {"hash": "abc", "category": "lidarr", "content_path": "/downloads/A"}
+        o, lid, q = self.orch([t], [], gen_bump=True)
+        self.assertFalse(o._reap_torrent("abc", blocklist=True))
+        self.assertEqual(q.removed, [])
+
+    def test_webui_discard_waits_for_the_worker(self):
+        from orchestrator import Orchestrator
+        with tempfile.TemporaryDirectory() as root:
+            f = Path(root) / "Held"
+            f.mkdir()
+            o = Orchestrator.__new__(Orchestrator)
+            o._discard = lambda e: (True, "discarded")
+            with _ElsewhereClaim(f):
+                ok, msg = o.discard({"source_path": str(f)})
+            self.assertFalse(ok)
+            self.assertIn("being processed", msg)
+            self.assertEqual(o.discard({"source_path": str(f)}), (True, "discarded"))
+
+    def test_harvest_purge_of_a_claimed_source_stays_pending(self):
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as src:
+            ledger = SimpleNamespace(
+                pending={src: {"cid": 1, "mode": "copy", "paths": [],
+                               "tracks": {"5": [1]}}},
+                save=lambda: None)
+            ledger.drop_pending = lambda s: ledger.pending.pop(s, None)
+            lid = SimpleNamespace(
+                failure_generation=0, command_status=lambda c: "completed",
+                list_tracks_for_album=lambda a: [{"id": 1, "hasFile": True}])
+            purged = []
+            with mock.patch.object(SH, "purge_leftovers",
+                                   lambda s, **k: purged.append(s)):
+                with _ElsewhereClaim(src):
+                    self.assertEqual(SH.settle_pending_purges(lid, ledger, {}), 0)
+                self.assertEqual((purged, list(ledger.pending)), ([], [src]))
+                self.assertEqual(SH.settle_pending_purges(lid, ledger, {}), 1)
+            self.assertEqual((purged, ledger.pending), ([src], {}))
+
+    def test_qbt_remove_is_not_confirmed_by_a_failed_lookup(self):
+        c = QbtClient.__new__(QbtClient)
+        c.base = "http://q"
+        answers = iter([(True, {"hash": "abc", "content_path": "/downloads/A"})]
+                       + [(False, None)] * 3)
+        c.lookup = lambda h: next(answers)
+        c.s = mock.Mock()
+        with mock.patch("qbittorrent_client.time.sleep"):
+            self.assertFalse(c.remove("abc"))
+        c.lookup = lambda h: (False, None)
+        c.s = mock.Mock()
+        self.assertFalse(c.remove("abc"))
+        c.s.post.assert_not_called()
 
 
 if __name__ == "__main__":

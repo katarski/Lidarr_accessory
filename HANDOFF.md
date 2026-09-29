@@ -196,9 +196,17 @@ layer says `http://daniel:11434`.
 - **One redundant album never takes its neighbours**
   (`_dispose_redundant_download`): torrent found by content path in our
   category, queue row by downloadId, a discography leaf only deselected.
-- **One worker per folder** (`claims.py`): the CUE job and each hand-off claim
-  their folder; `QbtClient.remove` and `robust_rmtree` refuse a claimed one.
-  The sweep is one thread and one pass at a time.
+- **One worker per folder** (`claims.py`): the CUE job, each hand-off, the
+  WebUI Add/Overwrite/Discard, Assembly Add's source unlink and the harvest
+  (per source and its purge) claim their folder. `_delete_folder_under_watch`,
+  `QbtClient.remove` and `robust_rmtree` refuse a folder another thread holds.
+  The sweep is one thread and one pass at a time. Still unclaimed: reconcile,
+  the library audit/nudge, held auto-resolve (AUDIT_OPEN item 1).
+- **One torrent remover** (`Orchestrator._remove_torrent`): qBittorrent must
+  answer, our category only, never while claimed; Lidarr's queue rows (by
+  downloadId) are dropped with `removeFromClient=false` (blocklisting when
+  asked), and we remove the torrent. Lidarr never deletes from the client.
+  `QbtClient.lookup` tells "gone" from "could not ask".
 - **Nothing concluded during an outage is recorded**: LidarrClient counts
   failures (`failure_generation`, fail-fast breaker); a hand-off in which one
   happened records only facts and is not remembered by the sweep.
@@ -309,10 +317,11 @@ test of a feature whose purpose is removing files.
 
 ## 6. Open items
 
-1. **38 audit findings are open: `docs/AUDIT_OPEN.md`**, in fix order, each
+1. **35 audit findings are open: `docs/AUDIT_OPEN.md`**, in fix order, each
    with evidence, root cause and the agreed fix (the verifier's correction
-   where there was one). Start at item 1 (CLAIMS-1: one claim-aware delete
-   funnel). 53 are fixed; CLI-04/06/07 were refuted — do not redo them.
+   where there was one). Start at item 1 (loops F4, the rest: claim in
+   reconcile, audit/nudge and held auto-resolve). 56 are fixed;
+   CLI-04/06/07 were refuted — do not redo them.
 2. **The owner must re-download** Simply Red *Blue*, the Slim Harpo box and
    Elmore James *The Sky Is Crying* (the old number-only pairing misfiled
    them; the pairing is fixed).

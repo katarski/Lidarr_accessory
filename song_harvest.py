@@ -47,6 +47,7 @@ import os
 import re
 import unicodedata
 
+import claims
 import titlematch
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -740,90 +741,102 @@ def harvest_pass(
     if keep_dir and os.path.isdir(keep_dir) and keep_dir not in sources:
         sources.append(keep_dir)
     stats = {"sources": 0, "skipped_unchanged": 0, "scanned": 0,
-             "matched": 0, "imported": 0, "albums": 0, "no_quality": 0}
+             "matched": 0, "imported": 0, "albums": 0, "no_quality": 0,
+             "busy": 0}
     albums: set = set()
     budget = max(0, int(max_files))
     for src_dir in sources:
         if not src_dir or not os.path.isdir(src_dir):
             continue
-        stats["sources"] += 1
-        fsig = folder_signature(src_dir)
-        if (skip_unchanged and ledger is not None
-                and ledger.unchanged(src_dir, fsig, wsig)):
-            stats["skipped_unchanged"] += 1
+        # One worker per folder: the CUE job, the sweep or a WebUI action
+        # may be importing from it or deleting it right now. Skipped, it
+        # records no verdict (the ledger is not marked) and is taken on a
+        # later pass.
+        if not claims.claim(src_dir):
+            stats["busy"] += 1
             continue
-        files = scan_folder(src_dir, limit=budget)
-        budget = max(0, budget - len(files))
-        rep = match_files(files, index, tolerance_seconds=tolerance_seconds)
-        stats["scanned"] += rep.scanned
-        stats["matched"] += len(rep.matches)
-        for line in format_report(rep, source=src_dir):
-            logger.info("%s", line)
-        if rep.matches and acoustid is not None:
-            # LAST gate before anything moves: the fingerprint must agree.
-            verified, unproven = acoustid_verify(
-                rep.matches, acoustid, min_score=acoustid_min_score,
-                require=acoustid_required)
-            for m, why in unproven:
-                logger.warning("harvest: AcoustID rejected %s -- %s",
-                               os.path.basename(m.src.path)[:40], why)
-            stats["acoustid_rejected"] = (stats.get("acoustid_rejected", 0)
-                                          + len(unproven))
-            rep.matches = verified
-        if rep.matches and not dry_run:
-            qmap = quality_map(lidarr, {os.path.dirname(m.src.path)
-                                        for m in rep.matches})
-            entries, skipped = build_import_files(rep.matches,
-                                                 quality_by_path=qmap)
-            stats["no_quality"] += len(skipped)
-            for m, why in skipped:
-                logger.warning("harvest: skipped %s -- %s",
-                               os.path.basename(m.src.path), why)
-            if entries:
-                cid = lidarr.manual_import_apply_files(
-                    entries, import_mode=import_mode)
-                if cid:
-                    stats["imported"] += len(entries)
-                    albums |= {e["albumId"] for e in entries}
-                    logger.info("harvest: submitted %d track(s) to Lidarr "
-                                "(command %s, mode=%s)",
-                                len(entries), cid, import_mode)
-                    # A submitted command is not an import: Lidarr's queue
-                    # runs minutes behind, and purging now raced it (and won).
-                    # The purge is recorded and settled on a later pass, once
-                    # every submitted track has its file.
-                    if purge_leftovers_enabled and ledger is not None:
-                        tracks: Dict[str, List[int]] = {}
-                        for e in entries:
-                            tracks.setdefault(str(e["albumId"]), []).extend(
-                                int(x) for x in e["trackIds"])
-                        ledger.add_pending(src_dir, {
-                            "cid": int(cid), "mode": import_mode,
-                            "paths": [e["path"] for e in entries],
-                            "tracks": tracks})
-                        logger.info("harvest: purge of %s waits until Lidarr "
-                                    "has filed all %d track(s)",
-                                    os.path.basename(src_dir.rstrip("/"))[:44],
-                                    len(entries))
-                else:
-                    logger.warning("harvest: Lidarr refused the import of "
-                                   "%d track(s) from %s", len(entries), src_dir)
-        if ledger is not None:
-            # Only remember a source once it has been fully judged. An import
-            # CHANGES the wanted set, so the next pass re-derives anyway --
-            # that is correct, not waste.
-            ledger.mark(src_dir, fsig, wsig)
-        if budget <= 0:
-            logger.info("harvest: hit the %d-file cap for this pass", max_files)
-            break
+        try:
+            stats["sources"] += 1
+            fsig = folder_signature(src_dir)
+            if (skip_unchanged and ledger is not None
+                    and ledger.unchanged(src_dir, fsig, wsig)):
+                stats["skipped_unchanged"] += 1
+                continue
+            files = scan_folder(src_dir, limit=budget)
+            budget = max(0, budget - len(files))
+            rep = match_files(files, index, tolerance_seconds=tolerance_seconds)
+            stats["scanned"] += rep.scanned
+            stats["matched"] += len(rep.matches)
+            for line in format_report(rep, source=src_dir):
+                logger.info("%s", line)
+            if rep.matches and acoustid is not None:
+                # LAST gate before anything moves: the fingerprint must agree.
+                verified, unproven = acoustid_verify(
+                    rep.matches, acoustid, min_score=acoustid_min_score,
+                    require=acoustid_required)
+                for m, why in unproven:
+                    logger.warning("harvest: AcoustID rejected %s -- %s",
+                                   os.path.basename(m.src.path)[:40], why)
+                stats["acoustid_rejected"] = (stats.get("acoustid_rejected", 0)
+                                              + len(unproven))
+                rep.matches = verified
+            if rep.matches and not dry_run:
+                qmap = quality_map(lidarr, {os.path.dirname(m.src.path)
+                                            for m in rep.matches})
+                entries, skipped = build_import_files(rep.matches,
+                                                     quality_by_path=qmap)
+                stats["no_quality"] += len(skipped)
+                for m, why in skipped:
+                    logger.warning("harvest: skipped %s -- %s",
+                                   os.path.basename(m.src.path), why)
+                if entries:
+                    cid = lidarr.manual_import_apply_files(
+                        entries, import_mode=import_mode)
+                    if cid:
+                        stats["imported"] += len(entries)
+                        albums |= {e["albumId"] for e in entries}
+                        logger.info("harvest: submitted %d track(s) to Lidarr "
+                                    "(command %s, mode=%s)",
+                                    len(entries), cid, import_mode)
+                        # A submitted command is not an import: Lidarr's queue
+                        # runs minutes behind, and purging now raced it (and won).
+                        # The purge is recorded and settled on a later pass, once
+                        # every submitted track has its file.
+                        if purge_leftovers_enabled and ledger is not None:
+                            tracks: Dict[str, List[int]] = {}
+                            for e in entries:
+                                tracks.setdefault(str(e["albumId"]), []).extend(
+                                    int(x) for x in e["trackIds"])
+                            ledger.add_pending(src_dir, {
+                                "cid": int(cid), "mode": import_mode,
+                                "paths": [e["path"] for e in entries],
+                                "tracks": tracks})
+                            logger.info("harvest: purge of %s waits until Lidarr "
+                                        "has filed all %d track(s)",
+                                        os.path.basename(src_dir.rstrip("/"))[:44],
+                                        len(entries))
+                    else:
+                        logger.warning("harvest: Lidarr refused the import of "
+                                       "%d track(s) from %s", len(entries), src_dir)
+            if ledger is not None:
+                # Only remember a source once it has been fully judged. An import
+                # CHANGES the wanted set, so the next pass re-derives anyway --
+                # that is correct, not waste.
+                ledger.mark(src_dir, fsig, wsig)
+            if budget <= 0:
+                logger.info("harvest: hit the %d-file cap for this pass", max_files)
+                break
+        finally:
+            claims.release(src_dir)
     stats["albums"] = len(albums)
     if ledger is not None:
         ledger.save()
     logger.info(
         "harvest pass: %d source(s), %d skipped unchanged, %d file(s) scanned, "
-        "%d match(es), %d imported into %d album(s)%s",
+        "%d match(es), %d imported into %d album(s)%s%s",
         stats["sources"], stats["skipped_unchanged"], stats["scanned"],
         stats["matched"], stats["imported"], stats["albums"],
+        ", %d busy (next pass)" % stats["busy"] if stats["busy"] else "",
         "  [DRY RUN -- nothing written]" if dry_run else "")
     return stats
 
@@ -870,15 +883,22 @@ def settle_pending_purges(lidarr, ledger, index, tolerance_seconds: float = 10.0
             ledger.drop_pending(src)
             continue
         if os.path.isdir(src):
-            try:
-                purge_leftovers(src, imported_paths=paths, index=index,
-                                tolerance_seconds=tolerance_seconds,
-                                staging_dir=staging_dir, delete=True, qbt=qbt,
-                                keep_dir=keep_dir, category=category)
-                done += 1
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("harvest: purge failed for %s: %s", src, exc)
-                continue
+            with claims.held(src) as ok:
+                if not ok:
+                    # a worker is in it right now: the purge stays pending
+                    logger.info("harvest purge %s: being processed right now "
+                                "-- settled on a later pass", name)
+                    continue
+                try:
+                    purge_leftovers(src, imported_paths=paths, index=index,
+                                    tolerance_seconds=tolerance_seconds,
+                                    staging_dir=staging_dir, delete=True,
+                                    qbt=qbt, keep_dir=keep_dir,
+                                    category=category)
+                    done += 1
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("harvest: purge failed for %s: %s", src, exc)
+                    continue
         ledger.drop_pending(src)
     ledger.save()
     return done
