@@ -2062,15 +2062,36 @@ def _player_info(p: Path) -> Dict[str, Any]:
     return out
 
 
-def _lidarr_web_url(actions: Any) -> str:
+# Names that only mean something inside the container.
+_CONTAINER_ONLY_HOSTS = {"host.docker.internal", "gateway.docker.internal",
+                         "localhost", "127.0.0.1", "::1"}
+
+
+def _lidarr_web_url(actions: Any, request_host: str = "") -> str:
     """Lidarr's own web UI, for the header link. Falls back to '#' so a missing
-    or half-built client cannot produce an href that reloads this page."""
+    or half-built client cannot produce an href that reloads this page.
+
+    The configured URL is how the CONTAINER reaches Lidarr. When its host is a
+    name only the container can resolve (host.docker.internal, localhost), the
+    browser gets the host it used to reach this page instead: Lidarr is on
+    that same machine."""
     try:
         url = str(getattr(getattr(actions, "lidarr", None).cfg,
                           "base_url", "") or "").strip().rstrip("/")
     except Exception:  # noqa: BLE001
         return "#"
-    return url or "#"
+    if not url:
+        return "#"
+    try:
+        u = urlparse(url)
+        seen = urlparse("//" + (request_host or "")).hostname
+        if seen and (u.hostname or "").lower() in _CONTAINER_ONLY_HOSTS:
+            host = "[%s]" % seen if ":" in seen else seen
+            url = u._replace(netloc=host + (":%d" % u.port if u.port else ""
+                                            )).geturl()
+    except ValueError:
+        pass
+    return url
 
 
 def make_handler(store, actions: HeldActions):
@@ -2096,8 +2117,8 @@ def make_handler(store, actions: HeldActions):
         def do_GET(self):  # noqa: N802
             path = urlparse(self.path).path
             if path in ("/", "/index.html"):
-                page = _PAGE.replace("__LIDARR_URL__",
-                                     _lidarr_web_url(actions))
+                page = _PAGE.replace("__LIDARR_URL__", _lidarr_web_url(
+                    actions, self.headers.get("Host", "")))
                 self._send(200, page.encode("utf-8"),
                            "text/html; charset=utf-8")
             elif path == "/api/held":

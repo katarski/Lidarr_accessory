@@ -50,7 +50,10 @@ ffmpeg:
   flac_compression_level: 8
   extra_args: []
 lidarr:
-  base_url: http://192.168.1.200:8686
+  # A name, never an address: host.docker.internal is the Docker host (the
+  # template adds it with --add-host=host.docker.internal:host-gateway), or use
+  # the server's own name. The LIDARR_URL env var overrides this.
+  base_url: http://host.docker.internal:8686
   api_key: YOUR_LIDARR_API_KEY
   library_root_lidarr: /music/Music
   library_root_windows: /music/Music
@@ -205,7 +208,10 @@ logging:
   max_bytes: 5242880
   backup_count: 3
 qbittorrent:
-  base_url: http://192.168.1.200:8080
+  # As lidarr.base_url. If qBittorrent bypasses auth by client address, the
+  # Docker gateway may not be on its whitelist: use the server's name, or set
+  # username/password. The QBIT_URL env var overrides this.
+  base_url: http://host.docker.internal:8080
   username: ''
   password: ''
   category: ''

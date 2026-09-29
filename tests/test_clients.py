@@ -205,5 +205,23 @@ class Qbt(unittest.TestCase):
         self.assertEqual(sum("authorized without login" in m for m in cm.output), 1)
 
 
+class LidarrLink(unittest.TestCase):
+    def link(self, base, host):
+        import webui
+        actions = type("A", (), {"lidarr": type("L", (), {
+            "cfg": type("C", (), {"base_url": base})()})()})()
+        return webui._lidarr_web_url(actions, host)
+
+    def test_a_container_only_host_becomes_the_one_the_browser_used(self):
+        self.assertEqual(self.link("http://host.docker.internal:8686/", "nas:8830"),
+                         "http://nas:8686")
+        self.assertEqual(self.link("http://localhost:8686", "[fd00::5]:8830"),
+                         "http://[fd00::5]:8686")
+
+    def test_a_real_name_is_kept(self):
+        self.assertEqual(self.link("http://park:8686", "10.0.0.9:8830"), "http://park:8686")
+        self.assertEqual(self.link("", "nas:8830"), "#")
+
+
 if __name__ == "__main__":
     unittest.main()

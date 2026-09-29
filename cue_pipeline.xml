@@ -14,7 +14,7 @@
   <WebUI/>
   <TemplateURL/>
   <Icon>https://raw.githubusercontent.com/lidarr/Lidarr/develop/Logo/256.png</Icon>
-  <ExtraParams>--user 99:100</ExtraParams>
+  <ExtraParams>--user 99:100 --add-host=host.docker.internal:host-gateway</ExtraParams>
   <PostArgs/>
   <CPUset/>
   <DateInstalled/>
@@ -38,7 +38,7 @@
 
   <Config Name="Timezone" Target="TZ" Default="Europe/Copenhagen" Mode="" Description="Timezone for log timestamps." Type="Variable" Display="always" Required="false" Mask="false">Europe/Copenhagen</Config>
 
-  <Config Name="Lidarr URL" Target="LIDARR_URL" Default="http://192.168.1.200:8686" Mode="" Description="Base URL of your Lidarr instance." Type="Variable" Display="always" Required="false" Mask="false">http://192.168.1.200:8686</Config>
+  <Config Name="Lidarr URL" Target="LIDARR_URL" Default="http://host.docker.internal:8686" Mode="" Description="Base URL of your Lidarr instance." Type="Variable" Display="always" Required="false" Mask="false">http://192.168.1.200:8686</Config>
   <Config Name="Lidarr API key" Target="LIDARR_API_KEY" Default="" Mode="" Description="Lidarr -> Settings -> General -> API Key." Type="Variable" Display="always" Required="false" Mask="true"></Config>
 
   <Config Name="LLM enabled (master switch)" Target="OLLAMA_ENABLED" Default="true" Mode="" Description="MASTER SWITCH. false = no LLM at all and EVERY LLM_* field below is ignored (GPU stays free). true = use the provider+URL+model below. The LLM only auto-repairs malformed .cue files -- optional." Type="Variable" Display="always" Required="false" Mask="false">true</Config>
@@ -83,7 +83,7 @@
   <Config Name="Purge-imported: interval (s)" Target="PURGE_IMPORTED_INTERVAL" Default="1800" Mode="" Description="How often to run the purge sweep (seconds, min 300)." Type="Variable" Display="advanced" Required="false" Mask="false">1800</Config>
   <Config Name="Purge-imported: min stable (s)" Target="PURGE_IMPORTED_MIN_STABLE" Default="300" Mode="" Description="A folder must be untouched this many seconds before it can be purged, so an in-flight download/import is never removed mid-write." Type="Variable" Display="advanced" Required="false" Mask="false">300</Config>
 
-  <Config Name="qBittorrent URL" Target="QBIT_URL" Default="http://192.168.1.200:8080" Mode="" Description="qBittorrent Web UI URL (for selective-download)." Type="Variable" Display="always" Required="false" Mask="false">http://192.168.1.200:8080</Config>
+  <Config Name="qBittorrent URL" Target="QBIT_URL" Default="http://host.docker.internal:8080" Mode="" Description="qBittorrent Web UI URL (for selective-download)." Type="Variable" Display="always" Required="false" Mask="false">http://192.168.1.200:8080</Config>
   <Config Name="qBittorrent user" Target="QBIT_USER" Default="admin" Mode="" Description="qBittorrent Web UI username." Type="Variable" Display="always" Required="false" Mask="false">admin</Config>
   <Config Name="qBittorrent password" Target="QBIT_PASS" Default="" Mode="" Description="qBittorrent Web UI password." Type="Variable" Display="always" Required="false" Mask="true"></Config>
   <Config Name="qBit auto-deselect" Target="QBIT_AUTO_DESELECT" Default="false" Mode="" Description="Auto-deselect (skip) albums already in the library on incomplete music torrents, so a discography grab only downloads what's missing. true/false." Type="Variable" Display="always" Required="false" Mask="false">false</Config>
