@@ -161,19 +161,25 @@ _SEGMENT_RE = re.compile("[%s]+|[^%s]+" % (_UNSPACED, _UNSPACED))
 _DROP_MARK_BASES = re.compile("[\u0000-ԯ֐-ۿḀ-῿]")
 
 
-def fold(s: str) -> str:
-    """The comparable spelling of `s` (see module docstring)."""
-    s = _demojibake(s or "").casefold().replace("&", " and ")
+def strip_accents(s: str) -> str:
+    """`s` without its decorative accents, case and script kept: 'Tiësto' ->
+    'Tiesto', but 'ドラゴン' keeps the voicing marks that make it a word."""
     out: List[str] = []
     base = ""
-    for c in unicodedata.normalize("NFKD", s):
+    for c in unicodedata.normalize("NFKD", s or ""):
         if unicodedata.combining(c):
             if base and _DROP_MARK_BASES.match(base):
                 continue
         else:
             base = c
         out.append(c)
-    s = unicodedata.normalize("NFC", "".join(out)).translate(_LATIN_EXTRA)
+    return unicodedata.normalize("NFC", "".join(out))
+
+
+def fold(s: str) -> str:
+    """The comparable spelling of `s` (see module docstring)."""
+    s = _demojibake(s or "").casefold().replace("&", " and ")
+    s = strip_accents(s).translate(_LATIN_EXTRA)
     if any("Ͱ" <= ch <= "Ͽ" for ch in s):
         s = "".join(_GREEK_TO_LATIN.get(ch, ch) for ch in s)
     return _translit_cyrillic(s)

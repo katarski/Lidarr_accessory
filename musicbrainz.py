@@ -25,6 +25,7 @@ business -- nothing is added to Lidarr automatically.
 from __future__ import annotations
 
 import collections
+import email.utils
 import json
 import logging
 import re
@@ -33,6 +34,7 @@ import unicodedata
 import titlematch
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -81,11 +83,39 @@ def norm_release_title(s: Any) -> str:
     return " ".join(titlematch.words(_NORM_BRACKETS_RE.sub(" ", str(s or ""))))
 
 
+class MusicBrainzUnavailable(Exception):
+    """MusicBrainz could not be asked (503, timeout, backing off). Not "no
+    match": a caller must not remember it as an answer."""
+
+
+def _retry_after(exc: Exception, default: float) -> float:
+    """Seconds a 429/503 asks us to wait (delta or HTTP date), bounded."""
+    raw = ""
+    try:
+        raw = str((getattr(exc, "headers", None) or {}).get("Retry-After") or "")
+    except Exception:  # noqa: BLE001
+        raw = ""
+    secs = default
+    if raw.strip().isdigit():
+        secs = float(raw.strip())
+    elif raw:
+        try:
+            secs = email.utils.parsedate_to_datetime(raw).timestamp() - time.time()
+        except (TypeError, ValueError):
+            secs = default
+    return min(120.0, max(1.0, secs))
+
+
 class MusicBrainzClient:
     """Read-only MusicBrainz WS/2 client, rate-limited to <=1 request/second."""
 
     _rate_lock = threading.Lock()
     _last_call = 0.0
+    # After a 429/503 nobody asks before this (Retry-After, shared by every
+    # thread). A caller that would have to wait longer than _MAX_WAIT gets
+    # "unavailable" at once instead of stalling its own work.
+    _not_before = 0.0
+    _MAX_WAIT = 5.0
 
     # Answers are shared by every instance, like the rate limiter. MusicBrainz
     # asks clients to cache, and this client pays 1.1s of enforced silence per
@@ -95,6 +125,7 @@ class MusicBrainzClient:
     _cache_file = Path("/config/musicbrainz_cache.json")
     _cache_loaded = False
     _cache_saved = 0.0
+    _cache_dirty = False
     _cache_hits = 0
     _CACHE_TTL = 7 * 24 * 3600.0
     _CACHE_MAX = 5000
@@ -122,35 +153,44 @@ class MusicBrainzClient:
                     MusicBrainzClient._cache_hits,
                     MusicBrainzClient._cache_hits * self.min_interval)
             return hit.get("data")
-        # Serialise ALL callers so the 1 req/s courtesy limit holds even when
-        # several pipeline threads ask at once. One retry covers the odd slow
-        # response; a still-failing call returns None and the caller must treat
-        # that as "couldn't check", never as "the artist has no albums".
+        # Request STARTS are spaced process-wide so the 1 req/s courtesy limit
+        # holds however many threads ask; the request itself runs outside the
+        # lock, so one stalled call (30 s timeout) no longer stalls them all.
+        # A still-failing call returns None, and the caller must treat that
+        # as "couldn't check", never as "the artist has no albums".
         last: Optional[str] = None
         for attempt in range(self.retries + 1):
             with MusicBrainzClient._rate_lock:
-                wait = self.min_interval - (
-                    time.time() - MusicBrainzClient._last_call)
-                if wait > 0:
-                    time.sleep(wait)
-                try:
-                    req = urllib.request.Request(
-                        url, headers={"User-Agent": self.user_agent,
-                                      "Accept": "application/json"})
-                    with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                        data = json.loads(
-                            resp.read().decode("utf-8", "replace"))
-                    # Only a real answer is remembered. A failure returns None
-                    # below and is never stored: "could not ask" must not be
-                    # replayed for a week as "there is nothing there".
-                    self._remember(url, data)
-                    return data
-                except Exception as exc:  # noqa: BLE001
-                    last = str(exc)
-                finally:
-                    MusicBrainzClient._last_call = time.time()
-            if attempt < self.retries:
-                time.sleep(2.0)
+                now = time.time()
+                if MusicBrainzClient._not_before - now > self._MAX_WAIT:
+                    logger.debug("musicbrainz GET %s skipped: backing off "
+                                 "(MusicBrainz asked us to wait)", path)
+                    return None
+                start = max(MusicBrainzClient._last_call + self.min_interval,
+                            MusicBrainzClient._not_before)
+                if start > now:
+                    time.sleep(start - now)
+                MusicBrainzClient._last_call = time.time()
+            try:
+                req = urllib.request.Request(
+                    url, headers={"User-Agent": self.user_agent,
+                                  "Accept": "application/json"})
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    data = json.loads(resp.read().decode("utf-8", "replace"))
+                # Only a real answer is remembered. A failure returns None
+                # below and is never stored: "could not ask" must not be
+                # replayed for a week as "there is nothing there".
+                self._remember(url, data)
+                return data
+            except urllib.error.HTTPError as exc:
+                last = str(exc)
+                if exc.code in (429, 503):
+                    wait = _retry_after(exc, 2.0 * self.min_interval)
+                    with MusicBrainzClient._rate_lock:
+                        MusicBrainzClient._not_before = max(
+                            MusicBrainzClient._not_before, time.time() + wait)
+            except Exception as exc:  # noqa: BLE001
+                last = str(exc)
         logger.warning("musicbrainz GET %s failed: %s", path, last)
         return None
 
@@ -173,6 +213,8 @@ class MusicBrainzClient:
             return None
         data = self._get("/artist", query='artist:"%s"' % name.replace('"', ""),
                          limit=10, inc="aliases")
+        if data is None:
+            raise MusicBrainzUnavailable("artist lookup for %r" % name)
         for a in ((data or {}).get("artists") or []):
             names = [a.get("name") or "", a.get("sort-name") or ""]
             names += [al.get("name") or "" for al in (a.get("aliases") or [])]
@@ -205,21 +247,31 @@ class MusicBrainzClient:
                 len(live), len(live) * 1.1)
 
     def _remember(self, url: str, data: Any) -> None:
-        now = time.time()
-        MusicBrainzClient._cache[url] = {"at": now, "data": data}
-        if now - MusicBrainzClient._cache_saved < self._CACHE_SAVE_EVERY:
+        MusicBrainzClient._cache[url] = {"at": time.time(), "data": data}
+        MusicBrainzClient._cache_dirty = True
+        if time.time() - MusicBrainzClient._cache_saved >= self._CACHE_SAVE_EVERY:
+            MusicBrainzClient.flush()
+
+    @classmethod
+    def flush(cls) -> None:
+        """Write the answer cache if anything is unsaved. The debounce in
+        _remember leaves the tail of a burst in memory; the pass end and the
+        shutdown path call this so a restart does not lose it."""
+        if not cls._cache_dirty:
             return
-        cache = MusicBrainzClient._cache
-        if len(cache) > self._CACHE_MAX:
+        now = time.time()
+        cache = cls._cache
+        if len(cache) > cls._CACHE_MAX:
             for k in sorted(cache, key=lambda x: float(
-                    (cache[x] or {}).get("at") or 0))[:len(cache) - self._CACHE_MAX]:
+                    (cache[x] or {}).get("at") or 0))[:len(cache) - cls._CACHE_MAX]:
                 cache.pop(k, None)
         try:
-            tmp = MusicBrainzClient._cache_file.with_suffix(".json.tmp")
+            tmp = cls._cache_file.with_suffix(".json.tmp")
             tmp.parent.mkdir(parents=True, exist_ok=True)
             tmp.write_text(json.dumps(cache), encoding="utf-8")
-            tmp.replace(MusicBrainzClient._cache_file)
-            MusicBrainzClient._cache_saved = now
+            tmp.replace(cls._cache_file)
+            cls._cache_saved = now
+            cls._cache_dirty = False
         except OSError as exc:  # noqa: BLE001
             logger.debug("musicbrainz cache save failed: %s", exc)
 
@@ -235,16 +287,21 @@ class MusicBrainzClient:
         Matching is as strict as artist_mbid_for_name: the artist is used only
         when `name` exactly equals (normalized) its name or one of its
         aliases, because searching under the WRONG artist's alias is worse
-        than not searching at all. Latin-script aliases only -- a release
-        filed as the Japanese spelling is not what this is for -- and the
-        canonical name itself is never returned, the caller has already tried
-        it.
+        than not searching at all. Aliases in EVERY script: a Cyrillic,
+        Greek or Japanese tracker files the artist under its own spelling.
+        The canonical name itself is never returned, the caller has already
+        tried it.
+
+        Raises MusicBrainzUnavailable when MusicBrainz could not be asked, so
+        the caller does not remember "no aliases" for an outage.
         """
         want = _norm_name(name)
         if not want:
             return []
         data = self._get("/artist", query='artist:"%s"' % name.replace('"', ""),
                          limit=10, inc="aliases")
+        if data is None:
+            raise MusicBrainzUnavailable("alias lookup for %r" % name)
         for a in ((data or {}).get("artists") or []):
             alias_names = [al.get("name") or ""
                            for al in (a.get("aliases") or [])]
@@ -255,9 +312,10 @@ class MusicBrainzClient:
             out: List[str] = []
             for cand in [a.get("name") or ""] + alias_names:
                 cand = " ".join(str(cand).split())
-                if not cand or _norm_name(cand) == want:
-                    continue
-                if any(ord(ch) > 0x24F for ch in cand):
+                # The same SPELLING is skipped, not the same folded key: an
+                # indexer does not fold, so 'Филипп Киркоров' is a different
+                # query from 'Filipp Kirkorov' although both key alike.
+                if not cand or cand.casefold() == " ".join(name.split()).casefold():
                     continue
                 if cand not in out:
                     out.append(cand)

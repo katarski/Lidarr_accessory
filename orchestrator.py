@@ -11658,6 +11658,11 @@ class Orchestrator:
                 " -- see %s",
                 checked, report["totals"]["albums_missing_from_lidarr"],
                 report["totals"]["artists_with_gaps"], state_path or "(no file)")
+        # The answers of this pass's last minute are still only in memory.
+        try:
+            type(self._mb).flush()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("musicbrainz cache flush failed: %s", exc)
         return checked
 
     def _best_release_title_coverage(
@@ -11860,9 +11865,10 @@ class Orchestrator:
 
     @staticmethod
     def _ascii_fold(s: str) -> str:
-        """'Tiësto' -> 'Tiesto'. Trackers index the folded spelling."""
-        s = unicodedata.normalize("NFKD", s or "")
-        return "".join(c for c in s if not unicodedata.combining(c))
+        """'Tiësto' -> 'Tiesto'. Trackers index the folded spelling. Only
+        decorative accents go: stripping every combining mark turned 'ドラゴン'
+        into 'トラコン', a different word, and searched for that."""
+        return titlematch.strip_accents(s)
 
     def _artist_search_aliases(self, artist: str) -> List[str]:
         """Alternative names to ask an indexer for, cached per artist.
@@ -11882,11 +11888,14 @@ class Orchestrator:
         out: List[str] = []
         try:
             mb = self._get_mb()
-            if mb is not None:
-                out = mb.artist_aliases(name) or []
+            if mb is None:
+                return []
+            out = list(mb.artist_aliases(name) or [])
         except Exception as exc:  # noqa: BLE001
+            # MusicBrainz could not be asked: not cached, so the next pass
+            # asks again. Remembering [] hid the alias until a restart.
             logger.debug("alias lookup failed for %r: %s", name, exc)
-            out = []
+            return []
         if out:
             logger.info("interactive search: %r is also filed as %s",
                         name, ", ".join(repr(a) for a in out))
@@ -13390,8 +13399,15 @@ class Orchestrator:
         store = self.held
         if store is None:
             return 0
+        with store.batch():
+            return self._curate_held(store)
+
+    def _curate_held(self, store) -> int:
+        cfg = self.cfg
         try:
-            store.prune_missing()
+            store.prune_missing(roots=[
+                getattr(cfg, "watch_root", None), getattr(cfg, "staging_root", None),
+                getattr(cfg, "library_root_windows", None)])
         except Exception as exc:  # noqa: BLE001
             logger.debug("held curator: prune failed: %s", exc)
         for it in store.list():
@@ -13416,7 +13432,12 @@ class Orchestrator:
                 logger.debug("held curator: gap auto-resolve failed: %s", exc)
         refreshed = 0
         now = time.time()
-        ttl = max(60, int(getattr(self.cfg, "webui_held_refresh_seconds", 300)))
+        # How long a "not in the library" answer stands. It used to equal the
+        # curator's own cadence (300 s), so EVERY entry was re-summarised on
+        # EVERY pass. A success clears its entry the moment it happens
+        # (_record), so this only catches imports made outside the pipeline.
+        ttl = max(60, int(getattr(self.cfg, "webui_held_refresh_seconds", 300)),
+                  int(getattr(self.cfg, "held_recheck_seconds", 1800) or 0))
         for it in store.list():
             # Refresh the library compare. Cache a positive (in_library) hit;
             # keep RETRYING a stale negative -- the album may not have been in
@@ -13426,10 +13447,19 @@ class Orchestrator:
             found = isinstance(ex, dict) and ex.get("in_library") is True
             fresh = isinstance(ex, dict) and (now - float(ex.get("_ts", 0)) < ttl)
             if not (found or fresh):
+                gen = self._lidarr_generation()
                 try:
-                    ex = self.existing_album_summary(it) or {}
+                    new = self.existing_album_summary(it) or {}
                 except Exception:  # noqa: BLE001
-                    ex = {}
+                    new = {}
+                # An answer given while Lidarr was failing, or no answer at
+                # all, never replaces what is stored: the outage of 27 Sep
+                # overwrote 32,000 summaries with outage results.
+                if self._lidarr_generation() != gen or (
+                        not new and isinstance(ex, dict)
+                        and self._sans_ts_nonempty(ex)):
+                    continue
+                ex = new
                 ex["_ts"] = now
                 fields: Dict[str, Any] = {"existing": ex}
                 # Backfill/repair identity when it's missing or the stored
@@ -13462,6 +13492,10 @@ class Orchestrator:
                 if not upgrade:
                     store.remove(it["id"])
         return refreshed
+
+    @staticmethod
+    def _sans_ts_nonempty(ex: Dict[str, Any]) -> bool:
+        return any(k != "_ts" for k in ex)
 
     # ---- WebUI actions (#11) ------------------------------------------
     def _held_audio_files(self, folder: Path) -> List[Path]:
@@ -14604,8 +14638,9 @@ class Orchestrator:
         if q is not None:
             return q
         try:
-            from qbittorrent_client import QbtClient
-            q = QbtClient(self.cfg.qbt_url, self.cfg.qbt_user, self.cfg.qbt_pass)
+            import qbittorrent_client
+            q = qbittorrent_client.shared(
+                self.cfg.qbt_url, self.cfg.qbt_user, self.cfg.qbt_pass)
             if not q.login():
                 return None
             self._qbt_webui = q

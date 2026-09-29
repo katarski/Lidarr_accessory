@@ -730,6 +730,10 @@ class LidarrClient:
             logger.info("manualimport cache: %d live entry(ies) restored",
                         len(kept))
 
+    def flush(self) -> None:
+        """Write what the debounce left in memory (pass end, shutdown)."""
+        self._save_mi_cache(force=True)
+
     def _save_mi_cache(self, force: bool = False) -> None:
         """Checkpoint during the pass (temp file + replace, so a kill
         cannot truncate it), pruned by age and bounded by BYTES: one probe of
@@ -1268,16 +1272,18 @@ class LidarrClient:
         cache = getattr(self, "_mb_artist_cache", None)
         if cache is None:
             cache = self._mb_artist_cache = {}
-        if key in cache:                      # negatives cached too: MusicBrainz
-            mbid = cache[key]                 # is rate-limited to ~1 req/sec
+        if key in cache:                      # a real "no match" is cached too:
+            mbid = cache[key]                 # MusicBrainz is ~1 req/sec
         else:
             try:
                 mbid = mb.artist_mbid_for_name(name)
+                cache[key] = mbid
             except Exception as exc:  # noqa: BLE001
+                # Could not ask (503, timeout): not remembered, the next
+                # lookup asks again -- an outage is not "no such artist".
                 logger.debug("musicbrainz artist lookup failed for %r: %s",
                              name, exc)
                 mbid = None
-            cache[key] = mbid
         if not mbid:
             return None
         for a in results:

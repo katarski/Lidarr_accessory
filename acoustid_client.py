@@ -287,6 +287,10 @@ class AcoustIDClient:
                 len(live), hits, len(live) - hits,
             )
 
+    def flush(self) -> None:
+        """Write what the debounce left in memory (pass end, shutdown)."""
+        self._save_cache(force=True)
+
     def _save_cache(self, force: bool = False) -> None:
         """Checkpointed during the run (temp file + replace, so a kill
         cannot truncate it), debounced, and bounded by entry count.

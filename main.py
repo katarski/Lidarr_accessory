@@ -347,6 +347,18 @@ class _RedactSecrets(logging.Filter):
         return True
 
 
+def _flush_caches(*clients) -> None:
+    """Write every debounced answer cache (shutdown)."""
+    from musicbrainz import MusicBrainzClient
+    for flush in [getattr(c, "flush", None) for c in clients] + [MusicBrainzClient.flush]:
+        if flush is None:
+            continue
+        try:
+            flush()
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger("cue_pipeline").debug("cache flush failed: %s", exc)
+
+
 def configure_logging(cfg: Dict[str, Any]) -> None:
     root = logging.getLogger()
     level = getattr(logging, cfg.get("level", "INFO").upper(), logging.INFO)
@@ -641,19 +653,20 @@ def interactive_search_loop(
     Periodically run the interactive-search + smart-grab pass (backlog #10):
     find monitored albums missing for >N days, grab the best torrent release,
     then verify its contents in qBittorrent before committing (see
-    Orchestrator.interactive_search_pass). A fresh QbtClient is built + logged
-    in per pass (mirrors the qbt loop); if qBittorrent is unavailable the pass
+    Orchestrator.interactive_search_pass). The process's one QbtClient is
+    re-checked per pass (it re-logs in on a 403); if qBittorrent is unavailable the pass
     still runs but can't content-verify. Minimum cadence 300s; first pass is
     staggered one cadence out so startup stays light.
     """
-    from qbittorrent_client import QbtClient
+    import qbittorrent_client
 
     cadence = max(300, interval)
     delay = cadence
     while not stop.wait(delay):
         try:
-            qbt = QbtClient(qcfg.get("base_url", ""), qcfg.get("username", ""),
-                            qcfg.get("password", ""))
+            qbt = qbittorrent_client.shared(
+                qcfg.get("base_url", ""), qcfg.get("username", ""),
+                qcfg.get("password", ""))
             if not (qcfg.get("base_url") and qbt.login()):
                 logger.warning("interactive search: qBittorrent unavailable "
                                "this pass; grabs can't be content-verified")
@@ -794,7 +807,7 @@ def qbt_auto_deselect_loop(
 
     Cadence is kept short (min 10s). Login is re-checked each pass.
     """
-    from qbittorrent_client import QbtClient
+    import qbittorrent_client
     from qbt_deselect import (
         auto_deselect_pass, torrent_lifecycle_pass, dead_grab_reaper_pass,
         stalled_grab_reaper_pass, adopt_uncategorised,
@@ -894,8 +907,9 @@ def qbt_auto_deselect_loop(
     while not stop.wait(delay):
         delay = cadence
         try:
-            qbt = QbtClient(qcfg["base_url"], qcfg.get("username", ""),
-                            qcfg.get("password", ""))
+            qbt = qbittorrent_client.shared(
+                qcfg["base_url"], qcfg.get("username", ""),
+                qcfg.get("password", ""))
             if not qbt.login():
                 logger.warning("qbt loop: login failed; will retry next pass")
                 continue
@@ -2216,6 +2230,9 @@ def main() -> int:
         while not stop.is_set():
             time.sleep(0.5)
     finally:
+        # First: docker stop allows ~10 s and the joins below can use all of
+        # it. The debounced caches hold their last minute only in memory.
+        _flush_caches(lidarr, acoustid_client)
         observer.stop()
         observer.join(timeout=5)
         worker.join(timeout=5)

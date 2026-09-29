@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 import time
 import uuid
 from typing import Any, Dict, List, Optional
@@ -39,32 +40,95 @@ def btih_from_magnet(magnet: str) -> Optional[str]:
     return m.group(1).lower() if m else None
 
 
+class _ReauthSession:
+    """The client's session: a 403 (the SID expired, qBittorrent restarted)
+    logs in again and repeats the request once. The client lives for the
+    whole process now, so this is its only re-authentication."""
+
+    def __init__(self, client: "QbtClient") -> None:
+        self.raw = requests.Session()
+        self._client = client
+
+    def _send(self, method: str, url: str, **kw):
+        r = getattr(self.raw, method)(url, **kw)
+        if getattr(r, "status_code", 0) == 403 and "/api/v2/auth/" not in url:
+            if self._client._relogin():
+                r = getattr(self.raw, method)(url, **kw)
+        return r
+
+    def get(self, url: str, **kw):
+        return self._send("get", url, **kw)
+
+    def post(self, url: str, **kw):
+        return self._send("post", url, **kw)
+
+    def __getattr__(self, name: str):
+        return getattr(self.raw, name)
+
+
+_shared: Dict[tuple, "QbtClient"] = {}
+_shared_lock = threading.Lock()
+
+
+def shared(base_url: str, username: str = "", password: str = "") -> "QbtClient":
+    """One client per qBittorrent for the whole process. Every loop built its
+    own every pass (a new session, a probe and an INFO line every 30 s, and a
+    fresh login whenever auth is on)."""
+    key = (str(base_url or "").rstrip("/"), username or "", password or "")
+    with _shared_lock:
+        q = _shared.get(key)
+        if q is None:
+            q = _shared[key] = QbtClient(base_url, username, password)
+        return q
+
+
 class QbtClient:
     def __init__(self, base_url: str, username: str = "", password: str = ""):
         self.base = base_url.rstrip("/")
         self.username = username
         self.password = password
-        self.s = requests.Session()
+        self.s = _ReauthSession(self)
         self._logged_in = False
+        self._auth_mode = ""
+        self._login_lock = threading.Lock()
+
+    def _http(self):
+        return getattr(self.s, "raw", self.s)
 
     def _api_ok(self) -> bool:
         """True if the API answers without a 403 -- i.e. we're authorized
         (either auth is bypassed for our IP, or we already have a session)."""
         try:
-            r = self.s.get(f"{self.base}/api/v2/app/webapiVersion", timeout=10)
+            r = self._http().get(f"{self.base}/api/v2/app/webapiVersion", timeout=10)
             return r.status_code == 200
         except Exception:  # noqa: BLE001
             return False
 
+    def _relogin(self) -> bool:
+        self._logged_in = False
+        return self.login()
+
+    def _note_auth(self, mode: str) -> None:
+        if mode != self._auth_mode:
+            self._auth_mode = mode
+            logger.info("qBittorrent: %s", "authorized without login (auth "
+                        "bypassed for this host)" if mode == "bypass"
+                        else "logged in")
+
     def login(self) -> bool:
         # Many setups bypass auth for LAN/whitelisted IPs -> no login needed.
         # Probe first; only POST credentials if the API actually challenges us.
+        with self._login_lock:
+            return self._login_locked()
+
+    def _login_locked(self) -> bool:
         if self._api_ok():
             self._logged_in = True
-            logger.info("qBittorrent: authorized without login (auth bypassed for this host)")
+            if self._auth_mode != "login":
+                self._note_auth("bypass")
             return True
         try:
-            r = self.s.post(
+            r = self._http().post(
                 f"{self.base}/api/v2/auth/login",
                 data={"username": self.username, "password": self.password},
                 headers={"Referer": self.base},
@@ -72,6 +136,8 @@ class QbtClient:
             )
             if r.status_code == 200 and r.text.strip().lower() == "ok.":
                 self._logged_in = self._api_ok()
+                if self._logged_in:
+                    self._note_auth("login")
                 return self._logged_in
             logger.warning("qBittorrent login failed (status=%s body=%r)",
                            r.status_code, r.text[:100])
