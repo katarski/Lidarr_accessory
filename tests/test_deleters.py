@@ -502,5 +502,121 @@ class ClaimsFunnel(unittest.TestCase):
         c.s.post.assert_not_called()
 
 
+class ClaimsEveryActor(unittest.TestCase):
+    """loops F4: reconcile, the library audit, held auto-resolve, the nudge
+    and the library move each work on a folder only while holding it."""
+
+    def _reconcile(self, landed=True):
+        from types import SimpleNamespace
+        from orchestrator import Orchestrator
+        o = Orchestrator.__new__(Orchestrator)
+        o.cfg = SimpleNamespace(sweep_min_stable_seconds=0, content_identify=False,
+                                manual_import_timeout_seconds=5)
+        calls = []
+        o.lidarr = SimpleNamespace(
+            list_all_albums=lambda: [{
+                "id": 1, "monitored": True, "artist": {"artistName": "Some Artist"},
+                "statistics": {"totalTrackCount": 2, "trackFileCount": 0}}],
+            manual_import_folder=lambda f, **k: calls.append(f) or (77, 2, ["Album"]))
+        o._release_llm_waiting = lambda: None
+        o._llm_blocked = lambda f: False
+        o._wait_for_manual_import = lambda c, f, timeout, **k: landed
+        o._reconcile_cache = {}
+        return o, calls
+
+    @staticmethod
+    def _album(root):
+        f = Path(root) / "Some Artist - Album"
+        f.mkdir()
+        for n in ("01.flac", "02.flac"):
+            (f / n).write_bytes(b"x")
+        return f
+
+    def test_reconcile_skips_a_claimed_folder_without_a_verdict(self):
+        with tempfile.TemporaryDirectory() as root:
+            f = self._album(root)
+            o, calls = self._reconcile()
+            with _ElsewhereClaim(f):
+                self.assertEqual(o.reconcile_monitored_gaps(Path(root)), 0)
+            self.assertEqual((calls, o._reconcile_cache), ([], {}))
+            self.assertEqual(o.reconcile_monitored_gaps(Path(root)), 2)
+            self.assertEqual(calls, [str(f)])
+
+    def test_reconcile_counts_only_an_import_that_landed(self):
+        with tempfile.TemporaryDirectory() as root:
+            f = self._album(root)
+            o, calls = self._reconcile(landed=False)
+            self.assertEqual(o.reconcile_monitored_gaps(Path(root)), 0)
+            self.assertIn(str(f), o._reconcile_cache)
+            # Not submitted again while Lidarr may still be on it.
+            self.assertEqual(o.reconcile_monitored_gaps(Path(root)), 0)
+            self.assertEqual(calls, [str(f)])
+
+    def test_audit_skips_a_library_folder_a_worker_holds(self):
+        import inspect
+        import claims
+        from orchestrator import Orchestrator
+        self.assertIn("self._claimed_dirs(album_children",
+                      inspect.getsource(Orchestrator.audit_library_vs_lidarr))
+        with tempfile.TemporaryDirectory() as root:
+            a, b = Path(root) / "A", Path(root) / "B"
+            seen = []
+            with _ElsewhereClaim(a):
+                for d in Orchestrator._claimed_dirs([a, b], "audit"):
+                    seen.append((d, claims._norm(d) in claims._held))
+            self.assertEqual(seen, [(b, True)])
+            for d in Orchestrator._claimed_dirs([b], "audit"):
+                break
+            self.assertNotIn(claims._norm(b), claims._held)
+
+    def test_held_auto_resolve_waits_for_the_worker(self):
+        from types import SimpleNamespace
+        from orchestrator import Orchestrator
+        with tempfile.TemporaryDirectory() as root:
+            f = Path(root) / "Held"
+            f.mkdir()
+            row = {"id": 1, "source_path": str(f), "artist": "A", "album": "B",
+                   "existing": {"lidarr": {"present": True, "monitored": True,
+                                           "have": 0, "total": 2}}}
+            gone, tried = [], []
+            o = Orchestrator.__new__(Orchestrator)
+            o.held = SimpleNamespace(list=lambda: [row], remove=gone.append)
+            o._held_audio_files = lambda p: [p / "1.flac", p / "2.flac"]
+            o._try_positional_force_import = lambda *a: tried.append(a[1]) or True
+            with _ElsewhereClaim(f):
+                self.assertEqual(o._auto_resolve_held_gaps(), 0)
+            self.assertEqual((tried, gone), ([], []))
+            self.assertEqual(o._auto_resolve_held_gaps(), 1)
+            self.assertEqual((tried, gone), ([f], [1]))
+
+    def test_nudge_and_library_move_wait_for_the_audit(self):
+        import threading
+        from types import SimpleNamespace
+        from orchestrator import Orchestrator
+        with tempfile.TemporaryDirectory() as root:
+            d = Path(root) / "Artist" / "Album"
+            o = Orchestrator.__new__(Orchestrator)
+            o.cfg = SimpleNamespace(library_root_windows=Path(root),
+                                    album_folder_template="")
+            ran = []
+            o._nudge_positional = lambda *a: ran.append("nudge") or True
+            o._move_into_library = lambda p, s, t: ran.append(str(t)) or t
+            plan = SimpleNamespace(albumartist="Artist", artist="Artist")
+            with mock.patch("orchestrator.album_folder_name",
+                            lambda p, template=None: "Album"):
+                with _ElsewhereClaim(d):
+                    ths = [threading.Thread(target=o._nudge_positional_force_import,
+                                            args=(1, 2, d, 3), daemon=True),
+                           threading.Thread(target=o._manual_move_to_library,
+                                            args=([plan], []), daemon=True)]
+                    for th in ths:
+                        th.start()
+                    time.sleep(0.3)
+                    self.assertEqual(ran, [])
+                for th in ths:
+                    th.join(5)
+            self.assertEqual(sorted(ran), sorted(["nudge", str(d)]))
+
+
 if __name__ == "__main__":
     unittest.main()

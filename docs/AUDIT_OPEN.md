@@ -2,8 +2,8 @@
 
 Generated 29 Sep 2026 from the read-only audit (6 areas, each finding
 adversarially verified). 91 findings were confirmed and 3 refuted
-(CLI-04, CLI-06, CLI-07: do not redo them). **56 are fixed and pushed**;
-the 35 below are open, in the order to fix them (data loss first).
+(CLI-04, CLI-06, CLI-07: do not redo them). **57 are fixed and pushed**;
+the 34 below are open, in the order to fix them (data loss first).
 
 **Line numbers are from commit 98d2656, the commit the audit read.** They
 have shifted since, so find the code by the function or the quoted text.
@@ -15,19 +15,7 @@ abort on a count mismatch), one unittest per rule in
 `tools/deploy.sh` (see HANDOFF section 1). Grep the suite for the changed
 symbol first: green tests that never call it prove nothing.
 
-## 1. loops F4 (high) -- 'One worker per folder' covers only the CUE job and the sweep; reconcile, harvest, audit and nudge import or delete the same folders...
-
-`orchestrator.py:7060`
-
-**Status:** PARTLY DONE (CLAIMS-1): every folder delete (_delete_folder_under_watch) and every torrent removal (_remove_torrent, the one funnel; Lidarr never deletes from the client) checks the claims; the WebUI Add/Overwrite/Discard, Assembly Add's source unlink and the harvest (per source, and its purge) claim. OPEN: reconcile_monitored_gaps, the library audit / positional nudge and held auto-resolve still import without claiming; count 'imported' only after the command succeeds; add %(threadName)s to the log format in main.py.
-
-**Evidence:** 29 Sep, claims-era code: 04:31:08 the CUE worker triggered ManualImport 511416 (move) for '/downloads/Ojos de Brujo - Bari/Bari (2002)'. At 04:32:04 the reconcile thread submitted 'reconcile ManualImport id=511420: 13 file(s) -> Barí (mode=copy)' for the same folder and logged 'reconcile: imported 13 file(s)'; Lidarr later failed 511420 with FileNotFoundException. At 04:34:03 the sweep called the same folder an 'orphaned split output ... its .cue has finished' while the job was still running. 04:36:11 the CUE worker logged 'Both Lidarr strategies failed' although 511416 completed at 04:36:33. Jonas Brothers: 04:33:27 'positional ManualImport id=511428' and 04:34:47 'Triggered ManualImport id=511428 with 14 files' from a second actor, with two interleaved 'Waiting on ManualImport cmd=511428' countdowns (299/268/238 and 299/269/238). Lead 4's original cause was 25ed5ec main.py, where...
-
-**Root cause:** Claims are taken only in Orchestrator.process (989) and _handoff_pre_split_to_lidarr (5973). reconcile_monitored_gaps (7060 manual_import_folder), song_harvest (import, purge, torrent removal), the library audit and positional nudge, and held auto-resolve all act under /downloads without claim() or busy(). Their only guard is mtime stability, which a finished split passes. The one-worker invariant therefore does not hold, and the duplicate commands also lengthen Lidarr's queue, which makes...
-
-**Fix:** Make claiming the entry condition of every actor that imports from or deletes under /downloads. Each per-folder step (reconcile loop, harvest per source, audit/nudge per album dir, held auto-resolve) runs inside `with claims.held(folder) as ok`; if ok is false it skips and records no verdict and no negative cache. Count 'imported' only after the command succeeds. Add %(threadName)s to the log format (main.py:367) so interleaved actors can be told apart. Must not break: claim re-entrancy for the CUE job's own hand-off, the sweep not remembering 'skipped this time', and the claims check in QbtClient.remove and robust_rmtree.
-
-## 2. orch3 ASM-PLAN-1 (high) -- A failed Lidarr album list is treated as 'no gaps', which wipes every assembly plan with its hunt and compilation state
+## 1. orch3 ASM-PLAN-1 (high) -- A failed Lidarr album list is treated as 'no gaps', which wipes every assembly plan with its hunt and compilation state
 
 `orchestrator.py:10590`
 
@@ -39,7 +27,7 @@ symbol first: green tests that never call it prove nothing.
 
 **Fix:** The generation check is the right mechanism: gen before list_all_albums, and if it has changed by the end of the per-album loop, skip keep_only and skip every store.remove(aid) made in this pass. Changing every read helper to raise instead of returning [] is a wider refactor with many callers; the generation guard already exists and is the minimal single mechanism here. Also apply it to _assembly_keep, so an unreadable store or list gives 'no deselect' rather than an empty keep set.
 
-## 3. orch2 missed (high) -- The torrent song check accepts a release when only 25-59% of the songs match: the gray zone falls through to the count rule
+## 2. orch2 missed (high) -- The torrent song check accepts a release when only 25-59% of the songs match: the gray zone falls through to the count rule
 
 `orchestrator.py:11821`
 
@@ -49,7 +37,7 @@ symbol first: green tests that never call it prove nothing.
 
 **Fix:** Make song evidence decide whenever it exists. Accept only at or above accept_at. In the gray zone, return a non-accept verdict (reject without blocklisting, so a mis-parsed correct release can be retried) and let count rules decide only when no title evidence can be computed (total == 0, a single image, DSD/ISO). Must not break bonus-track supersets that already clear 60%.
 
-## 4. orch2 F4 (high) -- _title_relation scores another album that contains the album's word as a perfect 1.0 match, so wrong albums are grabbed
+## 3. orch2 F4 (high) -- _title_relation scores another album that contains the album's word as a perfect 1.0 match, so wrong albums are grabbed
 
 `orchestrator.py:9622`
 
@@ -59,7 +47,7 @@ symbol first: green tests that never call it prove nothing.
 
 **Fix:** Keep the idea of scoring against the whole discography, and make it the general rule, not only the self-titled one. A title is evidence for album A only if no other album of the artist is contained in it more specifically (more identifying tokens). Also require the album's tokens to form a whole segment of the title after removing the artist once, with segments split on ' - ', brackets, '/' and '_'. With segments, 'Blue Eyed Soul' is not 'Blue' even when Lidarr lacks the other album; 'Jewel - 0304 - 2003' still has the segment '0304', and 'Frida - Frida' still has two segments equal to the album. Cache the album list per pass.
 
-## 5. orch2 F9 (medium) -- Import success check and 'files remaining' check don't look into subfolders, so a multi-disc parent handoff always reads as cleared
+## 4. orch2 F9 (medium) -- Import success check and 'files remaining' check don't look into subfolders, so a multi-disc parent handoff always reads as cleared
 
 `orchestrator.py:8798`
 
@@ -69,7 +57,7 @@ symbol first: green tests that never call it prove nothing.
 
 **Fix:** Base success, 'remaining' and verified on the exact set of submitted paths plus an rglob of the folder. If any audio remains that was not submitted, or was submitted and is still present, verified must not be True. That audio is not the album the release covers, so HANDOFF §3's 'never delete while its audio is in it' applies.
 
-## 6. orch2 F3 (high) -- Startup cueless sweep and periodic sweep run at the same time and hand off the same folders twice
+## 5. orch2 F3 (high) -- Startup cueless sweep and periodic sweep run at the same time and hand off the same folders twice
 
 `orchestrator.py:6698`
 
@@ -81,7 +69,7 @@ symbol first: green tests that never call it prove nothing.
 
 **Fix:** HEAD covers the concurrent case. It still misses a serial duplicate that is live today. The cue watcher hands off the WHOLE multi-disc parent once per disc .cue (HEAD 1077): CD 1.cue at 06:25:11 and CD 3.cue at 06:27:27 both handed off the same Slim Harpo parent, and each one ran another destructive import. key the claim and the 'handled' record on the resolved hand-off target (the parent), and mark every disc cue under it handled when the parent is handed off.
 
-## 7. loops F6 (medium) -- Multi-disc CUE path hands off the whole album once per disc CUE, and again on every restart
+## 6. loops F6 (medium) -- Multi-disc CUE path hands off the whole album once per disc CUE, and again on every restart
 
 `orchestrator.py:1081`
 
@@ -93,7 +81,7 @@ symbol first: green tests that never call it prove nothing.
 
 **Fix:** Resolve the work unit before processing. When a disc CUE resolves to the album root, claim the root, and record the one outcome for every CUE under it (ledger rows and skip_seen) so siblings log 'handled with <album>' and cost nothing; retries are counted once per album. Must not break: a real single-image CUE inside a disc folder still takes the split path, and a changed .cue signature still forces a redo.
 
-## 8. orch2 F11 (low) -- Prefer-lossless groups files by an ASCII-only filename key across disc folders, and quarantines and rescans only in the first folder
+## 7. orch2 F11 (low) -- Prefer-lossless groups files by an ASCII-only filename key across disc folders, and quarantines and rescans only in the first folder
 
 `orchestrator.py:4595`
 
@@ -105,7 +93,7 @@ symbol first: green tests that never call it prove nothing.
 
 **Fix:** The key half is done in HEAD. What remains is grouping by (parent, key), quarantining in p.parent, and rescanning every changed parent. Quarantine only, never delete, and exclude quarantine folders from nesting as now.
 
-## 9. orch3 COMP-NEG-1 (medium) -- The compilation hunt and external audit record an outage as an answer (hunt switched off, or all albums 'missing from Lidarr' for a week)
+## 8. orch3 COMP-NEG-1 (medium) -- The compilation hunt and external audit record an outage as an answer (hunt switched off, or all albums 'missing from Lidarr' for a week)
 
 `orchestrator.py:10926`
 
@@ -115,7 +103,7 @@ symbol first: green tests that never call it prove nothing.
 
 **Fix:** Do not make compilations_for_tracks raise on the first failed lookup; that would throw away the rest of a ~40 s rate-limited pass. Have it return (results, complete). Use the partial results for this pass's search, but set comp['looked_up'] (the cache stamp) only when complete. Leave comp active and write no negative note when not complete. _comp_missing_tracks and the external audit should use the Lidarr generation check as proposed.
 
-## 10. orch3 ISEARCH-AVAIL-1 (medium) -- Interactive search treats an open Lidarr breaker or a failed call as 'no candidates' or 'grab refused', burns candidates and stamps the...
+## 9. orch3 ISEARCH-AVAIL-1 (medium) -- Interactive search treats an open Lidarr breaker or a failed call as 'no candidates' or 'grab refused', burns candidates and stamps the...
 
 `orchestrator.py:12609`
 
@@ -125,7 +113,7 @@ symbol first: green tests that never call it prove nothing.
 
 **Fix:** Also check self.lidarr.available() before each candidate's release_grab and stop the candidate loop (no stamp, no Prowlarr fallback) when the breaker is open. Checking the generation per album is not enough, because a single album's 13-candidate loop burned itself inside one generation change. A grab failure must not consume a candidate.
 
-## 11. orch2 F6 (medium) -- Reconcile's 'nothing importable' cache and the sweep ledger record a failed Lidarr or LLM call as a real answer
+## 10. orch2 F6 (medium) -- Reconcile's 'nothing importable' cache and the sweep ledger record a failed Lidarr or LLM call as a real answer
 
 `orchestrator.py:6689`
 
@@ -135,7 +123,7 @@ symbol first: green tests that never call it prove nothing.
 
 **Fix:** In reconcile, snapshot self._lidarr_generation() before the probe and cache only when it has not changed (and the LLM was not blocked). That uses the one mechanism HEAD already has instead of a second tri-state API, and it keeps suppressing folders that really were probed and are empty.
 
-## 12. orch2 F7 (medium) -- Audit caches a failed per-artist album fetch as 'this artist has no albums' for the whole pass
+## 11. orch2 F7 (medium) -- Audit caches a failed per-artist album fetch as 'this artist has no albums' for the whole pass
 
 `orchestrator.py:8091`
 
@@ -145,7 +133,7 @@ symbol first: green tests that never call it prove nothing.
 
 **Fix:** The fix is correct. Also re-evaluate the green gate on the resolved rec: _bail_if_green must check whichever album is about to be acted on, not only album_rec. Mark the artist as unknown for the pass (skip it, no row) when its album fetch fails, and don't cache [].
 
-## 13. orch2 missed (low) -- The external audit records a failed Lidarr album fetch as 'Lidarr has none of these albums' and does not re-check for the recheck period
+## 12. orch2 missed (low) -- The external audit records a failed Lidarr album fetch as 'Lidarr has none of these albums' and does not re-check for the recheck period
 
 `orchestrator.py:11262`
 
@@ -155,7 +143,7 @@ symbol first: green tests that never call it prove nothing.
 
 **Fix:** Apply the same 'could not ask is not no' rule on the Lidarr side. If the Lidarr generation changed during the call, or the call failed, skip the artist without writing seen_state. The report is advisory, so severity stays low.
 
-## 14. orch3 ISEARCH-STATE-1 (high) -- Interactive-search state is saved only at the end of a pass: today's 4-hour pass (82 grabs accepted) was lost at restart
+## 13. orch3 ISEARCH-STATE-1 (high) -- Interactive-search state is saved only at the end of a pass: today's 4-hour pass (82 grabs accepted) was lost at restart
 
 `orchestrator.py:12827`
 
@@ -165,7 +153,7 @@ symbol first: green tests that never call it prove nothing.
 
 **Fix:** Checkpoint after each album and after each artist fallback. _save_isearch_state is already tmp+os.replace, so call it right after st['last_attempt'] and ast['last_attempt'] are set. Let the loop honour the stop event so SIGTERM ends the pass between albums with state written. Keep the prune of non-missing albums only at the end of a completed pass. Must not break: the generation guard that skips the pass on a failed wanted_missing; the pruning rule; state stays bounded to missing albums.
 
-## 15. orch3 WEBUI-CSRF-1 (medium) -- Unauthenticated WebUI POST endpoints accept cross-site requests, so any web page opened on the LAN can delete library folders
+## 14. orch3 WEBUI-CSRF-1 (medium) -- Unauthenticated WebUI POST endpoints accept cross-site requests, so any web page opened on the LAN can delete library folders
 
 `webui.py:2387`
 
@@ -175,7 +163,7 @@ symbol first: green tests that never call it prove nothing.
 
 **Fix:** One gate at the top of do_POST: reject with 403 unless Content-Type is application/json (which forces a preflight this server never approves) and any Origin/Referer host equals the Host header. Add the JSON header to the page's own header-less POSTs (convert/cancel, convert/pause, ctrl() restart/stop, the held actions). Must not break: the WebUI's own fetch calls; LAN access without login.
 
-## 16. orch3 SETTINGS-SAVE-1 (medium) -- Settings Save writes every field, not just changed ones: every container template variable is silently frozen, and the warning never...
+## 15. orch3 SETTINGS-SAVE-1 (medium) -- Settings Save writes every field, not just changed ones: every container template variable is silently frozen, and the warning never...
 
 `webui.py:1117`
 
@@ -185,7 +173,7 @@ symbol first: green tests that never call it prove nothing.
 
 **Fix:** save_settings cannot tell 'equals the env/config value' from what it has: self._raw_cfg is the post-override merge (it is updated in place at 14677). main.py must keep a snapshot of cfg after the yaml and env layers and before apply_webui_overrides, and hand it to the Orchestrator. save_settings then removes a key from the overrides file when the submitted value equals that snapshot value. Posting only changed controls (client side) remains the primary fix.
 
-## 17. orch3 ENV-BOOL-1 (low) -- Five env overrides cast with bool(), so a template value of 'false' turns the feature on
+## 16. orch3 ENV-BOOL-1 (low) -- Five env overrides cast with bool(), so a template value of 'false' turns the feature on
 
 `main.py:169`
 
@@ -197,7 +185,7 @@ symbol first: green tests that never call it prove nothing.
 
 **Fix:** Use _as_bool for these five. Better, derive the env cast from the schema row's type (bool/int/float/str) so env parsing, WebUI parsing (save_settings) and main.py cannot diverge. Must not break: env still loses to Settings-tab values the user actually changed.
 
-## 18. orch2 F5 (medium) -- The audit's skip-if-unchanged check never works (signature file can't be written), would record an aborted pass as done, and the report...
+## 17. orch2 F5 (medium) -- The audit's skip-if-unchanged check never works (signature file can't be written), would record an aborted pass as done, and the report...
 
 `orchestrator.py:8003`
 
@@ -207,7 +195,7 @@ symbol first: green tests that never call it prove nothing.
 
 **Fix:** The fix is correct. One point to add: writing a tmp file in /config (which 99:100 can write) and then calling os.replace also gets past the root-owned file, because replace needs permission on the directory, not the file. Keep the first-run marker separate as proposed. Until F1 is fixed, a working skip also cuts down the repeated destructive imports.
 
-## 19. orch2 F8 (medium) -- Library paths go through the downloads path translator (1,612 warnings); only works because the two roots happen to be identical
+## 18. orch2 F8 (medium) -- Library paths go through the downloads path translator (1,612 warnings); only works because the two roots happen to be identical
 
 `orchestrator.py:5384`
 
@@ -219,7 +207,7 @@ symbol first: green tests that never call it prove nothing.
 
 **Fix:** Use one translator that tries each configured root pair (downloads mapping, library mapping) and raises when none matches, and remove the choice from callers. It must not change how any /downloads path is translated today.
 
-## 20. orch2 F10 (low) -- Positional force-import is attempted when it can never succeed (±1 release match vs exact-count check); it changes Lidarr settings every...
+## 19. orch2 F10 (low) -- Positional force-import is attempted when it can never succeed (±1 release match vs exact-count check); it changes Lidarr settings every...
 
 `orchestrator.py:8452`
 
@@ -229,7 +217,7 @@ symbol first: green tests that never call it prove nothing.
 
 **Fix:** Positional pairing must take an exact trackCount release. Decide that before set_album_monitored_release, so a ±1 match never flips the monitored release. Leave Step 1 (anyReleaseOk) alone, since it is not part of this disagreement. As noted, positional pairing must also agree with the file titles (F1).
 
-## 21. loops F8 (medium) -- Lead 7: audit and nudge retry impossible positional imports every pass (±1 release pick, stale track rows, no memory), writing to Lidarr...
+## 20. loops F8 (medium) -- Lead 7: audit and nudge retry impossible positional imports every pass (±1 release pick, stale track rows, no memory), writing to Lidarr...
 
 `lidarr.py:323`
 
@@ -241,7 +229,7 @@ symbol first: green tests that never call it prove nothing.
 
 **Fix:** Choose the release by exact equality with the manualimport candidate count (the list that is actually zipped), not len(audios). Read its rows with list_tracks_for_release(album_id, rid) before any PUT or RefreshArtist. The remembered 'impossible' fact must be keyed to that successful candidates call and the release set.
 
-## 22. loops F7 (medium) -- CUE decoding tries cp1251 before cp1252/Shift-JIS/GB18030, so non-UTF-8 Western and CJK CUEs become Cyrillic mojibake in tags
+## 21. loops F7 (medium) -- CUE decoding tries cp1251 before cp1252/Shift-JIS/GB18030, so non-UTF-8 Western and CJK CUEs become Cyrillic mojibake in tags
 
 `cue_parser.py:149`
 
@@ -251,7 +239,7 @@ symbol first: green tests that never call it prove nothing.
 
 **Fix:** After UTF-8 fails, choose the encoding by evidence rather than by 'first that decodes': run charset detection over the whole text and score each candidate for plausibility (mostly one script, agreement with the folder name and the companion audio's tags). Must not break: Cyrillic cp1251 CUEs (cp1251 still wins when the text is Cyrillic words), UTF-8 BOM handling, and the LLM repair fallback.
 
-## 23. loops F9 (medium) -- Harvest re-reads every source's tags on nearly every pass: global wanted-signature gate, an easy=True sniff, no tag cache, end-of-pass...
+## 22. loops F9 (medium) -- Harvest re-reads every source's tags on nearly every pass: global wanted-signature gate, an easy=True sniff, no tag cache, end-of-pass...
 
 `song_harvest.py:631`
 
@@ -261,7 +249,7 @@ symbol first: green tests that never call it prove nothing.
 
 **Fix:** Also required: a source must not be marked when lidarr.failure_generation changed while build_wanted_index ran. With a per-source signature, a partial index (list_tracks_for_album returns [] on failure) would otherwise be remembered as 'nothing wanted here', which is a failed call cached as a negative.
 
-## 24. loops F10 (low) -- Lifecycle re-check state (lifecycle_checked, completed_seen) lives only in memory, so every restart re-plans every completed torrent...
+## 23. loops F10 (low) -- Lifecycle re-check state (lifecycle_checked, completed_seen) lives only in memory, so every restart re-plans every completed torrent...
 
 `main.py:879`
 
@@ -271,7 +259,7 @@ symbol first: green tests that never call it prove nothing.
 
 **Fix:** Persist lifecycle_checked as {hash: (disk signature, ts)}, plus completed_seen, the same way as deselect_planned.json: load at start, tmp and os.replace, checkpoint every N torrents during the pass, prune by age. Must not break: an immediate re-check whenever the folder's disk signature changes, and negative stamps meaning 'waiting for the LLM'.
 
-## 25. loops F11 (low) -- The single CUE worker waits 60 s on every queued .cue whose folder was already removed
+## 24. loops F11 (low) -- The single CUE worker waits 60 s on every queued .cue whose folder was already removed
 
 `orchestrator.py:1713`
 
@@ -281,7 +269,7 @@ symbol first: green tests that never call it prove nothing.
 
 **Fix:** An absent .cue means gone: the worker checks existence at dequeue and _wait_for_stability returns 'gone' immediately (debug log), dropping the entry from cue_seen. Must not break: a .cue that watchdog reports on_created already exists, so stability waiting for real in-progress writes is unchanged.
 
-## 26. loops F12 (low) -- Keep-folder consolidation renames files already in _harvest_pending on every pass until the name length hits the limit
+## 25. loops F12 (low) -- Keep-folder consolidation renames files already in _harvest_pending on every pass until the name length hits the limit
 
 `song_harvest.py:879`
 
@@ -291,7 +279,7 @@ symbol first: green tests that never call it prove nothing.
 
 **Fix:** Consolidate only files whose dirpath is outside keep_dir; a file already in the keep folder stays as it is. Must not break: collision renaming for same-named songs arriving from two different boxes.
 
-## 27. loops F14 (low) -- Converter-tab library tree stats all 95k library files every hour, whether or not anyone uses the tab
+## 26. loops F14 (low) -- Converter-tab library tree stats all 95k library files every hour, whether or not anyone uses the tab
 
 `main.py:1757`
 
@@ -301,7 +289,7 @@ symbol first: green tests that never call it prove nothing.
 
 **Fix:** Build and refresh the tree on demand, when the Converter tab is opened and the cache is stale, or feed it from the library audit's walk; keep refresh_dir for writes. Must not break: instant tab rendering from the file-backed cache and the delete/convert refreshes.
 
-## 28. loops missed (low) -- _clean_album reads 'Title - YYYY.MM.DD' as 'Artist - Year - Album' and reduces the album to 'MM.DD'
+## 27. loops missed (low) -- _clean_album reads 'Title - YYYY.MM.DD' as 'Artist - Year - Album' and reduces the album to 'MM.DD'
 
 `qbt_deselect.py:203`
 
@@ -309,7 +297,7 @@ symbol first: green tests that never call it prove nothing.
 
 **Fix:** Strip the year only when what follows it is a title rather than a date remainder (require a separator plus a word, and never an MM.DD tail). Better, look the album up with the raw folder name as a second candidate (folder_hint already carries it) before concluding total==0.
 
-## 29. orch3 COMP-BATCH-1 (low) -- comp_hunt_grabs_per_pass > 1 silently discards all but the first candidate of each batch
+## 28. orch3 COMP-BATCH-1 (low) -- comp_hunt_grabs_per_pass > 1 silently discards all but the first candidate of each batch
 
 `orchestrator.py:11139`
 
@@ -319,7 +307,7 @@ symbol first: green tests that never call it prove nothing.
 
 **Fix:** Keep a single cap. Either _assembly_grab_for_songs tries every candidate it is handed when hunt is given (the caller already sliced), or assembly_find_compilation puts back into comp['queue'] every batch entry not in hunt['tried'] after the call. Must not break: one grab per pass for the artist-scope hunt, and the 'tried' bookkeeping.
 
-## 30. orch3 SETTINGS-REC-1 (low) -- The 'Recommended' button in Library & sweeps turns the cueless sweep off (recommended keys use the wrong section)
+## 29. orch3 SETTINGS-REC-1 (low) -- The 'Recommended' button in Library & sweeps turns the cueless sweep off (recommended keys use the wrong section)
 
 `orchestrator.py:14351`
 
@@ -329,7 +317,7 @@ symbol first: green tests that never call it prove nothing.
 
 **Fix:** Key them by the real ids. Better, make 'recommended' a column of the _SETTINGS_SCHEMA tuple and check at class load that every id in _SETTINGS_GROUPS and any remaining side table exists in the schema. Must not break: 'anything not listed recommends its own default'.
 
-## 31. orch3 LOG-TAIL-1 (low) -- The Log tab's 400-line view splices the tail of the rotated log in front of the live tail and skips the middle
+## 30. orch3 LOG-TAIL-1 (low) -- The Log tab's 400-line view splices the tail of the rotated log in front of the live tail and skips the middle
 
 `orchestrator.py:13986`
 
@@ -339,7 +327,7 @@ symbol first: green tests that never call it prove nothing.
 
 **Fix:** Read the current file backwards in blocks until it yields `need` newlines or offset 0, and move to the next rotation only after the current file is exhausted. Drop the leading partial line whenever the read did not start at offset 0. Must not break: small reads for a 400-line refresh (no multi-MB reads), whole-file mode for lines<=0.
 
-## 32. orch3 SETTINGS-FLOAT-1 (low) -- Every float setting is rendered with min=0 max=1 step=0.05, so one spinner or wheel step on 'Min track match (%)' 50 sets it to 1
+## 31. orch3 SETTINGS-FLOAT-1 (low) -- Every float setting is rendered with min=0 max=1 step=0.05, so one spinner or wheel step on 'Min track match (%)' 50 sets it to 1
 
 `webui.py:1091`
 
@@ -349,7 +337,7 @@ symbol first: green tests that never call it prove nothing.
 
 **Fix:** Give each schema row an optional (min, max, step) and emit those attributes per row, with no bounds when none is declared. Keep float() parsing server-side, and optionally clamp there to the same declared range. Must not break: the 0-1 ratio fields keep their 0..1 bounds.
 
-## 33. clients CLI-03 (high) -- 'Could not ask Lidarr' is returned as an empty answer, and callers act on it and persist it
+## 32. clients CLI-03 (high) -- 'Could not ask Lidarr' is returned as an empty answer, and callers act on it and persist it
 
 `lidarr.py:1258`
 
@@ -361,7 +349,7 @@ symbol first: green tests that never call it prove nothing.
 
 **Fix:** wanted_missing (lidarr.py:376-408) must also raise when a page FAILS MID-WALK. Today it breaks and returns the partial list, which the pass then treats as complete. The interactive-search prune at orchestrator.py:12442-12455 must run only on a complete answer: every page fetched and len(out)==totalRecords. In the external audit, a LidarrUnavailable from list_albums_for_artist must skip the artist without writing seen_state. The held curator must keep the stored 'existing' summary when the summary call fails, not replace it with {} plus a new _ts.
 
-## 34. llm LLM-5 (medium) -- Content-identify's LLM 'tie-break' is given the leader alone (the rival is filtered out) and answers by title, and the result drove...
+## 33. llm LLM-5 (medium) -- Content-identify's LLM 'tie-break' is given the leader alone (the rival is filtered out) and answers by title, and the result drove...
 
 `orchestrator.py:4045`
 
@@ -373,7 +361,7 @@ symbol first: green tests that never call it prove nothing.
 
 **Fix:** Build the tie-break set from the same rule that made clear_margin false: every result within the margin of the leader. Do not accept a pick below min_cov, though. If the LLM picks a rival under min_cov, return None (undecided) rather than accept an album that failed the coverage floor. The clause 'if that set has one member, return None' can never fire, because when clear_margin is false results[1] is always within the margin, so the set always has at least 2 members. Drop it. Offer numbered options carrying year and track count, map the index back to the album record, and have _identify_album_by_content return the album id so callers stop re-matching by title. The same title-to-record collapse exists in dedup_downloads' LLM fallback (see the missed finding). Use one title/record resolver for both.
 
-## 35. llm missed (medium) -- The LLM's owned-album pick is resolved to the FIRST album with that title, skipping the same-title guard, so a missing edition can be...
+## 34. llm missed (medium) -- The LLM's owned-album pick is resolved to the FIRST album with that title, skipping the same-title guard, so a missing edition can be...
 
 `dedup_downloads.py:277`
 

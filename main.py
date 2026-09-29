@@ -364,7 +364,8 @@ def configure_logging(cfg: Dict[str, Any]) -> None:
     level = getattr(logging, cfg.get("level", "INFO").upper(), logging.INFO)
     root.setLevel(level)
 
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(threadName)s %(name)s: %(message)s")
     redactor = _RedactSecrets()
 
     stream = logging.StreamHandler(sys.stdout)

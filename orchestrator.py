@@ -7044,57 +7044,79 @@ class Orchestrator:
             prev = cache.get(key)
             if prev and prev[0] == mtime and (now_ts - prev[1]) < recheck:
                 continue
-            probes += 1
-            try:
-                _cmd, n, titles = self.lidarr.manual_import_folder(
-                    str(folder),
-                    allowed_album_ids=gap_ids,
-                    import_mode=import_mode,
-                    album_track_totals=gap_totals,
-                    require_full_album=require_full,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("reconcile: import failed for %s: %s", folder, exc)
+            # One worker per folder: the CUE job or the sweep may be
+            # importing or deleting this folder right now. Skip it without a
+            # verdict (nothing cached); the next pass looks again.
+            if not claims.claim(folder):
+                logger.info("reconcile: %r is being processed right now -- "
+                            "next pass", folder.name)
                 continue
-            if n:
-                imported += n
-                # Imported: drop any cache entry so a follow-up pass re-checks
-                # (e.g. a multi-disc folder that fills more of the album later).
-                cache.pop(key, None)
-                logger.info(
-                    "reconcile: imported %d file(s) into %s from %r",
-                    n, ", ".join(titles) or "?", folder.name,
-                )
-            else:
-                # Lidarr's own matcher couldn't place this folder (bad tags /
-                # folder-name discrepancy). Content-identify fallback: match
-                # the download's track titles against the gap artist's
-                # monitored gap albums and, on a confident hit, import via the
-                # release-flipping force-import (which re-verifies the file
-                # count against a concrete release).
-                did = False
-                if (getattr(self.cfg, "content_identify", True)
-                        and ident_budget > 0):
-                    matched_key = next(
-                        (k for k in gap_artist_keys if k in path_key), None)
-                    artist_nm = gap_artist_names.get(matched_key or "", "")
-                    if not artist_nm and audios:
-                        tags = self._read_track_tags(audios[0])
-                        artist_nm = (tags.get("albumartist")
-                                     or tags.get("artist") or "")
-                    if artist_nm:
-                        ident_budget -= 1
-                        title = self._identify_album_by_content(
-                            folder, audios, artist_nm, gap_only=True)
-                        if title:
-                            did = self._try_positional_force_import(
-                                None, folder, folder, artist_nm, title,
-                                audios, "reconcile content-identify")
-                            if did:
-                                imported += len(audios)
-                                cache.pop(key, None)
-                if not did and not self._llm_blocked(folder):
+            try:
+                probes += 1
+                try:
+                    _cmd, n, titles = self.lidarr.manual_import_folder(
+                        str(folder),
+                        allowed_album_ids=gap_ids,
+                        import_mode=import_mode,
+                        album_track_totals=gap_totals,
+                        require_full_album=require_full,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("reconcile: import failed for %s: %s", folder, exc)
+                    continue
+                if n and not (_cmd and self._wait_for_manual_import(
+                        _cmd, folder, timeout=int(getattr(
+                            self.cfg, "manual_import_timeout_seconds", 300)),
+                        require_cleared=False)):
+                    # Submitted is not imported. A command that failed, or is
+                    # still running at the timeout, is not counted, and the
+                    # folder waits out the recheck so the same files are not
+                    # submitted again while Lidarr may still be on them.
+                    logger.warning(
+                        "reconcile: ManualImport %s for %r did not complete -- "
+                        "not counted", _cmd, folder.name)
                     cache[key] = (mtime, now_ts)
+                elif n:
+                    imported += n
+                    # Imported: drop any cache entry so a follow-up pass re-checks
+                    # (e.g. a multi-disc folder that fills more of the album later).
+                    cache.pop(key, None)
+                    logger.info(
+                        "reconcile: imported %d file(s) into %s from %r",
+                        n, ", ".join(titles) or "?", folder.name,
+                    )
+                else:
+                    # Lidarr's own matcher couldn't place this folder (bad tags /
+                    # folder-name discrepancy). Content-identify fallback: match
+                    # the download's track titles against the gap artist's
+                    # monitored gap albums and, on a confident hit, import via the
+                    # release-flipping force-import (which re-verifies the file
+                    # count against a concrete release).
+                    did = False
+                    if (getattr(self.cfg, "content_identify", True)
+                            and ident_budget > 0):
+                        matched_key = next(
+                            (k for k in gap_artist_keys if k in path_key), None)
+                        artist_nm = gap_artist_names.get(matched_key or "", "")
+                        if not artist_nm and audios:
+                            tags = self._read_track_tags(audios[0])
+                            artist_nm = (tags.get("albumartist")
+                                         or tags.get("artist") or "")
+                        if artist_nm:
+                            ident_budget -= 1
+                            title = self._identify_album_by_content(
+                                folder, audios, artist_nm, gap_only=True)
+                            if title:
+                                did = self._try_positional_force_import(
+                                    None, folder, folder, artist_nm, title,
+                                    audios, "reconcile content-identify")
+                                if did:
+                                    imported += len(audios)
+                                    cache.pop(key, None)
+                    if not did and not self._llm_blocked(folder):
+                        cache[key] = (mtime, now_ts)
+            finally:
+                claims.release(folder)
         if imported:
             logger.info("reconcile: imported %d file(s) this pass "
                         "(%d folder(s) probed)", imported, probes)
@@ -7934,6 +7956,22 @@ class Orchestrator:
         album_dir: Path,
         disk_file_count: int,
     ) -> bool:
+        """The library audit imports the same folders positionally: wait
+        until it is done with this one, then nudge (see _nudge_positional)."""
+        claims.claim(album_dir, wait=True)
+        try:
+            return self._nudge_positional(
+                album_id, artist_id, album_dir, disk_file_count)
+        finally:
+            claims.release(album_dir)
+
+    def _nudge_positional(
+        self,
+        album_id: int,
+        artist_id: int,
+        album_dir: Path,
+        disk_file_count: int,
+    ) -> bool:
         """
         Force Lidarr to recognize files on disk when the normal nudges
         (Rescan / Refresh / DownloadedAlbumsScan) can't bridge a
@@ -8436,6 +8474,21 @@ class Orchestrator:
             logger.debug("audit: could not persist signature: %s", exc)
         return result
 
+    @staticmethod
+    def _claimed_dirs(dirs, who: str):
+        """Yield each of `dirs` while this thread holds its claim, released
+        before the next one. A folder another worker holds is skipped (no
+        verdict, no row); the next pass sees it again."""
+        for d in dirs:
+            if not claims.claim(d):
+                logger.info("%s: %s is being processed right now -- next pass",
+                            who, d)
+                continue
+            try:
+                yield d
+            finally:
+                claims.release(d)
+
     def audit_library_vs_lidarr(self) -> int:
         """
         Walk `library_root_windows` and flag album folders that Lidarr
@@ -8634,7 +8687,7 @@ class Orchestrator:
                 logger.debug("audit: cannot iterate %s: %s", artist_dir, exc)
                 continue
 
-            for album_dir in album_children:
+            for album_dir in self._claimed_dirs(album_children, "audit"):
                 try:
                     if not album_dir.is_dir():
                         continue
@@ -9474,6 +9527,17 @@ class Orchestrator:
         album_dir = album_folder_name(plans, template=self.cfg.album_folder_template)
 
         target = self.cfg.library_root_windows / artist / album_dir
+        # The library audit imports what it finds in a library folder: it
+        # must not see this one half-written (and this waits for it).
+        claims.claim(target, wait=True)
+        try:
+            return self._move_into_library(plans, splits, target)
+        finally:
+            claims.release(target)
+
+    def _move_into_library(
+        self, plans: List[TagPlan], splits: List[SplitResult], target: Path
+    ) -> Optional[Path]:
         try:
             target.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -13493,14 +13557,20 @@ class Orchestrator:
                 "(%d/%d) and we hold %d track(s) -- importing automatically.",
                 artist, album, have, total, len(audios),
             )
-            try:
-                ok = self._try_positional_force_import(
-                    None, folder, folder, artist, album, audios,
-                    "held auto-resolve",
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("held auto-resolve failed for %s: %s", folder, exc)
-                continue
+            with claims.held(folder) as mine:
+                if not mine:
+                    logger.info("held auto-resolve: %s is being processed right "
+                                "now -- next pass", folder)
+                    continue
+                try:
+                    ok = self._try_positional_force_import(
+                        None, folder, folder, artist, album, audios,
+                        "held auto-resolve",
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("held auto-resolve failed for %s: %s",
+                                   folder, exc)
+                    continue
             if ok:
                 store.remove(it["id"])
                 done += 1

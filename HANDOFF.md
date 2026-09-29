@@ -200,8 +200,17 @@ layer says `http://daniel:11434`.
   WebUI Add/Overwrite/Discard, Assembly Add's source unlink and the harvest
   (per source and its purge) claim their folder. `_delete_folder_under_watch`,
   `QbtClient.remove` and `robust_rmtree` refuse a folder another thread holds.
-  The sweep is one thread and one pass at a time. Still unclaimed: reconcile,
-  the library audit/nudge, held auto-resolve (AUDIT_OPEN item 1).
+  The sweep is one thread and one pass at a time. Reconcile (per folder) and
+  held auto-resolve skip a claimed folder with no verdict and no negative
+  cache. In the library, the audit claims each album folder
+  (`_claimed_dirs`, skips a held one), and the positional nudge and
+  `_manual_move_to_library` wait for that claim, so the audit never sees a
+  folder half-written. Left: the audit can still act while Lidarr's own
+  ManualImport is moving files in, before the worker's verify claims it;
+  the audit's green gate re-polls the album first. Reconcile counts an
+  import only when the command completes (`_wait_for_manual_import`); a
+  failed or timed-out one waits out the recheck. The log format carries
+  `%(threadName)s`.
 - **One torrent remover** (`Orchestrator._remove_torrent`): qBittorrent must
   answer, our category only, never while claimed; Lidarr's queue rows (by
   downloadId) are dropped with `removeFromClient=false` (blocklisting when
@@ -317,10 +326,10 @@ test of a feature whose purpose is removing files.
 
 ## 6. Open items
 
-1. **35 audit findings are open: `docs/AUDIT_OPEN.md`**, in fix order, each
+1. **34 audit findings are open: `docs/AUDIT_OPEN.md`**, in fix order, each
    with evidence, root cause and the agreed fix (the verifier's correction
-   where there was one). Start at item 1 (loops F4, the rest: claim in
-   reconcile, audit/nudge and held auto-resolve). 56 are fixed;
+   where there was one). Start at item 1 (ASM-PLAN-1, its exact plan is in
+   the item). 57 are fixed;
    CLI-04/06/07 were refuted — do not redo them.
 2. **Orphan CUE whose image is gone** (logged once each, `[ERROR] No companion
    audio next to ...`): `/downloads/Oliver Deriviere - Music From Alone In The
