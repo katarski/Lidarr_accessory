@@ -5431,27 +5431,31 @@ class Orchestrator:
         if not aid:
             return False
         artist_name = str((alb.get("artist") or {}).get("artistName") or "")
-        # OUR OWN grab is trusted -- we chose the album and verified the
-        # release before adding it. Lidarr's queue attribution is NOT: its
-        # queue currently holds a Glee EP against five cupcakKe albums, and a
-        # by-track-number import would file those blind. So when the target
-        # came from the queue, the folder's SONGS have to agree first.
-        if str(rec.get("source") or "") == "queue":
-            try:
-                files = [{"name": p.name} for p in audios]
-                cov, matched, total = self._best_release_title_coverage(
-                    files, album_id)
-            except Exception:  # noqa: BLE001
-                cov, matched, total = 0.0, 0, 0
-            floor = float(getattr(self.cfg, "verify_track_titles_accept", 0.60))
-            if not total or cov < floor:
-                logger.info(
-                    "Queue target: %s claims %s / %r but only %d/%d song "
-                    "titles agree (%.0f%% < %.0f%%) -- not importing on that "
-                    "claim", folder.name[:40], artist_name[:22],
-                    str(alb.get("title"))[:30], matched, total, cov * 100,
-                    floor * 100)
-                return False
+        # A target is a CLAIM about which album this torrent was for, never
+        # proof of what it holds -- whether Lidarr's queue made it (a Glee EP
+        # against five cupcakKe albums) or we recorded it ourselves (a Slim
+        # Harpo box bound to Simply Red / "Blue" by a substring of a queue
+        # title, then imported 18 files at a time, each import deleting the
+        # last). So the folder's SONGS have to agree, whatever the source:
+        # most of the album is here, or most of these files are its songs
+        # (one disc of a set).
+        try:
+            files = [{"name": p.name} for p in audios]
+            cov, matched, total = self._best_release_title_coverage(
+                files, album_id)
+        except Exception:  # noqa: BLE001
+            cov, matched, total = 0.0, 0, 0
+        floor = float(getattr(self.cfg, "verify_track_titles_accept", 0.60))
+        fcov = matched / float(len(audios)) if audios else 0.0
+        if not total or (cov < floor and fcov < 0.85):
+            logger.info(
+                "%s target: %s claims %s / %r but only %d/%d song titles "
+                "agree (%.0f%% < %.0f%%) -- not importing on that claim",
+                "Queue" if str(rec.get("source") or "") == "queue" else "Grab",
+                folder.name[:40], artist_name[:22],
+                str(alb.get("title"))[:30], matched, total, cov * 100,
+                floor * 100)
+            return False
         try:
             self._align_release_to_disk(
                 aid, artist_name, str(alb.get("title") or ""), audios,
@@ -5595,8 +5599,27 @@ class Orchestrator:
         self, album_rec: Dict[str, Any], artist_id: int, audios: List[Path],
     ) -> Optional[int]:
         """
-        Import a LIBRARY folder by pairing each file to the track carrying its
-        own TAG TRACK NUMBER. Returns the ManualImport command id, or None.
+        Import a LIBRARY folder by pairing each file to its track. Returns the
+        ManualImport command id, or None.
+
+        A file is paired by its SONG TITLE (tag title, then the titles its
+        filename carries). Its disc/track number only breaks a tie between
+        equal titles, or pairs a file with no title at all -- and then only
+        when the rest of the folder agrees with this album by title. Numbers
+        alone once filed a whole Slim Harpo box into Simply Red / "Blue" and
+        Elmore James' "Rollin' and Tumblin'" into "The Sky Is Crying": the
+        album was picked by name or coverage, which says nothing about the
+        numbering, and position N of one record is not song N of another.
+
+        A track that already has a file is never a target. Lidarr treats an
+        explicit-trackId import onto a filled track as an "Upgrade" and deletes
+        the existing file (replaceExistingFiles=False notwithstanding), and the
+        recycle bin may be off. This path only fills gaps.
+
+        When the folder's titles contradict the album -- under
+        verify_track_titles_reject of the titled files are songs of this
+        release -- nothing is imported: that is the wrong album, not a
+        partial one.
 
         The audit's existing fallback pairs files to tracks by SORTED POSITION,
         which is only safe when the folder is complete. `Gloria Estefan /
@@ -5649,19 +5672,18 @@ class Orchestrator:
         # way -- one CD imported and two silently dropped.
         ordered = sorted([t for t in (tracks or []) if t.get("id")],
                          key=lambda t: _ints(t))
-        by_pos: Dict[int, Dict[str, Any]] = {
-            i: t for i, t in enumerate(ordered, 1)}
-        by_disc: Dict[tuple, Dict[str, Any]] = {}
-        by_title: Dict[str, Dict[str, Any]] = {}
-        from song_harvest import norm_title
-        for t in ordered:
-            md, tn = _ints(t)
-            if md and tn:
-                by_disc.setdefault((md, tn), t)
-            k = norm_title(t.get("title"))
-            if k:
-                by_title.setdefault(k, t)
-        if not by_pos:
+        if not ordered:
+            return None
+        pairs = self._pair_files_to_tracks(ordered, audios, _ints)
+        if pairs is None:
+            logger.info(
+                "audit: NOT importing %r -- the files' song titles contradict "
+                "this album (%d file(s))", str(album_rec.get("title"))[:50],
+                len(audios))
+            return None
+        if not pairs:
+            logger.info("audit: nothing to import into %r -- no file pairs "
+                        "with an empty track", str(album_rec.get("title"))[:50])
             return None
         # Quality has to come from Lidarr's own parse of the folder, or the
         # import is accepted and then dies in FileNameBuilder with a
@@ -5687,45 +5709,9 @@ class Orchestrator:
             except Exception as exc:  # noqa: BLE001
                 logger.debug("audit: quality probe failed for %s: %s",
                              parent, exc)
-        items, unmapped, used = [], 0, set()
-        for p in sorted(audios):
-            disc, n = self._tag_disc_and_track(p)
-            t = None
-            # Files use ONE of two conventions and both must work:
-            #   per-disc   disc=2 track=1   -> (medium 2, track 1)
-            #   continuous disc=2 track=17  -> the 17th track of the release
-            # Try (disc, track) first; it is unambiguous when it hits. A miss
-            # means the file is numbered continuously, so the number IS the
-            # position -- which is how this library tags its 45 Two Towers files
-            # (disc 1/2/3, tracks 1..45) against Lidarr's 16/15/14 media.
-            if disc and n:
-                t = by_disc.get((disc, n))
-            if t is None and n:
-                t = by_pos.get(n)
-            if t is None or int(t.get("id") or 0) in used:
-                # Numbering failed or already claimed -- fall back to the TITLE,
-                # off the file's own tag and then its filename. This is what
-                # rescues a folder whose numbering is missing, wrong, or shifted;
-                # a wrong number silently files the right song under the wrong
-                # track, whereas a title match either hits or it doesn't.
-                # Try EVERY title we can derive, and keep the first that lands
-                # on a track nobody has claimed. Stopping at the first title
-                # that merely resolves is what lost 8 tracks of TRON: Ares --
-                # those files carry the WRONG tags (the file named
-                # "- 07 - A Question of Trust.flac" is tagged "I Know You Can
-                # Feel It"), so the tag title resolved to a disc-1 track that
-                # was already taken, and the correct filename title was never
-                # tried.
-                for name in ([self._tag_title(p)]
-                             + self._title_candidates_from_name(p)):
-                    cand = by_title.get(norm_title(name or ""))
-                    if cand is not None and int(cand.get("id") or 0) not in used:
-                        t = cand
-                        break
-            if not t or not t.get("id") or int(t["id"]) in used:
-                unmapped += 1
-                continue
-            used.add(int(t["id"]))
+        items = []
+        unmapped = len(audios) - len(pairs)
+        for p, t in pairs:
             lp = self.lidarr.windows_to_lidarr(p)
             q = qmap.get(lp)
             if q is None:
@@ -5742,11 +5728,124 @@ class Orchestrator:
                         "(%d file(s) unmapped)", album_rec.get("title"), unmapped)
             return None
         logger.info(
-            "audit: importing %r by TAG TRACK NUMBER -- %d of %d file(s) mapped "
-            "to tracks%s", str(album_rec.get("title"))[:50], len(items),
+            "audit: importing %r by SONG TITLE -- %d of %d file(s) paired with "
+            "empty tracks%s", str(album_rec.get("title"))[:50], len(items),
             len(audios),
-            " (%d unmapped)" % unmapped if unmapped else "")
+            " (%d not imported)" % unmapped if unmapped else "")
         return self.lidarr.manual_import_apply_files(items, import_mode="move")
+
+    # A title that says nothing: "Track 01", "Audio Track 3", "Piste 4", "07".
+    # Four digits stay a title ("1979").
+    _GENERIC_TITLE_RE = re.compile(
+        r"^(?:(?:(?:audio)?track|piste|titel|pista|trilha|traccia|untitled|"
+        r"unknown|cd|disc|disk|side)\d*|\d{0,3})$")
+
+    def _pair_files_to_tracks(self, ordered: List[Dict[str, Any]],
+                              audios: List[Path], _ints) -> Optional[list]:
+        """[(file, track)] for the files that belong on EMPTY tracks of this
+        release, or None when the titles say it is the wrong album.
+
+        Files use one of two numbering conventions and both still work as a
+        tie-break: per-disc (disc 2 track 1 -> medium 2 track 1) and continuous
+        (disc 2 track 17 -> the 17th track: Two Towers' 45 flat files against
+        Lidarr's 16/15/14 media). Every title a file carries is tried, because
+        tags can be wrong where the filename is right (TRON: Ares' "07 - A
+        Question of Trust" is tagged "I Know You Can Feel It"). Titles are
+        folded across scripts, so Latin transliterations meet Cyrillic
+        metadata."""
+        from song_harvest import norm_title
+        by_pos = {i: t for i, t in enumerate(ordered, 1)}
+        by_disc: Dict[tuple, Dict[str, Any]] = {}
+        for t in ordered:
+            md, tn = _ints(t)
+            if md and tn:
+                by_disc.setdefault((md, tn), t)
+
+        def filled(t) -> bool:
+            return bool(t.get("hasFile") or t.get("trackFileId"))
+
+        keyed: Dict[str, List[Dict[str, Any]]] = {}
+        for t in ordered:
+            k = norm_title(t.get("title"))
+            if k:
+                keyed.setdefault(k, []).append(t)
+
+        def evidence(p: Path) -> List[str]:
+            out: List[str] = []
+            for name in [self._tag_title(p)] + self._title_candidates_from_name(p):
+                k = norm_title(name or "")
+                if k and not self._GENERIC_TITLE_RE.match(k) and k not in out:
+                    out.append(k)
+            return out
+
+        def title_match(keys: List[str]) -> List[str]:
+            """The track titles this file's titles name, best first."""
+            exact = [k for k in keys if k in keyed]
+            if exact or not keyed:
+                return exact
+            score = {tk: max(difflib.SequenceMatcher(None, k, tk).ratio()
+                             for k in keys) for tk in keyed}
+            ranked = sorted(score.items(), key=lambda kv: kv[1], reverse=True)
+            if ranked[0][1] < 0.88:
+                return []
+            if len(ranked) > 1 and ranked[0][1] - ranked[1][1] < 0.05:
+                return []                   # two tracks fit as well: no answer
+            return [ranked[0][0]]
+
+        def numbered(p: Path) -> List[Dict[str, Any]]:
+            disc, n = self._tag_disc_and_track(p)
+            out = []
+            if disc and n and (disc, n) in by_disc:
+                out.append(by_disc[(disc, n)])
+            if n and n in by_pos and by_pos[n] not in out:
+                out.append(by_pos[n])
+            return out
+
+        used: set = set()
+        pairs: list = []
+        titled = agreed = 0
+        untitled: List[Path] = []
+        for p in sorted(audios):
+            keys = evidence(p)
+            if not keys:
+                untitled.append(p)
+                continue
+            titled += 1
+            named = title_match(keys)
+            if not named:
+                continue                    # a song this release does not have
+            agreed += 1
+            # The first title naming an EMPTY track wins: a wrong tag that
+            # names a filled track must not hide the filename's right one.
+            cands: List[Dict[str, Any]] = []
+            for k in named:
+                cands = [t for t in keyed[k]
+                         if not filled(t) and int(t["id"]) not in used]
+                if cands:
+                    break
+            if not cands:
+                continue                    # already in the library (or a dupe)
+            nums = [t for t in numbered(p) if t in cands]
+            t = nums[0] if nums else cands[0]
+            used.add(int(t["id"]))
+            pairs.append((p, t))
+        reject = float(getattr(self.cfg, "verify_track_titles_reject", 0.25))
+        accept = float(getattr(self.cfg, "verify_track_titles_accept", 0.60))
+        if titled and agreed / float(titled) < reject:
+            return None
+        # A file with no title can only be placed by its number, which is
+        # evidence only when the folder is demonstrably this album: most of
+        # its titled files agree, or -- with no titles anywhere -- the file
+        # count is exactly the release's track count.
+        if untitled and ((titled >= 3 and agreed / float(titled) >= accept)
+                         or (not titled and len(audios) == len(ordered))):
+            for p in untitled:
+                nums = [t for t in numbered(p)
+                        if not filled(t) and int(t["id"]) not in used]
+                if nums:
+                    used.add(int(nums[0]["id"]))
+                    pairs.append((p, nums[0]))
+        return pairs
 
     @staticmethod
     def _tag_title(path: Path) -> str:
