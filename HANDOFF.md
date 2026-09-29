@@ -218,7 +218,11 @@ layer says `http://daniel:11434`.
   `QbtClient.lookup` tells "gone" from "could not ask".
 - **Nothing concluded during an outage is recorded**: LidarrClient counts
   failures (`failure_generation`, fail-fast breaker); a hand-off in which one
-  happened records only facts and is not remembered by the sweep.
+  happened records only facts and is not remembered by the sweep. The
+  assembly plan pass prunes no plan in such a pass (nor when a gap album's
+  track list is missing), and a keep-set that cannot be read makes the
+  deselect and the stalled reaper skip the pass (`_assembly_keep` raises;
+  None means only "assembly off").
 - **An unanswered LLM question is not a "no"** (`UNAVAILABLE`, `llm_gate.py`):
   the item waits and is re-examined when the gate reopens.
 - **Encodes appear only complete** (`_encode_flac`: `.partial`, verify, tag,
@@ -326,10 +330,10 @@ test of a feature whose purpose is removing files.
 
 ## 6. Open items
 
-1. **34 audit findings are open: `docs/AUDIT_OPEN.md`**, in fix order, each
+1. **33 audit findings are open: `docs/AUDIT_OPEN.md`**, in fix order, each
    with evidence, root cause and the agreed fix (the verifier's correction
-   where there was one). Start at item 1 (ASM-PLAN-1, its exact plan is in
-   the item). 57 are fixed;
+   where there was one). Start at item 1 (orch2 gray zone 25-59%). 58 are
+   fixed;
    CLI-04/06/07 were refuted — do not redo them.
 2. **Orphan CUE whose image is gone** (logged once each, `[ERROR] No companion
    audio next to ...`): `/downloads/Oliver Deriviere - Music From Alone In The

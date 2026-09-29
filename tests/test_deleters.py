@@ -618,5 +618,88 @@ class ClaimsEveryActor(unittest.TestCase):
             self.assertEqual(sorted(ran), sorted(["nudge", str(d)]))
 
 
+class AssemblyPlansSurviveAnOutage(unittest.TestCase):
+    """ASM-PLAN-1: a pass during a Lidarr outage prunes no plan, and a
+    keep-set that cannot be read stops the deselect instead of reading as
+    'assembly off'."""
+
+    class _Store:
+        def __init__(self):
+            self.plans, self.pruned = {"5": {"id": 5}}, []
+
+        def list(self):
+            return list(self.plans.values())
+
+        def get(self, aid):
+            return self.plans.get(str(aid))
+
+        def remove(self, aid):
+            return self.plans.pop(str(aid), None) is not None
+
+        def upsert(self, aid, plan):
+            self.plans[str(aid)] = plan
+
+        def keep_only(self, ids):
+            self.pruned.append(list(ids))
+            keep = {str(i) for i in ids}
+            self.plans = {k: v for k, v in self.plans.items() if k in keep}
+
+    def _pass(self, root, albums, tracks=lambda aid: []):
+        from types import SimpleNamespace
+        from orchestrator import Orchestrator
+        src = Path(root) / "Best Of"
+        src.mkdir()
+        (src / "01.flac").write_bytes(b"x")
+        o = Orchestrator.__new__(Orchestrator)
+        o.cfg = SimpleNamespace()
+        o.assembly = store = self._Store()
+        o.held = SimpleNamespace(list=lambda: [{"source_path": str(src)}])
+        o._read_song_tags = lambda p: ("Song", "Some Artist", "Best Of")
+        lid = SimpleNamespace(failure_generation=0)
+        lid.list_all_albums = lambda: albums(lid)
+        o.lidarr = lid
+        o._album_track_titles_rows = tracks
+        o._assembly_continue_hunts = lambda **k: 0
+        o.assembly_plan_pass()
+        return store
+
+    GAP = {"id": 7, "monitored": True, "title": "Album",
+           "artist": {"artistName": "Some Artist"},
+           "statistics": {"totalTrackCount": 10, "trackFileCount": 2}}
+
+    def test_an_outage_prunes_no_plan(self):
+        def down(lid):
+            lid.failure_generation += 1
+            return []
+        with tempfile.TemporaryDirectory() as root:
+            store = self._pass(root, down)
+        self.assertEqual((store.pruned, list(store.plans)), ([], ["5"]))
+
+    def test_a_missing_track_list_prunes_no_plan(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self._pass(root, lambda lid: [self.GAP])
+        self.assertEqual((store.pruned, list(store.plans)), ([], ["5"]))
+
+    def test_an_answered_pass_still_prunes(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self._pass(root, lambda lid: [])
+        self.assertEqual((store.pruned, store.plans), ([[]], {}))
+
+    def test_an_unreadable_keep_set_is_not_assembly_off(self):
+        import inspect
+        from types import SimpleNamespace
+        import main
+        self.assertIsNone(main._assembly_keep(SimpleNamespace(assembly=None)))
+
+        class Broken:
+            def needed_files(self):
+                raise OSError("plans unreadable")
+        with self.assertRaises(OSError):
+            main._assembly_keep(SimpleNamespace(assembly=Broken()))
+        src = inspect.getsource(main)
+        self.assertIn("acted = asm_known and auto_deselect_pass(", src)
+        self.assertIn("assembly_keep=_asm_keep_now(), llm=match_llm", src)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -10682,6 +10682,9 @@ class Orchestrator:
             len(index), len(folders))
 
         # ---- 2) every album Lidarr wants and is missing tracks for.
+        # Lidarr's read methods answer [] during an outage; the generation
+        # tells that from "nothing is missing" (see the prune below).
+        gen = self._lidarr_generation()
         try:
             albums = self.lidarr.list_all_albums()
         except Exception as exc:  # noqa: BLE001
@@ -10740,6 +10743,7 @@ class Orchestrator:
         gaps = gaps[:cap_albums]
         planned = 0
         keep_ids: List[Any] = []
+        unanswered = 0
         min_pct = float(getattr(self.cfg, "assembly_min_pct", 10.0))
         for a in gaps:
             aid = a.get("id")
@@ -10750,8 +10754,11 @@ class Orchestrator:
             try:
                 tracks = self._album_track_titles_rows(int(aid))
             except Exception:  # noqa: BLE001
-                continue
+                tracks = []
             if not tracks:
+                # A gap album has tracks (total > 0 above): no list is no
+                # answer, and its plan must not be pruned for it.
+                unanswered += 1
                 continue
             plan = planner.plan_album(artist, title, tracks, index)
             if plan["n_matched"] <= 0 or plan["pct"] < min_pct:
@@ -10773,8 +10780,15 @@ class Orchestrator:
             keep_ids.append(aid)
             planned += 1
         # Only prune plans when this pass covered EVERY candidate album -- during
-        # a rotated pass the albums we didn't revisit must keep their plans.
-        if not rotated:
+        # a rotated pass the albums we didn't revisit must keep their plans --
+        # and Lidarr answered every question: an outage empties the album
+        # list, which would otherwise wipe every plan and with them the
+        # songs the deselect keeps.
+        if self._lidarr_generation() != gen or unanswered:
+            logger.info("assembly: Lidarr did not answer for every album this "
+                        "pass (%d track list(s) missing) -- no plan pruned",
+                        unanswered)
+        elif not rotated:
             store.keep_only(keep_ids)
         if planned:
             logger.info(

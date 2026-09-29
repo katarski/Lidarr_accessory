@@ -680,15 +680,14 @@ def interactive_search_loop(
 
 def _assembly_keep(orch: Orchestrator) -> Optional[set]:
     """Match keys for every source song the album assemblies need (union across
-    plans), for the qBittorrent deselect. None when assembly is off."""
+    plans), for the qBittorrent deselect. None when assembly is off. Raises
+    when the plans cannot be read: "unknown" must not look like "assembly
+    off", or the deselect would run with no song protected."""
     store = getattr(orch, "assembly", None)
     if store is None:
         return None
-    try:
-        from qbt_deselect import assembly_keep_tails
-        return assembly_keep_tails(store.needed_files().keys())
-    except Exception:  # noqa: BLE001
-        return None
+    from qbt_deselect import assembly_keep_tails
+    return assembly_keep_tails(store.needed_files().keys())
 
 
 def assembly_loop(
@@ -897,12 +896,11 @@ def qbt_auto_deselect_loop(
             logger.debug("qbt complete: cue scan of %s failed: %s", folder, exc)
 
     def _asm_keep_now():
+        # Raises when the keep-set cannot be read, so its caller skips the
+        # pass instead of running with no song protected.
         if assembly_keep_provider is None:
             return None
-        try:
-            return assembly_keep_provider()
-        except Exception:  # noqa: BLE001
-            return None
+        return assembly_keep_provider()
 
     delay = min(cadence, 10)  # first pass right after startup
     while not stop.wait(delay):
@@ -924,30 +922,34 @@ def qbt_auto_deselect_loop(
             if do_deselect:
                 # Songs an album assembly needs must stay selected even when
                 # their compilation looks fully "owned"/unwanted (requirement e).
-                asm_keep = None
-                if assembly_keep_provider is not None:
-                    try:
-                        asm_keep = assembly_keep_provider()
-                    except Exception as exc:  # noqa: BLE001
-                        logger.debug("assembly keep-set unavailable: %s", exc)
-                acted = auto_deselect_pass(qbt, lidarr, seen, category=category,
-                                           emit=logger.info,
-                                           pause_during_scan=pause_scan,
-                                           llm=match_llm,
-                                           deselect_video=deselect_video,
-                                           reap_useless=reap_useless,
-                                           planned=planned_deselect,
-                                           recheck_seconds=redeselect_recheck,
-                                           assembly_keep=asm_keep,
-                                           # Checkpoint mid-walk: a full pass
-                                           # takes the better part of an hour,
-                                           # so end-of-pass-only saving lost
-                                           # everything on a restart.
-                                           on_progress=lambda: (
-                                               _save_deselect_ledger(
-                                                   deselect_ledger_path,
-                                                   planned_deselect)),
-                                           start_added_stopped=start_added_stopped)
+                # A keep-set that cannot be read is not "assembly off": the
+                # deselect waits for the next pass.
+                asm_keep, asm_known = None, True
+                try:
+                    asm_keep = _asm_keep_now()
+                except Exception as exc:  # noqa: BLE001
+                    asm_known = False
+                    logger.warning(
+                        "qbt auto-deselect: the assembly keep-set cannot be "
+                        "read (%s) -- deselect waits for the next pass", exc)
+                acted = asm_known and auto_deselect_pass(qbt, lidarr, seen, category=category,
+                                                         emit=logger.info,
+                                                         pause_during_scan=pause_scan,
+                                                         llm=match_llm,
+                                                         deselect_video=deselect_video,
+                                                         reap_useless=reap_useless,
+                                                         planned=planned_deselect,
+                                                         recheck_seconds=redeselect_recheck,
+                                                         assembly_keep=asm_keep,
+                                                         # Checkpoint mid-walk: a full pass
+                                                         # takes the better part of an hour,
+                                                         # so end-of-pass-only saving lost
+                                                         # everything on a restart.
+                                                         on_progress=lambda: (
+                                                             _save_deselect_ledger(
+                                                                 deselect_ledger_path,
+                                                                 planned_deselect)),
+                                                         start_added_stopped=start_added_stopped)
                 if acted:
                     logger.info("qbt auto-deselect: acted on %d torrent(s)", acted)
                 # Final save for the pass (it is also checkpointed mid-walk).
