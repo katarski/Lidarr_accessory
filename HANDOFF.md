@@ -322,21 +322,28 @@ test of a feature whose purpose is removing files.
    where there was one). Start at item 1 (loops F4, the rest: claim in
    reconcile, audit/nudge and held auto-resolve). 56 are fixed;
    CLI-04/06/07 were refuted — do not redo them.
-2. **The owner must re-download** Simply Red *Blue*, the Slim Harpo box and
+2. **Orphan CUE whose image is gone** (logged once each, `[ERROR] No companion
+   audio next to ...`): `/downloads/Oliver Deriviere - Music From Alone In The
+   Dark/` holds only `CDIMAGE.flac.cue` (FILE "CDIMAGE.flac"), `CDIMAGE.log`
+   and `scans/`; same for Carly Simon *Have You Seen Me Lately*
+   (`edit.flac.cue`). Not investigated: find whether the pipeline imported the
+   image and left the cue (then the cue should be retired as done, not an
+   ERROR) or the torrent never had it (then it is a real hold).
+3. **The owner must re-download** Simply Red *Blue*, the Slim Harpo box and
    Elmore James *The Sky Is Crying* (the old number-only pairing misfiled
    them; the pairing is fixed).
-3. **Lidarr's own AlbumSearch found 0 reports** for 9 missing albums (Cyrillic,
+4. **Lidarr's own AlbumSearch found 0 reports** for 9 missing albums (Cyrillic,
    Arabic, Japanese, Latin with curly quotes): indexer coverage, not code.
-4. **CUE ledger "gave up" rows** from before 29 Sep may be outage artefacts
+5. **CUE ledger "gave up" rows** from before 29 Sep may be outage artefacts
    (Lidarr down -> `skipped_unmonitored` x3). Replace/edit the .cue to retry.
-5. **Lidarr's recycle bin is OFF** (`recycleBin: ''`). Still worth proposing.
-6. **`interactive_search_max_candidates` is 1000.** The user's setting.
-7. **`.mkv` files in the music library.** **Cloud LLM** wired but unused.
-8. `staging.delete_source_folder_on_success` is **effectively false** via
+6. **Lidarr's recycle bin is OFF** (`recycleBin: ''`). Still worth proposing.
+7. **`interactive_search_max_candidates` is 1000.** The user's setting.
+8. **`.mkv` files in the music library.** **Cloud LLM** wired but unused.
+9. `staging.delete_source_folder_on_success` is **effectively false** via
    `webui_overrides.json` (`delete_originals_on_success` true).
-9. **Recommend rotating the Prowlarr API key** (it was in old logs before
+10. **Recommend rotating the Prowlarr API key** (it was in old logs before
    CLI-08). Ask the owner; never rotate it yourself.
-10. The owner sometimes **pauses the Lidarr container on purpose**; the
+11. The owner sometimes **pauses the Lidarr container on purpose**; the
     pipeline then waits ("Lidarr not reachable ... no deadline"). Don't unpause.
 
 ---
