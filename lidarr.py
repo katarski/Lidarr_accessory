@@ -593,10 +593,11 @@ class LidarrClient:
         self, artist_name: str, album_name: str
     ) -> Optional[Dict[str, Any]]:
         """
-        Look up the download-client queue entry matching this artist/album.
-        Matches on artist name (exact) first, then falls back to 'album
-        name appears in the queue title'. Returns the full queue record
-        (we need its `downloadId` for scan correlation).
+        Look up the download-client queue entry matching this artist/album:
+        the artist exactly, and the album in its title. Returns the full
+        queue record (its `downloadId` correlates a scan). There is no
+        artist-less fallback: "album name appears in any title" matched
+        Confidence Man's '5AM (LA LA LA)' for Priscilla Ahn's 'La La La'.
         """
         entries = self.queue_list()
         if not entries:
@@ -611,13 +612,6 @@ class LidarrClient:
                 not tgt_album or tgt_album in title
             ):
                 return e
-        # Pass 2: album match anywhere (torrent title often starts with artist).
-        if tgt_album:
-            for e in entries:
-                title = (e.get("title") or "").lower()
-                output = (e.get("outputPath") or "").lower()
-                if tgt_album in title or tgt_album in output:
-                    return e
         return None
 
     def process_monitored_downloads(self) -> Optional[int]:

@@ -10399,17 +10399,52 @@ class Orchestrator:
         )
         return scored
 
-    def _await_queue_hash(self, artist: str, album: str, timeout: int = 90):
+    def _queue_download_ids(self) -> Optional[set]:
+        """Every downloadId in Lidarr's queue now, or None when the queue
+        cannot be read. Taken just before a grab, so the grab's own row is
+        the one that was not there."""
+        gen = self._lidarr_generation()
+        rows = self.lidarr.queue_list() or []
+        if self._lidarr_generation() != gen:
+            return None
+        return {str(r.get("downloadId") or "").lower() for r in rows
+                if r.get("downloadId")}
+
+    def _await_grab(self, release_title: str, album_id=None, before=None,
+                    guid: str = "", timeout: int = 90):
         """
-        Poll Lidarr's queue for the just-grabbed item and return
-        (downloadId_hash, record) once it appears, else (None, None). Lidarr
-        adds the torrent to qBittorrent within a few seconds of the grab.
+        (downloadId_hash, record) of the queue row this grab created, else
+        (None, None). Bound exactly: the infohash in the guid when it has
+        one; otherwise a row that was not in `before` whose album id or
+        whole title is this release's. Never a substring of another
+        download's title -- that bound Priscilla Ahn's 'La La La' grab to
+        Confidence Man's live '5AM (LA LA LA)', which was then verified
+        against the wrong album and deleted.
         """
-        deadline = time.time() + timeout
+        from qbittorrent_client import btih_from_magnet, magnet_from_guid
+        magnet = magnet_from_guid(guid or "") if guid else None
+        ih = (btih_from_magnet(magnet) or "").lower() if magnet else ""
+        norm = self._norm_title(release_title or "")
+        deadline = time.time() + max(5, int(timeout))
         while time.time() < deadline:
-            rec = self.lidarr.queue_find_for(artist, album)
-            if rec and rec.get("downloadId"):
-                return str(rec["downloadId"]).lower(), rec
+            try:
+                for rec in self.lidarr.queue_list() or []:
+                    did = str(rec.get("downloadId") or "").lower()
+                    if not did:
+                        continue
+                    if ih:
+                        if did == ih:
+                            return did, rec
+                        continue
+                    if before is None or did in before:
+                        continue            # not provably this grab's row
+                    rid = rec.get("albumId") or (rec.get("album") or {}).get("id")
+                    if ((album_id and rid and int(rid) == int(album_id))
+                            or (norm and self._norm_title(
+                                rec.get("title") or "") == norm)):
+                        return did, rec
+            except Exception:  # noqa: BLE001
+                pass
             time.sleep(3)
         return None, None
 
@@ -11938,9 +11973,13 @@ class Orchestrator:
         return "reject:no-audio", info
 
     def _reject_grab(self, artist: str, album: str, thash: str, qbt) -> None:
-        """Blocklist + remove the grabbed release from Lidarr's queue and qBit."""
+        """Blocklist + remove THIS grab (its hash) from Lidarr's queue and
+        qBit. The queue row is the one whose downloadId is the hash, never one
+        found by artist/album name."""
         try:
-            rec = self.lidarr.queue_find_for(artist, album)
+            rec = next((r for r in (self.lidarr.queue_list() or [])
+                        if thash and str(r.get("downloadId") or "").lower()
+                        == str(thash).lower()), None)
             if rec and rec.get("id") is not None:
                 if not self.lidarr.queue_remove(
                         int(rec["id"]), remove_from_client=True, blocklist=True):
@@ -11954,7 +11993,11 @@ class Orchestrator:
                            "%s / %s: %s", artist, album, exc)
         if qbt is not None and thash:
             try:
-                if not qbt.remove(thash, delete_files=True):
+                if not self._qbt_ours_by_hash(qbt, thash):
+                    logger.info("rejected grab %s: already gone, or not in "
+                                "our category -- nothing more removed",
+                                thash[:12])
+                elif not qbt.remove(thash, delete_files=True):
                     logger.warning(
                         "rejected grab %s but qBittorrent did not remove it -- "
                         "torrent and data are still there", thash[:12])
@@ -12200,13 +12243,16 @@ class Orchestrator:
             # the search, so a release Lidarr can't parse ("Unknown Artist")
             # should still be grabbed against it, exactly as confirming the
             # UI's "Grab Release" dialog does.
+            before = self._queue_download_ids()
             if not self.lidarr.release_grab(
                 guid, indexer, album_id=aid,
                 artist_id=(alb.get("artistId")
                            or (alb.get("artist") or {}).get("id")),
             ):
                 continue
-            thash, _rec = self._await_queue_hash(artist, album, timeout=90)
+            thash, _rec = self._await_grab(str(cand.get("title") or ""),
+                                           album_id=aid, before=before,
+                                           guid=str(guid), timeout=90)
             if not thash:
                 logger.warning(
                     "interactive search: %s -- grabbed but no queue hash "
@@ -12563,8 +12609,9 @@ class Orchestrator:
         return None
 
     def _await_queue_hash_by_title(self, release_title: str, timeout: int = 90):
-        """Poll Lidarr's queue for the item whose title matches the grabbed
-        release, returning (downloadId_hash, record)."""
+        """The queue row whose WHOLE title is the grabbed release's --
+        (downloadId_hash, record). A title contained in another ('La La La'
+        in '5AM (LA LA LA)') is a different download."""
         norm = self._norm_title(release_title)
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -12572,8 +12619,7 @@ class Orchestrator:
                 for rec in self.lidarr.queue_list():
                     if not rec.get("downloadId"):
                         continue
-                    t = self._norm_title(rec.get("title") or "")
-                    if t and (t == norm or norm in t or t in norm):
+                    if norm and self._norm_title(rec.get("title") or "") == norm:
                         return str(rec["downloadId"]).lower(), rec
             except Exception:  # noqa: BLE001
                 pass
@@ -12705,12 +12751,14 @@ class Orchestrator:
             _m = cand.get("_match") or ()
             _alb_id = (_m[2] if (not cand.get("_is_disco") and len(_m) > 2)
                        else None)
+            before = self._queue_download_ids()
             if not self.lidarr.release_grab(
                 guid, indexer, album_id=_alb_id, artist_id=artist_id,
             ):
                 continue
-            thash, _rec = self._await_queue_hash_by_title(
-                cand.get("title") or "", timeout=90)
+            thash, _rec = self._await_grab(cand.get("title") or "",
+                                           album_id=_alb_id, before=before,
+                                           guid=str(guid), timeout=90)
             if not thash:
                 logger.warning(
                     "interactive search: %s -- grabbed %s but no queue hash; "

@@ -197,5 +197,40 @@ class Discard(unittest.TestCase):
             self.assertEqual(reaped, want)
 
 
+class GrabBinding(unittest.TestCase):
+    def orch(self, rows):
+        from orchestrator import Orchestrator
+        o = Orchestrator.__new__(Orchestrator)
+        removed = []
+        o.lidarr = type("L", (), {
+            "failure_generation": 0,
+            "queue_list": lambda self: rows,
+            "queue_remove": lambda self, i, **k: removed.append(i) or True})()
+        o._lidarr_generation = lambda: 0
+        return o, removed
+
+    def test_another_downloads_title_containing_the_album_is_not_this_grab(self):
+        live = {"id": 1, "downloadId": "F3A3", "title": "Confidence Man - 5AM (LA LA LA)",
+                "albumId": 77}
+        o, _ = self.orch([live])
+        before = o._queue_download_ids()
+        with mock.patch("orchestrator.time.sleep", lambda s: None):
+            self.assertEqual(o._await_grab("Priscilla Ahn - La La La", album_id=5,
+                                           before=before, timeout=0), (None, None))
+            mine = {"id": 2, "downloadId": "3B55", "title": "Priscilla Ahn - La La La",
+                    "albumId": 5}
+            o.lidarr.queue_list = lambda: [live, mine]
+            self.assertEqual(o._await_grab("x", album_id=5, before=before,
+                                           timeout=5)[0], "3b55")
+
+    def test_a_reject_removes_only_the_row_with_its_hash(self):
+        rows = [{"id": 1, "downloadId": "AAA", "title": "Other - La La La"},
+                {"id": 2, "downloadId": "BBB", "title": "Mine"}]
+        o, removed = self.orch(rows)
+        o._qbt_ours_by_hash = lambda q, h: False
+        o._reject_grab("Priscilla Ahn", "La La La", "bbb", None)
+        self.assertEqual(removed, [2])
+
+
 if __name__ == "__main__":
     unittest.main()
