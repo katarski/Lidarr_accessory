@@ -13,6 +13,31 @@ The image is **built locally on PARK and exists in no registry**. Every code
 change needs a rebuild AND a container replace — `docker restart` keeps the old
 image.
 
+**The routine used for every fix since 29 Sep** (the Windows repo pushes;
+PARK only pulls):
+
+```bash
+# Windows, in the repo: commit, push, ship the tree to PARK
+git push origin main
+tar --exclude=.git --exclude=__pycache__ -cf - . | ssh root@192.168.1.200   'rm -rf /tmp/cue_test && mkdir -p /tmp/cue_test && tar -xf - -C /tmp/cue_test'
+# PARK: tests in the image, sync the checkout, deploy
+docker run --rm -v /tmp/cue_test:/src -w /src -e PYTHONIOENCODING=utf-8   --entrypoint python cue_pipeline:pre-gate-20260929 -m unittest discover -s tests -t .
+D=/mnt/cache/appdata/cue_pipeline_src
+git -c safe.directory=$D -C $D fetch -q origin && git -c safe.directory=$D -C $D reset -q --hard origin/main
+sh /tmp/cue_test/tools/deploy.sh guard-<date>-<what>
+```
+
+`tools/deploy.sh` builds FROM `cue_pipeline:pre-gate-20260929` (the last full
+build) with the repo's `*.py` and `tools/`, checks `OrchestratorConfig` is
+still a dataclass, generates the run command from the flash template
+(`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
+mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
+then is the container replaced. Live now: **`guard-20260929-assembly`**
+(f01ef2f). Earlier tags for rollback: `guard-20260929-binding`,
+`-deleters`, `-pairing`, `-names`, `pre-gate-20260929`.
+
+The bundle procedure below is only for commits made ON PARK.
+
 | Location | Role |
 |---|---|
 | `C:\Users\zvani\Documents\GitHub\cue_pipeline\Lidarr_accessory` | the repo that can push (`main`) |
@@ -182,6 +207,28 @@ layer says `http://daniel:11434`.
 - **Encodes appear only complete** (`_encode_flac`: `.partial`, verify, tag,
   rename); DVD-Audio publishes the whole disc or nothing.
 - **Titles compare in any script** (`titlematch.py`) — see README.
+- **Deselected is not owned** (`qbt_deselect`): `plan_torrent` gives each
+  album `have` (don't download) and `owned` (Lidarr holds it complete, matched
+  without the LLM). Only `owned` may ground a delete; the lifecycle pass also
+  requires `folder_fully_owned` for every on-disk folder, and never asks the
+  LLM. Uncategorised torrents are adopted only if they carry our own tag.
+- **A submitted import is not an import**: the harvest purge waits in the
+  ledger (`pending`) until every submitted track has a file; unproven audio is
+  never deleted; only the torrent whose content IS the folder is removed.
+  Assembly Add re-reads the tracks (never imports onto a filled one: an
+  explicit-trackId import there is an Upgrade that deletes) and frees a source
+  only when its track holds a new trackfile outside staging
+  (`LidarrClient.command_succeeded` is the one verdict on a command record).
+- **A grab is bound to its own queue row** (`_await_grab`): the infohash, or a
+  row new since the pre-grab snapshot whose album id or whole title is the
+  release's. Never a substring: Priscilla Ahn's "La La La" once bound to, and
+  deleted, Confidence Man's live "5AM (LA LA LA)". A reject removes only the
+  row with that hash, and only our torrent.
+- **WebUI Add/Overwrite** imports only the files it copied (title pairing onto
+  empty tracks), refuses two held files with one name, and deletes the held
+  folder only when every song has an equal copy in the library. Discard never
+  reaps on an unreadable file list, and deselects by the album's path inside
+  the torrent, not a folder-name segment.
 
 ---
 
@@ -262,26 +309,26 @@ test of a feature whose purpose is removing files.
 
 ## 6. Open items
 
-1. **Audit pairs 3 (qbt/loops, orchestrator tail) were still running** at the
-   29 Sep deploy; pairs 1-2 are fixed. Fix what pair 3 confirms, same way.
-2. **Content-identify returns a TITLE**; callers re-find the album by name, so
-   among same-titled albums the first wins. The pick itself is now labelled by
-   year and track count; passing the album id through the name-based hand-off
-   is the remaining refactor.
+1. **38 audit findings are open: `docs/AUDIT_OPEN.md`**, in fix order, each
+   with evidence, root cause and the agreed fix (the verifier's correction
+   where there was one). Start at item 1 (CLAIMS-1: one claim-aware delete
+   funnel). 53 are fixed; CLI-04/06/07 were refuted — do not redo them.
+2. **The owner must re-download** Simply Red *Blue*, the Slim Harpo box and
+   Elmore James *The Sky Is Crying* (the old number-only pairing misfiled
+   them; the pairing is fixed).
 3. **Lidarr's own AlbumSearch found 0 reports** for 9 missing albums (Cyrillic,
-   Arabic, Japanese, Latin with curly quotes): indexer coverage, not code. (The
-   pipeline's interactive search had been a no-op since 26 Sep: a Lidarr
-   failure listed 0 missing albums and the prune wiped every album's clock.
-   Fixed 29 Sep — a failed listing keeps the state, and "missing since" comes
-   from the release date / artist-added date.)
+   Arabic, Japanese, Latin with curly quotes): indexer coverage, not code.
 4. **CUE ledger "gave up" rows** from before 29 Sep may be outage artefacts
    (Lidarr down -> `skipped_unmonitored` x3). Replace/edit the .cue to retry.
 5. **Lidarr's recycle bin is OFF** (`recycleBin: ''`). Still worth proposing.
 6. **`interactive_search_max_candidates` is 1000.** The user's setting.
-7. **Orphan uncategorised torrents** escape every category-scoped guard.
-8. **`.mkv` files in the music library.** **Cloud LLM** wired but unused.
-9. `staging.delete_source_folder_on_success` is **effectively false** via
+7. **`.mkv` files in the music library.** **Cloud LLM** wired but unused.
+8. `staging.delete_source_folder_on_success` is **effectively false** via
    `webui_overrides.json` (`delete_originals_on_success` true).
+9. **Recommend rotating the Prowlarr API key** (it was in old logs before
+   CLI-08). Ask the owner; never rotate it yourself.
+10. The owner sometimes **pauses the Lidarr container on purpose**; the
+    pipeline then waits ("Lidarr not reachable ... no deadline"). Don't unpause.
 
 ---
 
@@ -290,9 +337,9 @@ test of a feature whose purpose is removing files.
 | Thing | Value |
 |---|---|
 | PARK | `192.168.1.200`, key `C:\Users\zvani\.ssh\id_ed25519`, **bash over SSH** |
-| Lidarr | `http://192.168.1.200:8686` |
+| Lidarr | `http://park:8686` (`park` resolves inside the container) |
 | Prowlarr | `http://192.168.1.200:9696` |
-| qBittorrent | `http://192.168.1.200:8080`, category **`lidarr`** — never touch others |
+| qBittorrent | `http://park:8080`, category **`lidarr`** — never touch others |
 | LLM | `http://daniel:11434`, **HA's own** `huihui_ai/Qwen3.6-abliterated:27b`, `num_ctx 16384`, `think false` — one runner serves both. Asked only when the GPU gate is open (HA sensors via `HA_URL`/`HA_TOKEN`); `keep_alive` 600 never shortens HA's; `warmup_on_start` false |
 | WebUI | `http://192.168.1.200:8830` |
 | Container limits | `--cpuset-cpus 1,3,7,9 --cpus 2.0 --cpu-shares 256 --memory 4g` |
