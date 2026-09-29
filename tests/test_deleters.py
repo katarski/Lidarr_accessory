@@ -232,5 +232,72 @@ class GrabBinding(unittest.TestCase):
         self.assertEqual(removed, [2])
 
 
+class AssemblyAdd(unittest.TestCase):
+    """Add to library imports onto empty tracks only, and a source goes only
+    after Lidarr has filed its song."""
+
+    def run_add(self, filled_before, files_it):
+        from assembly import AssemblyStore
+        from orchestrator import Orchestrator
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        src = Path(tmp.name, "comp", "07 - Song.flac")
+        src.parent.mkdir()
+        src.write_bytes(b"x")
+        tracks = {1: 55 if filled_before else 0}
+        sent = []
+
+        class L:
+            failure_generation = 0
+
+            def get_album(self, aid):
+                return {"releases": [{"id": 9, "monitored": True}], "artistId": 3}
+
+            def list_tracks_for_album(self, aid):
+                return [{"id": t, "trackFileId": f} for t, f in tracks.items()]
+
+            def list_trackfiles_for_album(self, aid):
+                return [{"id": 77, "path": "/music/A/B/01.flac"}] if tracks[1] == 77 else []
+
+            def manual_import_candidates(self, path, artist_id=None):
+                return []
+
+            def manual_import_apply_files(self, items, import_mode="move"):
+                sent.extend(items)
+                if files_it:
+                    tracks[1] = 77
+                return 1
+
+            def wait_for_command(self, cmd, **k):
+                return {"status": "completed"}
+
+        o = Orchestrator.__new__(Orchestrator)
+        o.lidarr = L()
+        o.cfg = type("C", (), {"staging_root": tmp.name})()
+        o.assembly = AssemblyStore(None)
+        o.assembly.upsert(5, {"artist": "A", "album": "B", "total": 1,
+                              "matched": [{"source": str(src), "track_id": 1,
+                                           "number": 1, "track": "Song"}],
+                              "sources": {str(src): 1}})
+        o._lidarr_generation = lambda: 0
+        o._trigger_artist_refresh = lambda *a, **k: None
+        o._write_basic_tags = lambda *a, **k: None
+        ok, _msg = o.assembly_add_to_library(5)
+        return ok, sent, src.exists()
+
+    def test_a_track_filled_since_the_plan_is_not_imported_onto(self):
+        ok, sent, kept = self.run_add(filled_before=True, files_it=True)
+        self.assertEqual((ok, sent, kept), (False, [], True))
+
+    def test_a_completed_command_that_filed_nothing_keeps_the_source(self):
+        ok, sent, kept = self.run_add(filled_before=False, files_it=False)
+        self.assertEqual((ok, len(sent), kept), (False, 1, True))
+
+    def test_a_filed_song_frees_its_source(self):
+        ok, sent, kept = self.run_add(filled_before=False, files_it=True)
+        self.assertEqual((ok, len(sent), kept), (True, 1, False))
+        self.assertNotIn("_source", sent[0])
+
+
 if __name__ == "__main__":
     unittest.main()

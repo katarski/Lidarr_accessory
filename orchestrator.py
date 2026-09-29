@@ -11479,8 +11479,10 @@ class Orchestrator:
         files them as that album instead of guessing.
 
         Sources are COPIED, never moved, because one compilation can feed several
-        assemblies. Afterwards a source is deleted only when no OTHER remaining
-        plan still needs it (the shared-file guard).
+        assemblies. Afterwards a source is deleted only when Lidarr has filed
+        its song -- the track has a NEW trackfile outside staging -- and no
+        OTHER plan still needs it (the shared-file guard). A command record is
+        not proof: it comes back for failed, aborted and timed-out imports too.
         """
         store = getattr(self, "assembly", None)
         if store is None:
@@ -11506,6 +11508,16 @@ class Orchestrator:
         if not artist_id:
             return False, "could not resolve the Lidarr artist id"
         total = int(plan.get("total") or len(matched))
+        # The plan is a snapshot. An explicit-trackId ManualImport onto a track
+        # that has since been filled is an "Upgrade": Lidarr deletes the file
+        # already there. So read the tracks now, and import onto empty ones only.
+        gen = self._lidarr_generation()
+        before = {int(t["id"]): int(t.get("trackFileId") or 0)
+                  for t in (self.lidarr.list_tracks_for_album(int(album_id)) or [])
+                  if t.get("id")}
+        if self._lidarr_generation() != gen or not before:
+            return False, ("could not read the album's tracks from Lidarr -- "
+                           "nothing done")
 
         staging = Path(self.cfg.staging_root) / ("assembly-%s" % album_id)
         try:
@@ -11515,8 +11527,15 @@ class Orchestrator:
             return False, "cannot create staging folder: %s" % exc
 
         items = []
-        n_gone = n_nocopy = n_notid = 0
+        n_gone = n_nocopy = n_notid = n_filled = 0
         for m in matched:
+            tid = m.get("track_id")
+            if not tid or int(tid) not in before:
+                n_notid += 1            # no track of the selected release
+                continue
+            if before[int(tid)]:
+                n_filled += 1           # filled since the plan: never replaced
+                continue
             src = Path(str(m["source"]))
             if not src.is_file():
                 # The plan is a snapshot; its sources move underneath it. The
@@ -11535,17 +11554,14 @@ class Orchestrator:
                 continue
             self._write_basic_tags(dst, artist, album,
                                    str(m.get("track") or ""), num, total)
-            tid = m.get("track_id")
-            if not tid:
-                n_notid += 1
-            if tid:
-                items.append({
-                    "path": str(dst), "artistId": artist_id,
-                    "albumId": int(album_id), "albumReleaseId": release_id,
-                    "trackIds": [int(tid)], "quality": None,
-                    "disableReleaseSwitching": True,
-                    "additionalFile": False, "replaceExistingFiles": False,
-                })
+            items.append({
+                "path": str(dst), "artistId": artist_id,
+                "albumId": int(album_id), "albumReleaseId": release_id,
+                "trackIds": [int(tid)], "quality": None,
+                "disableReleaseSwitching": True,
+                "additionalFile": False, "replaceExistingFiles": False,
+                "_source": str(m["source"]),
+            })
         if not items:
             shutil.rmtree(staging, ignore_errors=True)
             # Say WHICH of the three reasons it was. "copy failed or no track
@@ -11565,6 +11581,9 @@ class Orchestrator:
                 bits.append("%d copy failure(s)" % n_nocopy)
             if n_notid:
                 bits.append("%d without a Lidarr track id" % n_notid)
+            if n_filled:
+                bits.append("%d already in the library since the plan was made"
+                            % n_filled)
             return False, ("no file could be prepared: %s"
                            % ("; ".join(bits) if bits else "no matched songs"))
         # Quality has to come from Lidarr's own parse, so ask it about the staged
@@ -11577,26 +11596,28 @@ class Orchestrator:
                 it["quality"] = qmap.get(it["path"]) or it["quality"]
         except Exception:  # noqa: BLE001
             pass
+        sources = {it["trackIds"][0]: it.pop("_source") for it in items}
         cmd = self.lidarr.manual_import_apply_files(items, import_mode="move")
         if cmd is None:
             return False, "Lidarr refused the import (see log)"
+        rec = None
         try:
-            ok = bool(self.lidarr.wait_for_command(cmd, timeout_seconds=300,
-                                                   poll_interval=3))
+            rec = self.lidarr.wait_for_command(cmd, timeout_seconds=300,
+                                               poll_interval=3)
         except Exception:  # noqa: BLE001
-            ok = False
+            pass
         self._trigger_artist_refresh(artist, artist_id=artist_id)
-        if not ok:
-            return False, ("import command %s did not confirm -- staged files "
-                           "left in %s" % (cmd, staging))
-        shutil.rmtree(staging, ignore_errors=True)
-        store.remove(album_id)
-        # SHARED-FILE GUARD: a source may still feed another assembly, so only
-        # remove one that nothing else needs.
-        still_needed = set(store.needed_files().keys())
+        filed = self._assembly_filed(album_id, before, staging)
+        done = [t for t in sources if t in filed]
+        if len(done) == len(items):
+            shutil.rmtree(staging, ignore_errors=True)
+            store.remove(album_id)
+        # SHARED-FILE GUARD: only a source whose song Lidarr has filed, and
+        # that no other assembly needs.
+        still_needed = set(store.needed_files(exclude=album_id).keys())
         freed = 0
-        for m in matched:
-            sp = str(m["source"])
+        for t in done:
+            sp = sources[t]
             if sp in still_needed:
                 continue
             try:
@@ -11607,9 +11628,34 @@ class Orchestrator:
             except OSError:
                 continue
         tail = ("; removed %d source file(s) no other assembly needs" % freed
-                if freed else "; sources kept (still needed elsewhere)")
+                if freed else "; sources kept")
+        if len(done) < len(items):
+            state = str((rec or {}).get("status") or "no answer")
+            return False, ("Lidarr filed %d of %d song(s) (import %s: %s); the "
+                           "other %d stay staged in %s and their sources are "
+                           "kept%s" % (len(done), len(items), cmd, state,
+                                       len(items) - len(done), staging, tail))
         return True, ("assembled %d song(s) into %s / %s%s"
                       % (len(items), artist, album, tail))
+
+    def _assembly_filed(self, album_id, before, staging) -> set:
+        """Track ids of this album that now hold a NEW trackfile (not the one
+        they had before the import) whose path is outside staging. An empty
+        set when Lidarr could not be read: an outage is not an answer."""
+        gen = self._lidarr_generation()
+        after = {int(t["id"]): int(t.get("trackFileId") or 0)
+                 for t in (self.lidarr.list_tracks_for_album(int(album_id)) or [])
+                 if t.get("id")}
+        paths = {int(f["id"]): str(f.get("path") or "")
+                 for f in (self.lidarr.list_trackfiles_for_album(int(album_id))
+                           or []) if f.get("id")}
+        if self._lidarr_generation() != gen:
+            return set()
+        st = str(staging).replace("\\", "/").rstrip("/") + "/"
+        return {t for t, fid in after.items()
+                if fid and fid != before.get(t)
+                and paths.get(fid) and not paths[fid].replace("\\", "/")
+                .startswith(st)}
 
     def _assembly_continue_hunts(self, budget: int = 2) -> int:
         """

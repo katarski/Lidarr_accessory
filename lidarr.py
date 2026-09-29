@@ -647,6 +647,13 @@ class LidarrClient:
             logger.warning("command_record(%s) failed: %s", command_id, exc)
             return None
 
+    @staticmethod
+    def command_succeeded(record: Optional[Dict[str, Any]]) -> bool:
+        """True only for a record Lidarr reports as completed. The record
+        wait_for_command returns is not a verdict: it is also returned for
+        failed, aborted, and a wait that timed out while still running."""
+        return str((record or {}).get("status") or "").lower() == "completed"
+
     def wait_for_command(
         self,
         command_id: int,

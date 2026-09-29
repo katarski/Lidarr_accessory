@@ -546,15 +546,18 @@ class AssemblyStore:
                                 str(e.get("artist") or "")))
         return out
 
-    def needed_files(self) -> Dict[str, List[str]]:
+    def needed_files(self, exclude: Any = None) -> Dict[str, List[str]]:
         """
         UNION of source files needed across ALL assemblies -> the albums each
         one feeds. This is what the torrent deselect keeps: one compilation can
         serve several assemblies, so a file is needed if ANY plan wants it.
+        `exclude` leaves out one plan (the one being assembled).
         """
         out: Dict[str, List[str]] = {}
         with self._lock:
-            for e in self._items.values():
+            for k, e in self._items.items():
+                if exclude is not None and k == str(exclude):
+                    continue
                 label = f"{e.get('artist')} - {e.get('album')}"
                 for path in (e.get("sources") or {}):
                     out.setdefault(path, [])
