@@ -334,15 +334,30 @@ def apply_webui_overrides(cfg: Dict[str, Any], path: Path) -> Dict[str, Any]:
     return cfg
 
 
+class _RedactSecrets(logging.Filter):
+    """Replace apikey=/token=/password= values in every log line. The log is
+    served by the WebUI, and a Prowlarr grab link logged its API key."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        from prowlarr import redact
+        msg = record.getMessage()
+        clean = redact(msg)
+        if clean != msg:
+            record.msg, record.args = clean, None
+        return True
+
+
 def configure_logging(cfg: Dict[str, Any]) -> None:
     root = logging.getLogger()
     level = getattr(logging, cfg.get("level", "INFO").upper(), logging.INFO)
     root.setLevel(level)
 
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    redactor = _RedactSecrets()
 
     stream = logging.StreamHandler(sys.stdout)
     stream.setFormatter(fmt)
+    stream.addFilter(redactor)
     root.addHandler(stream)
 
     log_file = cfg.get("file")
@@ -355,6 +370,7 @@ def configure_logging(cfg: Dict[str, Any]) -> None:
             encoding="utf-8",
         )
         rot.setFormatter(fmt)
+        rot.addFilter(redactor)
         root.addHandler(rot)
 
 

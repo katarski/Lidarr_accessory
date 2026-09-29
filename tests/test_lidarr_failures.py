@@ -119,5 +119,30 @@ class HandoffRecords(unittest.TestCase):
         self.assertFalse(s._lidarr_failed_in_last_handoff())
 
 
+class InteractiveSearchState(unittest.TestCase):
+    def test_iso_ts(self):
+        from orchestrator import _iso_ts
+        self.assertGreater(_iso_ts("2026-09-25T00:00:00Z"), 1.7e9)
+        self.assertEqual(_iso_ts(None), 0.0)
+        self.assertEqual(_iso_ts("garbage"), 0.0)
+
+    def test_a_pass_during_a_lidarr_failure_keeps_the_state(self):
+        from orchestrator import Orchestrator
+        saved = []
+        lid = SimpleNamespace(failure_generation=0)
+
+        def wanted_missing():
+            lid.failure_generation += 1          # listing failed part-way
+            return []
+        lid.wanted_missing = wanted_missing
+        s = SimpleNamespace(lidarr=lid, cfg=SimpleNamespace(
+            interactive_search_enabled=True, interactive_search_state_file=None))
+        s._load_isearch_state = lambda: {"12": {"first_missing": 1.0}}
+        s._save_isearch_state = saved.append
+        s._lidarr_generation = Orchestrator._lidarr_generation.__get__(s)
+        self.assertEqual(Orchestrator.interactive_search_pass(s), 0)
+        self.assertEqual(saved, [])
+
+
 if __name__ == "__main__":
     unittest.main()

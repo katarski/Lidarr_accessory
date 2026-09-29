@@ -62,5 +62,49 @@ class Claims(unittest.TestCase):
         self.assertFalse(in_thread(lambda: q.remove("H", delete_files=True)))
 
 
+class AddByUrl(unittest.TestCase):
+    """The new torrent is found by its one-off tag, never by diffing."""
+    def client(self, appear):
+        from qbittorrent_client import QbtClient
+        q = QbtClient.__new__(QbtClient)
+        q.base = "http://qbt"
+        q._api_ok = lambda: True
+        sent = []
+
+        class S:
+            def post(self, url, data=None, timeout=None):
+                sent.append((url.rsplit("/", 1)[-1], dict(data or {})))
+                return type("R", (), {"raise_for_status": lambda self: None})()
+        q.s = S()
+
+        def torrents(category="", state_filter="", tag=""):
+            added = [d for u, d in sent if u == "add"]
+            nonce = added[-1]["tags"].split(",")[-1] if added else None
+            other = [{"hash": "0000other", "category": "radarr"}]  # someone else's add
+            mine = [{"hash": "ABCDEF12", "category": category}] if appear and tag == nonce else []
+            return mine if tag else other + mine
+        q.torrents = torrents
+        return q, sent
+
+    def test_finds_only_its_own_add_and_cleans_the_tag(self):
+        q, sent = self.client(appear=True)
+        self.assertEqual(q.add_torrent_url("http://prowlarr/dl/1", category="lidarr",
+                                           timeout=5), "abcdef12")
+        names = [u for u, _ in sent]
+        self.assertEqual(names, ["add", "removeTags", "deleteTags"])
+        self.assertIn("cue-add-", sent[0][1]["tags"])
+
+    def test_nothing_of_ours_appears_returns_none(self):
+        import qbittorrent_client as qc
+        q, sent = self.client(appear=False)
+        real_sleep, qc.time.sleep = qc.time.sleep, lambda s: None
+        try:
+            self.assertIsNone(q.add_torrent_url("http://prowlarr/dl/1", category="lidarr",
+                                                timeout=5))
+        finally:
+            qc.time.sleep = real_sleep
+        self.assertEqual([u for u, _ in sent], ["add", "deleteTags"])
+
+
 if __name__ == "__main__":
     unittest.main()

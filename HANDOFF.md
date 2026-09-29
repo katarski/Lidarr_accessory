@@ -268,10 +268,12 @@ test of a feature whose purpose is removing files.
    among same-titled albums the first wins. The pick itself is now labelled by
    year and track count; passing the album id through the name-based hand-off
    is the remaining refactor.
-3. **Interactive search passes finish in ~60 ms with 0 accepted** over 583
-   missing albums — something skips them all (cooldown state?). Lidarr's own
-   AlbumSearch for 9 missing albums (Cyrillic, Arabic, Japanese, Latin with
-   curly quotes) found 0 reports: indexer coverage.
+3. **Lidarr's own AlbumSearch found 0 reports** for 9 missing albums (Cyrillic,
+   Arabic, Japanese, Latin with curly quotes): indexer coverage, not code. (The
+   pipeline's interactive search had been a no-op since 26 Sep: a Lidarr
+   failure listed 0 missing albums and the prune wiped every album's clock.
+   Fixed 29 Sep — a failed listing keeps the state, and "missing since" comes
+   from the release date / artist-added date.)
 4. **CUE ledger "gave up" rows** from before 29 Sep may be outage artefacts
    (Lidarr down -> `skipped_unmonitored` x3). Replace/edit the .cue to retry.
 5. **Lidarr's recycle bin is OFF** (`recycleBin: ''`). Still worth proposing.

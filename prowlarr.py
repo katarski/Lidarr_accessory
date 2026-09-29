@@ -216,6 +216,18 @@ def title_plausible(release_title: str, comp_title: str,
     return 2.0 * recall * precision / (recall + precision)
 
 
+# apikey=/token=/password= values in a URL or a log line. A Prowlarr grab link
+# is .../download?apikey=<key>, and it reached the log (served by the WebUI
+# without authentication) and the persisted interactive-search state.
+_SECRET_PARAM_RE = re.compile(
+    r"(?i)\b(api_?key|token|access_token|password|passkey)=([^&\s'\"<>]+)")
+
+
+def redact(text) -> str:
+    """`text` with every secret query value replaced by ***."""
+    return _SECRET_PARAM_RE.sub(r"\1=***", str(text or ""))
+
+
 class ProwlarrClient:
     """Read-only Prowlarr client: free-text search across enabled indexers."""
 
@@ -384,7 +396,9 @@ class ProwlarrClient:
             if ih:
                 seen.add(ih)
             out.append({
-                "guid": grab_url,        # the assembly path reads magnets here
+                # An identity (tried lists, blocklists -- persisted), so without
+                # the key; the add uses grab_url. A magnet is unchanged.
+                "guid": redact(grab_url),
                 "grab_url": grab_url,
                 "is_magnet": bool(magnet),
                 "indexerId": rec.get("indexerId"),

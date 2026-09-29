@@ -177,6 +177,16 @@ def _is_pre_split_reason(reason: str) -> bool:
     return any(m in r for m in _PRE_SPLIT_REASON_MARKERS)
 
 
+def _iso_ts(value) -> float:
+    """Epoch seconds of an ISO-8601 stamp from Lidarr, or 0.0."""
+    if not value:
+        return 0.0
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return 0.0
+
+
 class _SeenSet:
     """
     "Already looked at this" -- remembered for a while, and only for the
@@ -9844,8 +9854,11 @@ class Orchestrator:
             return {}
         try:
             import json
+            from prowlarr import redact
             with open(path, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
+                # Guids saved before they were redacted carry the Prowlarr key;
+                # redacted here they also still match the new, redacted ones.
+                data = json.loads(redact(fh.read()))
             return data if isinstance(data, dict) else {}
         except FileNotFoundError:
             return {}
@@ -12640,7 +12653,16 @@ class Orchestrator:
         cfg = self.cfg
         now = time.time()
         state = self._load_isearch_state()
+        gen0 = self._lidarr_generation()
         missing = self.lidarr.wanted_missing()
+        if self._lidarr_generation() != gen0:
+            # Lidarr failed while listing: an empty or partial list is not
+            # "nothing is missing". Treating it so pruned every album's state
+            # (75 passes of "scanning 0" on 26-28 Sep) and restarted every
+            # 3-day clock, so nothing was searched for days after it recovered.
+            logger.info("interactive search: Lidarr failed while listing missing "
+                        "albums -- pass skipped, state kept")
+            return 0
         logger.info(
             "interactive search: scanning %d missing monitored album(s) "
             "(min_missing=%dd, dry_run=%s)", len(missing),
@@ -12690,7 +12712,14 @@ class Orchestrator:
                      int((alb.get("statistics") or {}).get("trackCount") or 0),
                      aid))
             st = state.setdefault(str(aid), {})
-            st.setdefault("first_missing", now)
+            # Missing since the later of its release and its artist joining
+            # Lidarr -- Lidarr's facts, not our memory of them, so a lost or
+            # pruned state file does not restart the clock (it did, for all
+            # 583 albums). The earliest known value wins.
+            since = max(_iso_ts(alb.get("releaseDate")),
+                        _iso_ts((alb.get("artist") or {}).get("added")))
+            st["first_missing"] = min(float(st.get("first_missing") or now),
+                                      since if 0 < since < now else now)
             if now - float(st.get("first_missing") or now) < min_missing:
                 continue
             if aid in queued_ids:
@@ -14438,6 +14467,12 @@ class Orchestrator:
         ]),
     ]
 
+    _SECRET_SET = "(set)"
+
+    @staticmethod
+    def _is_secret_key(key: str) -> bool:
+        return bool(re.search(r"(?:api_?key|token|password|secret)$", str(key or "")))
+
     def get_settings(self):
         """Current values of the curated settings (for the WebUI Settings tab).
 
@@ -14453,6 +14488,10 @@ class Orchestrator:
         rows = []
         for sid, section, key, label, typ, default, help_ in self._SETTINGS_SCHEMA:
             val = (self._raw_cfg.get(section) or {}).get(key, default)
+            if self._is_secret_key(key):
+                # The WebUI has no authentication and port 8830 is on the LAN:
+                # a secret is shown only as set / not set, never its value.
+                val = self._SECRET_SET if val else ""
             rows.append({"id": sid, "label": label, "type": typ,
                          "value": val, "help": help_,
                          "recommended": self._SETTINGS_RECOMMENDED.get(
@@ -14482,6 +14521,8 @@ class Orchestrator:
                 if sid not in schema:
                     continue
                 _sid, section, key, _l, typ, _d, _h = schema[sid]
+                if self._is_secret_key(key) and raw in (self._SECRET_SET, "", None):
+                    continue       # the form echoed the placeholder: unchanged
                 if typ == "bool":
                     val = raw in (True, "true", "True", "1", 1, "on")
                 elif typ == "int":

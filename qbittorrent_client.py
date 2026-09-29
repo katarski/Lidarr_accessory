@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+import uuid
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -79,10 +80,13 @@ class QbtClient:
             logger.warning("qBittorrent login error: %s", exc)
             return False
 
-    def torrents(self, category: str = "", state_filter: str = "") -> List[Dict[str, Any]]:
+    def torrents(self, category: str = "", state_filter: str = "",
+                 tag: str = "") -> List[Dict[str, Any]]:
         params: Dict[str, Any] = {}
         if category:
             params["category"] = category
+        if tag:
+            params["tag"] = tag
         if state_filter:
             params["filter"] = state_filter   # e.g. "paused", "downloading"
         try:
@@ -240,10 +244,13 @@ class QbtClient:
         differs is that the infohash CANNOT be known in advance, and every
         verification step downstream is keyed on it.
 
-        So the hash is discovered after the fact: snapshot the client's hashes,
-        add, then watch for the new one. Matching on the diff (not on a title
-        guess) is what makes this reliable -- the tracker's torrent name and the
-        release title frequently disagree.
+        So the add carries a one-off tag (`cue-add-<nonce>`) and the new torrent
+        is found by that tag inside our category. It used to be found by
+        diffing EVERY torrent in the client before and after: a failed snapshot
+        made every torrent "new", and any other app's add in the same seconds
+        (the client is shared) was as likely to be picked -- and the pick is
+        what the verifier later blocklists or deletes. A duplicate add (the
+        torrent is already there) yields None.
         """
         u = str(url or "").strip()
         if not u.lower().startswith(("http://", "https://")):
@@ -251,16 +258,10 @@ class QbtClient:
             return None
         if not self._api_ok():
             self.login()
-        try:
-            before = {str(t.get("hash") or "").lower()
-                      for t in (self.torrents() or [])}
-        except Exception:  # noqa: BLE001
-            before = set()
-        data: Dict[str, str] = {"urls": u}
+        nonce = "cue-add-" + uuid.uuid4().hex[:12]
+        data: Dict[str, str] = {"urls": u, "tags": ",".join(t for t in (tags, nonce) if t)}
         if category:
             data["category"] = category
-        if tags:
-            data["tags"] = tags
         if paused and stop_on_metadata:
             data["stopCondition"] = "MetadataReceived"
         elif paused:
@@ -275,22 +276,34 @@ class QbtClient:
             return None
         # Fetching the .torrent through Prowlarr and parsing it takes a moment,
         # so poll rather than reading once.
+        ih = None
         deadline = time.time() + max(5, int(timeout))
-        while time.time() < deadline:
-            try:
-                now = {str(t.get("hash") or "").lower()
-                       for t in (self.torrents() or [])}
-            except Exception:  # noqa: BLE001
-                now = set()
-            new = now - before
-            if new:
-                ih = sorted(new)[0]
-                logger.info("add_torrent_url: qBittorrent accepted %s", ih[:12])
-                return ih
-            time.sleep(2)
-        logger.warning("add_torrent_url: nothing new appeared in qBittorrent "
-                       "for %s", u[:80])
-        return None
+        try:
+            while time.time() < deadline:
+                found = [str(t.get("hash") or "").lower()
+                         for t in (self.torrents(category=category, tag=nonce) or [])]
+                found = [h for h in found if h]
+                if found:
+                    ih = found[0]
+                    logger.info("add_torrent_url: qBittorrent accepted %s", ih[:12])
+                    return ih
+                time.sleep(2)
+            logger.warning("add_torrent_url: nothing appeared in qBittorrent for "
+                           "%s (a duplicate, or the fetch failed)", u[:80])
+            return None
+        finally:
+            self._drop_tag(ih, nonce)
+
+    def _drop_tag(self, torrent_hash: Optional[str], tag: str) -> None:
+        """Take a one-off tag off the torrent and out of the client."""
+        try:
+            if torrent_hash:
+                self.s.post(f"{self.base}/api/v2/torrents/removeTags",
+                            data={"hashes": torrent_hash, "tags": tag}, timeout=15)
+            self.s.post(f"{self.base}/api/v2/torrents/deleteTags",
+                        data={"tags": tag}, timeout=15)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("could not drop tag %s: %s", tag, exc)
 
     def torrent_by_hash(self, torrent_hash: str) -> Optional[Dict[str, Any]]:
         """The one torrent, or None if qBittorrent does not have it (which is
