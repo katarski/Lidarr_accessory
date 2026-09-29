@@ -15048,43 +15048,41 @@ class Orchestrator:
             else self.cfg.library_root_windows / (_sanitize_fs(artist_name) or "Unknown Artist")
         return base / (_sanitize_fs(album_name) or _sanitize_fs(folder.name) or "Unknown Album"), art
 
-    def _force_import_library_folder(self, target: Path, art) -> bool:
+    def _force_import_library_folder(self, target: Path, art,
+                                     files: List[Path]) -> bool:
         """
-        WebUI Add/Overwrite: force Lidarr to import the audio now sitting in
-        `target`, OVERRIDING its track-match-quality threshold. Lidarr matches a
-        file's embedded tags (title / length / MusicBrainz recording id) against
-        the release, so old or foreign-tagged rips score low ("15.6% vs 60%")
-        and are refused even when they're the right tracks. We pair the files to
-        the matched album's tracks by position and ManualImport them. Returns
-        True if a ManualImport was submitted (else caller falls back to a scan).
+        WebUI Add/Overwrite: import `files` -- exactly the files this action
+        just copied into `target` -- past Lidarr's match-quality threshold
+        (old or foreign-tagged rips score "15.6% vs 60%" and are refused even
+        when they are the right songs). Each file is paired to an EMPTY track
+        of the album by song title (_import_library_folder_by_tracknumber), the
+        one pairing mechanism. The folder's other files -- library files
+        already filed, the prefer-lossless quarantine -- are never candidates:
+        pairing the whole folder by position once filed CD2 as CD1 and could
+        move a quarantined lossy copy onto a lossless track. Returns True if an
+        import was submitted (else the caller rescans).
         """
+        if not files:
+            return False
+        mine = {self.lidarr.windows_to_lidarr(p) for p in files}
         try:
-            cands = [c for c in (self.lidarr.manual_import_candidates(str(target)) or [])
-                     if c.get("path")]
+            cands = [c for c in (self.lidarr.manual_import_candidates(
+                         self.lidarr.windows_to_lidarr(target)) or [])
+                     if str(c.get("path") or "") in mine]
         except Exception:  # noqa: BLE001
             cands = []
-        if not cands:
-            return False
         from collections import Counter
         cnt = Counter((c.get("album") or {}).get("id") for c in cands
                       if (c.get("album") or {}).get("id"))
         if not cnt:
             return False
-        album_id = cnt.most_common(1)[0][0]
-        cands = [c for c in cands if (c.get("album") or {}).get("id") == album_id]
-        full = self.lidarr.get_album(album_id) or {}
-        rels = [r for r in (full.get("releases") or []) if r.get("monitored")] \
-            or (full.get("releases") or [])
-        if not rels:
-            return False
-        release_id = rels[0].get("id")
+        full = self.lidarr.get_album(cnt.most_common(1)[0][0]) or {}
         artist_id = ((art or {}).get("id") or full.get("artistId")
                      or ((full.get("artist") or {}).get("id")))
-        tracks = self.lidarr.list_tracks_for_album(album_id) or []
-        if artist_id and release_id and tracks and len(cands) == len(tracks):
-            return self.lidarr.manual_import_positional(
-                cands, tracks, album_id, release_id, artist_id) is not None
-        return False
+        if not full.get("id") or not artist_id:
+            return False
+        return self._import_library_folder_by_tracknumber(
+            full, int(artist_id), list(files)) is not None
 
     def _apply_to_library(self, entry: Dict[str, Any], overwrite: bool) -> Tuple[bool, str]:
         """
@@ -15103,22 +15101,45 @@ class Orchestrator:
         target, art = self._resolve_library_target(entry)
         if target is None:
             return (False, "couldn't determine the artist/album -- handle by hand")
+        # The copy is flat, so two held files with one name (CD1/01.flac and
+        # CD2/01.flac) would land on one file and a song would be lost.
+        names: Dict[str, Path] = {}
+        for a in audios:
+            if a.name.lower() in names:
+                return (False, "%s and %s share the name %s -- handle by hand"
+                        % (names[a.name.lower()].parent.name, a.parent.name,
+                           a.name))
+            names[a.name.lower()] = a
         try:
             target.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             return (False, f"could not create {target}: {exc}")
         copied = skipped = 0
+        fresh: List[Path] = []          # new names: may be paired to empty tracks
+        replaced = 0                    # same name overwritten: rescan only
+        uncopied: List[Path] = []       # sources with no equal copy in target
         for a in audios:
             dst = target / a.name
             try:
-                if dst.exists() and not overwrite:
+                existed = dst.exists()
+                if existed and not overwrite:
                     skipped += 1
+                    if dst.stat().st_size != a.stat().st_size:
+                        uncopied.append(a)      # a different file by that name
                     continue
-                if dst.exists():
+                if existed:
                     dst.unlink(missing_ok=True)
                 shutil.copy2(str(a), str(dst))
+                if dst.stat().st_size != a.stat().st_size:
+                    raise OSError("copy is %d bytes, source %d"
+                                  % (dst.stat().st_size, a.stat().st_size))
                 copied += 1
+                if existed:
+                    replaced += 1
+                else:
+                    fresh.append(dst)
             except OSError as exc:
+                uncopied.append(a)
                 logger.warning("WebUI resolve: copy %s -> %s failed: %s", a, dst, exc)
         if copied == 0 and skipped == 0:
             return (False, "copied 0 files (permission/path error) -- left in place")
@@ -15127,20 +15148,33 @@ class Orchestrator:
         # unmonitored album, so unmonitoring would leave it 0/N ("not populated").
         # A fully-imported album is complete, so it won't be re-searched anyway.
         try:
-            # Force-import (override the match-quality threshold) when the files
-            # cleanly map to one album's tracks; else fall back to a plain scan.
-            forced = self._force_import_library_folder(target, art)
-            if not forced:
+            # Force-import only the files copied under new names, onto empty
+            # tracks. Files that replaced a same-named library file are already
+            # trackfile paths: a rescan re-reads them, and no explicit import
+            # onto a filled track (an "Upgrade" that deletes) is ever issued.
+            forced = self._force_import_library_folder(target, art, fresh)
+            if replaced or not forced:
                 self.lidarr.downloaded_albums_scan_rescan(str(target))
             if art:
                 self.lidarr.refresh_artist(art["id"])
             self.lidarr.process_monitored_downloads()
         except Exception as exc:  # noqa: BLE001
             logger.warning("WebUI resolve: Lidarr import hiccup: %s", exc)
+        verb = "Overwrote" if overwrite else "Added"
+        if uncopied:
+            # The human decided on the premise that the files are in the
+            # library now. For these they are not, so the source stays and the
+            # row stays for another try.
+            logger.warning("WebUI resolve: %d of %d file(s) have no equal copy "
+                           "in %s -- held folder kept", len(uncopied),
+                           len(audios), target)
+            return (False, f"{verb} {copied} track(s) into {target.name}, but "
+                           f"{len(uncopied)} could not be copied (or differ "
+                           f"from the library file of that name) -- the held "
+                           f"folder is kept")
         # Delete the source torrent (safe: only a single-folder torrent) + folder.
         tmsg = self._remove_torrent_for_folder(folder)
         self._delete_folder_under_watch(folder)
-        verb = "Overwrote" if overwrite else "Added"
         logger.info("WebUI resolve (%s): %d copied / %d skipped -> %s%s",
                     verb.lower(), copied, skipped, target, tmsg)
         extra = f", skipped {skipped} already present" if skipped else ""

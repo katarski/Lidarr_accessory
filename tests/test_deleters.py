@@ -299,5 +299,53 @@ class AssemblyAdd(unittest.TestCase):
         self.assertNotIn("_source", sent[0])
 
 
+class WebuiResolve(unittest.TestCase):
+    """Add/Overwrite imports only the files it copied, and deletes the held
+    folder only when every song has an equal copy in the library."""
+
+    def resolve(self, held, library, overwrite=False):
+        from orchestrator import Orchestrator
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        src, lib = Path(tmp.name, "held"), Path(tmp.name, "lib")
+        for rel, data in held.items():
+            Path(src, rel).parent.mkdir(parents=True, exist_ok=True)
+            Path(src, rel).write_bytes(data)
+        lib.mkdir()
+        for rel, data in library.items():
+            Path(lib, rel).write_bytes(data)
+        forced, deleted = [], []
+        o = Orchestrator.__new__(Orchestrator)
+        o.lidarr = type("L", (), {
+            "downloaded_albums_scan_rescan": lambda self, p: 1,
+            "process_monitored_downloads": lambda self: 1})()
+        o._held_audio_files = lambda f: sorted(f.rglob("*.flac"))
+        o._resolve_library_target = lambda e: (lib, None)
+        o._force_import_library_folder = (
+            lambda t, a, files: forced.extend(p.name for p in files) or True)
+        o._remove_torrent_for_folder = lambda f: ""
+        o._delete_folder_under_watch = lambda f: deleted.append(f) or True
+        ok, _ = o._apply_to_library({"source_path": str(src)}, overwrite)
+        return ok, sorted(forced), bool(deleted)
+
+    def test_two_discs_with_one_file_name_are_refused(self):
+        self.assertEqual(self.resolve({"CD1/01.flac": b"a", "CD2/01.flac": b"b"}, {}),
+                         (False, [], False))
+
+    def test_a_different_library_file_of_that_name_keeps_the_held_folder(self):
+        self.assertEqual(self.resolve({"01.flac": b"new", "02.flac": b"x"},
+                                      {"01.flac": b"library"}),
+                         (False, ["02.flac"], False))
+
+    def test_every_song_copied_or_identical_deletes_and_imports_the_copies(self):
+        self.assertEqual(self.resolve({"01.flac": b"same", "02.flac": b"x"},
+                                      {"01.flac": b"same"}),
+                         (True, ["02.flac"], True))
+
+    def test_overwrite_never_force_imports_a_replaced_file(self):
+        self.assertEqual(self.resolve({"01.flac": b"new!"}, {"01.flac": b"old"},
+                                      overwrite=True), (True, [], True))
+
+
 if __name__ == "__main__":
     unittest.main()
