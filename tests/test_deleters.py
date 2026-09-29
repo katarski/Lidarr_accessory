@@ -701,5 +701,50 @@ class AssemblyPlansSurviveAnOutage(unittest.TestCase):
         self.assertIn("assembly_keep=_asm_keep_now(), llm=match_llm", src)
 
 
+class SongEvidenceDecides(unittest.TestCase):
+    """orch2 M11821: a release whose songs only partly match is not accepted
+    on its file count, and not blocklisted; a disc image is judged by the
+    image rules, not by its one file name."""
+
+    def _verify(self, cov, image=False):
+        from types import SimpleNamespace
+        from orchestrator import Orchestrator
+        o = Orchestrator.__new__(Orchestrator)
+        o.cfg = SimpleNamespace()
+        o._await_torrent_files = lambda q, h, l: [{"name": "x.flac"}]
+        o._classify_torrent_files = lambda f: {
+            "audio_count": 1 if image else 21, "is_dsd": False, "is_iso": False,
+            "is_single_image": image, "has_cue": image}
+        scored = []
+        o._best_release_title_coverage = (
+            lambda f, aid: scored.append(aid) or (cov, int(cov * 12), 12))
+        verdict, _info = o._verify_torrent(object(), "h", 12, "Dusty", album_id=7)
+        return verdict, scored, o
+
+    def test_the_gray_zone_is_not_accepted_nor_blocklisted(self):
+        verdict, _s, o = self._verify(0.25)
+        self.assertEqual(verdict, "unsure:songs-partly-match(3/12)")
+        self.assertFalse(o._blocklists(verdict))
+        self.assertTrue(o._blocklists(self._verify(0.2)[0]))
+        self.assertEqual(self._verify(0.6)[0], "accept")
+
+    def test_a_disc_image_is_not_scored_by_its_file_name(self):
+        verdict, scored, _o = self._verify(0.0, image=True)
+        self.assertEqual((verdict, scored), ("accept", []))
+
+    def test_an_unsure_grab_is_removed_without_blocklisting(self):
+        import inspect
+        from orchestrator import Orchestrator
+        o = Orchestrator.__new__(Orchestrator)
+        seen = []
+        o._remove_torrent = lambda h, **k: seen.append(k["blocklist"]) or True
+        o._reject_grab("A", "B", "h", None, blocklist=False)
+        o._reject_by_hash("h", None, blocklist=False)
+        o._reject_grab("A", "B", "h", None)
+        self.assertEqual(seen, [False, False, True])
+        src = inspect.getsource(Orchestrator)
+        self.assertEqual(src.count("block = self._blocklists(verdict)"), 3)
+
+
 if __name__ == "__main__":
     unittest.main()

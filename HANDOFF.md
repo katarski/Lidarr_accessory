@@ -211,6 +211,13 @@ layer says `http://daniel:11434`.
   import only when the command completes (`_wait_for_manual_import`); a
   failed or timed-out one waits out the recheck. The log format carries
   `%(threadName)s`.
+- **Song evidence decides a grab** (`_verify_torrent`): below
+  `verify_track_titles_reject` it is `reject:` (blocklisted); in the gray
+  zone up to `verify_track_titles_accept` it is `unsure:` (removed, not
+  blocklisted, `_blocklists`); the file count decides only with no title
+  evidence. A single disc image is not scored by its one file name. An
+  assembly-hunt grab that could not be inspected is removed, not
+  blocklisted.
 - **One torrent remover** (`Orchestrator._remove_torrent`): qBittorrent must
   answer, our category only, never while claimed; Lidarr's queue rows (by
   downloadId) are dropped with `removeFromClient=false` (blocklisting when
@@ -330,10 +337,9 @@ test of a feature whose purpose is removing files.
 
 ## 6. Open items
 
-1. **33 audit findings are open: `docs/AUDIT_OPEN.md`**, in fix order, each
+1. **32 audit findings are open: `docs/AUDIT_OPEN.md`**, in fix order, each
    with evidence, root cause and the agreed fix (the verifier's correction
-   where there was one). Start at item 1 (orch2 gray zone 25-59%). 58 are
-   fixed;
+   where there was one). Start at item 1 (orch2 F4). 59 are fixed;
    CLI-04/06/07 were refuted — do not redo them.
 2. **Orphan CUE whose image is gone** (logged once each, `[ERROR] No companion
    audio next to ...`): `/downloads/Oliver Deriviere - Music From Alone In The

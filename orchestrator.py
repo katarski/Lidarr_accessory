@@ -11415,7 +11415,10 @@ class Orchestrator:
                 logger.warning("assembly: %r never appeared in qBittorrent or "
                                "the queue -- cannot verify, removing the grab",
                                title[:70])
-                self._reject_grab(artist, str(missing[0]), ih or "", qbt)
+                # Never seen is not "wrong": removed, not blocklisted (the
+                # hunt remembers the releases it tried).
+                self._reject_grab(artist, str(missing[0]), ih or "", qbt,
+                                  blocklist=False)
                 continue
             files = []
             try:
@@ -11444,7 +11447,8 @@ class Orchestrator:
             if not files:
                 logger.warning("assembly: %r produced no file list -- cannot "
                                "verify, removing the grab", title[:70])
-                self._reject_grab(artist, str(missing[0]), thash, qbt)
+                self._reject_grab(artist, str(missing[0]), thash, qbt,
+                                  blocklist=False)
                 continue
             hits = []
             for f in files or []:
@@ -12054,8 +12058,12 @@ class Orchestrator:
             return "accept", info                      # pipeline handles these
         # (d) SONG-TITLE COMPARISON, Lidarr <-> torrent. Runs before the count
         # rules because a matching count proves nothing about WHICH songs these
-        # are; low overlap means we grabbed a different record.
-        if album_id and bool(getattr(self.cfg, "verify_track_titles", True)):
+        # are; low overlap means we grabbed a different record. A single disc
+        # image has one file name, which cannot show which songs it holds:
+        # scoring it would blocklist every correct image+cue release, so the
+        # image rules below decide it.
+        if (album_id and bool(getattr(self.cfg, "verify_track_titles", True))
+                and not info["is_single_image"]):
             try:
                 cov, matched, total = self._best_release_title_coverage(
                     files, int(album_id))
@@ -12076,11 +12084,18 @@ class Orchestrator:
                 if cov < reject_at:
                     return (f"reject:songs-dont-match"
                             f"({matched}/{total})"), info
-                if cov >= accept_at:
-                    # The songs ARE this album -- allow it even when the file
-                    # count differs from Lidarr's expectation (bonus tracks, a
-                    # different pressing, an extra intro/outro file).
-                    return "accept", info
+                if cov < accept_at:
+                    # Some songs match, too few to call it this album (Dusty
+                    # at 3/12 accepted 'Dusty In Memphis (Deluxe)' on its file
+                    # count). Song evidence decides whenever it exists: not
+                    # accepted, and not blocklisted either, since a correct
+                    # release with badly named files may be offered again.
+                    return (f"unsure:songs-partly-match"
+                            f"({matched}/{total})"), info
+                # The songs ARE this album -- allow it even when the file
+                # count differs from Lidarr's expectation (bonus tracks, a
+                # different pressing, an extra intro/outro file).
+                return "accept", info
         if expected > 0 and ac >= expected:
             return "accept", info                      # complete / superset
         if info["is_single_image"] and info["has_cue"]:
@@ -12093,11 +12108,22 @@ class Orchestrator:
             return "accept", info                      # unknown expected count
         return "reject:no-audio", info
 
-    def _reject_grab(self, artist: str, album: str, thash: str, qbt) -> None:
+    @staticmethod
+    def _blocklists(verdict: str) -> bool:
+        """An 'unsure:' verdict (songs partly match) drops the torrent but
+        does not blocklist the release; every 'reject:' one blocklists it."""
+        return not str(verdict or "").startswith("unsure:")
+
+    @staticmethod
+    def _reject_note(block: bool) -> str:
+        return "blocklist + next" if block else "dropped, not blocklisted; next"
+
+    def _reject_grab(self, artist: str, album: str, thash: str, qbt,
+                     blocklist: bool = True) -> None:
         """Blocklist + remove THIS grab: the queue rows whose downloadId is its
         hash (never one found by artist/album name), then the torrent with its
         data -- all through _remove_torrent (category, claims, outage)."""
-        if not self._remove_torrent(thash, delete_files=True, blocklist=True,
+        if not self._remove_torrent(thash, delete_files=True, blocklist=blocklist,
                                     qbt=qbt, why=" (rejected grab for %s / %s)"
                                     % (artist[:24], album[:30])):
             logger.warning("rejected %s / %s, but its torrent %s is not "
@@ -12276,11 +12302,13 @@ class Orchestrator:
                     "force-started download" if started
                     else "BUT IT IS NOT DOWNLOADING")
                 return True
+            block = self._blocklists(verdict)
             logger.info(
-                "interactive search: %s -- rejected Prowlarr %r (%s); "
-                "blocklist + next", label, cand.get("title"), verdict)
-            self._reject_by_hash(thash, qbt)
-            blocklisted.append(cand.get("guid"))
+                "interactive search: %s -- rejected Prowlarr %r (%s); %s",
+                label, cand.get("title"), verdict, self._reject_note(block))
+            self._reject_by_hash(thash, qbt, blocklist=block)
+            if block:
+                blocklisted.append(cand.get("guid"))
         return False
 
     def _isearch_one_album(self, alb: Dict[str, Any], st: Dict[str, Any], qbt) -> bool:
@@ -12376,11 +12404,13 @@ class Orchestrator:
                     "force-started download" if started
                     else "BUT IT IS NOT DOWNLOADING -- see the warning above")
                 return True
+            block = self._blocklists(verdict)
             logger.info(
-                "interactive search: %s -- rejected %r (%s); blocklist + next",
-                label, cand.get("title"), verdict)
-            self._reject_grab(artist, album, thash, qbt)
-            blocklisted.append(guid)
+                "interactive search: %s -- rejected %r (%s); %s",
+                label, cand.get("title"), verdict, self._reject_note(block))
+            self._reject_grab(artist, album, thash, qbt, blocklist=block)
+            if block:
+                blocklisted.append(guid)
 
         logger.warning(
             "interactive search: %s -- %d candidate(s) tried, none verified; "
@@ -12865,11 +12895,14 @@ class Orchestrator:
                     " -- auto-deselect drops owned albums"
                     if cand.get("_is_disco") else "")
                 return True
+            block = self._blocklists(verdict)
             logger.info(
-                "interactive search: %s -- rejected %s %r (%s); blocklist + "
-                "next", artist_name, kind, cand.get("title"), verdict)
-            self._reject_by_hash(thash, qbt)
-            blocklisted.append(guid)
+                "interactive search: %s -- rejected %s %r (%s); %s",
+                artist_name, kind, cand.get("title"), verdict,
+                self._reject_note(block))
+            self._reject_by_hash(thash, qbt, blocklist=block)
+            if block:
+                blocklisted.append(guid)
         return False
 
     def interactive_search_pass(self, qbt=None) -> int:
