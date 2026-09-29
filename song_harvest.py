@@ -647,6 +647,10 @@ class HarvestLedger:
     def __init__(self, path: Optional[str]) -> None:
         self.path = path
         self._seen: Dict[str, str] = {}
+        # source -> {"cid", "paths", "tracks": {albumId: [trackId]}, "mode"}:
+        # imports submitted but not yet seen to land. The purge of a source
+        # waits here until Lidarr's own state shows every track filed.
+        self.pending: Dict[str, Dict[str, Any]] = {}
         self._dirty = False
         if path and os.path.exists(path):
             try:
@@ -654,8 +658,18 @@ class HarvestLedger:
                 with open(path, encoding="utf-8") as fh:
                     data = json.load(fh)
                 self._seen = dict(data.get("checked") or {})
+                self.pending = dict(data.get("pending") or {})
             except Exception as exc:  # noqa: BLE001
                 logger.debug("harvest ledger unreadable (%s): %s", path, exc)
+
+    def add_pending(self, source: str, rec: Dict[str, Any]) -> None:
+        self.pending[source] = rec
+        self._dirty = True
+        self.save()            # a deploy between submit and settle loses nothing
+
+    def drop_pending(self, source: str) -> None:
+        if self.pending.pop(source, None) is not None:
+            self._dirty = True
 
     def unchanged(self, source: str, folder_sig: str, want_sig: str) -> bool:
         return self._seen.get(source) == "%s|%s" % (folder_sig, want_sig)
@@ -675,7 +689,7 @@ class HarvestLedger:
             import json
             tmp = self.path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump({"checked": self._seen}, fh)
+                json.dump({"checked": self._seen, "pending": self.pending}, fh)
             os.replace(tmp, self.path)
             self._dirty = False
         except OSError as exc:
@@ -709,8 +723,17 @@ def harvest_pass(
     import_mode is COPY on purpose: these sources are usually SEEDING torrents,
     and moving files out from under qBittorrent breaks the seed.
     """
+    gen = getattr(lidarr, "failure_generation", 0)
     index = build_wanted_index(lidarr)
     wsig = wanted_signature(index)
+    # A Lidarr failure while the index was built makes "not wanted" unknown,
+    # and the purge deletes on "not wanted". No purge this pass.
+    index_ok = getattr(lidarr, "failure_generation", 0) == gen
+    if ledger is not None and index_ok and purge_leftovers_enabled:
+        settle_pending_purges(
+            lidarr, ledger, index, tolerance_seconds=tolerance_seconds,
+            staging_dir=leftovers_dir, qbt=qbt, keep_dir=keep_dir,
+            category=category)
     # The consolidated keep-folder is a source in its own right: songs parked
     # there are exactly the ones a later pass should be able to take.
     sources = list(sources)
@@ -765,29 +788,23 @@ def harvest_pass(
                     logger.info("harvest: submitted %d track(s) to Lidarr "
                                 "(command %s, mode=%s)",
                                 len(entries), cid, import_mode)
-                    # Everything the harvest did NOT need goes. A file that is
-                    # still wanted survives -- purge_leftovers re-checks each
-                    # one against the index rather than trusting this pass.
-                    try:
-                        pst = purge_leftovers(
-                            src_dir,
-                            imported_paths=[e["path"] for e in entries],
-                            index=index,
-                            tolerance_seconds=tolerance_seconds,
-                            staging_dir=leftovers_dir,
-                            delete=purge_leftovers_enabled,
-                            qbt=qbt if purge_leftovers_enabled else None,
-                            keep_dir=keep_dir,
-                            # Shared qBittorrent: the purge may only ever remove
-                            # torrents in OUR category.
-                            category=category)
-                        for k in ("deleted", "bytes_freed", "torrent_removed",
-                                  "kept_wanted"):
-                            stats["purge_" + k] = (
-                                stats.get("purge_" + k, 0) + pst.get(k, 0))
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning("harvest: purge failed for %s: %s",
-                                       src_dir, exc)
+                    # A submitted command is not an import: Lidarr's queue
+                    # runs minutes behind, and purging now raced it (and won).
+                    # The purge is recorded and settled on a later pass, once
+                    # every submitted track has its file.
+                    if purge_leftovers_enabled and ledger is not None:
+                        tracks: Dict[str, List[int]] = {}
+                        for e in entries:
+                            tracks.setdefault(str(e["albumId"]), []).extend(
+                                int(x) for x in e["trackIds"])
+                        ledger.add_pending(src_dir, {
+                            "cid": int(cid), "mode": import_mode,
+                            "paths": [e["path"] for e in entries],
+                            "tracks": tracks})
+                        logger.info("harvest: purge of %s waits until Lidarr "
+                                    "has filed all %d track(s)",
+                                    os.path.basename(src_dir.rstrip("/"))[:44],
+                                    len(entries))
                 else:
                     logger.warning("harvest: Lidarr refused the import of "
                                    "%d track(s) from %s", len(entries), src_dir)
@@ -812,6 +829,60 @@ def harvest_pass(
 
 
 # ---------------------------------------------------------------- leftovers
+
+def settle_pending_purges(lidarr, ledger, index, tolerance_seconds: float = 10.0,
+                          staging_dir: Optional[str] = None, qbt=None,
+                          keep_dir: Optional[str] = None,
+                          category: str = "") -> int:
+    """Purge each source whose submitted import has provably landed: the
+    command completed, every submitted track now has a file, and in move mode
+    every submitted path has left the source. A command still running waits;
+    one that failed, or left a track without a file, purges nothing.
+    Returns the number of sources purged."""
+    done = 0
+    for src, rec in list(ledger.pending.items()):
+        name = os.path.basename(src.rstrip("/"))[:44]
+        status = lidarr.command_status(int(rec.get("cid") or 0))
+        if status is None or status in ("queued", "started"):
+            continue                              # not yet, or no answer
+        if status != "completed":
+            logger.warning("harvest purge %s: import command %s ended %r -- "
+                           "nothing purged", name, rec.get("cid"), status)
+            ledger.drop_pending(src)
+            continue
+        gen = getattr(lidarr, "failure_generation", 0)
+        filed = True
+        for aid, tids in (rec.get("tracks") or {}).items():
+            have = {int(t.get("id")) for t in
+                    (lidarr.list_tracks_for_album(int(aid)) or [])
+                    if t.get("hasFile") or t.get("trackFileId")}
+            if not set(int(x) for x in tids) <= have:
+                filed = False
+                break
+        if getattr(lidarr, "failure_generation", 0) != gen:
+            continue                              # an outage is not an answer
+        paths = list(rec.get("paths") or [])
+        if filed and rec.get("mode") == "move":
+            filed = not any(os.path.exists(p) for p in paths)
+        if not filed:
+            logger.warning("harvest purge %s: Lidarr did not file every "
+                           "submitted track -- nothing purged", name)
+            ledger.drop_pending(src)
+            continue
+        if os.path.isdir(src):
+            try:
+                purge_leftovers(src, imported_paths=paths, index=index,
+                                tolerance_seconds=tolerance_seconds,
+                                staging_dir=staging_dir, delete=True, qbt=qbt,
+                                keep_dir=keep_dir, category=category)
+                done += 1
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("harvest: purge failed for %s: %s", src, exc)
+                continue
+        ledger.drop_pending(src)
+    ledger.save()
+    return done
+
 
 def purge_leftovers(
     src_dir: str,
@@ -845,9 +916,12 @@ def purge_leftovers(
                    The client is shared with other apps, so an empty value here
                    means "touch no torrent at all" rather than "touch any"
 
-    IMPORTANT: "not wanted" means not wanted RIGHT NOW. Adding an artist later
-    cannot resurrect a deleted file, which is why `delete` defaults to False and
-    staging exists.
+    IMPORTANT: "not wanted" means not wanted RIGHT NOW, and "not in the wanted
+    index" is not "in the library": a song Lidarr has no record of is neither.
+    So leftover AUDIO is never deleted here -- it is moved to `staging_dir`
+    when one is set, otherwise left in place -- and the torrent is removed
+    only when no such song is left in the folder. `imported_paths` must be
+    files Lidarr has already filed (settle_pending_purges checks).
     """
     stats = {"kept_wanted": 0, "leftover": 0, "moved": 0, "deleted": 0,
              "bytes_freed": 0, "torrent_removed": 0, "errors": 0}
@@ -890,7 +964,12 @@ def purge_leftovers(
                     continue
             leftovers.append(full)
     stats["leftover"] = len(leftovers)
+    unproven = 0
     for full in leftovers:
+        is_audio = os.path.splitext(full)[1].lower() in AUDIO_EXTS
+        if is_audio and not staging_dir:
+            unproven += 1                 # nobody proved it is in the library
+            continue
         try:
             size = os.path.getsize(full)
         except OSError:
@@ -904,14 +983,25 @@ def purge_leftovers(
                 os.replace(full, dest)
                 stats["moved"] += 1
                 full = dest
-            if delete:
+            if delete and not is_audio:
                 os.remove(full)
                 stats["deleted"] += 1
                 stats["bytes_freed"] += size
         except OSError as exc:
             stats["errors"] += 1
             logger.warning("harvest purge: %s -- %s", full, exc)
-    if qbt is not None and (stats["deleted"] or stats["moved"]):
+    stats["kept_unproven"] = unproven
+    if unproven:
+        logger.info("harvest purge %s: %d song(s) are neither wanted nor "
+                    "proven in the library -- kept, and the torrent with them",
+                    os.path.basename(src_dir.rstrip("/"))[:44], unproven)
+    # Any audio still here that Lidarr has not filed (kept-wanted that could
+    # not be moved, unproven songs) goes down with a removed torrent's data.
+    remaining = [os.path.join(dp, n) for dp, _d, ns in os.walk(src_dir)
+                 for n in ns if os.path.splitext(n)[1].lower() in AUDIO_EXTS
+                 and os.path.abspath(os.path.join(dp, n)) not in done]
+    if (qbt is not None and delete and not remaining
+            and (stats["deleted"] or stats["moved"] or done)):
         # The files are gone from where the torrent expects them, so the
         # torrent can only error from here on. Remove it WITH data so any
         # remaining pieces go too.
@@ -934,11 +1024,12 @@ def purge_leftovers(
                     nm = str(t.get("name") or "")
                     if not nm:
                         continue
-                    # Match the torrent to THIS source folder. The old test read
-                    # `nm in src_dir` -- "is the torrent NAME a substring of the
-                    # folder PATH" -- which is backwards, and is why this cleanup
-                    # never once fired (0 torrents removed across 21 purges).
-                    if nm == base or (base and base in cp) or (cp and cp in src_dir):
+                    # The torrent whose content IS this folder, and no other:
+                    # a substring test also matched a discography containing
+                    # it (its sibling albums went with it) or any torrent
+                    # whose path happened to be a prefix.
+                    top = os.path.basename(cp.replace("\\", "/").rstrip("/"))
+                    if base and (top == base or (not cp and nm == base)):
                         if qbt.remove(str(t.get("hash")), delete_files=True):
                             stats["torrent_removed"] += 1
                             logger.info("harvest purge: removed torrent %r "

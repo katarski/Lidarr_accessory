@@ -318,6 +318,8 @@ def album_complete_in_library(
                     alb, verdict = _pick_among_same_title(
                         [a for a in albums if norm_title(a.get("title")) == np_],
                         album, folder_hint)
+                    if out is not None and alb is not None:
+                        out["by_llm"] = True     # a guess: never grounds a delete
                     if verdict is not None:
                         return verdict
         if not alb:

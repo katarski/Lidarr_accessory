@@ -328,8 +328,14 @@ def plan_torrent(
 ) -> List[Dict[str, Any]]:
     """
     Return a per-album plan for a torrent's audio files:
-    [{artist, album, files:[...], size, have:bool, have_count, total}].
-    Empty if the torrent has no audio.
+    [{artist, album, files:[...], size, have:bool, owned:bool, have_count,
+    total, artist_id}]. Empty if the torrent has no audio.
+
+    `have` means "don't download this folder" -- it is also true for noise
+    and unofficial folders Lidarr has no record of, and for an album the LLM
+    matched. `owned` is narrower: Lidarr holds the album complete, with at
+    least as many tracks as the folder, matched without the LLM. Only
+    `owned` may ever ground deleting data.
     """
     audio = [f for f in files if Path(f.get("name", "")).suffix.lower() in AUDIO_EXTS]
     if not audio:
@@ -445,12 +451,17 @@ def plan_torrent(
                     % room if room else
                     "deselecting (no release of this album can hold the extras)")
         allf = all_by_key.get(key, afiles)
+        rec = matched.get("album") or {}
         plan.append({
             "artist": artist, "album": album,
             "files": afiles,       # audio only (drives the have-decision)
             "all_files": allf,     # every file in the folder (what we deselect)
             "size": sum(int(x.get("size") or 0) for x in allf),
             "have": deselect, "have_count": have, "total": total,
+            "owned": bool(complete and total >= len(afiles)
+                          and not deferred and not matched.get("by_llm")),
+            "artist_id": rec.get("artistId")
+                         or (matched.get("artist") or {}).get("id"),
             "deferred": bool(deferred and total == 0),
         })
     return plan
@@ -629,9 +640,19 @@ def process_torrent(
                      if Path(f.get("name", "")).suffix.lower() in AUDIO_EXTS]
         audio_kept = [f for f in audio_all
                       if int(f.get("index", -1)) not in desel]
-        if audio_all and not audio_kept:
+        owned_idx = {int(x["index"]) for a in plan if a.get("owned")
+                     for x in a["files"] if "index" in x}
+        unowned = [f for f in audio_all
+                   if int(f.get("index", -1)) not in owned_idx]
+        if audio_all and not audio_kept and unowned:
+            # Deselected is not owned: a noise or unofficial folder Lidarr has
+            # no record of, or an album only the LLM matched, is not in the
+            # library. Stop downloading it, but never delete its data.
+            emit(f"  -> keeping torrent data: {len(unowned)} deselected song(s) "
+                 f"are not proven in the library")
+        elif audio_all and not audio_kept:
             if qbt.remove(thash, delete_files=True):
-                emit("  -> REMOVED torrent (all wanted music already in library)")
+                emit("  -> REMOVED torrent (every song is already in the library)")
         elif (not audio_all) and video_idx:
             _blocklist_torrent(lidarr, thash)
             if qbt.remove(thash, delete_files=True):
@@ -909,9 +930,10 @@ def adopt_uncategorised(
     [FLAC 24-88]" sitting at 27% with an empty category while 263 other torrents
     were managed.
 
-    Only torrents whose file list is predominantly AUDIO are adopted, so a
-    tv-sonarr-style download (or anything else sharing the client) is never
-    hijacked. Returns the number adopted.
+    Only a torrent the pipeline itself added (it carries SELF_ADDED_TAG) is
+    adopted. Sniffing file types is not ownership: a hand-added or other
+    app's music torrent without a category is not ours, and adopting it put
+    it straight into the deleting passes. Returns the number adopted.
     """
     if not category:
         return 0
@@ -921,6 +943,9 @@ def adopt_uncategorised(
             break
         if (t.get("category") or "").strip():
             continue
+        tags = {x.strip() for x in str(t.get("tags") or "").split(",")}
+        if QbtClient.SELF_ADDED_TAG not in tags:
+            continue                              # not ours: never touched
         h = t.get("hash")
         if not h:
             continue
@@ -1098,6 +1123,40 @@ def _folder_newest_mtime(path: str) -> float:
     return newest
 
 
+def _songs_on_disk_owned(lidarr, plan, folder: str, download_root: str) -> tuple:
+    """(True, why) only when every audio file still on disk under `folder`
+    sits in a directory whose files Lidarr owns one by one (folder_fully_owned)
+    for the artist the plan matched there. A directory no plan album maps to
+    (split output of an unknown album, a folder Lidarr has no artist for)
+    answers False: nothing unproven is deleted."""
+    from dedup_downloads import folder_fully_owned
+    artist_of: Dict[Path, Any] = {}
+    for a in plan:
+        for f in a.get("files") or []:
+            d = (Path(download_root) / str(f.get("name") or "")).parent
+            if a.get("artist_id") and a.get("owned"):
+                artist_of.setdefault(d, a["artist_id"])
+    root = Path(folder)
+    if root.is_file():
+        on_disk = {root.parent: [root]}
+    else:
+        on_disk = {}
+        for dp, _dn, fn in os.walk(root):
+            for x in fn:
+                if os.path.splitext(x)[1].lower() in AUDIO_EXTS:
+                    on_disk.setdefault(Path(dp), []).append(Path(dp) / x)
+    for d, audios in sorted(on_disk.items()):
+        aid = artist_of.get(d)
+        if not aid:
+            return False, ("%s is not an album the library holds complete"
+                           % d.name)
+        owned, why = folder_fully_owned(lidarr, d, audios, aid)
+        if not owned:
+            return False, "%s: %s" % (d.name, why)
+    return True, ("every song still on disk (%d folder(s)) is already in the "
+                  "library" % len(on_disk))
+
+
 def torrent_lifecycle_pass(
     qbt: QbtClient, download_root: str, category: str = "",
     emit: Callable[[str], None] = logger.info,
@@ -1220,13 +1279,13 @@ def torrent_lifecycle_pass(
                 )
         else:
             # Audio still on disk (partly moved, or Lidarr self-imported in
-            # place). Decide from the library plan. With wanted_only (default),
-            # remove the torrent + data once every album Lidarr WANTS from it is
-            # owned -- treating compilations / live / box-exclusive / albums
-            # Lidarr doesn't know (total==0) as "not needed" leftovers that go
-            # with the torrent. An album Lidarr KNOWS but we don't fully own yet
-            # (total>0 and not have) still blocks removal, so un-imported wanted
-            # content is never deleted (it stays for the WebUI to resolve).
+            # place). Remove the torrent + data only when every audio file
+            # still on disk is one Lidarr already holds at the same or better
+            # quality -- its per-file ManualImport verdict (folder_fully_owned),
+            # the one redundancy test. An album Lidarr has no record of
+            # (total==0) is unknown, not unwanted, and the LLM is never asked:
+            # this decision deletes. Anything unproven stays on disk for the
+            # WebUI to resolve.
             reaped = False
             # Re-check throttle: a completed torrent whose DISK STATE hasn't
             # changed since the last library check is not re-planned until
@@ -1247,7 +1306,7 @@ def torrent_lifecycle_pass(
             if (remove_when_library_complete and lidarr is not None
                     and now - newest_mtime >= max(0, min_stable_seconds)):
                 try:
-                    plan = plan_torrent(lidarr, name, files, llm=llm)
+                    plan = plan_torrent(lidarr, name, files, llm=None)
                 except Exception as exc:  # noqa: BLE001
                     plan = None
                     emit(f"lifecycle: library check failed for {name!r}: {exc}")
@@ -1264,36 +1323,15 @@ def torrent_lifecycle_pass(
                     # ownership is undecided.
                     plan = None
                 if plan:
-                    def _blocks(a):
-                        return int(a.get("total") or 0) > 0 and not a.get("have")
-                    ok = (not any(_blocks(a) for a in plan) if wanted_only
-                          else all(a.get("have") for a in plan))
-                    owned = sum(1 for a in plan if a.get("have"))
-                    # DATA-LOSS GUARD: never delete a torrent's data when NOT ONE
-                    # of its albums is confirmed present in the library. An
-                    # album Lidarr can't resolve comes back total==0 (looks like
-                    # a "leftover"), and a Lidarr timeout makes EVERY album look
-                    # that way -- which previously deleted a fully-downloaded,
-                    # not-yet-imported album (e.g. Eminem "Infinite" during a
-                    # Lidarr overload). If nothing is owned, there is nothing to
-                    # clean up after: keep the data and retry next pass.
-                    if ok and owned < 1:
-                        emit(
-                            f"lifecycle: NOT removing {name!r} -- no album "
-                            f"confirmed in library (still importing, or Lidarr "
-                            f"unreachable); keeping data for a later pass"
-                        )
-                        ok = False
-                    if ok:
-                        leftover = len(plan) - owned
-                        if qbt.remove(h, delete_files=True):
-                            removed += 1
-                            reaped = True
-                            emit(
-                                f"lifecycle: REMOVED (all wanted albums in library"
-                                + (f"; {leftover} un-wanted leftover(s) deleted" if leftover else "")
-                                + f") {name!r}"
-                            )
+                    ok, why = _songs_on_disk_owned(lidarr, plan, folder,
+                                                   download_root)
+                    if not ok:
+                        emit(f"lifecycle: NOT removing {name!r} -- {why}; "
+                             f"keeping data for a later pass")
+                    elif qbt.remove(h, delete_files=True):
+                        removed += 1
+                        reaped = True
+                        emit(f"lifecycle: REMOVED ({why}) {name!r}")
             if (not reaped and on_disk < sel_audio
                     and "paused" not in state and "stopped" not in state):
                 # Partially moved, still has wanted content -> pause seeding

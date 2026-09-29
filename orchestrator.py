@@ -14839,20 +14839,40 @@ class Orchestrator:
         if q is None or not self._qbt_ours(t):
             return ""
         fr = str(folder.resolve(strict=False)).replace("\\", "/").rstrip("/")
-        seg = "/" + os.path.basename(fr) + "/"  # this album's folder segment
-        files = q.files(t.get("hash")) or []
+        # This album's files are the ones under ITS path inside the torrent,
+        # not every file under a folder of the same name: a bare "/CD1/"
+        # segment matched every album's CD1 in a discography.
+        cp = str(t.get("content_path") or "").replace("\\", "/").rstrip("/")
+        top = os.path.basename(cp)
+        wr = str((self.cfg.watch_root or Path("/")).resolve(strict=False)
+                 ).replace("\\", "/").rstrip("/")
+        prefix = ""
+        for root in (cp, f"{wr}/{top}"):
+            if top and fr.startswith(root + "/"):
+                prefix = f"{top}/{fr[len(root) + 1:]}/"
+                break
+        if not prefix:
+            return ""
+        files = q.files(t.get("hash"))
+        if not files:
+            # An unreadable file list is no answer: it must never read as
+            # "no other wanted album" and reap the whole torrent.
+            logger.warning("could not read the file list of torrent %s -- "
+                           "left untouched", str(t.get("name"))[:60])
+            return " (could not read the torrent's file list -- left it untouched)"
         desel: List[int] = []
         other_audio = 0
         for f in files:
-            fn = "/" + str(f.get("name") or "").replace("\\", "/")
+            fn = str(f.get("name") or "").replace("\\", "/")
             idx = f.get("index")
-            if seg in fn:                       # belongs to this album
+            if fn.startswith(prefix):           # belongs to this album
                 if idx is not None:
                     desel.append(int(idx))
             elif (os.path.splitext(fn)[1].lower() in _ALL_AUDIO_EXTS
-                  and int(f.get("priority", 1)) != 0):
-                other_audio += 1               # another still-wanted album
-        if other_audio == 0 and reap_if_last:
+                  and (int(f.get("priority", 1)) != 0
+                       or float(f.get("progress") or 0) > 0)):
+                other_audio += 1    # another album still wanted, or with data
+        if other_audio == 0 and reap_if_last and desel:
             if self._reap_torrent(t.get("hash"), blocklist=True):
                 return " and removed + blocklisted the discography torrent (no other wanted albums left)"
             return ""
