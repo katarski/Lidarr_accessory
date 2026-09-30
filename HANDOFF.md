@@ -312,6 +312,16 @@ layer says `http://daniel:11434`.
   (3) the 102 breaker-open warnings all fall at 22:49, the owner's Lidarr restart; none since,
   with Lidarr capped at 1 CPU. `lifecycle_state.json` is written; `library_audit.state.json`
   appears after the first complete audit pass.
+- **Not supported yet: one CUE describing several images (vinyl sides).**
+  `Ray Parker Jr. - After Dark` (and `A Woman Needs Love`, `I Love You Like
+  You Are`, all 32/192 vinyl rips) ship one .cue with FILE "... (Side 1)" and
+  FILE "... (Side 2)", five tracks each. The parser has no track-to-FILE
+  link, so the side-2 restart at 00:00 reads as "invalid", the folder looks
+  pre-split, and the two whole sides go to Lidarr, which refuses them; all
+  three sit in needs-attention. A scan of /downloads found only these three
+  (the other 21 multi-FILE cues are per-track EAC cues with the pregap at
+  the end of the previous file -- already handled). Fix when wanted: give
+  Track a file index, gate/split per image, hand off as one album.
 - **Library audio Lidarr has no record of (1 Oct scan, owner's call).**
   1,364 audio files in 163 album folders are on disk but neither mapped nor
   in Lidarr's unmapped list -- mostly a second disc left behind when an
