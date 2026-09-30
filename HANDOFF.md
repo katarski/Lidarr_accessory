@@ -32,8 +32,9 @@ build) with the repo's `*.py` and `tools/`, checks `OrchestratorConfig` is
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20260930-reconcile`**
-(62311c9). Earlier tags for rollback: `guard-20260930-isearch`,
+then is the container replaced. Live now: **`guard-20260930-auditidx`**
+(dcc1571). Earlier tags for rollback: `guard-20260930-reconcile`,
+`guard-20260930-isearch`,
 `guard-20260930-compneg`,
 `guard-20260930-lossless`,
 `guard-20260930-disccues`,
@@ -225,6 +226,12 @@ layer says `http://daniel:11434`.
 - **Reconcile caches "nothing importable" only when Lidarr answered**
   (orch2 F6): the probe snapshots `_lidarr_generation()`; a changed
   generation caches nothing, and with the breaker open the pass stops.
+- **The library audit treats a failed album list as unknown** (orch2 F7):
+  `_album_index` returns None and caches nothing, and that artist is
+  skipped for the pass; a song-title resolve that lost an album to a failed
+  read returns None; `_bail_if_green` also gates an album resolved by songs
+  or tags (green = holds as many files as the folder, or complete). The
+  external audit's Lidarr side (orch2 "missed") was closed by COMP-NEG-1.
 - **Nothing is grabbed for an unmonitored album or artist** — Lidarr will not
   import into one either, so the download is wasted twice. Fails open: no id, or
   a lookup error, and the grab proceeds.
@@ -393,9 +400,9 @@ test of a feature whose purpose is removing files.
 
 ## 6. Open items
 
-1. **24 audit findings are open: `docs/AUDIT_OPEN.md`**, in fix order, each
+1. **22 audit findings are open: `docs/AUDIT_OPEN.md`**, in fix order, each
    with evidence, root cause and the agreed fix (the verifier's correction
-   where there was one). Start at item 1 (orch2 F7). 67 are fixed;
+   where there was one). Start at item 1 (orch3 ISEARCH-STATE-1). 69 are fixed;
    CLI-04/06/07 were refuted — do not redo them. **The owner compacts
    after every fix: finish one (tests, deploy, verify, these two files),
    then stop.** orch2 F4 (30 Sep) is deployed; its first live
