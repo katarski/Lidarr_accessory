@@ -318,6 +318,19 @@ def album_complete_in_library(
                     alb, verdict = _pick_among_same_title(
                         [a for a in albums if norm_title(a.get("title")) == np_],
                         album, folder_hint)
+                    # The download names a year the picked album does not
+                    # carry: another release of that title, possibly one the
+                    # library is missing (the 1998 "Evanescence" vs the owned
+                    # 2011 one) -- not owned. Rejecting costs a duplicate
+                    # download; accepting costs a deselect (llm missed).
+                    dl_year = _year_of(folder_hint or album)
+                    al_year = str((alb or {}).get("releaseDate") or "")[:4]
+                    if alb is not None and dl_year and al_year and al_year != dl_year:
+                        logger.info(
+                            "  LLM pick %r is from %s; the download says %s -- "
+                            "not treating it as owned", alb.get("title"),
+                            al_year, dl_year)
+                        alb = None
                     if out is not None and alb is not None:
                         out["by_llm"] = True     # a guess: never grounds a delete
                     if verdict is not None:

@@ -2169,7 +2169,7 @@ class Orchestrator:
             if not arec:
                 return False
             aid = int(arec["id"])
-            alb = self.lidarr.find_album(aid, album_name)
+            alb = self._find_album(aid, album_name)
             if not alb:
                 return False
             # Matched album title must normalize-equal ours, so a fuzzy
@@ -4211,7 +4211,10 @@ class Orchestrator:
             return ("unknown", 0, 0)
         target = _match_key(album_name)
         match = None
-        for a in albums:
+        pin = getattr(getattr(self, "_tl", None), "album_pin", None)
+        if pin and _match_key(pin.get("title")) == target:
+            match = next((a for a in albums if a.get("id") == pin.get("id")), None)
+        for a in albums if match is None else ():
             if _match_key(a.get("title")) == target:
                 match = a
                 break
@@ -4541,6 +4544,12 @@ class Orchestrator:
         logger.info(
             "content-identify: %s -> %s / %r via %s",
             folder.name, artist_name, winner.get("title"), via)
+        # The TITLE goes back (every caller works in names); the RECORD is
+        # kept for the hand-off to pin (_find_album), so a same-titled album
+        # is not chosen again by a different rule downstream (llm LLM-5).
+        tl = getattr(self, "_tl", None)
+        if tl is not None:
+            tl.identified_album = winner
         return winner.get("title") or None
 
     def _album_candidate_title_sets(
@@ -5016,7 +5025,7 @@ class Orchestrator:
         """
         for nm in [n for n in names if n and n.strip()]:
             try:
-                rec = self.lidarr.find_album(int(artist_id), nm,
+                rec = self._find_album(int(artist_id), nm,
                                              track_count=n_files)
                 if rec:
                     return rec
@@ -6090,7 +6099,7 @@ class Orchestrator:
             # Prefer an ALREADY-RESOLVED album. Re-resolving by name here would
             # reintroduce the very failure the caller just worked around: the
             # LOTR folders are named after the edition and match no Lidarr title.
-            alb = album_rec or self.lidarr.find_album(
+            alb = album_rec or self._find_album(
                 int(artist_id), album_name, track_count=len(audios),
                 year=self._year_from_name(album_name))
             if not alb:
@@ -6168,14 +6177,39 @@ class Orchestrator:
         outer = getattr(tl, "gen", None)
         tl.gen = self._lidarr_generation()
         tl.lidarr_failed = False
+        # An album identified for this folder is pinned for this hand-off only.
+        tl.album_pin = tl.identified_album = None
         try:
             self._handoff_inner(*args, **kwargs)
         finally:
             tl.lidarr_failed_last = (tl.lidarr_failed
                                      or self._lidarr_generation() != tl.gen)
             tl.gen = outer
+            tl.album_pin = tl.identified_album = None
             if folder is not None:
                 claims.release(folder)
+
+    def _find_album(self, artist_id, album_title, **kw):
+        """lidarr.find_album, except that inside a hand-off whose album was
+        identified by content (or by the LLM among same-scored rivals) the
+        identified RECORD answers for its own title. Content-identify
+        returned only a title, and each lookup after it re-resolved that
+        title by its own rule: on 17 Sep 'The Sky Is Crying' was identified
+        as one album and the pre-flight matched another of that title
+        (45212), whose monitored release was then switched twice (llm
+        LLM-5)."""
+        pin = getattr(getattr(self, "_tl", None), "album_pin", None)
+        if (pin and album_title
+                and str(pin.get("artistId") or artist_id) == str(artist_id)
+                and _match_key(pin.get("title")) == _match_key(album_title)):
+            return pin
+        return self.lidarr.find_album(artist_id, album_title, **kw)
+
+    def _adopt_identified_album(self) -> None:
+        """Pin the album content-identify just chose, for this hand-off."""
+        tl = getattr(self, "_tl", None)
+        if tl is not None:
+            tl.album_pin = getattr(tl, "identified_album", None)
 
     def _lidarr_failed_in_last_handoff(self) -> bool:
         """The last hand-off on this thread was not conclusive: Lidarr failed
@@ -6341,6 +6375,7 @@ class Orchestrator:
             ident = self._identify_album_by_content(folder, audios, artist_name)
             if ident:
                 album_name = ident
+                self._adopt_identified_album()
         if not (artist_name and album_name):
             logger.warning(
                 "Pre-split handoff: could not determine artist/album from "
@@ -6384,6 +6419,7 @@ class Orchestrator:
                         "tracks identify it as %r -- importing under that "
                         "album.", artist_name, album_name, ident)
                     album_name = ident
+                    self._adopt_identified_album()
                     verdict, _have, _total = self._monitored_album_status(
                         artist_name, album_name)
             if verdict == "skip":
@@ -6413,6 +6449,7 @@ class Orchestrator:
                                 "identify this as %r -- using it.",
                                 f_artist, f_ident)
                             artist_name, album_name = f_artist, f_ident
+                            self._adopt_identified_album()
                             verdict, _have, _total = (
                                 self._monitored_album_status(
                                     f_artist, f_ident))
@@ -8362,7 +8399,7 @@ class Orchestrator:
             # No file count in scope here (this only asks whether Lidarr already
             # reflects the album), but the year still separates same-titled
             # albums -- Weezer has seven called "Weezer".
-            album_rec = self.lidarr.find_album(
+            album_rec = self._find_album(
                 artist_id, album_name,
                 year=self._year_from_name(album_name))
         except Exception as exc:  # noqa: BLE001
@@ -10217,7 +10254,7 @@ class Orchestrator:
         #    NOT affect the clean matches.
         artist_rec = self.lidarr.find_artist(artist_name) if artist_name else None
         album_rec = (
-            self.lidarr.find_album(
+            self._find_album(
                 artist_rec["id"], album_name,
                 track_count=len(candidates),
                 year=self._year_from_name(album_name))
@@ -14701,7 +14738,10 @@ class Orchestrator:
             return out
         target = _match_key(album_name)
         match = None
-        for a in albums:
+        pin = getattr(getattr(self, "_tl", None), "album_pin", None)
+        if pin and _match_key(pin.get("title")) == target:
+            match = next((a for a in albums if a.get("id") == pin.get("id")), None)
+        for a in albums if match is None else ():
             if _match_key(a.get("title")) == target:
                 match = a
                 break
@@ -16322,7 +16362,7 @@ class Orchestrator:
         if not artist:
             return None
         try:
-            album = self.lidarr.find_album(artist["id"], album_name)
+            album = self._find_album(artist["id"], album_name)
         except Exception as exc:
             logger.warning("Pre-flight: find_album failed: %s", exc)
             return None
