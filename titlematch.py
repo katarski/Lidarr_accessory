@@ -35,9 +35,10 @@ Whether a word is SIGNIFICANT -- evidence that two titles name the same record
 
 from __future__ import annotations
 
+import html
 import re
 import unicodedata
-from typing import List, Sequence, Set
+from typing import List, Optional, Sequence, Set
 
 # ---------------------------------------------------------------------------
 # Transliteration and repair (lidarr.py re-exports these under the same names)
@@ -327,3 +328,238 @@ def names_artist(path_parts: Sequence[str], artist: str) -> bool:
             if _drop_the(tokens(field)) == want:
                 return True
     return False
+
+
+# ---------------------------------------------------------------------------
+# Does a release title NAME an album?
+# ---------------------------------------------------------------------------
+
+# Words a tracker writes around an album's name that do not make it another
+# record: edition, format, medium, source, pressing. A word holding a digit
+# (a year, "2cd", "24bit", "180g", "dsd64") is one too.
+DECOR_WORDS = NOISE_WORDS | frozenset({
+    "cd", "cds", "cdda", "lp", "lps", "dvd", "dvda", "bd", "bluray", "blu",
+    "ray", "spec", "bluspec", "shm", "shmcd", "xrcd", "uhqcd", "hqcd", "k2hd",
+    "mp3", "ape", "alac", "wav", "wv", "wavpack", "aac", "m4a", "ogg", "opus",
+    "dsd", "dsf", "dff", "pcm", "mqa", "tta", "aiff", "aif", "lossy", "hi",
+    "res", "khz", "kbps", "kbit", "bit", "vbr", "cbr", "web", "webrip",
+    "cdrip", "rip", "vinylrip", "eac", "image", "cue", "log", "tracks",
+    "scans", "scan", "covers", "artwork", "booklet", "japan", "japanese",
+    "jpn", "jp", "uk", "us", "usa", "eu", "import", "press", "pressing",
+    "repress", "qobuz", "tidal", "deezer", "bandcamp", "itunes", "hdtracks",
+    "mofi", "pbthal", "ost", "soundtrack", "score", "original", "album",
+    "extended", "remastering",
+})
+
+# Release-type words: decoration next to a name ("Album EP"), but a sibling
+# title that adds one ("X" beside "X EP") is a different record.
+_TYPE_WORDS = frozenset({"ep", "single", "maxi"})
+
+# Where a release title separates its fields: " - ", brackets, double quotes
+# or a pair of single ones ('Entre Eux Deux'), "/", "|", "+", "•", ";", and a
+# run of spaces ("Macklemore & Ryan Lewis   BEN" -- a whole family of
+# uploaders separates artist and album that way). Not "." and not a colon
+# inside a word run: "After Silence" is not "After Silence II. Devotion".
+# Not "," either: "Bach, Dove, Monteverdi" is one list. Not "...": "The
+# Real... Gipsy Kings" is a compilation, not the album "Gipsy Kings". A lone
+# apostrophe is not a quote: "The Drifters' Golden Hits".
+_RELEASE_SEP_RE = re.compile(
+    "[\[\](){}<>/\\|+«»•·;\"“”„]|\s{2,}"
+    "|(?:^|\s)[-–—~_]+|[-–—~_]+(?=\s|$)")
+_QUOTED_RE = re.compile("(?<!\S)['‘]([^'‘’]+)['’](?!\w)")
+
+# A colon then a space OPENS a field -- "Bryan Adams: Classic" names
+# "Classic" -- but does not close one: after an album's name it begins a
+# subtitle that can make it another record, "Joker: Folie à Deux" or
+# "Destination: Treasure Island".
+_COLON_RE = re.compile(r":+(?=\s)")
+
+# " & " joins two names ("Lady Soul & Aretha Now") but is also inside one
+# ("Kool & the Gang"): it stays the word "and", and its place is a boundary.
+_AMP_RE = re.compile(r"\s&\s")
+
+_ARTICLES = frozenset({"a", "an", "the"})
+_GLUE = _ARTICLES | {"and", "of"}
+
+
+def is_decor(w: str) -> bool:
+    return (w in DECOR_WORDS or w in _TYPE_WORDS
+            or any(c.isdigit() for c in w))
+
+
+def _text(s: str) -> str:
+    t = html.unescape(s or "")
+    if t and not any(c.isspace() for c in t):
+        # A scene name has no spaces: "Artist-Album-2CD-FLAC-2002-GRP".
+        t = re.sub(r"[._]+", " ", t).replace("-", " - ")
+    return _QUOTED_RE.sub(r'"\1"', t)
+
+
+def _fields(s: str) -> List[List[str]]:
+    """The fields of an album's own title; its colon does separate them:
+    "Ladies and Gentlemen: Barenaked Ladies and The Persuasions"."""
+    return [w for f in _RELEASE_SEP_RE.split(_text(s))
+            for w in (words(p) for p in _COLON_RE.split(f)) if w]
+
+
+def _stream(title: str):
+    """The title's words in order; the indexes where a field starts (a word
+    may follow one), where one ends (a word may precede one), and those of
+    an "and" that was a joining " & "."""
+    ws: List[str] = []
+    opens, closes, joins = set(), set(), set()
+    for f in _RELEASE_SEP_RE.split(_text(title)):
+        opens.add(len(ws))
+        closes.add(len(ws))
+        for i, sub in enumerate(_COLON_RE.split(f)):
+            if i:
+                opens.add(len(ws))
+            for k, piece in enumerate(_AMP_RE.split(sub)):
+                if k:
+                    joins.add(len(ws))
+                    ws.append("and")
+                ws.extend(words(piece))
+    return ws, opens, closes, joins
+
+
+def _runs_of(ws: Sequence[str], pat: Sequence[str]) -> List[tuple]:
+    n = len(pat)
+    if not n:
+        return []
+    return [(i, i + n) for i in range(len(ws) - n + 1)
+            if list(ws[i:i + n]) == list(pat)]
+
+
+def more_specific_albums(album: str, others: Sequence[str]) -> List[List[str]]:
+    """
+    The artist's other album titles that hold this album's whole name plus a
+    word of their own that is not decoration: for "Dusty", "Dusty in
+    Memphis" and "Ev'rything's Coming Up Dusty"; for "Blue", "Blue Eyed
+    Soul". "Album (Deluxe Edition)" is an edition of "Album", not another
+    record; a number is not decoration here: "Chicago 17" is not "Chicago".
+    Computed once per album, not per release.
+    """
+    a = words(album)
+    out: List[List[str]] = []
+    if not a:
+        return out
+    for o in others or ():
+        b = words(o)
+        if len(b) <= len(a) or not contains_run(b, a):
+            continue
+        extra = list(b)
+        i = _runs_of(b, a)[0][0]
+        del extra[i:i + len(a)]
+        if any(w not in DECOR_WORDS for w in extra):
+            out.append(b)
+    return out
+
+
+def _spellings(pat: List[str], art: List[str]) -> List[List[str]]:
+    """How a tracker may write an album's words: as they are; without the
+    decoration Lidarr's title carries ("A Star Is Born Soundtrack"); without
+    a leading article ("Bedlam in Goliath"); without the artist's name the
+    credit already gives ("Crystal Waters - The Best Of")."""
+    def trim(p):
+        i, j = 0, len(p)
+        while i < j and (p[i] in DECOR_WORDS or p[i] in _TYPE_WORDS):
+            i += 1
+        while j > i and (p[j - 1] in DECOR_WORDS or p[j - 1] in _TYPE_WORDS):
+            j -= 1
+        return list(p[i:j]) or list(p)
+
+    out = [list(pat), trim(pat)]
+    if len(pat) > 1 and pat[0] in _ARTICLES:
+        out.append(trim(pat[1:]))
+    if art and len(pat) > len(art):
+        for s, e in _runs_of(pat, art)[:1]:
+            rest = list(pat[:s]) + list(pat[e:])
+            if any(w not in _GLUE and not is_decor(w) for w in rest):
+                out.append(trim(rest))
+    seen, uniq = set(), []
+    for p in out:
+        if p and tuple(p) not in seen:
+            seen.add(tuple(p))
+            uniq.append(p)
+    return uniq
+
+
+def album_naming(title: str, album: str, artist: str = "",
+                 specific: Sequence[Sequence[str]] = ()) -> Optional[str]:
+    """
+    Does release `title` NAME `album`, or only contain its words?
+
+      "named"    -- the album's words stand as a whole field of the title,
+                    after the artist's credit is taken out once: bounded by
+                    a separator, the title's edge, the artist's name ("Kusa
+                    No Ran by Deep Forest"), decoration or a leading article.
+                    "Jewel - 0304 - 2003" names "0304"; "Frida - Frida" names
+                    "Frida"; "Pink Floyd - The Wall 1979 FLAC" names "The Wall".
+      "sibling"  -- every place the album's words occur is inside the name of
+                    a more specific album of the same artist (`specific`, from
+                    more_specific_albums): "Dusty Springfield - Dusty In
+                    Memphis" is not "Dusty".
+      "embedded" -- the words occur only inside a longer name, or only in the
+                    artist's credit: "Joni Mitchell - Blue Eyed Soul" is not
+                    "Blue", even when Lidarr does not know that album, and
+                    "ABBA, Björn, Benny, Agnetha & Frida - Waterloo" is not
+                    Frida's "Frida".
+      None       -- the album has no words to judge by.
+    """
+    ws, opens, closes, joins = _stream(title)
+    whole = words(album)
+    if not whole:
+        return None
+    # The artist's credit, taken out once: the earliest occurrence of the
+    # name (or of the name without its leading "the").
+    art = words(artist)
+    pats = [art] + ([art[1:]] if len(art) > 1 and art[0] == "the" else [])
+    art_occ = [sp for p in pats for sp in _runs_of(ws, p)]
+    first = min(art_occ, key=lambda sp: (sp[0], -sp[1]), default=None)
+    ms, me = first if first else (0, 0)
+    art_starts = {s for s, _e in art_occ}
+    art_ends = {e for _s, e in art_occ}
+
+    def free(sp):
+        # Clear of the credit -- or holding all of it and more: in
+        # "Miles Davis - Cookin' with the Miles Davis Quintet" the credit
+        # found first is inside the album's own name.
+        s, e = sp
+        return (e <= ms or s >= me or ms == me
+                or (s <= ms and me <= e and e - s > me - ms))
+
+    def left_ok(i):
+        return (i == 0 or i in opens or i in art_ends or (i - 1) in joins
+                or is_decor(ws[i - 1]))
+
+    def bounded(sp):
+        s, e = sp
+        left = left_ok(s) or (ws[s - 1] in _ARTICLES and left_ok(s - 1))
+        right = (e == len(ws) or e in closes or e in art_starts
+                 or e in joins or is_decor(ws[e])
+                 or (ws[e] == "by" and e + 1 in art_starts))
+        return left and right
+
+    covers = [sp for b in specific or () for sp in _runs_of(ws, b) if free(sp)]
+
+    def covered(sp):
+        return any(bs <= sp[0] and sp[1] <= be for bs, be in covers)
+
+    def named(pat):
+        return any(free(sp) and bounded(sp) and not covered(sp)
+                   for p in _spellings(pat, art) for sp in _runs_of(ws, p))
+
+    if named(whole):
+        return "named"
+    # An album titled in fields -- "Joker (Original Motion Picture
+    # Soundtrack)" -- is named when each field is, wherever the tracker put
+    # it: "Joker (by Hildur Gudnadottir) (Original Motion Picture
+    # Soundtrack)". A field of pure decoration is not required.
+    parts = [p for p in _fields(album) if not all(is_decor(w) for w in p)]
+    if len(parts) >= 2 and all(named(p) for p in parts):
+        return "named"
+    occ = [sp for p in _spellings(whole, art) for sp in _runs_of(ws, p)
+           if free(sp)]
+    if occ and covers and all(covered(sp) for sp in occ):
+        return "sibling"
+    return "embedded"

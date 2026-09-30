@@ -39,7 +39,7 @@ import titlematch
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from cue_parser import Cue, LLMUnavailableError, parse_cue
 from dedup_downloads import _EDITION_WORDS as _EDITION_NOISE_WORDS
@@ -10053,12 +10053,11 @@ class Orchestrator:
         return " ".join(titlematch.words(s))
 
     @classmethod
-    def _title_relation(cls, want_norm: str, title_norm: str,
-                        album_norm: Optional[str] = None,
-                        artist_norm: Optional[str] = None) -> float:
+    def _title_relation(cls, artist: str, album: str, title: str,
+                        specific: Sequence[Sequence[str]] = ()) -> float:
         """
-        How well does a release title match "<artist> <album>"? Both inputs are
-        already _norm_title'd.
+        How well does release `title` match "<artist> <album>"? `specific` is
+        titlematch.more_specific_albums(album, <the artist's other albums>).
 
         Plain SequenceMatcher over the WHOLE title punishes the decoration that
         trackers put around a perfectly good release. Measured case:
@@ -10074,8 +10073,22 @@ class Orchestrator:
         the extra words are format noise, not evidence of a different album.
         Anything short of a full containment falls back to the old ratio, so a
         partial/wrong match is judged exactly as before.
+
+        CONTAINMENT IS NOT NAMING (orch2 F4). "Dusty Springfield - Dusty In
+        Memphis" contains every word of "Dusty Springfield Dusty", and so did
+        "Ev'rything's Coming Up Dusty": both scored 1.0 for the album "Dusty"
+        and were grabbed, one after the other. The 1.0 is given only when the
+        title NAMES the album -- its words stand as a whole field once the
+        artist is taken out (titlematch.album_naming). A title that holds
+        every word but names something else -- a more specific album of the
+        artist, or any longer name ("Blue Eyed Soul" for "Blue") -- is
+        evidence AGAINST the album and scores 0. A similarity of what was
+        left could not say so: at the live 0.45 floor it took "Kool & The
+        Gang - Wild And Peaceful" (0.46) for "Kool and the Gang".
         """
-        want = [w for w in (want_norm or "").split() if w]
+        want_norm = cls._norm_title(f"{artist} {album}")
+        title_norm = cls._norm_title(title)
+        want = [w for w in want_norm.split() if w]
         seq = difflib.SequenceMatcher(None, want_norm, title_norm).ratio()
         # Containment is only evidence when the words carry information. A
         # dotted initialism explodes into single letters -- "M.I.A." + the
@@ -10086,47 +10099,15 @@ class Orchestrator:
         # before containment may speak; otherwise fall back to the ratio.
         if len([w for w in want if len(w) >= 2]) < 2:
             return seq
-        have = set((title_norm or "").split())
+        have = set(title_norm.split())
         if not all(w in have for w in want):
             return seq
-        # CONTAINMENT ALONE IS NOT ENOUGH FOR A SELF-TITLED ALBUM. `want` is
-        # "<artist> <album>", so when the album IS the artist's name every
-        # release by that artist contains every want-word and scores a perfect
-        # 1.0. Searching Frida's album "Frida" therefore matched
-        # "ABBA, Björn, Benny, Agnetha & Frida - Waterloo 2 lp - 1974, DSD 128"
-        # and grabbed it; the same made Kool & the Gang's self-titled album
-        # match "Kool & The Gang - Wild And Peaceful". Require the ALBUM to
-        # contribute at least one identifying word of its own -- when it does
-        # not, the sequence ratio decides, which a genuinely self-titled
-        # release still wins on.
-        if album_norm is not None and artist_norm is not None:
-            def _ident(s: str) -> set:
-                return {w for w in (s or "").split()
-                        if len(w) >= 2 and w not in cls._TITLE_STOPWORDS}
-            alb_tokens = _ident(album_norm)
-            art_tokens = _ident(artist_norm)
-            # Grammar is not identity: "Kool and the Gang" vs the artist
-            # "Kool & the Gang" differs only by the word "and", and treating
-            # that as distinctive let the self-titled album match
-            # "Kool & The Gang - Wild And Peaceful".
-            if alb_tokens and not (alb_tokens - art_tokens):
-                # SELF-TITLED. A correct release names the artist TWICE --
-                # "Kool & The Gang - Kool and the Gang - 1969" -- while a
-                # different album of theirs names it once and then something
-                # else: "Kool & The Gang - Wild And Peaceful". Counting is what
-                # separates them; the raw ratio cannot (0.57 for the wrong one
-                # against 0.43 for the right one).
-                toks = (title_norm or "").split()
-                if alb_tokens and min(toks.count(w) for w in alb_tokens) >= 2:
-                    return 1.0
-                # Named once: the title identifies a DIFFERENT album, and the
-                # raw ratio is inflated by the artist name it shares (0.57 for
-                # "Kool & The Gang - Wild And Peaceful" against a 0.45 floor).
-                # Score what is left after removing the artist instead.
-                rest = " ".join(w for w in toks if w not in art_tokens)
-                return difflib.SequenceMatcher(
-                    None, album_norm or "", rest).ratio()
-        return 1.0
+        # The artist is taken out ONCE, so a self-titled album needs its name
+        # twice: "Frida - Frida" names "Frida", "ABBA, Björn, Benny, Agnetha &
+        # Frida - Waterloo" does not, nor "Kool & The Gang - Wild And
+        # Peaceful" Kool & the Gang's "Kool and the Gang".
+        verdict = titlematch.album_naming(title, album, artist, specific)
+        return 1.0 if verdict in (None, "named") else 0.0
 
     _TITLE_STOPWORDS = frozenset(
         "a an and the of on in at to for with by or from de la le les el".split())
@@ -10294,6 +10275,29 @@ class Orchestrator:
         return (min(max(0, seeders), 100) * w
                 + min(max(0, leechers), 50) * 0.3 * w)
 
+    def _artist_album_titles(self, artist_id, exclude=None) -> List[str]:
+        """
+        The titles of every album Lidarr has for this artist but `exclude`,
+        asked once per interactive-search pass (the pass resets the cache).
+        A failed ask is not cached and reads as []: the sibling rule of
+        _title_relation then does not apply, and nothing is recorded.
+        """
+        if artist_id is None:
+            return []
+        cache = getattr(self, "_isearch_albums", None)
+        if cache is None:
+            cache = self._isearch_albums = {}
+        key = int(artist_id)
+        got = cache.get(key)
+        if got is None:
+            gen = self._lidarr_generation()
+            rows = self.lidarr.list_albums_for_artist(key) or []
+            got = [(a.get("id"), str(a.get("title") or "")) for a in rows]
+            if self._lidarr_generation() == gen:
+                cache[key] = got
+        return [t for i, t in got
+                if exclude is None or i is None or int(i) != int(exclude)]
+
     def _rank_releases(
         self, releases, artist: str, album: str, blocklisted,
         album_rec: Optional[Dict[str, Any]] = None,
@@ -10308,7 +10312,10 @@ class Orchestrator:
         title relation (dominant) then seeders. Returns scored copies with
         _score/_seeders/_quality/_title_ratio/_lossless attached, best first.
         """
-        want = self._norm_title(f"{artist} {album}")
+        rec = album_rec or {}
+        specific = titlematch.more_specific_albums(album, self._artist_album_titles(
+            rec.get("artistId") or (rec.get("artist") or {}).get("id"),
+            exclude=rec.get("id")))
         blocked = set(blocklisted or [])
         prefer_lossless = bool(self.cfg.interactive_search_require_lossless)
         floor = float(self.cfg.interactive_search_min_title_ratio)
@@ -10389,10 +10396,7 @@ class Orchestrator:
             if seeders < min_seeders:
                 dropped_dead += 1
                 continue
-            ratio = self._title_relation(
-                want, self._norm_title(title),
-                album_norm=self._norm_title(album),
-                artist_norm=artn)
+            ratio = self._title_relation(artist, album, title, specific)
             # (a) Swarm health is a first-class ranking signal now (was a token
             # seeders/10 nudge), so among releases of the right album the
             # healthiest wins.
@@ -12259,6 +12263,8 @@ class Orchestrator:
         blocklisted = st.setdefault("blocklisted", [])
         category = str(getattr(self.cfg, "qbt_category", "") or "")
         for cand in cands[:max(1, int(cfg.interactive_search_max_candidates))]:
+            if float(cand.get("_title_ratio") or 0) < floor:
+                break           # ranked relevant-first: the rest are too
             # A Prowlarr result has no Lidarr guid or indexer id, so pushing it
             # through Lidarr can only 404 -- add it ourselves, PAUSED, stamped
             # with OUR category. An uncategorised torrent escapes every
@@ -12358,6 +12364,12 @@ class Orchestrator:
         blocklisted = st.setdefault("blocklisted", [])
         tried = 0
         for cand in cands[:max(1, int(cfg.interactive_search_max_candidates))]:
+            # Only the top was held to the floor, so once the relevant ones
+            # were rejected the loop went on down the list into releases that
+            # never matched. Ranked relevant-first, so the first below the
+            # floor ends it.
+            if float(cand.get("_title_ratio") or 0) < floor:
+                break
             guid, indexer = cand.get("guid"), cand.get("indexerId")
             if not guid or indexer is None:
                 continue
@@ -12511,7 +12523,8 @@ class Orchestrator:
                 return True
         return False
 
-    def _rank_artist_releases(self, releases, artist: str, missing, blocklisted):
+    def _rank_artist_releases(self, releases, artist: str, missing, blocklisted,
+                              artist_id=None):
         """
         Rank artist-scope torrent releases by how much MISSING music they fill.
         A release counts if it's a discography/collection OR its title matches
@@ -12524,7 +12537,9 @@ class Orchestrator:
         blocked = set(blocklisted or [])
         artn = self._norm_title(artist)
         n_missing = len(missing)
-        m_norm = [(self._norm_title(f"{artist} {t}"), t, exp, aid)
+        m_norm = [(titlematch.more_specific_albums(
+                       t, self._artist_album_titles(artist_id, exclude=aid)),
+                   t, exp, aid)
                   for (t, exp, aid) in missing]
         dropped_video_a = 0
         dropped_wrong_artist = 0
@@ -12587,15 +12602,12 @@ class Orchestrator:
             info = self._discography_info(title)
             # Best single missing-album match.
             best_ratio, best_match = 0.0, None
-            for mn, t, exp, aid in m_norm:
-                # Pass the album and artist so the SELF-TITLED rule applies
-                # here too. Without it "Muddy Waters / Muddy Waters" matched
-                # every Muddy Waters album by containment alone -- Folk Singer,
-                # Hard Again, King Bee, At Newport -- each later thrown out by
-                # the song verifier at 0-4 of 18.
-                ratio = self._title_relation(
-                    mn, tnorm, album_norm=self._norm_title(t),
-                    artist_norm=artn)
+            for specific, t, exp, aid in m_norm:
+                # The album must be NAMED, here too. By containment alone
+                # "Muddy Waters / Muddy Waters" matched every Muddy Waters
+                # album -- Folk Singer, Hard Again, King Bee, At Newport --
+                # each later thrown out by the song verifier at 0-4 of 18.
+                ratio = self._title_relation(artist, t, title, specific)
                 # THE ALBUM HAS TO BE NAMED, not just the artist. `mn` is
                 # "<artist> <album>" and the artist is in every one of that
                 # artist's releases, so a long artist name alone can carry the
@@ -12827,7 +12839,7 @@ class Orchestrator:
             return False
         cands = self._rank_artist_releases(
             self.lidarr.release_search_artist(artist_id), artist_name,
-            missing, blocklisted)
+            missing, blocklisted, artist_id=artist_id)
         if not cands:
             return False
         if cfg.interactive_search_dry_run:
@@ -12916,6 +12928,7 @@ class Orchestrator:
         """
         cfg = self.cfg
         now = time.time()
+        self._isearch_albums = {}       # _artist_album_titles, per pass
         state = self._load_isearch_state()
         gen0 = self._lidarr_generation()
         missing = self.lidarr.wanted_missing()

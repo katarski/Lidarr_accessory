@@ -746,5 +746,212 @@ class SongEvidenceDecides(unittest.TestCase):
         self.assertEqual(src.count("block = self._blocklists(verdict)"), 3)
 
 
+class TitleNamesTheAlbum(unittest.TestCase):
+    """orch2 F4: a release title is evidence for an album only when it NAMES
+    it -- the album's words a whole field once the artist is taken out, and
+    not inside a more specific album of the same artist. Below the title
+    floor nothing is grabbed, not even after better candidates failed."""
+
+    DUSTY = ["Ev'rything's Coming Up Dusty", "Dusty in Memphis",
+             "Simply Dusty", "A Girl Called Dusty"]
+
+    def test_naming_verdicts(self):
+        import titlematch as T
+        rows = [
+            # (title, album, artist, siblings, verdict)
+            ("Dusty Springfield-Ev'rything's Coming Up Dusty(1965;1998) [FLAC]",
+             "Dusty", "Dusty Springfield", self.DUSTY, "sibling"),
+            ("Dusty Springfield-Ev'rything's Coming Up Dusty(1965;1998) [FLAC]",
+             "Dusty", "Dusty Springfield", [], "embedded"),
+            ("Dusty Springfield - Dusty In Memphis (Deluxe Edition FLAC) TNT V",
+             "Dusty", "Dusty Springfield", self.DUSTY, "sibling"),
+            ("Dusty Springfield - Dusty (1964) [FLAC]",
+             "Dusty", "Dusty Springfield", self.DUSTY, "named"),
+            ("(Pop / Folk / Soft Rock) Jewel - 0304 - 2003 (CD-Extra), FLAC "
+             "(image+.cue) lossless", "0304", "Jewel", [], "named"),
+            ("Frida - Frida (1996) [FLAC]", "Frida", "Frida", [], "named"),
+            ("ABBA, Björn, Benny, Agnetha & Frida - Waterloo 2 lp - 1974, DSD 128",
+             "Frida", "Frida", [], "embedded"),
+            ("Kool & The Gang - Kool and the Gang - 1969",
+             "Kool and the Gang", "Kool & the Gang", [], "named"),
+            ("Joni Mitchell - Blue Eyed Soul (2003)", "Blue", "Joni Mitchell",
+             [], "embedded"),
+            ("Pink Floyd - The Wall 1979 FLAC", "The Wall", "Pink Floyd", [],
+             "named"),
+            ("[TR24][OF] Voces8 - Bach, Dove, Monteverdi, Stopford, Whitacre - "
+             "After Silence II. Devotion - 2020 (Classical)", "After Silence",
+             "VOCES8", [], "embedded"),
+            ("(Score) [CD] / Joker (by Hildur Guðnadóttir / Hildur Gudnadottir) "
+             "(Original Motion Picture Soundtrack) - 2019, FLAC (tracks+.cue)",
+             "Joker (Original Motion Picture Soundtrack)", "Hildur Guðnadóttir",
+             [], "named"),
+            ("Beatles - The Beatles (White Album)", "The Beatles",
+             "The Beatles", [], "named"),
+            ("Dusty_Springfield-Dusty_In_Memphis-2CD-FLAC-2002-DJ",
+             "Dusty in Memphis", "Dusty Springfield", [], "named"),
+            ("Chicago - Chicago 17 (1984) [FLAC]", "Chicago", "Chicago",
+             ["Chicago 17"], "sibling"),
+            # An edition is not another record.
+            ("Artist - Album (Deluxe Edition) [FLAC]", "Album", "Artist",
+             ["Album (Deluxe Edition)"], "named"),
+            ("[TR24][OF] Alanis Morissette - Jagged Little Pill [Acoustic] "
+             "[24bit-192kHz] - 1995 / 2005 (Rock)", "Jagged Little Pill",
+             "Alanis Morissette", ["Jagged Little Pill Acoustic"], "sibling"),
+            ("Simply Red   Blue Eyed Soul (2019) [CD Rip] [320 KBPS]", "Blue",
+             "Simply Red", ["Blue Eyed Soul"], "sibling"),
+            # Found in Lidarr's grab history: separators trackers really use.
+            ("Macklemore & Ryan Lewis   BEN (2023) [24Bit 44.1kHz] FLAC",
+             "Ben", "Macklemore", [], "named"),
+            ("[TR24][OF][LDR] Bryan Adams - Bryan Adams: Classic (Reissue) - "
+             "2025 (Rock Pop)", "Classic", "Bryan Adams", [], "named"),
+            ("Miley Cyrus &ndash; Bass Persuades (The Miley Edition) Pop (2026)",
+             "Bass Persuades", "MILEY", [], "named"),
+            ("(Melodic Rock) [CD] Michael Bolton - Michael Bolton•Everybody's "
+             "Crazy - Two Originals", "Everybody’s Crazy", "Michael Bolton", [],
+             "named"),
+            ("(Midwest Rap, Hip Hop, Scene) [CD] Twista - The Dark Horse "
+             "(Deluxe Version) - 2014, FLAC (tracks), lossless", "Dark Horse",
+             "Twista", [], "named"),
+            ("[SACD-R][OF] Miles Davis - Cookin' with the Miles Davis Quintet "
+             "(Analogue Productions) - 2014", "Cookin’ With the Miles Davis "
+             "Quintet", "Miles Davis Quintet", [], "named"),
+            ("(Pop-rock) Barenaked Ladies & The Persuasions - Ladies and "
+             "Gentlemen - 2017, MP3, 320 kbps", "Ladies and Gentlemen: Barenaked "
+             "Ladies and The Persuasions", "Barenaked Ladies", [], "named"),
+            ("(Funk) [CD] Kool & The Gang - Wild And Peaceful - 1996, FLAC",
+             "Kool and the Gang", "Kool & the Gang", [], "embedded"),
+            ("(Pop) [CD] ABBA - The Best Of ABBA - 2000, FLAC (image+.cue)",
+             "ABBA", "ABBA", [], "embedded"),
+            ("(Soundtrack) Kusa No Ran by Deep Forest - 2004, FLAC",
+             "Kusa no Ran", "Deep Forest", [], "named"),
+            ("(vocal jazz) Ray Charles - Ray Charles Invites You To Listen - "
+             "1967", "Invites You to Listen", "Ray Charles", [], "named"),
+            ("The Mars Volta - Bedlam in Goliath [2008] [320kbps]",
+             "The Bedlam in Goliath", "The Mars Volta", [], "named"),
+            ("(House) [CD] Crystal Waters - The Best Of - 1998, FLAC",
+             "The Best of Crystal Waters", "Crystal Waters", [], "named"),
+            ("Aretha Franklin - Lady Soul & Aretha Now (MFSL 623) FLAC",
+             "Aretha Now", "Aretha Franklin", [], "named"),
+            ("Gipsy Kings - The Real... Gipsy Kings (2014) (3 CD) [FLAC]",
+             "Gipsy Kings", "Gipsy Kings", [], "embedded"),
+            ("[TR24][OF] Joe Bonamassa - B.B. King's Blues Summit 100 - 2026",
+             "Blues Summit", "B.B. King", [], "embedded"),
+            # A colon opens a field but does not close one: after the name
+            # it begins a subtitle that can make it another record.
+            ("[TR24][OF][FM] Hildur Guðnadóttir - Joker: Folie à Deux (Score) "
+             "(Original Motion Picture Soundtrack) - 2024",
+             "Joker: Original Motion Picture Soundtrack", "Hildur Guðnadóttir",
+             [], "embedded"),
+            # A lone apostrophe is not a quote.
+            ("[TR24][OF] The Drifters - The Drifters' Golden Hits (1959-1966 "
+             "mono) - 1968/2021", "The Drifters", "The Drifters", [],
+             "embedded"),
+            ("(Jazz) [LP] Melody Gardot & Philippe Powell 'Entre Eux Deux' - "
+             "2022, WavPack", "Entre eux deux", "Melody Gardot", [], "named"),
+        ]
+        for title, album, artist, others, want in rows:
+            spec = T.more_specific_albums(album, others)
+            got = T.album_naming(title, album, artist, spec)
+            self.assertEqual(got, want, (title, album))
+
+    def test_the_three_dusty_grabs_now_score_below_the_live_floor(self):
+        import titlematch as T
+        from orchestrator import Orchestrator
+        rel = Orchestrator._title_relation
+        spec = T.more_specific_albums("Dusty", self.DUSTY)
+        for wrong in ("Dusty Springfield-Ev'rything's Coming Up Dusty(1965;1998) [FLAC]",
+                      "Dusty Springfield - Dusty In Memphis (Deluxe Edition FLAC) TNT V",
+                      "Dusty Springfield Simply Dusty 4CD 2000 FLAC-DJ"):
+            self.assertLess(rel("Dusty Springfield", "Dusty", wrong, spec), 0.45,
+                            wrong)
+        # Not even without the discography: the words sit in a longer name.
+        self.assertLess(rel("Dusty Springfield", "Dusty",
+                            "Dusty Springfield-Ev'rything's Coming Up Dusty(1965;1998)"
+                            " [FLAC]"), 0.45)
+        self.assertLess(rel("Joni Mitchell", "Blue",
+                            "Joni Mitchell - Blue Eyed Soul (2003)"), 0.45)
+        self.assertLess(rel("Kool & the Gang", "Kool and the Gang",
+                            "Kool & The Gang - Wild And Peaceful"), 0.45)
+        for right, artist, album in (
+                ("Dusty Springfield - Dusty (1964) [FLAC]", "Dusty Springfield",
+                 "Dusty"),
+                ("(Pop / Folk / Soft Rock) Jewel - 0304 - 2003 (CD-Extra), FLAC "
+                 "(image+.cue) lossless", "Jewel", "0304"),
+                ("Frida - Frida (1996) [FLAC]", "Frida", "Frida")):
+            self.assertEqual(rel(artist, album, right, spec
+                                 if album == "Dusty" else ()), 1.0, right)
+
+    def _orch(self, albums, fail=False):
+        from types import SimpleNamespace
+        from orchestrator import Orchestrator
+        o = Orchestrator.__new__(Orchestrator)
+        o.cfg = SimpleNamespace(
+            interactive_search_require_lossless=True,
+            interactive_search_min_title_ratio=0.45,
+            interactive_search_min_seeders=1,
+            interactive_search_refuse_unofficial=True,
+            interactive_search_max_candidates=1000,
+            interactive_search_dry_run=False)
+        asked = []
+
+        def list_albums_for_artist(aid):
+            asked.append(aid)
+            if fail:
+                o.lidarr.failure_generation += 1
+                return []
+            return [{"id": i, "title": t} for i, t in albums]
+        o.lidarr = SimpleNamespace(failure_generation=0,
+                                   list_albums_for_artist=list_albums_for_artist)
+        return o, asked
+
+    def _rel(self, title, seeders=5):
+        return {"protocol": "torrent", "guid": title, "indexerId": 1,
+                "title": title, "seeders": seeders, "leechers": 0,
+                "artistName": "Dusty Springfield",
+                "quality": {"quality": {"name": "FLAC"}}}
+
+    def test_the_ranker_asks_the_discography_once_per_pass(self):
+        o, asked = self._orch([(1, "Dusty"), (2, "Dusty in Memphis"),
+                               (3, "Ev'rything's Coming Up Dusty")])
+        rec = {"id": 1, "artistId": 9, "title": "Dusty"}
+        rels = [self._rel("Dusty Springfield - Dusty In Memphis [FLAC]", 50),
+                self._rel("Dusty Springfield - Dusty (1964) [FLAC]", 2)]
+        for _ in range(2):
+            ranked = o._rank_releases(rels, "Dusty Springfield", "Dusty", [],
+                                      album_rec=rec)
+        self.assertEqual(asked, [9])
+        self.assertEqual(ranked[0]["title"],
+                         "Dusty Springfield - Dusty (1964) [FLAC]")
+        self.assertEqual(ranked[1]["_title_ratio"], 0.0)
+        # The album's own title is never its own sibling.
+        self.assertNotIn("Dusty", o._artist_album_titles(9, exclude=1))
+
+    def test_a_failed_album_list_is_not_cached(self):
+        o, asked = self._orch([], fail=True)
+        self.assertEqual(o._artist_album_titles(9), [])
+        self.assertEqual(o._artist_album_titles(9), [])
+        self.assertEqual(asked, [9, 9])
+
+    def test_below_the_floor_is_never_grabbed(self):
+        o, _asked = self._orch([])
+        grabbed = []
+        top = {"guid": "g1", "indexerId": 1, "title": "right", "_title_ratio": 1.0}
+        low = {"guid": "g2", "indexerId": 1, "title": "wrong", "_title_ratio": 0.3}
+        o._rank_releases = lambda *a, **k: [top, low]
+        o.lidarr.release_search = lambda aid: [top, low]
+        o.lidarr.release_grab = (
+            lambda guid, idx, **k: grabbed.append(guid) or True)
+        o._queue_download_ids = lambda: set()
+        o._await_grab = lambda *a, **k: ("h", {})
+        o.record_grab_target = lambda *a, **k: None
+        o._verify_torrent = lambda *a, **k: ("reject:songs", {})
+        o._reject_grab = lambda *a, **k: None
+        o._isearch_prowlarr_album = lambda *a, **k: False
+        alb = {"id": 1, "artistId": 9, "title": "Dusty",
+               "artist": {"artistName": "Dusty Springfield"}}
+        self.assertFalse(o._isearch_one_album(alb, {}, None))
+        self.assertEqual(grabbed, ["g1"])
+
+
 if __name__ == "__main__":
     unittest.main()
