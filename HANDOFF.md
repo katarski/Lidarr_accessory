@@ -310,6 +310,24 @@ layer says `http://daniel:11434`.
   (3) the 102 breaker-open warnings all fall at 22:49, the owner's Lidarr restart; none since,
   with Lidarr capped at 1 CPU. `lifecycle_state.json` is written; `library_audit.state.json`
   appears after the first complete audit pass.
+- **Lidarr load and failure accounting (1 Oct, night).** `find_artist`'s
+  spelling fallback now requires the same number of words ('J. D.
+  Blackfoot' was taken for 'Blackfoot' 49 times). A Lidarr 5xx that is its
+  own answer no longer opens the breaker: NotFound (a queue row it lists but
+  cannot delete -- 845 Fatals in its log, one row retried every 10 min) is an
+  answer and that row is not asked about again; another 5xx with Lidarr's
+  JSON error ("Failed to connect to qBittorrent") counts as a failed call
+  with the breaker shut. Reconcile's "nothing importable" verdicts persist
+  (`reconcile_seen.json`, was 60-173 /manualimport probes an hour after
+  restarts), and the library audit remembers what it did to each folder
+  (`library_audit.seen.json`): unchanged on disk and in Lidarr, the repair is
+  not repeated for a week. The harvest's AcoustID gate proves a match by
+  MusicBrainz recording/artist id (Hildegarde Neff = Hildegard Knef) and
+  reads "Cheatin'"/"Cheating", "Gonna"/"Going to" as one title; harvest
+  verdicts carry `JUDGE_VERSION` so a rule change re-judges every source
+  once. A Prowlarr .torrent link is fetched by the pipeline: a refusal is
+  known at once (was a 40 s wait, 28 times), the infohash is exact, and a
+  copy under another category is never taken over.
 - **Wrong-album imports and orphaned library files (30 Sep, second session).**
   At 11:52 the sweep forced the compilation 'More Abba Gold' into the 1975
   album 'ABBA' on a 50.2% match (override floor 50%), the import switched
