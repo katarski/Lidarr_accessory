@@ -50,6 +50,17 @@ from titlematch import (  # noqa: E402,F401
 _PERFORMER_PREFIX_RE = re.compile(r"(?i)^\s*(?:dj|mc|vj|dr)[\s.\-_]+")
 
 
+def _name_words(s: str) -> int:
+    """How many words with a letter the name has, after the fold and the
+    leading 'the' / honorific _norm_artist drops. Digits and punctuation are
+    tagging junk ('77-Candi Staton', 'armin van Buuren ] 76'); a word is part
+    of the name ('J. D. Blackfoot' is not 'Blackfoot')."""
+    s = _fold_text(s)
+    s = re.sub(r"^\s*the\s+", "", s)
+    s = re.sub(r"^\s*(?:ms|mrs|miss|mr)\.?\s+(?=\S)", "", s)
+    return sum(1 for w in _word_runs(s) if any(ch.isalpha() for ch in w))
+
+
 def _norm_artist(s: str) -> str:
     """Fold an artist name for tolerant equality (titlematch.fold: case,
     accents, '&' -> 'and', Cyrillic/Greek transliterated), drop a leading
@@ -1348,11 +1359,18 @@ class LidarrClient:
         # >= 0.90 similarity AND a clear margin over the runner-up, so an
         # ambiguous field never resolves to a guess. Logged, because a fuzzy
         # identity match should never be silent.
+        #
+        # A spelling variant spells the SAME words: one with a word more or
+        # fewer is another name. 'J. D. Blackfoot' scored 0.90 against the
+        # band 'Blackfoot' (the initials are two letters of eleven) and was
+        # taken for it 49 times.
         if ntarget and len(ntarget) >= 6:
+            nwords = _name_words(name)
             scored = sorted(
                 ((difflib.SequenceMatcher(
                     None, ntarget, _norm_artist(a.get("artistName", ""))).ratio(), a)
-                 for a in results),
+                 for a in results
+                 if _name_words(a.get("artistName", "")) == nwords),
                 key=lambda x: x[0], reverse=True)
             if scored and scored[0][0] >= 0.90:
                 runner_up = scored[1][0] if len(scored) > 1 else 0.0
