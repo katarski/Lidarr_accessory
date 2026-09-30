@@ -376,7 +376,7 @@ class AuditUnknownIsNotEmpty(unittest.TestCase):
         o._lidarr_lookup_artist = lambda name, idx: {"id": 5}
         o._library_album_dirs = lambda d: [p for p in d.iterdir() if p.is_dir()]
         o._audit_append_rows = lambda f, r: rows.extend(r)
-        self.assertEqual(o.audit_library_vs_lidarr(), 0)
+        self.assertEqual(o.audit_library_vs_lidarr(), (0, False))  # incomplete
         self.assertEqual((rows, touched), ([], []))
 
         # Listed, and truly without this album: the album it resolves to by
@@ -415,6 +415,106 @@ class AuditUnknownIsNotEmpty(unittest.TestCase):
         o._tag_title = lambda p: p.stem
         audios = [Path("/x/%s.flac" % s) for s in self.SONGS]
         self.assertIsNone(o._resolve_album_by_song_titles(9, audios))
+
+
+class AuditRecordsOnlyACompletePass(unittest.TestCase):
+    """orch2 F5: the change signature is stored only after a complete pass
+    (every folder examined, Lidarr answering throughout), atomically, and a
+    save that fails is a WARNING; the report is replaced each pass and the
+    first-run marker lives in the state file."""
+
+    def _orch(self):
+        import tempfile
+        from orchestrator import Orchestrator
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+        self.root = self.dir / "Music"
+        (self.root / "Artist" / "Album").mkdir(parents=True)
+        (self.root / "Artist" / "Album" / "01.flac").write_bytes(b"x")
+        self.report = self.dir / "library_audit.csv"
+        self.state = self.dir / "library_audit.state.json"
+        o = Orchestrator.__new__(Orchestrator)
+        o.cfg = SimpleNamespace(library_root_windows=self.root,
+                                library_audit_report_file=self.report,
+                                library_audit_skip_unchanged=True)
+        o.lidarr = SimpleNamespace(failure_generation=0)
+        o._build_lidarr_artist_index = lambda: {"someone": {"id": 1}}
+        o._lidarr_lookup_artist = lambda name, idx: None  # not in Lidarr
+        o._library_album_dirs = lambda d: [p for p in d.iterdir() if p.is_dir()]
+        self.walks = []
+        real = o.audit_library_vs_lidarr
+        o.audit_library_vs_lidarr = lambda: self.walks.append(1) or real()
+        return o
+
+    def _rows(self):
+        import csv
+        with self.report.open(encoding="utf-8", newline="") as fh:
+            return list(csv.reader(fh))
+
+    def test_an_aborted_pass_is_not_recorded(self):
+        o = self._orch()
+        o._build_lidarr_artist_index = lambda: {}   # "Lidarr returned no artists"
+        o.maybe_audit_library()
+        o.maybe_audit_library()                     # nothing changed on disk
+        self.assertEqual(len(self.walks), 2)        # ... and it walks again
+        o._build_lidarr_artist_index = lambda: {"someone": {"id": 1}}
+        o.maybe_audit_library()                     # complete: recorded
+        o.maybe_audit_library()
+        self.assertEqual(len(self.walks), 3)        # unchanged library skipped
+
+    def test_a_pass_in_which_lidarr_failed_is_not_recorded(self):
+        o = self._orch()
+        o.maybe_audit_library()                     # complete, recorded
+        (self.root / "Artist" / "New Album").mkdir()
+        (self.root / "Artist" / "New Album" / "01.flac").write_bytes(b"x")
+
+        def failing(name, idx):
+            o.lidarr.failure_generation += 1
+            return None
+        o._lidarr_lookup_artist = failing
+        o.maybe_audit_library()                     # changed: walks, fails
+        o._lidarr_lookup_artist = lambda name, idx: None
+        o.maybe_audit_library()                     # must not skip
+        self.assertEqual(len(self.walks), 3)
+
+    def test_each_pass_replaces_the_report_and_the_marker_is_state(self):
+        import json
+        from orchestrator import Orchestrator
+        o = self._orch()
+        o.maybe_audit_library()                     # first run: dry run
+        self.assertEqual([r[-1] for r in self._rows()[1:]], [""])
+        o._library_audit_ran = False                # a restart
+        o.maybe_audit_library()                     # act
+        rows = self._rows()
+        self.assertEqual(rows[0], Orchestrator._AUDIT_CSV_HEADER)
+        self.assertEqual([r[-1] for r in rows[1:]],
+                         ["artist-missing-no-auto-add"])
+        self.assertTrue(json.loads(self.state.read_text())["first_run_complete"])
+
+    def test_a_legacy_marker_row_moves_to_the_state_file(self):
+        import csv
+        from orchestrator import Orchestrator
+        o = self._orch()
+        with self.report.open("w", encoding="utf-8", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(Orchestrator._AUDIT_CSV_HEADER)
+            w.writerow([Orchestrator._AUDIT_MARKER_SENTINEL] + [""] * 7)
+            w.writerows([["old"] * 8] * 3)
+        o.maybe_audit_library()
+        o._library_audit_ran = False
+        o.maybe_audit_library()                     # the marker row is gone
+        self.assertEqual([r[-1] for r in self._rows()[1:]],
+                         ["artist-missing-no-auto-add"])     # still act mode
+
+    def test_a_state_that_cannot_be_saved_is_a_warning(self):
+        o = self._orch()
+        self.state.mkdir()                          # os.replace onto it fails
+        with self.assertLogs("orchestrator", "WARNING") as cm:
+            o.maybe_audit_library()
+        self.assertTrue(any("could not save" in m for m in cm.output))
+        o.maybe_audit_library()
+        self.assertEqual(len(self.walks), 2)        # nothing recorded: walks
 
 
 class SearchStateIsCheckpointed(unittest.TestCase):

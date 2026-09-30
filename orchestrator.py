@@ -8547,37 +8547,108 @@ class Orchestrator:
                     return rec
         return None
 
+    def _audit_state_path(self) -> Optional[Path]:
+        """library_audit.state.json beside the report: the first-run marker
+        and the signature of the last COMPLETE pass (maybe_audit_library)."""
+        rf = self.cfg.library_audit_report_file
+        return rf.with_suffix(".state.json") if rf else None
+
+    def _audit_load_state(self) -> Dict[str, Any]:
+        p = self._audit_state_path()
+        if p is None:
+            return {}
+        try:
+            with p.open("r", encoding="utf-8") as fh:
+                st = json.load(fh)
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError) as exc:
+            logger.warning("audit: could not read %s: %s", p, exc)
+            return {}
+        return st if isinstance(st, dict) else {}
+
+    def _audit_save_state(self, **fields: Any) -> bool:
+        """Merge `fields` into the state file through a tmp file and
+        os.replace, and say so at WARNING when that fails. The signature used
+        to be written in place with its OSError logged at debug: live,
+        /config/library_audit.sig was root-owned (0:0 644, 15 Aug) and the
+        container runs as 99:100, so no pass ever saved it and every pass
+        walked all 7,176 albums (~50 min) and re-sent the same imports (orch2
+        F5). The replace needs only the directory to be writable, not the
+        file."""
+        p = self._audit_state_path()
+        if p is None:
+            return False
+        state = self._audit_load_state()
+        state.update(fields)
+        tmp = p.with_name(p.name + ".tmp")
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with tmp.open("w", encoding="utf-8") as fh:
+                json.dump(state, fh)
+            os.replace(tmp, p)
+            return True
+        except OSError as exc:
+            logger.warning("Library audit: could not save %s (%s) -- an "
+                           "unchanged library cannot be skipped until it can",
+                           p, exc)
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            return False
+
     def _audit_load_report(self, path: Path) -> tuple[bool, set]:
         """
         Returns (first_run_complete, folders_already_acted).
-        first_run_complete is True if the report CSV exists and contains
-        the marker row. folders_already_acted is always empty -- we
+        first_run_complete lives in the state file. It used to be a marker
+        row in the report, which is now replaced every pass, so a report
+        that still carries one is read once (up to the marker) and the fact
+        moved to the state file before this pass replaces the report.
+        folders_already_acted is always empty -- we
         retry failed actions on every restart rather than trusting that
         a past row with a non-empty action column actually worked.
         In-process dedup still prevents hammering within a single run.
         """
-        first_done = False
         acted: set = set()  # intentionally left empty across restarts
-        try:
-            if not path.exists():
-                return False, acted
-        except OSError:
-            return False, acted
+        if self._audit_load_state().get("first_run_complete"):
+            return True, acted
+        first_done = False
         try:
             with path.open("r", encoding="utf-8", newline="") as fh:
-                rdr = csv.reader(fh)
-                for row in rdr:
-                    if not row:
-                        continue
-                    if row[0] == self._AUDIT_MARKER_SENTINEL:
+                for row in csv.reader(fh):
+                    if row and row[0] == self._AUDIT_MARKER_SENTINEL:
                         first_done = True
-                        continue
-                    # Historic rows are ignored for dedup -- we retry on
-                    # every process start so failed actions (e.g. from an
-                    # earlier, buggy act strategy) get a fresh attempt.
+                        break
+        except FileNotFoundError:
+            pass
         except OSError as exc:
             logger.debug("audit: could not read report %s: %s", path, exc)
+        if first_done:
+            self._audit_save_state(first_run_complete=True)
         return first_done, acted
+
+    def _audit_begin_report(self, path: Path) -> Path:
+        """This pass's report: rows go to <report>.partial as they are found
+        (a killed pass keeps them) and _audit_publish_report puts it in the
+        report's place when the walk ends. The report used to be appended to
+        forever -- 98,428 rows and 33.5 MB since July, re-read every pass to
+        find one marker row."""
+        partial = path.with_name(path.name + ".partial")
+        try:
+            partial.parent.mkdir(parents=True, exist_ok=True)
+            with partial.open("w", encoding="utf-8", newline="") as fh:
+                csv.writer(fh).writerow(self._AUDIT_CSV_HEADER)
+        except OSError as exc:
+            logger.warning("audit: could not start report %s: %s", partial, exc)
+        return partial
+
+    @staticmethod
+    def _audit_publish_report(partial: Path, path: Path) -> None:
+        try:
+            os.replace(partial, path)
+        except OSError as exc:
+            logger.warning("audit: could not replace report %s: %s", path, exc)
 
     def _audit_append_rows(self, path: Path, rows: List[List[str]]) -> None:
         """Append rows to the audit CSV, creating it (with header) if needed."""
@@ -8593,10 +8664,9 @@ class Orchestrator:
         except OSError as exc:
             logger.warning("audit: could not write report %s: %s", path, exc)
 
-    def _audit_write_marker(self, path: Path) -> None:
-        """Write the 'first run complete' sentinel row to the report CSV."""
-        marker_row = [self._AUDIT_MARKER_SENTINEL] + [""] * (len(self._AUDIT_CSV_HEADER) - 1)
-        self._audit_append_rows(path, [marker_row])
+    def _audit_write_marker(self) -> None:
+        """Record 'first run complete' in the state file."""
+        self._audit_save_state(first_run_complete=True)
 
     def _library_signature(self) -> str:
         """
@@ -8636,21 +8706,16 @@ class Orchestrator:
             return ""
         return h.hexdigest()
 
-    def _audit_sig_path(self) -> Optional[Path]:
-        rf = self.cfg.library_audit_report_file
-        return rf.with_suffix(".sig") if rf else None
-
     def maybe_audit_library(self) -> int:
         """
         Scheduled entry point: run the disk-vs-Lidarr audit ONLY when the
         library changed since the last run. Compares a cheap dir-signature
         against the stored one; if identical, skips the whole walk. After a
-        real audit, stores the post-audit signature so the next cycle
+        COMPLETE audit, stores the post-audit signature so the next cycle
         compares against the settled state.
         """
         if not self.cfg.library_audit_report_file:
             return 0
-        sig_path = self._audit_sig_path()
         # FIRST PASS AFTER A RESTART ALWAYS WALKS. The signature gate skips the
         # ENTIRE audit in one shot, so a stale one hides every outstanding
         # discrepancy indefinitely -- the library does not change, so the
@@ -8660,19 +8725,15 @@ class Orchestrator:
         # or new config, which is exactly when the previous verdict is least
         # trustworthy. The per-item ledgers (sweep, deselect) are unaffected --
         # those avoid repeating work item by item rather than skipping the pass.
+        # "Ran" means a pass that COMPLETED: an aborted first pass must not let
+        # the second one skip on the signature stored before the restart.
         first_after_start = not getattr(self, "_library_audit_ran", False)
         if first_after_start:
             logger.info("Library audit: first pass since startup -- walking in "
                         "full, ignoring the change signature")
-        self._library_audit_ran = True
         if self.cfg.library_audit_skip_unchanged and not first_after_start:
             sig = self._library_signature()
-            last = ""
-            try:
-                if sig and sig_path and sig_path.exists():
-                    last = sig_path.read_text(encoding="utf-8").strip()
-            except OSError:
-                last = ""
+            last = str(self._audit_load_state().get("signature") or "")
             if sig and sig == last:
                 # #8(b): the walk is correctly skipped when nothing changed --
                 # keep this quiet (debug) so it doesn't spam the log every
@@ -8682,26 +8743,34 @@ class Orchestrator:
                     "(signature unchanged) -- skipping walk.",
                 )
                 return 0
-        result = self.audit_library_vs_lidarr()
+        result, complete = self.audit_library_vs_lidarr()
+        # Only a COMPLETE pass may be recorded: the signature says "this
+        # library was audited", and the next pass skips on it until the disk
+        # changes. It used to be written after any return -- including 27 Sep
+        # 13:33:22 "Lidarr returned no artists ... Aborting this pass", which
+        # walked nothing -- so a working write would have hidden every
+        # discrepancy behind one outage (orch2 F5).
+        if not complete:
+            return result
+        self._library_audit_ran = True
         # Store the POST-audit signature (the audit may have added albums),
         # so a follow-up cycle with nothing new correctly skips.
-        try:
-            post = self._library_signature()
-            if post and sig_path:
-                sig_path.write_text(post, encoding="utf-8")
-        except OSError as exc:
-            logger.debug("audit: could not persist signature: %s", exc)
+        post = self._library_signature()
+        if post:
+            self._audit_save_state(signature=post)
         return result
 
     @staticmethod
-    def _claimed_dirs(dirs, who: str):
+    def _claimed_dirs(dirs, who: str, busy: Optional[list] = None):
         """Yield each of `dirs` while this thread holds its claim, released
         before the next one. A folder another worker holds is skipped (no
-        verdict, no row); the next pass sees it again."""
+        verdict, no row) and added to `busy`; the next pass sees it again."""
         for d in dirs:
             if not claims.claim(d):
                 logger.info("%s: %s is being processed right now -- next pass",
                             who, d)
+                if busy is not None:
+                    busy.append(d)
                 continue
             try:
                 yield d
@@ -8727,14 +8796,17 @@ class Orchestrator:
                         02 - Track.flac
                         ...
 
-        Returns the count of discrepancies found this pass.
+        Returns (discrepancies found this pass, complete). Complete means
+        every artist and album folder was examined, every repair ran to its
+        end, and no Lidarr call failed meanwhile -- only such a pass may be
+        recorded as done (maybe_audit_library).
         """
         root = self.cfg.library_root_windows
         if not root:
             logger.warning(
                 "Library audit: library_root_windows not configured; skipping"
             )
-            return 0
+            return 0, False
         try:
             if not root.exists():
                 logger.warning(
@@ -8742,10 +8814,10 @@ class Orchestrator:
                     "skipping",
                     root,
                 )
-                return 0
+                return 0, False
         except OSError as exc:
             logger.warning("Library audit: stat of %s failed: %s", root, exc)
-            return 0
+            return 0, False
 
         report_file = self.cfg.library_audit_report_file
         if not report_file:
@@ -8753,7 +8825,7 @@ class Orchestrator:
                 "Library audit: no report file configured (library_audit_report_file "
                 "is null); skipping. Set a path in config.yaml to enable."
             )
-            return 0
+            return 0, False
 
         first_run_done, already_acted = self._audit_load_report(report_file)
         in_act_mode = first_run_done
@@ -8773,6 +8845,8 @@ class Orchestrator:
         # lifetime.
         self._audit_cycled_album_ids = set()
 
+        # Any Lidarr failure from here on makes the pass incomplete.
+        gen0 = self._lidarr_generation()
         # One bulk fetch of Lidarr's artist list, indexed by sanitized name.
         artist_index = self._build_lidarr_artist_index()
         if not artist_index:
@@ -8781,7 +8855,7 @@ class Orchestrator:
                 "every on-disk album will look like a discrepancy. "
                 "Aborting this pass."
             )
-            return 0
+            return 0, False
 
         # Per-artist album index, lazily built when we first need it.
         album_index_by_artist: Dict[int, Dict[str, Dict[str, Any]]] = {}
@@ -8852,12 +8926,15 @@ class Orchestrator:
         new_actions: List[tuple] = []  # (album_dir, row_index)
         scanned_artists = scanned_albums = 0
         now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        # What this pass could not examine or finish (see Returns).
+        unlisted = unreadable = failed = 0
+        busy: List[Path] = []
 
         try:
             artist_children = sorted(root.iterdir())
         except OSError as exc:
             logger.warning("Library audit: cannot iterate %s: %s", root, exc)
-            return 0
+            return 0, False
 
         # Pre-filter to directories only (excluding hidden/system) so the
         # progress denominator reflects actual artist-folder candidates,
@@ -8873,6 +8950,7 @@ class Orchestrator:
                 continue
             candidate_artists.append(d)
         total_artists = len(candidate_artists)
+        report_partial = self._audit_begin_report(report_file)
         logger.info(
             "Library audit: walking %d top-level folders under %s "
             "(Lidarr knows %d artists)",
@@ -8911,15 +8989,17 @@ class Orchestrator:
                 # Unknown this pass, not empty: no rows, no repairs.
                 logger.info("audit: Lidarr could not list %s's albums -- "
                             "skipped this pass", artist_dir.name)
+                unlisted += 1
                 continue
 
             try:
                 album_children = self._library_album_dirs(artist_dir)
             except OSError as exc:
                 logger.debug("audit: cannot iterate %s: %s", artist_dir, exc)
+                unreadable += 1
                 continue
 
-            for album_dir in self._claimed_dirs(album_children, "audit"):
+            for album_dir in self._claimed_dirs(album_children, "audit", busy):
                 try:
                     if not album_dir.is_dir():
                         continue
@@ -9333,6 +9413,7 @@ class Orchestrator:
                             "audit: import of %s failed: %s", album_dir, exc,
                         )
                         action_taken = f"exception: {exc}"
+                        failed += 1
 
                 row = [
                     now_iso,
@@ -9354,15 +9435,30 @@ class Orchestrator:
                     idx, total_artists, artist_name_guess, album_name_guess,
                     reason, action_taken or "(dry-run)",
                 )
-                self._audit_append_rows(report_file, [row])
+                self._audit_append_rows(report_partial, [row])
+        self._audit_publish_report(report_partial, report_file)
+        lidarr_failed = self._lidarr_generation() != gen0
+        complete = not (unlisted or unreadable or busy or failed
+                        or lidarr_failed)
+        if not complete:
+            logger.info(
+                "Library audit: pass incomplete (%d artist(s) Lidarr could not "
+                "list, %d unreadable, %d folder(s) busy, %d repair(s) failed, "
+                "Lidarr failed meanwhile=%s) -- not recorded as done; the next "
+                "pass walks again",
+                unlisted, unreadable, len(busy), failed, lidarr_failed)
         if not in_act_mode:
-            # First run: record the marker so the NEXT pass enters act mode.
-            self._audit_write_marker(report_file)
+            # First run: record the marker so the NEXT pass enters act mode --
+            # after a complete one only, or act mode would start on folders
+            # the dry run never showed.
+            if complete:
+                self._audit_write_marker()
             logger.info(
                 "Library audit (dry run): scanned %d artist folders, %d album "
-                "folders; %d discrepancies written to %s. Next pass will act "
-                "on new/unacted discrepancies.",
+                "folders; %d discrepancies written to %s. Next pass will %s.",
                 scanned_artists, scanned_albums, len(discrepancies), report_file,
+                "act on new/unacted discrepancies" if complete
+                else "repeat the dry run",
             )
         else:
             acted_this_pass = sum(1 for d in discrepancies if d[-1] and not d[-1].startswith("exception"))
@@ -9373,7 +9469,7 @@ class Orchestrator:
                 scanned_artists, scanned_albums, len(discrepancies),
                 acted_this_pass, report_file,
             )
-        return len(discrepancies)
+        return len(discrepancies), complete
 
     def _make_staging_dir(
         self, cue: Cue, cue_path: Path, audio_path: Path
