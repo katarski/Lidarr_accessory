@@ -1079,5 +1079,158 @@ class HandoffKeepsWhatLidarrDidNotTake(unittest.TestCase):
         self.assertFalse(self.folder.exists())
 
 
+class _Held:
+    def __init__(self, paths=()):
+        self.items = {str(p): "failed" for p in paths}
+
+    def add(self, source_path, **kw):
+        self.items[source_path] = kw.get("outcome")
+
+    def remove_by_path(self, p):
+        return self.items.pop(str(p), None) is not None
+
+
+class DiscCuesAreOneAlbum(unittest.TestCase):
+    """orch2 F3 / loops F6: every disc .cue of a multi-disc album resolves to
+    the album root. One hand-off per pass, one outcome and one attempt count
+    for every disc .cue, one held entry at the root, and the album's clean-up
+    is the root and all its disc .cues."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        base = Path(self._tmp.name)
+        self.cfgdir = base / "config"
+        self.cfgdir.mkdir()
+        self.dl = base / "downloads"
+        self.album = self.dl / "Artist - Box (4CD)"
+        self.cues = []
+        for n in range(1, 5):
+            d = self.album / f"CD{n:02d}"
+            d.mkdir(parents=True)
+            for t in ("01.flac", "02.flac"):
+                (d / t).write_bytes(b"x")
+            c = d / f"Box (CD{n:02d}).cue"
+            c.write_text("FILE x", encoding="utf-8")
+            self.cues.append(c)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _orch(self, outcome="skipped_unmonitored", held=()):
+        import threading
+        from types import SimpleNamespace
+        import orchestrator as O
+        o = O.Orchestrator.__new__(O.Orchestrator)
+        o.cfg = SimpleNamespace(
+            watch_root=self.dl, wait_for_lidarr=False,
+            ledger_file=self.cfgdir / "ledger.csv", cue_ledger_enabled=True,
+            cue_ledger_file=self.cfgdir / "cue_seen.json",
+            cue_ledger_max_attempts=3, cue_ledger_ttl_days=90,
+            delete_cue_if_pre_split=True, delete_source_folder_on_success=False)
+        o._skip_seen = O._SeenSet(86400)
+        o._tl, o._ledger_lock = threading.local(), threading.Lock()
+        o._repair_temps = set()
+        o.lidarr = SimpleNamespace(failure_generation=0)
+        o.held = _Held(held)
+        o.handoffs = []
+        o._wait_for_stability = lambda c: True
+        o._looks_pre_split = lambda f: True
+        o._cue_is_single_image = lambda c: False
+        o._add_held_one = lambda folder, oc, reason, artist="", album="": \
+            o.held.add(str(folder), outcome=oc)
+
+        def handoff(cue, folder, reason=""):
+            o.handoffs.append((cue, folder))
+            o._skip_seen.add(cue)                  # as _handoff_inner does
+            o._record(cue, outcome=outcome, pre_split=True, reason="t")
+        o._handoff_pre_split_to_lidarr = handoff
+        return o
+
+    def _pass(self, o):
+        for c in self.cues:
+            o.process(c)
+        return o
+
+    def _ledger(self):
+        import json
+        led = json.loads((self.cfgdir / "cue_seen.json").read_text("utf-8"))
+        return led["cues"]
+
+    def test_a_disc_cue_resolves_to_its_album(self):
+        import orchestrator as O
+        o = self._orch()
+        self.assertEqual(o._multidisc_cue_unit(self.cues[2]),
+                         (self.album, self.cues))
+        loose = self.dl / "Single" / "x.cue"
+        loose.parent.mkdir()
+        loose.write_text("x", encoding="utf-8")
+        self.assertIsNone(o._multidisc_cue_unit(loose))
+        for n in (1, 2):                  # CD1/CD2 loose in the watch root
+            (self.dl / f"CD{n}").mkdir()
+        (self.dl / "CD1" / "a.cue").write_text("x", encoding="utf-8")
+        self.assertIsNone(o._multidisc_cue_unit(self.dl / "CD1" / "a.cue"))
+        seen = []
+        real = O.claims.claim
+        with mock.patch("orchestrator.claims.claim",
+                        side_effect=lambda p, wait=False: seen.append(Path(p))
+                        or real(p, wait)):
+            o.process(self.cues[1])
+        self.assertEqual(seen[0], self.album)   # the job holds the album
+        self.assertNotIn(O.claims._norm(self.album), O.claims._held)
+
+    def test_one_handoff_per_pass_and_one_count(self):
+        for n in (1, 2, 3):                     # three restarts
+            o = self._pass(self._orch())
+            self.assertEqual(o.handoffs, [(self.cues[0], self.album)])
+            led = self._ledger()
+            self.assertEqual(
+                {tuple(led[str(c)][2:]) for c in self.cues},
+                {("skipped_unmonitored", n, str(self.album))})
+        o = self._pass(self._orch())            # the ALBUM gave up after 3
+        self.assertEqual(o.handoffs, [])
+
+    def test_the_album_is_one_held_entry(self):
+        discs = [c.parent for c in self.cues]
+        o = self._pass(self._orch(held=discs))  # the per-disc leftovers
+        self.assertEqual(o.held.items, {str(self.album): "skipped_unmonitored"})
+        o = self._pass(self._orch(outcome="imported_via_manual"))
+        self.assertEqual(o.held.items, {})
+
+    def test_a_changed_cue_is_done_again(self):
+        self._pass(self._orch(outcome="imported_via_manual"))
+        self.assertEqual(self._pass(self._orch()).handoffs, [])
+        self.cues[2].write_text("FILE x\nREM edited", encoding="utf-8")
+        o = self._pass(self._orch())
+        self.assertEqual(o.handoffs, [(self.cues[2], self.album)])
+
+    def test_a_single_image_disc_is_split_on_its_own(self):
+        o = self._orch()
+        o._cue_is_single_image = lambda c: True
+        split = []
+        o._find_companion_candidates = lambda c: split.append(c) or []
+        self._pass(o)
+        self.assertEqual(split, self.cues)
+        self.assertEqual([f for _, f in o.handoffs],
+                         [c.parent for c in self.cues])
+        self.assertTrue(all(len(v) == 4 for v in self._ledger().values()))
+
+    def test_the_album_cleanup_is_the_root_and_every_disc_cue(self):
+        for f in self.album.rglob("*.flac"):   # Lidarr took every disc
+            f.unlink()
+        o = self._orch()
+        o._tl.unit = (self.cues[0], self.album, self.cues)
+        o._finish_handoff_source(
+            self.cues[0], self.album, [], artist_name="A", album_name="B",
+            artist_id=1, expected_tracks=8, context="t", reason="t")
+        self.assertEqual([c for c in self.cues if c.exists()], [])
+        o.cfg.delete_source_folder_on_success = True
+        gone = []
+        o._delete_source_folder = lambda s, **k: gone.append(s.parent)
+        o._finish_handoff_source(
+            self.cues[0], self.album, [], artist_name="A", album_name="B",
+            artist_id=1, expected_tracks=8, context="t", reason="t")
+        self.assertEqual(gone, [self.album])
+
+
 if __name__ == "__main__":
     unittest.main()

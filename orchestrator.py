@@ -177,6 +177,15 @@ def _is_pre_split_reason(reason: str) -> bool:
     return any(m in r for m in _PRE_SPLIT_REASON_MARKERS)
 
 
+def _source_sentinel(cue_path: Optional[Path], folder: Path) -> Path:
+    """What _delete_source_folder is given for a hand-off of `folder`: it
+    removes the .parent, so a child of `folder`. Never the .cue as it lies: a
+    disc .cue hands off its album ROOT and a sidecar .cue the album one level
+    up, and the .cue's own folder is then only a part of what was imported
+    and judged."""
+    return folder / (cue_path.name if cue_path is not None else ".cueless_sweep")
+
+
 def _iso_ts(value) -> float:
     """Epoch seconds of an ISO-8601 stamp from Lidarr, or 0.0."""
     if not value:
@@ -984,8 +993,11 @@ class Orchestrator:
         self._repair_temps = set()
         # The CUE's folder is this job's for its whole run: nothing else in the
         # process deletes it or removes its torrent meanwhile (see claims). If
-        # a sweep hand-off holds it, wait for that to finish.
-        folder = Path(cue_path).parent
+        # a sweep hand-off holds it, wait for that to finish. A disc .cue's
+        # job can be its whole album (CD 3.cue hands off the album root), so
+        # it holds the root (loops F6).
+        unit = self._multidisc_cue_unit(cue_path)
+        folder = unit[0] if unit is not None else Path(cue_path).parent
         claims.claim(folder, wait=True)
         try:
             staging_dir = self._process(cue_path)
@@ -1066,10 +1078,12 @@ class Orchestrator:
             # neXt fits 12 files", because the album is a single 25-track
             # release and half of it was being offered on its own. Hand off the
             # album root with every disc so Lidarr sees all 25 at once.
+            album = None
             if self._DISC_SUBDIR_RE.match(target.name or ""):
                 parent = target.parent
                 discs = self._present_disc_subfolders(parent)
-                if len(discs) > 1:
+                unit = self._multidisc_cue_unit(cue_path)
+                if len(discs) > 1 and unit is not None:
                     allaudio: List[Path] = []
                     for d in discs:
                         allaudio.extend(self._sibling_audio_files(d))
@@ -1079,15 +1093,36 @@ class Orchestrator:
                             "%d tracks together (as ONE album, not one handoff "
                             "per disc)", parent.name, len(discs), len(allaudio))
                         target, audios = parent, allaudio
+                        album = unit
             logger.info(
                 "Folder %s looks pre-split (%d audio files, no dominant "
                 "disc image) -- handing off to Lidarr.",
                 target, len(audios),
             )
-            self._handoff_pre_split_to_lidarr(
-                cue_path, target,
-                reason=f"{len(audios)} similarly-sized audio files (no disc image)",
-            )
+            # ONE ALBUM, ONE OUTCOME. The hand-off is the album's, so its
+            # verdict is every disc .cue's. Each disc .cue used to hand the
+            # whole root off again and spend its own retries: Nat King Cole's
+            # 4-CD "100 Hits" went to Lidarr 12 times in an hour, the Slim
+            # Harpo 5CD box 4 times. And once an album import had taken the
+            # audio, the other discs' empty folders were logged "No companion
+            # audio" and recorded as failures (loops F6, orch2 F3). _record,
+            # _cue_ledger_mark and _delete_orphan_cue read this.
+            self._tl.unit = ((cue_path,) + album) if album else None
+            try:
+                self._handoff_pre_split_to_lidarr(
+                    cue_path, target,
+                    reason=f"{len(audios)} similarly-sized audio files (no disc image)",
+                )
+            finally:
+                self._tl.unit = None
+            if album and cue_path in self._skip_seen:
+                others = [c for c in album[1] if c != cue_path]
+                for c in others:
+                    self._skip_seen.add(c)
+                if others:
+                    logger.info(
+                        "multi-disc album %r: %s handled with this hand-off",
+                        album[0].name, ", ".join(c.name for c in others))
             return None
 
         candidates = self._find_companion_candidates(cue_path)
@@ -2392,11 +2427,9 @@ class Orchestrator:
         )
         if ok_to_delete:
             if self.cfg.delete_source_folder_on_success:
-                sentinel = (
-                    cue_path if cue_path is not None else folder / ".cueless_sweep"
-                )
                 self._delete_source_folder(
-                    sentinel, artist_name=artist_name, album_name=album_name,
+                    _source_sentinel(cue_path, folder),
+                    artist_name=artist_name, album_name=album_name,
                     artist_id=aid, expected_tracks=len(audios),
                     context="force-import")
             elif self.cfg.delete_originals_on_success:
@@ -3329,17 +3362,25 @@ class Orchestrator:
             return None            # the .cue itself changed -> redo it
         when = datetime.fromtimestamp(
             float(ts), timezone.utc).isoformat(timespec="seconds")
+        with_album = (", with its album %s" % Path(str(rec[4])).name
+                      if len(rec) > 4 and rec[4] else "")
         if outcome not in self._CUE_RETRYABLE:
-            return f"already handled ({outcome} at {when})"
+            return f"already handled ({outcome} at {when}{with_album})"
         cap = max(1, int(getattr(self.cfg, "cue_ledger_max_attempts", 3)))
         if attempts >= cap:
             return (f"gave up after {attempts} attempt(s) ({outcome} at "
-                    f"{when}); it is in the WebUI needs-attention list -- "
-                    f"replace or edit the .cue to retry")
+                    f"{when}{with_album}); it is in the WebUI needs-attention "
+                    f"list -- replace or edit the .cue to retry")
         return None
 
     def _cue_ledger_mark(self, cue_path: Path, outcome: str) -> None:
-        """Record a DECIDED verdict for this CUE and flush it immediately."""
+        """Record a DECIDED verdict for this CUE and flush it immediately.
+
+        While the CUE's multi-disc album hand-off runs (see _process), the
+        verdict is the album's: every disc .cue of it gets it, each under its
+        own signature (a changed .cue is still done again), with ONE attempt
+        count -- the album was tried once, not once per disc. The album root
+        is kept as a fifth field."""
         if not getattr(self.cfg, "cue_ledger_enabled", True):
             return
         try:
@@ -3350,15 +3391,28 @@ class Orchestrator:
         sig = self._cue_signature(Path(cue_path))
         if not sig:
             return                 # gone from disk -> nothing to remember
+        tl = getattr(self, "_tl", None)
+        unit = getattr(tl, "unit", None) if tl is not None else None
+        if unit is not None and Path(cue_path) != unit[0]:
+            unit = None
+        members = {str(cue_path): sig}
+        for c in (unit[2] if unit is not None else ()):
+            csig = self._cue_signature(Path(c))
+            if csig:
+                members.setdefault(str(c), csig)
         led = self._cue_ledger()
-        prev = led.get(str(cue_path))
         attempts = 0
-        if (isinstance(prev, list) and len(prev) >= 4 and prev[0] == sig
-                and str(prev[2]) in self._CUE_RETRYABLE):
-            attempts = int(prev[3])
+        for key, ksig in members.items():
+            prev = led.get(key)
+            if (isinstance(prev, list) and len(prev) >= 4 and prev[0] == ksig
+                    and str(prev[2]) in self._CUE_RETRYABLE):
+                attempts = max(attempts, int(prev[3]))
         if outcome in self._CUE_RETRYABLE:
             attempts += 1
-        led[str(cue_path)] = [sig, time.time(), outcome, attempts]
+        now = time.time()
+        extra = [str(unit[1])] if unit is not None else []
+        for key, ksig in members.items():
+            led[key] = [ksig, now, outcome, attempts] + extra
         self._cue_ledger_save()
 
     def _dvda_rip_in_progress(
@@ -4540,6 +4594,41 @@ class Orchestrator:
             pass
         return out
 
+    def _multidisc_cue_unit(
+        self, cue_path: Path,
+    ) -> Optional[Tuple[Path, List[Path]]]:
+        """
+        The album a disc .cue belongs to: (its root, every .cue in the root's
+        CD1/Disc 2/... folders) when the .cue sits in one of two or more such
+        folders -- else None. Structure only: once an album import has taken
+        the audio, the disc folders are empty but are still that album's
+        discs. Never the watch root itself: loose CD1/CD2 folders there are
+        not one album.
+        """
+        disc = Path(cue_path).parent
+        if not self._DISC_SUBDIR_RE.match(disc.name or ""):
+            return None
+        root = disc.parent
+        try:
+            wr = getattr(self.cfg, "watch_root", None)
+            if wr is not None and (root.resolve(strict=False)
+                                   == Path(wr).resolve(strict=False)):
+                return None
+            discs = sorted(p for p in root.iterdir() if p.is_dir()
+                           and self._DISC_SUBDIR_RE.match(p.name or ""))
+        except OSError:
+            return None
+        if len(discs) < 2:
+            return None
+        cues: List[Path] = []
+        for d in discs:
+            try:
+                cues.extend(sorted(p for p in d.iterdir()
+                                   if p.suffix.lower() == ".cue" and p.is_file()))
+            except OSError:
+                continue
+        return root, cues
+
     def _present_disc_subfolders(self, parent: Path) -> List[Path]:
         """Immediate CD1/Disc 2/... subfolders of `parent` that hold audio."""
         subs: List[Path] = []
@@ -5348,10 +5437,10 @@ class Orchestrator:
         deleting = bool(self.cfg.delete_source_folder_on_success
                         or self.cfg.delete_originals_on_success)
         if self.cfg.delete_source_folder_on_success:
-            sentinel = cue_path if cue_path is not None else folder / ".cueless_sweep"
             self._delete_source_folder(
-                sentinel, verified=True, artist_name=artist_name,
-                album_name=album_name, context="already in library (sweep)")
+                _source_sentinel(cue_path, folder), verified=True,
+                artist_name=artist_name, album_name=album_name,
+                context="already in library (sweep)")
         else:
             if self.cfg.delete_originals_on_success:
                 for a in audios:
@@ -6636,12 +6725,9 @@ class Orchestrator:
                 f"{len(left[1])} never sent")
             return
         if self.cfg.delete_source_folder_on_success:
-            # _delete_source_folder takes a cue_path and removes its .parent --
-            # for the CUE-less sweep, synthesize a child path so the correct
-            # folder is targeted.
-            sentinel = cue_path if cue_path is not None else folder / ".cueless_sweep"
             self._delete_source_folder(
-                sentinel, artist_name=artist_name, album_name=album_name,
+                _source_sentinel(cue_path, folder),
+                artist_name=artist_name, album_name=album_name,
                 artist_id=artist_id, expected_tracks=expected_tracks,
                 context=context)
         else:
@@ -13366,15 +13452,23 @@ class Orchestrator:
         """
         if cue_path is None or not self.cfg.delete_cue_if_pre_split:
             return
-        try:
-            if cue_path.exists():
-                cue_path.unlink()
-                logger.info(
-                    "Deleted orphan pre-split CUE %s (%s, after verified import)",
-                    cue_path.name, reason,
-                )
-        except OSError as exc:
-            logger.warning("Could not delete orphan CUE %s: %s", cue_path, exc)
+        # A multi-disc album's hand-off imported every disc, so every disc
+        # .cue of it is an orphan now -- not only the one that started it.
+        tl = getattr(self, "_tl", None)
+        unit = getattr(tl, "unit", None) if tl is not None else None
+        cues = [cue_path]
+        if unit is not None and Path(cue_path) == unit[0]:
+            cues += [Path(c) for c in unit[2] if Path(c) != Path(cue_path)]
+        for c in cues:
+            try:
+                if c.exists():
+                    c.unlink()
+                    logger.info(
+                        "Deleted orphan pre-split CUE %s (%s, after verified "
+                        "import)", c.name, reason,
+                    )
+            except OSError as exc:
+                logger.warning("Could not delete orphan CUE %s: %s", c, exc)
 
     def _delete_originals(self, cue_path: Path, audio_path: Path) -> None:
         """
@@ -13448,7 +13542,19 @@ class Orchestrator:
         except Exception as exc:  # noqa: BLE001 (bookkeeping is never fatal)
             logger.debug("cue ledger mark failed for %s: %s", cue_path, exc)
         # Keep the manual-attention WebUI store (#11) in sync with this outcome.
-        self._update_held(cue_path, outcome, artist, album, track_count, reason)
+        # A multi-disc album's hand-off is ONE entry, at its root -- not one
+        # per disc folder, which is where the per-disc hand-offs put them.
+        unit = getattr(tl, "unit", None) if tl is not None else None
+        if unit is not None and Path(cue_path) == unit[0]:
+            held = getattr(self, "held", None)
+            if held is not None:
+                for d in {Path(c).parent for c in unit[2]}:
+                    held.remove_by_path(str(d))
+            self._update_held(unit[1], outcome, artist, album, track_count,
+                              reason)
+        else:
+            self._update_held(cue_path, outcome, artist, album, track_count,
+                              reason)
 
     # Outcomes that mean "the pipeline gave up and left the files on disk for
     # the user" -- these show up in the WebUI. Both reliably PRESERVE the
