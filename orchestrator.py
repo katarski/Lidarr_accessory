@@ -11191,13 +11191,16 @@ class Orchestrator:
 
     def _comp_missing_tracks(self, album_id):
         """
-        The album's missing tracks as [{title, duration}] (duration in seconds).
+        The album's missing tracks as [{title, duration}] (duration in seconds),
+        or None when Lidarr could not be asked -- its client answers [] on a
+        failure, and that must not read as "nothing is missing".
 
         Read from LIDARR rather than the assembly plan, because the plan records
         no durations and duration is the check that tells a 1930s studio side
         from a later live take of the same standard.
         """
         out = []
+        gen = self._lidarr_generation()
         try:
             for t in (self.lidarr.list_tracks_for_album(int(album_id)) or []):
                 if t.get("hasFile"):
@@ -11210,6 +11213,9 @@ class Orchestrator:
         except Exception as exc:  # noqa: BLE001
             logger.warning("compilation hunt: track list failed for %s: %s",
                            album_id, exc)
+            return None
+        if self._lidarr_generation() != gen:
+            return None
         return out
 
     def _comp_lookup(self, album_id, plan, comp):
@@ -11218,12 +11224,19 @@ class Orchestrator:
         cache the ranked answer in the plan.
 
         Cached because it costs one rate-limited request per missing track (~34
-        seconds for this album) and the answer is stable metadata. Returns the
-        ranked list, or [] when it could not be worked out.
+        seconds for this album) and the answer is stable metadata. Returns True
+        when the answer is one -- comp["titles"] is then what MusicBrainz
+        names, possibly nothing -- and False when Lidarr or MusicBrainz could
+        not be asked. An outage used to be stored as "MusicBrainz names no
+        compilation" and switched the hunt off for good; a partial walk was
+        cached for 7 days as the whole answer (orch3 COMP-NEG-1). Now a partial
+        answer is used for this pass only: comp["looked_up"] (the cache stamp)
+        is set only for a complete one.
         """
         mb = self._get_mb()
         if mb is None:
-            return []
+            return False
+        gen = self._lidarr_generation()
         try:
             full = self.lidarr.get_album(int(album_id)) or {}
             artist_id = int((full.get("artist") or {}).get("id")
@@ -11234,31 +11247,55 @@ class Orchestrator:
             artist_name = str(art.get("artistName") or plan.get("artist") or "")
         except Exception as exc:  # noqa: BLE001
             logger.warning("compilation hunt: Lidarr lookup failed: %s", exc)
-            return []
+            return False
+        if self._lidarr_generation() != gen:
+            logger.info("compilation hunt: Lidarr failed while reading album %s "
+                        "-- asked again next pass", album_id)
+            return False
         if not arid:
             logger.warning("compilation hunt: no MusicBrainz artist id for %r",
                            artist_name)
-            return []
+            comp["titles"] = []
+            return True
         tracks = self._comp_missing_tracks(album_id)
+        if tracks is None:
+            logger.info("compilation hunt: Lidarr failed while listing the "
+                        "missing tracks of album %s -- asked again next pass",
+                        album_id)
+            return False
         if not tracks:
-            return []
+            comp["titles"] = []
+            return True
         album_title = str(plan.get("album") or full.get("title") or "")
         logger.info("compilation hunt: asking MusicBrainz which compilations "
                     "carry %d missing song(s) of %s / %s (about %ds -- one "
                     "request a second)", len(tracks), artist_name, album_title,
                     min(len(tracks), int(getattr(
                         self.cfg, "comp_hunt_max_tracks", 40))))
-        comps = mb.compilations_for_tracks(
+        comps, complete = mb.compilations_for_tracks(
             tracks, arid, artist_name=artist_name,
             tolerance=float(getattr(self.cfg, "harvest_duration_tolerance", 10.0)),
             collections_only=bool(getattr(
                 self.cfg, "comp_hunt_collections_only", True)),
             exclude=[album_title],
             max_tracks=int(getattr(self.cfg, "comp_hunt_max_tracks", 40)))
+        if not complete:
+            logger.info("compilation hunt: MusicBrainz could not be asked about "
+                        "every missing song of %s / %s -- using the %d "
+                        "compilation(s) found so far for this pass only; asked "
+                        "again next pass", artist_name, album_title, len(comps))
+            if comps:
+                comp["titles"] = [{"title": c["title"],
+                                   "coverage": c["coverage"]}
+                                  for c in comps[:60]]
+                comp["artist_name"] = artist_name
+            return False
         if not comps:
             logger.info("compilation hunt: MusicBrainz named no compilation for "
                         "%s / %s", artist_name, album_title)
-            return []
+            comp["titles"] = []
+            comp["looked_up"] = time.time()
+            return True
         # Only the head of the list is worth keeping: it is ordered by how many
         # of the missing songs each release carries, and the tail is single-song
         # repackages that are no better than the artist-level search.
@@ -11271,7 +11308,7 @@ class Orchestrator:
                     "best is %r with %d of %d",
                     len(comps), keep[0]["title"][:60], keep[0]["coverage"],
                     len(tracks))
-        return comp["titles"]
+        return True
 
     def assembly_find_compilation(self, album_id):
         """
@@ -11320,10 +11357,15 @@ class Orchestrator:
         comp = dict(plan.get("comp") or {})
         # (1)+(2) MusicBrainz, once per cache window.
         age = time.time() - float(comp.get("looked_up") or 0)
+        answered = True
         if not comp.get("titles") or age > float(getattr(
                 self.cfg, "comp_hunt_cache_seconds", 604800)):
-            self._comp_lookup(album_id, plan, comp)
+            answered = self._comp_lookup(album_id, plan, comp)
         titles = list(comp.get("titles") or [])
+        if not titles and not answered:
+            # Not an answer: the hunt stays as it was and asks again.
+            return False, ("MusicBrainz or Lidarr could not be asked just now "
+                           "-- the hunt stays on and tries again next pass")
         if not titles:
             comp["active"] = False
             comp["note"] = "MusicBrainz names no compilation for these songs"
@@ -12061,11 +12103,20 @@ class Orchestrator:
                 # Couldn't check (network/rate/unknown) -- do NOT record an empty
                 # result as truth, just move on and retry next pass.
                 continue
-            checked += 1
+            # Lidarr's client answers [] when it fails, which made every
+            # MusicBrainz album of the artist "missing from Lidarr" for a week
+            # (orch3 COMP-NEG-1). A failed read records nothing, and the rest
+            # of the pass waits for Lidarr to answer again.
+            gen = self._lidarr_generation()
             try:
                 have = self.lidarr.list_albums_for_artist(int(aid)) or []
             except Exception:  # noqa: BLE001
-                have = []
+                have = None
+            if have is None or self._lidarr_generation() != gen:
+                logger.info("external audit: Lidarr failed listing %s's albums "
+                            "-- nothing recorded; this pass stops here", name)
+                break
+            checked += 1
             have_keys = {_match_key(a.get("title")) for a in have}
             missing = [
                 {"title": g["title"], "year": (g.get("first_release_date") or "")[:4],

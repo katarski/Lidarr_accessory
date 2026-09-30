@@ -144,5 +144,111 @@ class InteractiveSearchState(unittest.TestCase):
         self.assertEqual(saved, [])
 
 
+def _mb_answer(title):
+    return {"recordings": [{"title": title, "releases": [{
+        "title": "Best Of", "id": "r1",
+        "release-group": {"primary-type": "Album",
+                          "secondary-types": ["Compilation"]}}]}]}
+
+
+class CouldNotAskIsNotAnAnswer(unittest.TestCase):
+    """orch3 COMP-NEG-1: a MusicBrainz or Lidarr failure during the
+    compilation hunt or the external audit is not recorded as "no
+    compilation" / "missing from Lidarr"."""
+
+    def _mb(self, down=()):
+        import musicbrainz as M
+        mb = M.MusicBrainzClient.__new__(M.MusicBrainzClient)
+        mb._get = lambda path, **kw: (
+            None if any(d in kw.get("query", "") for d in down)
+            else _mb_answer(kw["query"].split('"')[1]))
+        return mb
+
+    def test_a_failed_song_makes_the_walk_incomplete(self):
+        songs = [{"title": "Song A"}, {"title": "Song B"}]
+        got, complete = self._mb().compilations_for_tracks(songs, "arid")
+        self.assertTrue(complete)
+        self.assertEqual(got[0]["coverage"], 2)
+        got, complete = self._mb(down=("Song B",)).compilations_for_tracks(
+            songs, "arid")
+        self.assertFalse(complete)
+        self.assertEqual(got[0]["tracks"], ["Song A"])     # still used
+
+    def _orch(self, mb, tracks_fail=False):
+        from orchestrator import Orchestrator
+        o = Orchestrator.__new__(Orchestrator)
+        lid = SimpleNamespace(failure_generation=0)
+        lid.get_album = lambda i: {"title": "Album",
+                                   "artist": {"foreignArtistId": "arid",
+                                              "artistName": "Artist"}}
+
+        def tracks(i):
+            if tracks_fail:
+                lid.failure_generation += 1
+                return []
+            return [{"title": "Song A"}, {"title": "Song B"}]
+        lid.list_tracks_for_album = tracks
+        o.lidarr = lid
+        o.cfg = SimpleNamespace(comp_hunt_enabled=True)
+        plans = {1: {"album": "Album", "artist": "Artist",
+                     "missing": [{"track": "Song A"}, {"track": "Song B"}]}}
+        o.assembly = SimpleNamespace(
+            get=lambda i: dict(plans[i]),
+            upsert=lambda i, p: plans.__setitem__(i, p))
+        o._get_prowlarr = lambda: object()
+        o._get_mb = lambda: mb
+        o._comp_search_titles = lambda pw, titles, searched, a, i: ([], "n")
+        return o, plans
+
+    def test_an_outage_leaves_the_hunt_on(self):
+        for mb, fail in ((self._mb(down=("Song",)), False), (self._mb(), True)):
+            o, plans = self._orch(mb, tracks_fail=fail)
+            ok, msg = o.assembly_find_compilation(1)
+            self.assertFalse(ok)
+            self.assertIn("could not be asked", msg)
+            self.assertNotIn("comp", plans[1])       # nothing written
+
+    def test_a_partial_answer_is_used_but_not_cached(self):
+        o, plans = self._orch(self._mb(down=("Song B",)))
+        o.assembly_find_compilation(1)
+        comp = plans[1]["comp"]
+        self.assertEqual(comp["titles"], [{"title": "Best Of", "coverage": 1}])
+        self.assertNotIn("looked_up", comp)
+        self.assertTrue(comp.get("active"))
+
+    def test_a_real_empty_answer_still_ends_the_hunt(self):
+        import musicbrainz as M
+        mb = M.MusicBrainzClient.__new__(M.MusicBrainzClient)
+        mb._get = lambda path, **kw: {"recordings": []}
+        o, plans = self._orch(mb)
+        ok, msg = o.assembly_find_compilation(1)
+        self.assertFalse(plans[1]["comp"]["active"])
+        self.assertIn("does not list", msg)
+
+    def test_the_external_audit_records_nothing_while_lidarr_fails(self):
+        import json
+        import tempfile
+        from orchestrator import Orchestrator
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        o = Orchestrator.__new__(Orchestrator)
+        lid = SimpleNamespace(failure_generation=0)
+        lid.list_artists = lambda: [
+            {"id": i, "monitored": True, "foreignArtistId": "m%d" % i,
+             "artistName": "A%d" % i} for i in (1, 2)]
+
+        def albums(i):
+            lid.failure_generation += 1              # the read failed
+            return []
+        lid.list_albums_for_artist = albums
+        o.lidarr = lid
+        o._mb = SimpleNamespace(release_groups=lambda *a, **k: [
+            {"title": "Studio One", "first_release_date": "1990"}])
+        path = Path(tmp.name) / "audit.json"
+        o.cfg = SimpleNamespace(external_audit_file=path)
+        self.assertEqual(o.external_album_audit_pass(), 0)
+        self.assertEqual(json.loads(path.read_text("utf-8"))["artists"], {})
+
+
 if __name__ == "__main__":
     unittest.main()

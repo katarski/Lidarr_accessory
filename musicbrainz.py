@@ -38,7 +38,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -384,6 +384,15 @@ class MusicBrainzClient:
         self, title: str, artist_mbid: str, duration: float = 0.0,
         tolerance: float = 15.0, limit: int = 100,
     ) -> List[Dict[str, Any]]:
+        """recording_releases_or_none, with "couldn't check" read as []."""
+        return self.recording_releases_or_none(
+            title, artist_mbid, duration=duration, tolerance=tolerance,
+            limit=limit) or []
+
+    def recording_releases_or_none(
+        self, title: str, artist_mbid: str, duration: float = 0.0,
+        tolerance: float = 15.0, limit: int = 100,
+    ) -> Optional[List[Dict[str, Any]]]:
         """
         Every release MusicBrainz knows that carries this artist's recording of
         this song title.
@@ -402,8 +411,9 @@ class MusicBrainzClient:
         rarities are exactly where the metadata is thinnest.
 
         Returns [{title, norm, type, secondary_types, date, mbid}], one entry
-        per (release, recording) pair -- callers dedupe on `norm`. Empty on any
-        failure, which must be read as "couldn't check".
+        per (release, recording) pair -- callers dedupe on `norm`. None when
+        MusicBrainz could not be asked (failure or back-off): that is "couldn't
+        check", never "no release carries it".
         """
         title = str(title or "").strip()
         if not title or not artist_mbid:
@@ -411,8 +421,8 @@ class MusicBrainzClient:
         query = 'recording:"%s" AND arid:%s' % (
             _LUCENE_ESCAPE_RE.sub(r"\\\1", title), artist_mbid)
         data = self._get("/recording", query=query, limit=int(limit))
-        if not data:
-            return []
+        if data is None:
+            return None
         want = norm_release_title(title)
         out: List[Dict[str, Any]] = []
         for rec in (data.get("recordings") or []):
@@ -446,7 +456,7 @@ class MusicBrainzClient:
         artist_name: str = "", tolerance: float = 15.0,
         collections_only: bool = True, exclude: Iterable[str] = (),
         max_tracks: int = 40, on_progress=None,
-    ) -> List[Dict[str, Any]]:
+    ) -> Tuple[List[Dict[str, Any]], bool]:
         """
         Which releases carry the most of a set of wanted tracks -- the heart of
         the find-the-compilation workflow.
@@ -468,13 +478,18 @@ class MusicBrainzClient:
         so this is also the pass length in seconds. `on_progress(done, total,
         title)` is called per track if given.
 
-        Returns [{title, norm, coverage, tracks, type, secondary_types, date,
-        mbid}] sorted by coverage descending. Empty on total failure.
+        Returns ([{title, norm, coverage, tracks, type, secondary_types, date,
+        mbid}] sorted by coverage descending, complete). `complete` is False
+        when any song could not be looked up (MusicBrainz failed or asked us
+        to back off): the list is then only what could be asked -- good for
+        this pass, never an answer to remember. One failed song does not
+        abort the pass; that would throw away the rest of a ~40 s
+        rate-limited walk (orch3 COMP-NEG-1).
         """
         wanted = [t for t in tracks if str(t.get("title") or "").strip()]
         wanted = wanted[:max(1, int(max_tracks))]
         if not wanted or not artist_mbid:
-            return []
+            return [], True
         skip = {norm_release_title(x) for x in exclude}
         skip.discard("")
         artist_key = norm_release_title(artist_name)
@@ -483,11 +498,14 @@ class MusicBrainzClient:
 
         cover: Dict[str, set] = collections.defaultdict(set)
         meta: Dict[str, Dict[str, Any]] = {}
+        complete = True
         for i, trk in enumerate(wanted, 1):
             title = str(trk.get("title") or "").strip()
-            rels = self.recording_releases(
+            rels = self.recording_releases_or_none(
                 title, artist_mbid, duration=float(trk.get("duration") or 0.0),
                 tolerance=tolerance)
+            if rels is None:
+                complete, rels = False, []
             for rel in rels:
                 key = rel["norm"]
                 if key in skip:
@@ -518,4 +536,4 @@ class MusicBrainzClient:
         # Coverage first, then the older release -- an original-issue box set is
         # a likelier torrent than a 2019 streaming-era repackage of it.
         out.sort(key=lambda r: (-r["coverage"], r.get("date") or "9999"))
-        return out
+        return out, complete
