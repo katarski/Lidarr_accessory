@@ -837,6 +837,10 @@ def harvest_pass(
     sources = list(sources)
     if keep_dir and os.path.isdir(keep_dir) and keep_dir not in sources:
         sources.append(keep_dir)
+    if keep_dir and os.path.isdir(keep_dir) and not dry_run:
+        with claims.held(keep_dir) as ok:
+            if ok:
+                dedupe_keep_dir(keep_dir)
     stats = {"sources": 0, "skipped_unchanged": 0, "scanned": 0,
              "matched": 0, "imported": 0, "albums": 0, "no_quality": 0,
              "busy": 0}
@@ -1010,6 +1014,53 @@ def settle_pending_purges(lidarr, ledger, index, tolerance_seconds: float = 10.0
 def _is_within(path: str, root: str) -> bool:
     p, r = os.path.abspath(path), os.path.abspath(root)
     return p == r or p.startswith(r.rstrip(os.sep) + os.sep)
+
+
+def dedupe_keep_dir(keep_dir: str) -> int:
+    """Leave one copy of each song that sits in the keep folder more than
+    once, byte for byte -- the shortest name. The same song reached it from
+    several boxes (a collision renamed each '... (CD1)', '... (_harvest_
+    pending)'): three identical 'Without Love's and three 'Es kann zwischen
+    heute und morgen's on 1 Oct, each fingerprinted and judged every pass.
+    Only this pipeline's own folder, only exact duplicates."""
+    import hashlib
+    by_size: Dict[int, List[str]] = {}
+    try:
+        names = os.listdir(keep_dir)
+    except OSError:
+        return 0
+    for n in names:
+        full = os.path.join(keep_dir, n)
+        if os.path.splitext(n)[1].lower() not in AUDIO_EXTS:
+            continue
+        try:
+            if os.path.isfile(full):
+                by_size.setdefault(os.path.getsize(full), []).append(full)
+        except OSError:
+            continue
+    removed = 0
+    for paths in by_size.values():
+        if len(paths) < 2:
+            continue
+        kept: Dict[str, str] = {}
+        for p in sorted(paths, key=lambda p: (len(os.path.basename(p)), p)):
+            try:
+                h = hashlib.md5()
+                with open(p, "rb") as fh:
+                    for block in iter(lambda: fh.read(1 << 20), b""):
+                        h.update(block)
+                digest = h.hexdigest()
+                if digest in kept:
+                    os.remove(p)
+                    removed += 1
+                    logger.info("harvest keep: %s is a copy of %s -- removed",
+                                os.path.basename(p)[:60],
+                                os.path.basename(kept[digest])[:40])
+                else:
+                    kept[digest] = p
+            except OSError as exc:
+                logger.debug("harvest keep dedupe: %s -- %s", p, exc)
+    return removed
 
 
 def _unrepeat_keep_name(full: str, keep_dir: str) -> Optional[str]:
