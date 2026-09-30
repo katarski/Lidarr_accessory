@@ -92,11 +92,37 @@ class AcoustIdKeepsTheIds(unittest.TestCase):
         self.assertEqual(best["recording_ids"], ["r1", "r2"])
         self.assertEqual(best["artist_ids"], ["a1", "a2"])
 
-    def test_a_hit_stored_without_the_ids_is_asked_again(self):
+    def _client(self, path, lookup):
         c = AC.AcoustIDClient.__new__(AC.AcoustIDClient)
-        self.assertTrue(c._expired({"result": {"title": "T"}, "at": time.time()}))
-        self.assertFalse(c._expired({"result": {"title": "T", "recording_ids": []},
-                                     "at": time.time()}))
+        c.enabled = True
+        c._have_fpcalc = lambda: True
+        c._fingerprint = lambda p: (120, "FP")
+        c._lookup = lookup
+        c._save_cache = lambda *a, **k: None
+        st = os.stat(path)
+        c._cache = {c._ckey((path, st.st_size, int(st.st_mtime))): {
+            "result": {"title": "Old", "score": 0.9}, "at": time.time()}}
+        return c
+
+    def test_an_old_hit_is_kept_and_asked_again(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            f.write(b"x")
+        self.addCleanup(os.unlink, f.name)
+        c = AC.AcoustIDClient.__new__(AC.AcoustIDClient)
+        self.assertFalse(c._expired({"result": {"title": "T"}, "at": 0}))
+        failed = self._client(f.name, lambda d, fp: ("error", None))
+        self.assertEqual(failed.identify_file(f.name)["title"], "Old")
+        fresh = self._client(f.name, lambda d, fp: ("ok", {"results": [
+            {"score": 0.9, "recordings": [{"id": "r1", "title": "New"}]}]}))
+        self.assertEqual(fresh.identify_file(f.name)["recording_ids"], ["r1"])
+
+    def test_best_names_the_song_most_recordings_name(self):
+        best = AC.AcoustIDClient._best({"results": [{"score": 0.99, "recordings": [
+            {"id": "a", "title": "My Happiness"},
+            {"id": "b", "title": "Whole Lotta Loving"},
+            {"id": "c", "title": "Whole Lotta Loving"}]}]})
+        self.assertEqual(best["title"], "Whole Lotta Loving")
 
 
 if __name__ == "__main__":

@@ -200,7 +200,18 @@ class AcoustIDClient:
             return {"artist": "", "title": "", "album": "",
                     "recording_id": top.get("id"), "score": top.get("score", 0),
                     "recording_ids": [], "artist_ids": []}
+        # The song most of the fingerprint's recordings name. recs[0] is just
+        # the first listed: for Fats Domino's 'Whole Lotta Loving' it was a
+        # stray 'My Happiness' ahead of five 'Whole Lotta Loving's, and the
+        # harvest rejected the right file for weeks.
+        def _k(r):
+            return "".join(ch for ch in str(r.get("title") or "").lower()
+                           if ch.isalnum())
+        votes = Counter(_k(r) for r in recs if _k(r))
         rec = recs[0]
+        if votes:
+            best = votes.most_common(1)[0][0]
+            rec = next(r for r in recs if _k(r) == best)
         artist = ""
         for a in (rec.get("artists") or []):
             artist += (a.get("name") or "") + (a.get("joinphrase") or "")
@@ -234,11 +245,20 @@ class AcoustIDClient:
         except OSError:
             pass
         ckey = self._ckey(key)
+        stale = None
         if ckey is not None and ckey in self._cache:
             entry = self._cache[ckey]
             if not self._expired(entry):
-                return entry.get("result")
-            del self._cache[ckey]
+                res = entry.get("result")
+                if not (res and "recording_ids" not in res):
+                    return res
+                # A hit stored before the MusicBrainz ids were kept is asked
+                # once more, so it carries them -- and stays the answer if
+                # asking fails. Expiring such hits dropped all 105 at the 1 Oct
+                # 00:16 start, and a failed re-ask read as "unknown".
+                stale = res
+            else:
+                del self._cache[ckey]
         result = None
         answered = False
         fp = self._fingerprint(path)
@@ -247,6 +267,8 @@ class AcoustIDClient:
             answered = status == "ok"
             if data:
                 result = self._best(data)
+        if not answered and stale is not None:
+            return stale
         # Only a real answer is remembered. A failed fingerprint or a rejected
         # lookup must NOT be stored, or a spell of bad key / no network would
         # be baked in as "no match" for every file it touched.
@@ -275,9 +297,7 @@ class AcoustIDClient:
         if not isinstance(entry, dict):
             return True
         if entry.get("result"):
-            # A hit stored before the MusicBrainz ids were kept is asked once
-            # more, so it carries them.
-            return "recording_ids" not in entry["result"]
+            return False
         return (time.time() - float(entry.get("at") or 0)) > self._MISS_TTL
 
     def _load_cache(self) -> None:
