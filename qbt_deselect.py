@@ -1170,6 +1170,7 @@ def torrent_lifecycle_pass(
     wanted_only: bool = True,
     checked: Optional[dict] = None,
     recheck_seconds: int = 21600,
+    on_progress: Optional[Callable[[], None]] = None,
 ) -> tuple:
     """
     Manage COMPLETED music torrents by how much of their content the pipeline
@@ -1217,12 +1218,21 @@ def torrent_lifecycle_pass(
         return 0, 0
 
     removed = paused = 0
+    walked = 0
     for t in qbt.torrents(category=category):
         if float(t.get("progress") or 0) < 1.0:
             continue  # still downloading -> the deselect pass owns it
         h = t.get("hash")
         if not h:
             continue
+        # Checkpoint the re-check state (`checked`, `completed_seen`) every 20
+        # completed torrents: a restart mid-pass keeps what was decided.
+        walked += 1
+        if on_progress is not None and walked % 20 == 0:
+            try:
+                on_progress()
+            except Exception as exc:  # noqa: BLE001
+                emit(f"lifecycle: checkpoint failed: {exc}")
         files = qbt.files(h)
         sel_audio = sum(
             1 for f in files
@@ -1314,10 +1324,12 @@ def torrent_lifecycle_pass(
                 if plan and checked is not None:
                     # Only a SUCCESSFUL plan is throttled -- a Lidarr hiccup
                     # keeps retrying every pass as before. A plan with an
-                    # album the LLM could not be asked about is stamped -1:
-                    # planned again as soon as the LLM can answer.
+                    # album the LLM could not be asked about is stamped
+                    # negative (-now, so its age is its magnitude when the
+                    # saved state is pruned): planned again as soon as the
+                    # LLM can answer.
                     checked[h] = ((on_disk, int(newest_mtime)),
-                                  -1.0 if waiting else now)
+                                  -now if waiting else now)
                 if plan and waiting:
                     # Halt, don't guess: nothing is removed while an album's
                     # ownership is undecided.

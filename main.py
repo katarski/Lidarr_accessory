@@ -311,6 +311,78 @@ def _save_deselect_ledger(path: Optional[Path], planned: Dict[str, float],
             "could not save deselect ledger %s: %s", path, exc)
 
 
+class _StampedSet(dict):
+    """A set of torrent hashes that remembers when each was added, so the
+    saved copy can be pruned by age: `h in s`, `s.add(h)`."""
+
+    def add(self, h: str) -> None:
+        self[h] = time.time()
+
+
+def _load_lifecycle_state(path: Optional[Path]):
+    """(checked, completed_seen) of the torrent-lifecycle pass, as saved by
+    _save_lifecycle_state. They lived only in memory, so every start --
+    every deploy recreates the container -- re-planned every completed
+    torrent: 48 LLM calls in the 9 minutes after the 29 Sep 06:36 start,
+    Pharrell's 40 singles among them, and 70 of 174 distinct LLM questions
+    in that log asked more than once (loops F10). A missing or malformed
+    file is an empty state, which is only the old behaviour."""
+    checked: Dict[str, Any] = {}
+    seen = _StampedSet()
+    if not path:
+        return checked, seen
+    import json
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return checked, seen
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger("cue_pipeline").warning(
+            "lifecycle state %s unreadable (%s) -- starting empty", path, exc)
+        return checked, seen
+    if not isinstance(data, dict):
+        return checked, seen
+    for h, v in (data.get("checked") or {}).items():
+        try:
+            sig, ts = v
+            # JSON made the (audio count, newest mtime) tuple a list; the
+            # pass compares it with a tuple.
+            checked[str(h)] = ((int(sig[0]), int(sig[1])), float(ts))
+        except (TypeError, ValueError, IndexError):
+            continue
+    for h, ts in (data.get("completed") or {}).items():
+        try:
+            seen[str(h)] = float(ts)
+        except (TypeError, ValueError):
+            continue
+    return checked, seen
+
+
+def _save_lifecycle_state(path: Optional[Path], checked: Dict[str, Any],
+                          seen: Dict[str, float],
+                          max_age_days: float = 30.0) -> None:
+    """Persist the lifecycle state (tmp file + replace), dropping entries
+    older than `max_age_days`; a negative stamp (waiting for the LLM) is
+    aged by its magnitude."""
+    if not path:
+        return
+    import json
+    try:
+        cutoff = time.time() - max_age_days * 86400.0
+        data = {
+            "checked": {h: [list(v[0]), v[1]] for h, v in checked.items()
+                        if abs(float(v[1])) >= cutoff},
+            "completed": {h: ts for h, ts in seen.items() if ts >= cutoff},
+        }
+        p = Path(path)
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        tmp.write_text(json.dumps(data), encoding="utf-8")
+        os.replace(tmp, p)
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger("cue_pipeline").warning(
+            "could not save lifecycle state %s: %s", path, exc)
+
+
 def apply_webui_overrides(cfg: Dict[str, Any], path: Path) -> Dict[str, Any]:
     """
     Overlay {section: {key: value}} from the WebUI's Settings tab (written to
@@ -890,10 +962,17 @@ def qbt_auto_deselect_loop(
                     "already planned, so they are not re-planned on this start",
                     len(planned_deselect))
     redeselect_recheck = int(qcfg.get("redeselect_recheck_seconds", 1800) or 0)
-    completed_seen: set = set()   # #8a: torrents we've already kicked to process
-    # {hash: (disk_signature, ts)}: a completed torrent whose disk state hasn't
-    # changed isn't re-planned (Lidarr+LLM) until this interval passes.
-    lifecycle_checked: dict = {}
+    # completed_seen (#8a): torrents already kicked to process, and
+    # lifecycle_checked {hash: (disk_signature, ts)}: a completed torrent whose
+    # disk state hasn't changed isn't re-planned (Lidarr+LLM) until the
+    # re-check interval passes. Both PERSISTED beside the deselect ledger.
+    lifecycle_state_path = (Path(deselect_ledger_path).with_name(
+        "lifecycle_state.json") if deselect_ledger_path else None)
+    lifecycle_checked, completed_seen = _load_lifecycle_state(
+        lifecycle_state_path)
+    if lifecycle_checked:
+        logger.info("qbt lifecycle: resumed the re-check state -- %d completed "
+                    "torrent(s) already checked", len(lifecycle_checked))
     lifecycle_recheck = int(qcfg.get("lifecycle_recheck_seconds", 21600) or 21600)
 
     def _enqueue_folder_cues(folder: str) -> None:
@@ -982,7 +1061,12 @@ def qbt_auto_deselect_loop(
                     wanted_only=reap_completed_wanted_only,
                     checked=lifecycle_checked,
                     recheck_seconds=lifecycle_recheck,
+                    on_progress=lambda: _save_lifecycle_state(
+                        lifecycle_state_path, lifecycle_checked,
+                        completed_seen),
                 )
+                _save_lifecycle_state(lifecycle_state_path, lifecycle_checked,
+                                      completed_seen)
                 if removed or paused:
                     logger.info(
                         "qbt lifecycle: removed %d fully-imported, paused %d "
