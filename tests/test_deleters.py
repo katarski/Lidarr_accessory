@@ -552,6 +552,25 @@ class ClaimsEveryActor(unittest.TestCase):
             self.assertEqual(o.reconcile_monitored_gaps(Path(root)), 0)
             self.assertEqual(calls, [str(f)])
 
+    def test_reconcile_caches_no_verdict_reached_while_lidarr_failed(self):
+        with tempfile.TemporaryDirectory() as root:
+            f = self._album(root)
+            o, calls = self._reconcile()
+            o.lidarr.failure_generation, o.lidarr.available = 0, lambda: True
+
+            def failing(folder, **k):
+                calls.append(folder)
+                o.lidarr.failure_generation += 1      # the probe failed: [] back
+                return None, 0, []
+            o.lidarr.manual_import_folder = failing
+            self.assertEqual(o.reconcile_monitored_gaps(Path(root)), 0)
+            self.assertEqual(o._reconcile_cache, {})  # no "nothing importable"
+            o.lidarr.manual_import_folder = lambda folder, **k: (
+                calls.append(folder) or (None, 0, []))
+            o.reconcile_monitored_gaps(Path(root))
+            self.assertIn(str(f), o._reconcile_cache)  # a real answer is kept
+            self.assertEqual(calls, [str(f), str(f)])
+
     def test_audit_skips_a_library_folder_a_worker_holds(self):
         import inspect
         import claims

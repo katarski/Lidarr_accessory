@@ -7227,6 +7227,11 @@ class Orchestrator:
                 logger.info("reconcile: %r is being processed right now -- "
                             "next pass", folder.name)
                 continue
+            # Lidarr's client answers [] when a probe fails, which is exactly
+            # what "nothing importable" looks like -- and that verdict is cached
+            # for 6 h (orch2 F6: a 500 on ElmoreBest/CD1 on 17 Sep). A verdict
+            # reached while Lidarr failed is not cached.
+            gen = self._lidarr_generation()
             try:
                 probes += 1
                 try:
@@ -7289,10 +7294,16 @@ class Orchestrator:
                                 if did:
                                     imported += len(audios)
                                     cache.pop(key, None)
-                    if not did and not self._llm_blocked(folder):
+                    if (not did and not self._llm_blocked(folder)
+                            and self._lidarr_generation() == gen):
                         cache[key] = (mtime, now_ts)
             finally:
                 claims.release(folder)
+            if (self._lidarr_generation() != gen
+                    and not self.lidarr.available()):
+                logger.info("reconcile: Lidarr is not answering -- the rest of "
+                            "this pass waits for the next one")
+                break
         if imported:
             logger.info("reconcile: imported %d file(s) this pass "
                         "(%d folder(s) probed)", imported, probes)
