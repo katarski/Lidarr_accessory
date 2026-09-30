@@ -32,8 +32,9 @@ build) with the repo's `*.py` and `tools/`, checks `OrchestratorConfig` is
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20260930-auditstate`**
-(dfd53f8). Earlier tags for rollback: `guard-20260930-csrf`,
+then is the container replaced. Live now: **`guard-20260930-setsave`**
+(62db388). Earlier tags for rollback: `guard-20260930-auditstate`,
+`guard-20260930-csrf`,
 `guard-20260930-cli03`,
 `guard-20260930-isstate`,
 `guard-20260930-auditidx`,
@@ -254,6 +255,13 @@ layer says `http://daniel:11434`.
   failure, unlisted artist, busy folder or failed repair is logged "pass incomplete" and not
   recorded, so the next one walks again. `library_audit.csv` is now replaced each pass
   (rows go to `.csv.partial` first). The root-owned `library_audit.sig`/`.sig.bak` are unused.
+- **Settings tab saves only what you change** (orch3 SETTINGS-SAVE-1, `guard-20260930-setsave`).
+  A save drops every saved value equal to config.yaml/the container variable, so setting a
+  field back to that value hands it to the template again; the tab marks values "saved here;
+  else X". Live, all 125 keys are still saved from before (38 equal the template and go at
+  the next save). **Owner's call:** 4 saved values beat the template and stay until changed in
+  the tab: max albums/pass 300 (template 15), search interval 1000 s (3600), dead-grab grace
+  1440 min (360), delete source folder off (template on). Their warnings now reach pipeline.log.
 - **Nothing is grabbed for an unmonitored album or artist** — Lidarr will not
   import into one either, so the download is wasted twice. Fails open: no id, or
   a lookup error, and the grab proceeds.
@@ -422,9 +430,9 @@ test of a feature whose purpose is removing files.
 
 ## 6. Open items
 
-1. **18 audit findings are open: `docs/AUDIT_OPEN.md`**, in fix order, each
+1. **17 audit findings are open: `docs/AUDIT_OPEN.md`**, in fix order, each
    with evidence, root cause and the agreed fix (the verifier's correction
-   where there was one). Start at item 1 (orch3 SETTINGS-SAVE-1). 73 are fixed;
+   where there was one). Start at item 1 (orch3 ENV-BOOL-1). 74 are fixed;
    CLI-04/06/07 were refuted — do not redo them. **The owner compacts
    after every fix: finish one (tests, deploy, verify, these two files),
    then stop.** orch2 F4 (30 Sep) is deployed; its first live
