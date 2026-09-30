@@ -5017,11 +5017,21 @@ class Orchestrator:
         album_id = int((album_rec or {}).get("id") or 0)
         if not album_id or not audios:
             return 0
-        groups: Dict[str, List[Path]] = {}
+        # A song is a file name IN ONE FOLDER. A multi-disc album arrives as
+        # one list across CD1/CD2 (the audit's rglob), and grouping it by name
+        # alone made CD1's "01 - Intro.flac" and CD2's "01 - Intro.mp3" one
+        # song -- then moved the CD2 file into CD1's quarantine and rescanned
+        # only CD1 (orch2 F11). Grouped per folder, quarantined in the file's
+        # own folder, and every folder that changed is rescanned. A name with
+        # no letters or digits has no identity and is never grouped.
+        groups: Dict[Tuple[Path, str], List[Path]] = {}
         for p in audios:
-            groups.setdefault(self._same_song_key(p), []).append(p)
-        moved, folder = 0, audios[0].parent
-        for members in groups.values():
+            k = self._same_song_key(p)
+            if k:
+                groups.setdefault((p.parent, k), []).append(p)
+        moved = 0
+        changed: Dict[Path, int] = {}
+        for (folder, _k), members in groups.items():
             lossless = [p for p in members
                         if p.suffix.lower() in self._LOSSLESS_EXTS]
             lossy = [p for p in members
@@ -5041,13 +5051,14 @@ class Orchestrator:
                         n += 1
                     shutil.move(str(p), str(target))
                     moved += 1
+                    changed[folder] = changed.get(folder, 0) + 1
                     logger.info(
                         "prefer-lossless: %s moved to %s/ (the lossless %s is "
                         "in this album)", p.name, self.QUARANTINE_DIR, keep.name)
                 except OSError as exc:
                     logger.warning("prefer-lossless: cannot move %s: %s",
                                    p.name, exc)
-        if moved:
+        for folder, n in changed.items():
             # Lidarr re-reads the folder: the record for the file that is no
             # longer there is dropped, and the lossless sitting beside it is
             # picked up. No import command, no replace, nothing deleted.
@@ -5059,7 +5070,7 @@ class Orchestrator:
                                folder, exc)
             logger.info(
                 "prefer-lossless: %s -- moved %d lossy file(s) aside into %s/ "
-                "and asked Lidarr to rescan", folder.name, moved,
+                "and asked Lidarr to rescan", folder.name, n,
                 self.QUARANTINE_DIR)
         return moved
 

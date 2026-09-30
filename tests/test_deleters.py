@@ -1232,5 +1232,43 @@ class DiscCuesAreOneAlbum(unittest.TestCase):
         self.assertEqual(gone, [self.album])
 
 
+class PreferLosslessPerDiscFolder(unittest.TestCase):
+    """orch2 F11: a song is a file name in ONE folder. Grouped per folder,
+    the lossy twin is quarantined in its own folder, and every folder that
+    changed is rescanned. Nothing is deleted."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.album = Path(self._tmp.name) / "Artist" / "Album (2CD)"
+        for d, names in (("CD1", ("01 - Intro.flac", "02 - Ветрове.mp3",
+                                  "02 - Другая.flac")),
+                         ("CD2", ("01 - Intro.mp3", "02 - Song.flac",
+                                  "02 - Song.mp3"))):
+            (self.album / d).mkdir(parents=True)
+            for n in names:
+                (self.album / d / n).write_bytes(b"x")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_one_folder_one_song(self):
+        from types import SimpleNamespace
+        import orchestrator as O
+        o = O.Orchestrator.__new__(O.Orchestrator)
+        o.cfg = SimpleNamespace(prefer_lossless_over_lossy=True)
+        rescanned = []
+        o.lidarr = SimpleNamespace(windows_to_lidarr=str,
+                                   rescan_folder=rescanned.append)
+        audios = sorted(p for p in self.album.rglob("*") if p.is_file())
+        self.assertEqual(o._prefer_lossless_in_album({"id": 7}, 1, audios), 1)
+        q = O.Orchestrator.QUARANTINE_DIR
+        self.assertEqual(
+            sorted(str(p.relative_to(self.album)).replace("\\", "/")
+                   for p in self.album.rglob("*") if p.is_file()),
+            ["CD1/01 - Intro.flac", "CD1/02 - Ветрове.mp3", "CD1/02 - Другая.flac",
+             "CD2/01 - Intro.mp3", "CD2/02 - Song.flac", f"CD2/{q}/02 - Song.mp3"])
+        self.assertEqual(rescanned, [str(self.album / "CD2")])
+
+
 if __name__ == "__main__":
     unittest.main()
