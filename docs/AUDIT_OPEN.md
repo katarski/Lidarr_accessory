@@ -2,8 +2,8 @@
 
 Generated 29 Sep 2026 from the read-only audit (6 areas, each finding
 adversarially verified). 91 findings were confirmed and 3 refuted
-(CLI-04, CLI-06, CLI-07: do not redo them). **72 are fixed and pushed**;
-the 19 below are open, in the order to fix them (data loss first).
+(CLI-04, CLI-06, CLI-07: do not redo them). **73 are fixed and pushed**;
+the 18 below are open, in the order to fix them (data loss first).
 
 **Line numbers are from commit 98d2656, the commit the audit read.** They
 have shifted since, so find the code by the function or the quoted text.
@@ -39,17 +39,7 @@ orch2 F4 did over Lidarr's 31,496 past grabs) and read the changed rows.
 
 **Fix:** Use _as_bool for these five. Better, derive the env cast from the schema row's type (bool/int/float/str) so env parsing, WebUI parsing (save_settings) and main.py cannot diverge. Must not break: env still loses to Settings-tab values the user actually changed.
 
-## 3. orch2 F5 (medium) -- The audit's skip-if-unchanged check never works (signature file can't be written), would record an aborted pass as done, and the report...
-
-`orchestrator.py:8003`
-
-**Evidence:** maybe_audit_library 7998-8005: sig_path.write_text(post) (not atomic); OSError is logged at debug. LIVE: /config/library_audit.sig is owned 0:0, mode 644, mtime 2026-08-15 22:27; the container runs as 99:100, and `test -w` says NOT-writable. So every pass is a full walk: 17 Sep 18:55->19:42, 20:04->20:53, 21:15->22:05 (~50 min each, 7176 albums), and each pass sends the same imports again (Rock Me cmd 508966 at 19:19:47 and 509411 at 20:29:13; 42 folders imported by track number three times each, 124 commands). On 26-27 Sep 'Library audit starting' appears every ~22 min. When a pass aborts (27 Sep 13:33:22 'Lidarr returned no artists ... Aborting this pass'), the function still writes the post-audit signature. Once the file is writable, that would mark the library as audited and skip later passes until the library changes. library_audit.csv is append-only: 98,428 rows and 33.5 MB...
-
-**Root cause:** The check persists its state whatever the pass outcome was, hides write failures at debug level, and the report file doubles as long-lived state that is appended to and never replaced.
-
-**Fix:** The fix is correct. One point to add: writing a tmp file in /config (which 99:100 can write) and then calling os.replace also gets past the root-owned file, because replace needs permission on the directory, not the file. Keep the first-run marker separate as proposed. Until F1 is fixed, a working skip also cuts down the repeated destructive imports.
-
-## 4. orch2 F8 (medium) -- Library paths go through the downloads path translator (1,612 warnings); only works because the two roots happen to be identical
+## 3. orch2 F8 (medium) -- Library paths go through the downloads path translator (1,612 warnings); only works because the two roots happen to be identical
 
 `orchestrator.py:5384`
 
@@ -61,7 +51,7 @@ orch2 F4 did over Lidarr's 31,496 past grabs) and read the changed rows.
 
 **Fix:** Use one translator that tries each configured root pair (downloads mapping, library mapping) and raises when none matches, and remove the choice from callers. It must not change how any /downloads path is translated today.
 
-## 5. orch2 F10 (low) -- Positional force-import is attempted when it can never succeed (±1 release match vs exact-count check); it changes Lidarr settings every...
+## 4. orch2 F10 (low) -- Positional force-import is attempted when it can never succeed (±1 release match vs exact-count check); it changes Lidarr settings every...
 
 `orchestrator.py:8452`
 
@@ -71,7 +61,7 @@ orch2 F4 did over Lidarr's 31,496 past grabs) and read the changed rows.
 
 **Fix:** Positional pairing must take an exact trackCount release. Decide that before set_album_monitored_release, so a ±1 match never flips the monitored release. Leave Step 1 (anyReleaseOk) alone, since it is not part of this disagreement. As noted, positional pairing must also agree with the file titles (F1).
 
-## 6. loops F8 (medium) -- Lead 7: audit and nudge retry impossible positional imports every pass (±1 release pick, stale track rows, no memory), writing to Lidarr...
+## 5. loops F8 (medium) -- Lead 7: audit and nudge retry impossible positional imports every pass (±1 release pick, stale track rows, no memory), writing to Lidarr...
 
 `lidarr.py:323`
 
@@ -83,7 +73,7 @@ orch2 F4 did over Lidarr's 31,496 past grabs) and read the changed rows.
 
 **Fix:** Choose the release by exact equality with the manualimport candidate count (the list that is actually zipped), not len(audios). Read its rows with list_tracks_for_release(album_id, rid) before any PUT or RefreshArtist. The remembered 'impossible' fact must be keyed to that successful candidates call and the release set.
 
-## 7. loops F7 (medium) -- CUE decoding tries cp1251 before cp1252/Shift-JIS/GB18030, so non-UTF-8 Western and CJK CUEs become Cyrillic mojibake in tags
+## 6. loops F7 (medium) -- CUE decoding tries cp1251 before cp1252/Shift-JIS/GB18030, so non-UTF-8 Western and CJK CUEs become Cyrillic mojibake in tags
 
 `cue_parser.py:149`
 
@@ -93,7 +83,7 @@ orch2 F4 did over Lidarr's 31,496 past grabs) and read the changed rows.
 
 **Fix:** After UTF-8 fails, choose the encoding by evidence rather than by 'first that decodes': run charset detection over the whole text and score each candidate for plausibility (mostly one script, agreement with the folder name and the companion audio's tags). Must not break: Cyrillic cp1251 CUEs (cp1251 still wins when the text is Cyrillic words), UTF-8 BOM handling, and the LLM repair fallback.
 
-## 8. loops F9 (medium) -- Harvest re-reads every source's tags on nearly every pass: global wanted-signature gate, an easy=True sniff, no tag cache, end-of-pass...
+## 7. loops F9 (medium) -- Harvest re-reads every source's tags on nearly every pass: global wanted-signature gate, an easy=True sniff, no tag cache, end-of-pass...
 
 `song_harvest.py:631`
 
@@ -103,7 +93,7 @@ orch2 F4 did over Lidarr's 31,496 past grabs) and read the changed rows.
 
 **Fix:** Also required: a source must not be marked when lidarr.failure_generation changed while build_wanted_index ran. With a per-source signature, a partial index (list_tracks_for_album returns [] on failure) would otherwise be remembered as 'nothing wanted here', which is a failed call cached as a negative.
 
-## 9. loops F10 (low) -- Lifecycle re-check state (lifecycle_checked, completed_seen) lives only in memory, so every restart re-plans every completed torrent...
+## 8. loops F10 (low) -- Lifecycle re-check state (lifecycle_checked, completed_seen) lives only in memory, so every restart re-plans every completed torrent...
 
 `main.py:879`
 
@@ -113,7 +103,7 @@ orch2 F4 did over Lidarr's 31,496 past grabs) and read the changed rows.
 
 **Fix:** Persist lifecycle_checked as {hash: (disk signature, ts)}, plus completed_seen, the same way as deselect_planned.json: load at start, tmp and os.replace, checkpoint every N torrents during the pass, prune by age. Must not break: an immediate re-check whenever the folder's disk signature changes, and negative stamps meaning 'waiting for the LLM'.
 
-## 10. loops F11 (low) -- The single CUE worker waits 60 s on every queued .cue whose folder was already removed
+## 9. loops F11 (low) -- The single CUE worker waits 60 s on every queued .cue whose folder was already removed
 
 `orchestrator.py:1713`
 
@@ -123,7 +113,7 @@ orch2 F4 did over Lidarr's 31,496 past grabs) and read the changed rows.
 
 **Fix:** An absent .cue means gone: the worker checks existence at dequeue and _wait_for_stability returns 'gone' immediately (debug log), dropping the entry from cue_seen. Must not break: a .cue that watchdog reports on_created already exists, so stability waiting for real in-progress writes is unchanged.
 
-## 11. loops F12 (low) -- Keep-folder consolidation renames files already in _harvest_pending on every pass until the name length hits the limit
+## 10. loops F12 (low) -- Keep-folder consolidation renames files already in _harvest_pending on every pass until the name length hits the limit
 
 `song_harvest.py:879`
 
@@ -133,7 +123,7 @@ orch2 F4 did over Lidarr's 31,496 past grabs) and read the changed rows.
 
 **Fix:** Consolidate only files whose dirpath is outside keep_dir; a file already in the keep folder stays as it is. Must not break: collision renaming for same-named songs arriving from two different boxes.
 
-## 12. loops F14 (low) -- Converter-tab library tree stats all 95k library files every hour, whether or not anyone uses the tab
+## 11. loops F14 (low) -- Converter-tab library tree stats all 95k library files every hour, whether or not anyone uses the tab
 
 `main.py:1757`
 
@@ -143,7 +133,7 @@ orch2 F4 did over Lidarr's 31,496 past grabs) and read the changed rows.
 
 **Fix:** Build and refresh the tree on demand, when the Converter tab is opened and the cache is stale, or feed it from the library audit's walk; keep refresh_dir for writes. Must not break: instant tab rendering from the file-backed cache and the delete/convert refreshes.
 
-## 13. loops missed (low) -- _clean_album reads 'Title - YYYY.MM.DD' as 'Artist - Year - Album' and reduces the album to 'MM.DD'
+## 12. loops missed (low) -- _clean_album reads 'Title - YYYY.MM.DD' as 'Artist - Year - Album' and reduces the album to 'MM.DD'
 
 `qbt_deselect.py:203`
 
@@ -151,7 +141,7 @@ orch2 F4 did over Lidarr's 31,496 past grabs) and read the changed rows.
 
 **Fix:** Strip the year only when what follows it is a title rather than a date remainder (require a separator plus a word, and never an MM.DD tail). Better, look the album up with the raw folder name as a second candidate (folder_hint already carries it) before concluding total==0.
 
-## 14. orch3 COMP-BATCH-1 (low) -- comp_hunt_grabs_per_pass > 1 silently discards all but the first candidate of each batch
+## 13. orch3 COMP-BATCH-1 (low) -- comp_hunt_grabs_per_pass > 1 silently discards all but the first candidate of each batch
 
 `orchestrator.py:11139`
 
@@ -161,7 +151,7 @@ orch2 F4 did over Lidarr's 31,496 past grabs) and read the changed rows.
 
 **Fix:** Keep a single cap. Either _assembly_grab_for_songs tries every candidate it is handed when hunt is given (the caller already sliced), or assembly_find_compilation puts back into comp['queue'] every batch entry not in hunt['tried'] after the call. Must not break: one grab per pass for the artist-scope hunt, and the 'tried' bookkeeping.
 
-## 15. orch3 SETTINGS-REC-1 (low) -- The 'Recommended' button in Library & sweeps turns the cueless sweep off (recommended keys use the wrong section)
+## 14. orch3 SETTINGS-REC-1 (low) -- The 'Recommended' button in Library & sweeps turns the cueless sweep off (recommended keys use the wrong section)
 
 `orchestrator.py:14351`
 
@@ -171,7 +161,7 @@ orch2 F4 did over Lidarr's 31,496 past grabs) and read the changed rows.
 
 **Fix:** Key them by the real ids. Better, make 'recommended' a column of the _SETTINGS_SCHEMA tuple and check at class load that every id in _SETTINGS_GROUPS and any remaining side table exists in the schema. Must not break: 'anything not listed recommends its own default'.
 
-## 16. orch3 LOG-TAIL-1 (low) -- The Log tab's 400-line view splices the tail of the rotated log in front of the live tail and skips the middle
+## 15. orch3 LOG-TAIL-1 (low) -- The Log tab's 400-line view splices the tail of the rotated log in front of the live tail and skips the middle
 
 `orchestrator.py:13986`
 
@@ -181,7 +171,7 @@ orch2 F4 did over Lidarr's 31,496 past grabs) and read the changed rows.
 
 **Fix:** Read the current file backwards in blocks until it yields `need` newlines or offset 0, and move to the next rotation only after the current file is exhausted. Drop the leading partial line whenever the read did not start at offset 0. Must not break: small reads for a 400-line refresh (no multi-MB reads), whole-file mode for lines<=0.
 
-## 17. orch3 SETTINGS-FLOAT-1 (low) -- Every float setting is rendered with min=0 max=1 step=0.05, so one spinner or wheel step on 'Min track match (%)' 50 sets it to 1
+## 16. orch3 SETTINGS-FLOAT-1 (low) -- Every float setting is rendered with min=0 max=1 step=0.05, so one spinner or wheel step on 'Min track match (%)' 50 sets it to 1
 
 `webui.py:1091`
 
@@ -191,7 +181,7 @@ orch2 F4 did over Lidarr's 31,496 past grabs) and read the changed rows.
 
 **Fix:** Give each schema row an optional (min, max, step) and emit those attributes per row, with no bounds when none is declared. Keep float() parsing server-side, and optionally clamp there to the same declared range. Must not break: the 0-1 ratio fields keep their 0..1 bounds.
 
-## 18. llm LLM-5 (medium) -- Content-identify's LLM 'tie-break' is given the leader alone (the rival is filtered out) and answers by title, and the result drove...
+## 17. llm LLM-5 (medium) -- Content-identify's LLM 'tie-break' is given the leader alone (the rival is filtered out) and answers by title, and the result drove...
 
 `orchestrator.py:4045`
 
@@ -203,7 +193,7 @@ orch2 F4 did over Lidarr's 31,496 past grabs) and read the changed rows.
 
 **Fix:** Build the tie-break set from the same rule that made clear_margin false: every result within the margin of the leader. Do not accept a pick below min_cov, though. If the LLM picks a rival under min_cov, return None (undecided) rather than accept an album that failed the coverage floor. The clause 'if that set has one member, return None' can never fire, because when clear_margin is false results[1] is always within the margin, so the set always has at least 2 members. Drop it. Offer numbered options carrying year and track count, map the index back to the album record, and have _identify_album_by_content return the album id so callers stop re-matching by title. The same title-to-record collapse exists in dedup_downloads' LLM fallback (see the missed finding). Use one title/record resolver for both.
 
-## 19. llm missed (medium) -- The LLM's owned-album pick is resolved to the FIRST album with that title, skipping the same-title guard, so a missing edition can be...
+## 18. llm missed (medium) -- The LLM's owned-album pick is resolved to the FIRST album with that title, skipping the same-title guard, so a missing edition can be...
 
 `dedup_downloads.py:277`
 

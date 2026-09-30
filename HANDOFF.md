@@ -32,8 +32,9 @@ build) with the repo's `*.py` and `tools/`, checks `OrchestratorConfig` is
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20260930-csrf`**
-(b38ede9). Earlier tags for rollback: `guard-20260930-cli03`,
+then is the container replaced. Live now: **`guard-20260930-auditstate`**
+(dfd53f8). Earlier tags for rollback: `guard-20260930-csrf`,
+`guard-20260930-cli03`,
 `guard-20260930-isstate`,
 `guard-20260930-auditidx`,
 `guard-20260930-reconcile`,
@@ -248,6 +249,11 @@ layer says `http://daniel:11434`.
   POST to :8830 must send `X-CUE-Token` (the page has it inline; scripts `GET /api/token`
   first), and one whose Origin/Referer names another site is refused 403 and logged
   "webui: refused POST". The token changes on every restart; an open tab refreshes it itself.
+- **Library audit state is `library_audit.state.json`** (orch2 F5, `guard-20260930-auditstate`):
+  the first-run marker and the signature of the last COMPLETE pass. A pass with any Lidarr
+  failure, unlisted artist, busy folder or failed repair is logged "pass incomplete" and not
+  recorded, so the next one walks again. `library_audit.csv` is now replaced each pass
+  (rows go to `.csv.partial` first). The root-owned `library_audit.sig`/`.sig.bak` are unused.
 - **Nothing is grabbed for an unmonitored album or artist** — Lidarr will not
   import into one either, so the download is wasted twice. Fails open: no id, or
   a lookup error, and the grab proceeds.
@@ -416,9 +422,9 @@ test of a feature whose purpose is removing files.
 
 ## 6. Open items
 
-1. **19 audit findings are open: `docs/AUDIT_OPEN.md`**, in fix order, each
+1. **18 audit findings are open: `docs/AUDIT_OPEN.md`**, in fix order, each
    with evidence, root cause and the agreed fix (the verifier's correction
-   where there was one). Start at item 1 (orch3 SETTINGS-SAVE-1). 72 are fixed;
+   where there was one). Start at item 1 (orch3 SETTINGS-SAVE-1). 73 are fixed;
    CLI-04/06/07 were refuted — do not redo them. **The owner compacts
    after every fix: finish one (tests, deploy, verify, these two files),
    then stop.** orch2 F4 (30 Sep) is deployed; its first live
