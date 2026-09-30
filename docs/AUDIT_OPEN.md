@@ -2,8 +2,8 @@
 
 Generated 29 Sep 2026 from the read-only audit (6 areas, each finding
 adversarially verified). 91 findings were confirmed and 3 refuted
-(CLI-04, CLI-06, CLI-07: do not redo them). **86 are fixed and pushed**;
-the 5 below are open, in the order to fix them (data loss first).
+(CLI-04, CLI-06, CLI-07: do not redo them). **87 are fixed and pushed**;
+the 4 below are open, in the order to fix them (data loss first).
 
 **Line numbers are from commit 98d2656, the commit the audit read.** They
 have shifted since, so find the code by the function or the quoted text.
@@ -17,17 +17,7 @@ symbol first: green tests that never call it prove nothing. Where a fix
 changes a verdict, diff old against new over real data before shipping (as
 orch2 F4 did over Lidarr's 31,496 past grabs) and read the changed rows.
 
-## 1. orch3 COMP-BATCH-1 (low) -- comp_hunt_grabs_per_pass > 1 silently discards all but the first candidate of each batch
-
-`orchestrator.py:11139`
-
-**Evidence:** assembly_find_compilation takes batch, queue = queue[:cap], queue[cap:] with cap = comp_hunt_grabs_per_pass (10965-10967) and saves the shortened queue. _assembly_grab_for_songs then uses cap = 1 whenever hunt is given (11139-11141), so it tries only batch[0] and adds only that guid to 'tried'. batch[1:] is in neither queue nor tried. _comp_search_titles never re-searches a title already in 'searched' (11022), so those candidates are never tried. The WebUI help says 'How many candidates are grabbed and verified per pass'.
-
-**Root cause:** Two layers each enforce their own per-pass cap. The caller consumes the batch from the queue on the assumption that the callee tries all of it.
-
-**Fix:** Keep a single cap. Either _assembly_grab_for_songs tries every candidate it is handed when hunt is given (the caller already sliced), or assembly_find_compilation puts back into comp['queue'] every batch entry not in hunt['tried'] after the call. Must not break: one grab per pass for the artist-scope hunt, and the 'tried' bookkeeping.
-
-## 2. orch3 SETTINGS-REC-1 (low) -- The 'Recommended' button in Library & sweeps turns the cueless sweep off (recommended keys use the wrong section)
+## 1. orch3 SETTINGS-REC-1 (low) -- The 'Recommended' button in Library & sweeps turns the cueless sweep off (recommended keys use the wrong section)
 
 `orchestrator.py:14351`
 
@@ -37,7 +27,7 @@ orch2 F4 did over Lidarr's 31,496 past grabs) and read the changed rows.
 
 **Fix:** Key them by the real ids. Better, make 'recommended' a column of the _SETTINGS_SCHEMA tuple and check at class load that every id in _SETTINGS_GROUPS and any remaining side table exists in the schema. Must not break: 'anything not listed recommends its own default'.
 
-## 3. orch3 LOG-TAIL-1 (low) -- The Log tab's 400-line view splices the tail of the rotated log in front of the live tail and skips the middle
+## 2. orch3 LOG-TAIL-1 (low) -- The Log tab's 400-line view splices the tail of the rotated log in front of the live tail and skips the middle
 
 `orchestrator.py:13986`
 
@@ -47,7 +37,7 @@ orch2 F4 did over Lidarr's 31,496 past grabs) and read the changed rows.
 
 **Fix:** Read the current file backwards in blocks until it yields `need` newlines or offset 0, and move to the next rotation only after the current file is exhausted. Drop the leading partial line whenever the read did not start at offset 0. Must not break: small reads for a 400-line refresh (no multi-MB reads), whole-file mode for lines<=0.
 
-## 4. llm LLM-5 (medium) -- Content-identify's LLM 'tie-break' is given the leader alone (the rival is filtered out) and answers by title, and the result drove...
+## 3. llm LLM-5 (medium) -- Content-identify's LLM 'tie-break' is given the leader alone (the rival is filtered out) and answers by title, and the result drove...
 
 `orchestrator.py:4045`
 
@@ -59,7 +49,7 @@ orch2 F4 did over Lidarr's 31,496 past grabs) and read the changed rows.
 
 **Fix:** Build the tie-break set from the same rule that made clear_margin false: every result within the margin of the leader. Do not accept a pick below min_cov, though. If the LLM picks a rival under min_cov, return None (undecided) rather than accept an album that failed the coverage floor. The clause 'if that set has one member, return None' can never fire, because when clear_margin is false results[1] is always within the margin, so the set always has at least 2 members. Drop it. Offer numbered options carrying year and track count, map the index back to the album record, and have _identify_album_by_content return the album id so callers stop re-matching by title. The same title-to-record collapse exists in dedup_downloads' LLM fallback (see the missed finding). Use one title/record resolver for both.
 
-## 5. llm missed (medium) -- The LLM's owned-album pick is resolved to the FIRST album with that title, skipping the same-title guard, so a missing edition can be...
+## 4. llm missed (medium) -- The LLM's owned-album pick is resolved to the FIRST album with that title, skipping the same-title guard, so a missing edition can be...
 
 `dedup_downloads.py:277`
 
