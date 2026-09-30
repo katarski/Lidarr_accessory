@@ -6,6 +6,7 @@ priority (0 = don't download).
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import threading
@@ -80,6 +81,40 @@ def shared(base_url: str, username: str = "", password: str = "") -> "QbtClient"
         if q is None:
             q = _shared[key] = QbtClient(base_url, username, password)
         return q
+
+
+def infohash_of(data: bytes) -> Optional[str]:
+    """The v1 infohash of a .torrent: SHA-1 of its bencoded `info` value,
+    lowercase hex. None when it does not parse."""
+    def skip(i: int) -> int:
+        c = data[i:i + 1]
+        if c == b"i":
+            return data.index(b"e", i) + 1
+        if c in (b"l", b"d"):
+            i += 1
+            while data[i:i + 1] != b"e":
+                if i >= len(data):
+                    raise ValueError("unterminated")
+                i = skip(i)
+            return i + 1
+        if c.isdigit():
+            colon = data.index(b":", i)
+            return colon + 1 + int(data[i:colon])
+        raise ValueError("bad bencode at %d" % i)
+    try:
+        if data[:1] != b"d":
+            return None
+        i = 1
+        while data[i:i + 1] != b"e":
+            kend = skip(i)
+            key = data[data.index(b":", i) + 1:kend]
+            vend = skip(kend)
+            if key == b"info":
+                return hashlib.sha1(data[kend:vend]).hexdigest()
+            i = vend
+    except (ValueError, IndexError, RecursionError):
+        return None
+    return None
 
 
 class QbtClient:
@@ -295,6 +330,31 @@ class QbtClient:
             return None
         return ih
 
+    @staticmethod
+    def _fetch_torrent(url: str) -> Tuple[Optional[bytes], Optional[str], str]:
+        """GET a .torrent through its (Prowlarr) link: (body, magnet, why).
+        A redirect to a magnet gives the magnet; an HTTP refusal gives why;
+        body None, magnet None and why "" means we could not ask at all."""
+        try:
+            r = requests.get(url, timeout=60, allow_redirects=False)
+            for _ in range(3):
+                if r.status_code not in (301, 302, 303, 307, 308):
+                    break
+                loc = str(r.headers.get("Location") or "")
+                if loc.startswith("magnet:"):
+                    return None, loc, ""
+                r = requests.get(loc, timeout=60, allow_redirects=False)
+        except requests.RequestException as exc:
+            logger.debug("torrent fetch %s failed: %s", url[:60], exc)
+            return None, None, ""
+        if r.status_code != 200:
+            return None, None, "HTTP %d %s" % (r.status_code,
+                                               (r.text or "")[:120].strip())
+        body = r.content or b""
+        if not body.startswith(b"d"):
+            return None, None, "not a .torrent (%r)" % body[:40]
+        return body, None, ""
+
     def add_torrent_url(self, url: str, category: str = "",
                         paused: bool = True,
                         stop_on_metadata: bool = True,
@@ -322,6 +382,22 @@ class QbtClient:
         if not u.lower().startswith(("http://", "https://")):
             logger.warning("add_torrent_url: not an http(s) URL, refusing")
             return None
+        # Fetch it ourselves first. Handing qBittorrent the link hid every
+        # failure: RuTracker behind Cloudflare refused the fetch, nothing
+        # appeared, and each such candidate cost a 40s wait ending in "a
+        # duplicate, or the fetch failed" (28 times on 29-30 Sep). With the
+        # file in hand the reason is known at once, and so is the infohash.
+        body, magnet, why = self._fetch_torrent(u)
+        if magnet:
+            return self.add_magnet(magnet, category=category, paused=paused,
+                                   stop_on_metadata=stop_on_metadata, tags=tags)
+        if body is None and why:
+            logger.warning("add_torrent_url: the indexer refused the .torrent "
+                           "(%s) -- %s", why, u[:80])
+            return None
+        if body is not None:
+            return self._add_torrent_file(body, category, paused,
+                                          stop_on_metadata, tags)
         if not self._api_ok():
             self.login()
         nonce = "cue-add-" + uuid.uuid4().hex[:12]
@@ -359,6 +435,56 @@ class QbtClient:
             return None
         finally:
             self._drop_tag(ih, nonce)
+
+    def _add_torrent_file(self, body: bytes, category: str, paused: bool,
+                          stop_on_metadata: bool, tags: str) -> Optional[str]:
+        """Upload a fetched .torrent and return its infohash once qBittorrent
+        has it. A torrent already in the client is ours only in our category;
+        another app's is never taken over (None)."""
+        ih = infohash_of(body)
+        if not ih:
+            logger.warning("add_torrent_url: the .torrent does not parse")
+            return None
+        if not self._api_ok():
+            self.login()
+        answered, have = self.lookup(ih)
+        if not answered:
+            return None
+        if have is not None:
+            if category and str(have.get("category") or "") == category:
+                logger.info("add_torrent_url: %s is already in qBittorrent "
+                            "(ours)", ih[:12])
+                return ih
+            logger.warning("add_torrent_url: %s is already in qBittorrent under "
+                           "category %r -- not ours, not touched", ih[:12],
+                           have.get("category"))
+            return None
+        data: Dict[str, str] = {}
+        if tags:
+            data["tags"] = tags
+        if category:
+            data["category"] = category
+        if paused and stop_on_metadata:
+            data["stopCondition"] = "MetadataReceived"
+        elif paused:
+            data["paused"] = "true"
+            data["stopped"] = "true"
+        try:
+            r = self.s.post(f"{self.base}/api/v2/torrents/add", data=data,
+                            files={"torrents": ("%s.torrent" % ih, body,
+                                                "application/x-bittorrent")},
+                            timeout=60)
+            r.raise_for_status()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("add_torrent_url: upload of %s failed: %s", ih[:12], exc)
+            return None
+        for _ in range(10):
+            if self.torrent_by_hash(ih):
+                logger.info("add_torrent_url: qBittorrent accepted %s", ih[:12])
+                return ih
+            time.sleep(2)
+        logger.warning("add_torrent_url: %s never appeared in qBittorrent", ih[:12])
+        return None
 
     def _drop_tag(self, torrent_hash: Optional[str], tag: str) -> None:
         """Take a one-off tag off the torrent and out of the client."""
