@@ -1569,7 +1569,8 @@ class Orchestrator:
             candidates = self.lidarr.manual_import_candidates(lidarr_path)
             if candidates:
                 self._log_rejections(candidates)
-                acceptable = self._filter_acceptable(candidates)
+                acceptable = self._filter_acceptable(
+                    candidates, album_name=album_name, artist_name=artist_name)
                 if acceptable:
                     # Before calling ManualImport, hydrate any missing
                     # artist/album/release/track IDs ourselves. Lidarr
@@ -6618,7 +6619,8 @@ class Orchestrator:
             )
             return
         self._log_rejections(candidates)
-        acceptable = self._filter_acceptable(candidates)
+        acceptable = self._filter_acceptable(candidates, album_name=album_name,
+                                             artist_name=artist_name)
         if not acceptable:
             # Last-resort rescue: Lidarr rejected everything, but if the
             # file count exactly equals a release's track count it's almost
@@ -10077,7 +10079,45 @@ class Orchestrator:
         "worst track match",
     )
 
-    def _filter_acceptable(self, candidates: list) -> list:
+    _ROMAN = {"ii": "2", "iii": "3", "iv": "4", "vi": "6", "vii": "7",
+              "viii": "8", "ix": "9"}
+    # On top of the edition words: what a download's folder title carries
+    # beside the album's own name ("Obscure 2 OST", "... (Edt. 2000)").
+    _OVERRIDE_NOISE = frozenset({"ost", "soundtrack", "edt", "ed", "ep", "lp"})
+
+    def _override_title_ok(self, theirs: str, ours: str, artist: str = "") -> bool:
+        """Is Lidarr's album `theirs` the album this download names (`ours`)?
+        Equal, or either title's words inside the other's with every extra
+        word edition/format noise, a year, or a word of the artist's name --
+        roman numerals read as digits ('ObsCure II' = 'Obscure 2 OST',
+        'Monarchie und Alltag' = 'Fehlfarben - 1980 - Monarchie und Alltag
+        (Edt. 2000)'). 'ABBA' is not 'More Abba Gold', 'Blue' not 'Blue
+        Train'."""
+        a, b = _match_key(theirs or ""), _match_key(ours or "")
+        if not a or not b:
+            return True                   # nothing to judge by
+        if a == b:
+            return True
+        name = set(_match_key(artist or "").split())
+
+        def words(s):
+            return {self._ROMAN.get(w, w) for w in s.split()}
+
+        def noise(w):
+            return (w in _EDITION_NOISE_WORDS or w in self._OVERRIDE_NOISE
+                    or w in name
+                    or re.fullmatch(r"(?:19|20)\d{2}", w) is not None
+                    or re.fullmatch(r"\d+(?:cd|lp|disc)s?", w) is not None)
+
+        aw, bw = words(a), words(b)
+        for small, big in ((aw, bw), (bw, aw)):
+            core = {w for w in small if not noise(w)} or small
+            if core <= big and all(noise(w) for w in big - small):
+                return True
+        return False
+
+    def _filter_acceptable(self, candidates: list, album_name: str = "",
+                           artist_name: str = "") -> list:
         """
         Decide which manual-import candidates we'll commit.
         A candidate is 'acceptable' if:
@@ -10090,6 +10130,13 @@ class Orchestrator:
             wholesale on the 80% rule.
         Anything else (missing artist, no album match, permissions, etc.) is a
         hard fail.
+
+        The override is for "right album, wrong track count". It never
+        applies when the album Lidarr matched is not the album the download is
+        (`album_name`, title or edition of it): on 30 Sep the compilation
+        'More Abba Gold' scored 50.2% against the 1975 album 'ABBA', was
+        forced in over the 80% rule, switched that album to another release,
+        and left its own 13 files on disk with no Lidarr record.
         """
         floor = self.cfg.min_match_percent
         ok: list = []
@@ -10097,6 +10144,13 @@ class Orchestrator:
             rej = c.get("rejections") or []
             if not rej:
                 ok.append(c)
+                continue
+            theirs = str((c.get("album") or {}).get("title") or "")
+            if not self._override_title_ok(theirs, album_name, artist_name):
+                logger.info(
+                    "  [NO OVERRIDE] %s -- Lidarr matched album %r, but this "
+                    "download is %r: Lidarr's rule stands",
+                    Path(c.get("path") or "").name or "?", theirs, album_name)
                 continue
             override = True
             seen_pct = None

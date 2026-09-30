@@ -1027,7 +1027,7 @@ class HandoffKeepsWhatLidarrDidNotTake(unittest.TestCase):
         o._is_placeholder_identity = lambda a, b: False
         o._align_release_to_disk = lambda *a: None
         o._log_rejections = lambda c: None
-        o._filter_acceptable = lambda c: c
+        o._filter_acceptable = lambda c, **k: c
         o._hydrate_candidates = lambda c, *a: [dict(x, artistId=5) for x in c]
         o._record = lambda *a, **k: None
         o._trigger_artist_refresh = lambda *a, **k: None
