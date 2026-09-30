@@ -579,15 +579,25 @@ class CueEventHandler(FileSystemEventHandler):
 # --- Worker -------------------------------------------------------------
 
 
-def worker_loop(q: "queue.Queue[Path]", orch: Orchestrator, stop: threading.Event) -> None:
+def worker_loop(q: "queue.Queue[Path]", orch: Orchestrator, stop: threading.Event,
+                seen: "Optional[set]" = None) -> None:
+    """The one CUE worker. A .cue that is gone when its turn comes (its
+    folder was imported and removed meanwhile) is dropped at once, and so is
+    its entry in `seen` (the enqueue de-dup), so the same path is queued
+    again if it ever reappears (loops F11)."""
     while not stop.is_set():
         try:
             cue_path = q.get(timeout=1.0)
         except queue.Empty:
             continue
         try:
-            orch.process(cue_path)
+            if not Path(cue_path).exists():
+                logger.debug("queued CUE %s is gone -- dropped", cue_path)
+            else:
+                orch.process(cue_path)
         finally:
+            if seen is not None and not Path(cue_path).exists():
+                seen.discard(str(cue_path))
             q.task_done()
 
 
@@ -1950,7 +1960,8 @@ def main() -> int:
     observer.start()
 
     worker = threading.Thread(
-        target=worker_loop, args=(q, orch, stop), daemon=True, name="cue-worker"
+        target=worker_loop, args=(q, orch, stop, cue_seen), daemon=True,
+        name="cue-worker"
     )
     worker.start()
 

@@ -1061,7 +1061,12 @@ class Orchestrator:
             )
             return None
 
-        if not self._wait_for_stability(cue_path):
+        stable = self._wait_for_stability(cue_path)
+        if stable is None:
+            logger.debug("CUE %s is gone (its folder was removed) -- dropped",
+                         cue_path)
+            return None
+        if not stable:
             logger.warning("CUE %s never stabilized, skipping", cue_path)
             return None
 
@@ -1744,16 +1749,27 @@ class Orchestrator:
 
     # ---- Helpers -------------------------------------------------------
 
-    def _wait_for_stability(self, path: Path) -> bool:
-        """Return True when file size stops changing for `stable_seconds`."""
+    def _wait_for_stability(self, path: Path) -> Optional[bool]:
+        """True when the file's size stops changing for `stable_seconds`,
+        False when it is still changing at the deadline, None when the file
+        is not there.
+
+        A missing file used to count as "still being written" until the
+        deadline (at least 60 s): the one CUE worker spent 120 s on the two
+        CUEs of a Cream folder the lifecycle had just removed (loops F11). A
+        file being written exists -- the watcher reports it on creation -- so
+        an absent one is gone."""
         deadline = time.monotonic() + max(self.cfg.stable_seconds * 6, 60)
         last_size = -1
         last_change = time.monotonic()
         while time.monotonic() < deadline:
-            if not path.exists():
+            try:
+                size = path.stat().st_size
+            except FileNotFoundError:
+                return None
+            except OSError:
                 time.sleep(1)
                 continue
-            size = path.stat().st_size
             now = time.monotonic()
             if size != last_size:
                 last_size = size
@@ -8085,8 +8101,10 @@ class Orchestrator:
             except OSError as exc:
                 errors.append(f"{cand.name}: stat failed ({exc})")
                 continue
-            if not self._wait_for_stability(cand):
-                errors.append(f"{cand.name}: never stabilized")
+            stable = self._wait_for_stability(cand)
+            if not stable:
+                errors.append(f"{cand.name}: " + (
+                    "missing" if stable is None else "never stabilized"))
                 continue
             try:
                 duration = probe_duration(self.cfg.ffmpeg_binary, cand)
