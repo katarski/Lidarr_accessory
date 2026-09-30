@@ -1,6 +1,6 @@
 # cue_pipeline — handoff
 
-Consolidated 29 Sep 2026. This file is rewritten, not appended to: everything
+Consolidated 30 Sep 2026. This file is rewritten, not appended to: everything
 below is current. `README.md` explains what the pipeline does; this is what a
 fresh session needs — how to deploy, what is true now, what is still open, and
 the mistakes worth not repeating.
@@ -32,9 +32,10 @@ build) with the repo's `*.py` and `tools/`, checks `OrchestratorConfig` is
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20260929-assembly`**
-(f01ef2f). Earlier tags for rollback: `guard-20260929-binding`,
-`-deleters`, `-pairing`, `-names`, `pre-gate-20260929`.
+then is the container replaced. Live now: **`guard-20260930-titles`**
+(4a04c4b). Earlier tags for rollback: `guard-20260929-songs`, `-asmplan`,
+`-f4`, `-claims`, `-assembly`, `-binding`, `-deleters`, `-pairing`,
+`-names`, `pre-gate-20260929`.
 
 The bundle procedure below is only for commits made ON PARK.
 
@@ -247,6 +248,18 @@ layer says `http://daniel:11434`.
   explicit-trackId import there is an Upgrade that deletes) and frees a source
   only when its track holds a new trackfile outside staging
   (`LidarrClient.command_succeeded` is the one verdict on a command record).
+- **A release title must NAME the album** (`titlematch.album_naming`,
+  `_title_relation`): its words a whole field once the artist's credit is
+  taken out once, not inside a longer name nor inside a more specific
+  album of the same artist (the album list is asked once per search pass;
+  a failed ask is not cached). Containing the words is not enough: it
+  grabbed "Dusty In Memphis", "Ev'rything's Coming Up Dusty" and "Simply
+  Dusty" for "Dusty", and "Blue Eyed Soul" for Simply Red's "Blue". Not
+  named scores 0. A colon opens a field but does not close one ("Joker:
+  Folie a Deux" is not "Joker"). **Nothing below the title floor is ever
+  grabbed**, not even after the relevant candidates were rejected. The
+  live floor is **0.45** (`ISEARCH_MIN_TITLE_RATIO` and the Settings tab),
+  not the 0.55 default -- test title rules against 0.45.
 - **A grab is bound to its own queue row** (`_await_grab`): the infohash, or a
   row new since the pre-grab snapshot whose album id or whole title is the
   release's. Never a substring: Priscilla Ahn's "La La La" once bound to, and
@@ -337,10 +350,14 @@ test of a feature whose purpose is removing files.
 
 ## 6. Open items
 
-1. **32 audit findings are open: `docs/AUDIT_OPEN.md`**, in fix order, each
+1. **31 audit findings are open: `docs/AUDIT_OPEN.md`**, in fix order, each
    with evidence, root cause and the agreed fix (the verifier's correction
-   where there was one). Start at item 1 (orch2 F4). 59 are fixed;
-   CLI-04/06/07 were refuted — do not redo them.
+   where there was one). Start at item 1 (orch2 F9). 60 are fixed;
+   CLI-04/06/07 were refuted — do not redo them. **The owner compacts
+   after every fix: finish one (tests, deploy, verify, these two files),
+   then stop.** orch2 F4 (30 Sep) is deployed; its first live
+   interactive-search pass was not yet watched -- look for "best title
+   match 0.00" lines naming a release that WAS the album.
 2. **Orphan CUE whose image is gone** (logged once each, `[ERROR] No companion
    audio next to ...`): `/downloads/Oliver Deriviere - Music From Alone In The
    Dark/` holds only `CDIMAGE.flac.cue` (FILE "CDIMAGE.flac"), `CDIMAGE.log`
