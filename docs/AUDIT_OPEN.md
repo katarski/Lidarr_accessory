@@ -2,8 +2,8 @@
 
 Generated 29 Sep 2026 from the read-only audit (6 areas, each finding
 adversarially verified). 91 findings were confirmed and 3 refuted
-(CLI-04, CLI-06, CLI-07: do not redo them). **70 are fixed and pushed**;
-the 21 below are open, in the order to fix them (data loss first).
+(CLI-04, CLI-06, CLI-07: do not redo them). **71 are fixed and pushed**;
+the 20 below are open, in the order to fix them (data loss first).
 
 **Line numbers are from commit 98d2656, the commit the audit read.** They
 have shifted since, so find the code by the function or the quoted text.
@@ -201,19 +201,7 @@ orch2 F4 did over Lidarr's 31,496 past grabs) and read the changed rows.
 
 **Fix:** Give each schema row an optional (min, max, step) and emit those attributes per row, with no bounds when none is declared. Keep float() parsing server-side, and optionally clamp there to the same declared range. Must not break: the 0-1 ratio fields keep their 0..1 bounds.
 
-## 19. clients CLI-03 (high) -- 'Could not ask Lidarr' is returned as an empty answer, and callers act on it and persist it
-
-`lidarr.py:1258`
-
-**Status:** PARTLY DONE: failure_generation guards on the deleting/recording callers. Open: the remaining read helpers' callers that still treat [] as 'none'.
-
-**Evidence:** On a transport failure, list_albums_for_artist (1258-1264), list_all_albums (1266-1278), queue_list (1073-1086), wanted_missing (389-391), get_album (1457-1463) and artists() (1143-1147) all return []/None/stale. Consumers: (a) The external audit, orchestrator.py:11262, sets have=[], and 11272 then writes seen_state[aid] with checked=now and EVERY MusicBrainz album listed as missing_from_lidarr. That is persisted and not re-checked for 7 days. (b) Interactive search, orchestrator.py:12329-12336: a failed queue_list gives queued_ids = {}, so albums with a live download become eligible for a second grab. The 'except Exception: pass' there is unreachable. (c) The cueless sweep's _drop_duplicate_editions (orchestrator.py:4325-4336). Live, 26 Sep 20:19:01: 10 'has 2 editions -- keeping ... (most tracks (Lidarr count unknown)), skipping ...' (Bon Jovi, Agnetha Faltskog x3, Frida Leider,...
-
-**Root cause:** The client API has two answers (value/empty) for three states (value, genuinely empty, could not ask).
-
-**Fix:** wanted_missing (lidarr.py:376-408) must also raise when a page FAILS MID-WALK. Today it breaks and returns the partial list, which the pass then treats as complete. The interactive-search prune at orchestrator.py:12442-12455 must run only on a complete answer: every page fetched and len(out)==totalRecords. In the external audit, a LidarrUnavailable from list_albums_for_artist must skip the artist without writing seen_state. The held curator must keep the stored 'existing' summary when the summary call fails, not replace it with {} plus a new _ts.
-
-## 20. llm LLM-5 (medium) -- Content-identify's LLM 'tie-break' is given the leader alone (the rival is filtered out) and answers by title, and the result drove...
+## 19. llm LLM-5 (medium) -- Content-identify's LLM 'tie-break' is given the leader alone (the rival is filtered out) and answers by title, and the result drove...
 
 `orchestrator.py:4045`
 
@@ -225,7 +213,7 @@ orch2 F4 did over Lidarr's 31,496 past grabs) and read the changed rows.
 
 **Fix:** Build the tie-break set from the same rule that made clear_margin false: every result within the margin of the leader. Do not accept a pick below min_cov, though. If the LLM picks a rival under min_cov, return None (undecided) rather than accept an album that failed the coverage floor. The clause 'if that set has one member, return None' can never fire, because when clear_margin is false results[1] is always within the margin, so the set always has at least 2 members. Drop it. Offer numbered options carrying year and track count, map the index back to the album record, and have _identify_album_by_content return the album id so callers stop re-matching by title. The same title-to-record collapse exists in dedup_downloads' LLM fallback (see the missed finding). Use one title/record resolver for both.
 
-## 21. llm missed (medium) -- The LLM's owned-album pick is resolved to the FIRST album with that title, skipping the same-title guard, so a missing edition can be...
+## 20. llm missed (medium) -- The LLM's owned-album pick is resolved to the FIRST album with that title, skipping the same-title guard, so a missing edition can be...
 
 `dedup_downloads.py:277`
 
