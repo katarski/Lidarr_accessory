@@ -67,10 +67,23 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     cfg.setdefault("acoustid", {})
     cfg.setdefault("watch", {})
 
+    # A setting the Settings tab lists is parsed by the type its schema row
+    # declares, so the container variable, the tab (save_settings) and this
+    # file cannot read one setting two ways. Five booleans here were cast
+    # with bool(), and bool("false") is True: HARVEST_ENABLED=false left the
+    # harvest running and RECHECK_SKIP_UNCHANGED=false could not turn the
+    # skip off (orch3 ENV-BOOL-1).
+    schema_type = {(sec, k): typ for _sid, sec, k, _l, typ, _d, _h
+                   in Orchestrator._SETTINGS_SCHEMA}
+    schema_cast = {"bool": _as_bool, "int": int, "float": float}
+
     def put(section: str, key: str, env: str, cast=str) -> None:
         v = os.environ.get(env)
         if v is None or v == "":
             return
+        cast = schema_cast.get(schema_type.get((section, key)), cast)
+        if cast is bool:
+            cast = _as_bool    # never bool(): any non-empty string is True
         try:
             cfg[section][key] = cast(v)
             _ENV_SET[(section, key)] = env
@@ -157,21 +170,21 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     put("lidarr", "assembly_verify_timeout", "ASSEMBLY_VERIFY_TIMEOUT", int)
     put("lidarr", "assembly_lossless_bonus", "ASSEMBLY_LOSSLESS_BONUS", float)
     put("lidarr", "assembly_lossy_penalty", "ASSEMBLY_LOSSY_PENALTY", float)
-    put("lidarr", "comp_hunt_enabled", "COMP_HUNT_ENABLED", bool)
+    put("lidarr", "comp_hunt_enabled", "COMP_HUNT_ENABLED", _as_bool)
     put("lidarr", "prowlarr_base_url", "PROWLARR_BASE_URL", str)
     put("lidarr", "prowlarr_api_key", "PROWLARR_API_KEY", str)
     put("lidarr", "comp_hunt_lidarr_indexers_only",
-        "COMP_HUNT_LIDARR_INDEXERS_ONLY", bool)
+        "COMP_HUNT_LIDARR_INDEXERS_ONLY", _as_bool)
     put("lidarr", "comp_hunt_max_tracks", "COMP_HUNT_MAX_TRACKS", int)
     put("lidarr", "comp_hunt_titles_per_pass", "COMP_HUNT_TITLES_PER_PASS", int)
     put("lidarr", "comp_hunt_grabs_per_pass", "COMP_HUNT_GRABS_PER_PASS", int)
     put("lidarr", "comp_hunt_min_title_score", "COMP_HUNT_MIN_TITLE_SCORE", float)
     put("lidarr", "comp_hunt_healthy_seeders", "COMP_HUNT_HEALTHY_SEEDERS", int)
-    put("lidarr", "harvest_enabled", "HARVEST_ENABLED", bool)
-    put("lidarr", "harvest_dry_run", "HARVEST_DRY_RUN", bool)
+    put("lidarr", "harvest_enabled", "HARVEST_ENABLED", _as_bool)
+    put("lidarr", "harvest_dry_run", "HARVEST_DRY_RUN", _as_bool)
     put("lidarr", "harvest_duration_tolerance", "HARVEST_DURATION_TOLERANCE", float)
     put("lidarr", "harvest_max_files_per_pass", "HARVEST_MAX_FILES", int)
-    put("lidarr", "recheck_skip_unchanged", "RECHECK_SKIP_UNCHANGED", bool)
+    put("lidarr", "recheck_skip_unchanged", "RECHECK_SKIP_UNCHANGED", _as_bool)
     put("lidarr", "assembly_min_pct", "ASSEMBLY_MIN_PCT", float)
     put("lidarr", "assembly_max_albums_per_pass", "ASSEMBLY_MAX_ALBUMS", int)
     put("lidarr", "external_audit_enabled", "EXTERNAL_AUDIT_ENABLED", _as_bool)

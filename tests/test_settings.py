@@ -185,5 +185,51 @@ class OverrideWarning(unittest.TestCase):
         self.assertIn("(15)", cm.output[0])
 
 
+class EnvIsParsedByTheSchemaType(unittest.TestCase):
+    """orch3 ENV-BOOL-1: five env overrides were cast with bool(), so
+    HARVEST_ENABLED=false turned the harvest on."""
+
+    def _env_of_bool_rows(self):
+        import main
+        from orchestrator import Orchestrator
+        bools = {(sec, k) for _i, sec, k, _l, typ, _d, _h
+                 in Orchestrator._SETTINGS_SCHEMA if typ == "bool"}
+        src = Path(main.__file__).read_text(encoding="utf-8")
+        out = {}
+        for n in ast.walk(ast.parse(src)):
+            if (isinstance(n, ast.Call) and getattr(n.func, "id", "") == "put"
+                    and len(n.args) >= 3
+                    and all(isinstance(a, ast.Constant) for a in n.args[:3])):
+                sec, k, env = (a.value for a in n.args[:3])
+                if (sec, k) in bools:
+                    out[env] = (sec, k)
+        return out
+
+    def _apply(self, env, value):
+        import main
+        os.environ[env] = value
+        try:
+            return main.apply_env_overrides({})
+        finally:
+            del os.environ[env]
+            main._ENV_SET.clear()
+
+    def test_false_is_false_for_every_boolean_variable(self):
+        rows = self._env_of_bool_rows()
+        for env in ("HARVEST_ENABLED", "HARVEST_DRY_RUN", "COMP_HUNT_ENABLED",
+                    "COMP_HUNT_LIDARR_INDEXERS_ONLY", "RECHECK_SKIP_UNCHANGED"):
+            self.assertIn(env, rows)
+        for env, (sec, k) in rows.items():
+            for text, want in (("false", False), ("0", False), ("no", False),
+                               ("true", True), ("1", True)):
+                self.assertIs(self._apply(env, text)[sec][k], want,
+                              "%s=%s" % (env, text))
+
+    def test_a_number_follows_its_schema_type(self):
+        self.assertEqual(
+            self._apply("MIN_MATCH_PERCENT", "50")["lidarr"]["min_match_percent"],
+            50.0)
+
+
 if __name__ == "__main__":
     unittest.main()
