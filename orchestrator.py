@@ -8764,6 +8764,52 @@ class Orchestrator:
                 pass
             return False
 
+    # ---- what the audit last did to each folder -----------------------------
+    # {album folder: [disk signature, Lidarr's file count, when, action]}.
+    # Every pass repeated the full repair on every folder it could not fix --
+    # two RefreshArtist calls, an album PUT, a /manualimport probe, and for an
+    # under-registered folder a release align and a by-tracknumber import:
+    # Candi Staton / Life Happens was re-imported on 28 Sep 20:57, 29 Sep
+    # 02:29, 03:54 and 05:40, with its duplicates keeping it "under-
+    # registered" for good. Only a change on disk or in Lidarr acts again
+    # before the week is out.
+    _AUDIT_SEEN_TTL = 7 * 86400
+
+    def _audit_seen_path(self) -> Optional[Path]:
+        rf = self.cfg.library_audit_report_file
+        return rf.with_suffix(".seen.json") if rf else None
+
+    def _audit_seen_load(self) -> Dict[str, Any]:
+        p = self._audit_seen_path()
+        if p is None:
+            return {}
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError) as exc:
+            logger.debug("audit: could not read %s: %s", p, exc)
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _audit_seen_save(self, seen: Dict[str, Any], every: float = 0.0) -> None:
+        p = self._audit_seen_path()
+        if p is None:
+            return
+        now = time.monotonic()
+        if every and now - getattr(self, "_audit_seen_saved_at", 0.0) < every:
+            return
+        self._audit_seen_saved_at = now
+        old = time.time() - self._AUDIT_SEEN_TTL
+        keep = {k: v for k, v in seen.items()
+                if isinstance(v, list) and len(v) >= 4 and float(v[2]) >= old}
+        tmp = p.with_name(p.name + ".tmp")
+        try:
+            tmp.write_text(json.dumps(keep), encoding="utf-8")
+            os.replace(tmp, p)
+        except OSError as exc:
+            logger.debug("audit: could not save %s: %s", p, exc)
+
     def _audit_load_report(self, path: Path) -> tuple[bool, set]:
         """
         Returns (first_run_complete, folders_already_acted).
@@ -8995,6 +9041,7 @@ class Orchestrator:
 
         first_run_done, already_acted = self._audit_load_report(report_file)
         in_act_mode = first_run_done
+        audit_seen = self._audit_seen_load()
 
         logger.info(
             "Library audit starting: root=%s mode=%s report=%s acted_so_far=%d",
@@ -9280,10 +9327,27 @@ class Orchestrator:
                 # Discrepancy! Decide whether to act.
                 album_key = str(album_dir)
                 action_taken = ""
+                disk_sig = self._folder_signature(audios)
+                # (album_rec is only looked up for an artist Lidarr has.)
+                lidarr_n = (_album_track_file_count(album_rec)
+                            if artist_rec is not None and album_rec is not None
+                            else -1)
+                prev = audit_seen.get(album_key)
+                # Only a repair costs Lidarr anything: an artist it does not
+                # have is reported, not repaired, and needs no memory.
+                unchanged = (artist_rec is not None
+                             and isinstance(prev, list) and len(prev) >= 4
+                             and prev[0] == disk_sig and prev[1] == lidarr_n
+                             and time.time() - float(prev[2]) < self._AUDIT_SEEN_TTL)
+                if unchanged:
+                    action_taken = ("unchanged since it was last acted on (%s) "
+                                    "-- not repeated" % str(prev[3] or "?")[:60])
+                gen_act = self._lidarr_generation()
                 # Defined here, not inside the album_rec branch: the green
                 # gates below close over it and run on every path.
                 _under = reason.startswith("album under-registered")
-                if in_act_mode and album_key not in already_acted:
+                if (in_act_mode and album_key not in already_acted
+                        and not unchanged):
                     try:
                         if artist_rec is not None:
                             aid = int(artist_rec["id"])
@@ -9569,6 +9633,13 @@ class Orchestrator:
                         )
                         action_taken = f"exception: {exc}"
                         failed += 1
+                    # Remembered at the state it was acted on -- unless
+                    # Lidarr failed meanwhile (then nothing was learned).
+                    if (self._lidarr_generation() == gen_act
+                            and not action_taken.startswith("exception")):
+                        audit_seen[album_key] = [disk_sig, lidarr_n, time.time(),
+                                                 action_taken]
+                        self._audit_seen_save(audit_seen, every=30.0)
 
                 row = [
                     now_iso,
@@ -9591,6 +9662,7 @@ class Orchestrator:
                     reason, action_taken or "(dry-run)",
                 )
                 self._audit_append_rows(report_partial, [row])
+        self._audit_seen_save(audit_seen)
         self._audit_publish_report(report_partial, report_file)
         lidarr_failed = self._lidarr_generation() != gen0
         complete = not (unlisted or unreadable or busy or failed
