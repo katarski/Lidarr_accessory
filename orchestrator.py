@@ -41,7 +41,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from cue_parser import Cue, LLMUnavailableError, parse_cue
+from cue_parser import Cue, LLMUnavailableError, parse_cue, read_cue_text
 from dedup_downloads import _EDITION_WORDS as _EDITION_NOISE_WORDS
 from held_store import HeldStore
 from lidarr import LidarrClient, _demojibake, _translit_cyrillic
@@ -7932,7 +7932,10 @@ class Orchestrator:
         exts = set(exts_order)
 
         try:
-            cue_text = cue_path.read_text(encoding="utf-8", errors="ignore")
+            # The parser's decoder: read as UTF-8 with errors ignored, a
+            # cp1251 or cp1252 CUE lost every non-ASCII letter of its FILE
+            # names, so they matched no file on disk (loops F7).
+            cue_text = read_cue_text(cue_path)[0]
         except Exception:
             cue_text = ""
 
@@ -8028,7 +8031,11 @@ class Orchestrator:
         if audio_path.parent != cue_path.parent:
             return
         try:
-            text = cue_path.read_text(encoding="utf-8", errors="ignore")
+            # The parser's decoder. Read as UTF-8 with errors ignored, a
+            # cp1251/cp1252/Shift-JIS CUE lost every non-ASCII byte, and the
+            # write below saved it that way: the repair erased the titles of
+            # the CUE it repaired (loops F7). It is written back as UTF-8.
+            text = read_cue_text(cue_path)[0]
         except OSError:
             return
         lines = text.splitlines(keepends=True)
