@@ -990,6 +990,8 @@ class Orchestrator:
         # Trimmed "lead-in repair" temp files created while processing the
         # current CUE; deleted in process()'s finally so they never linger.
         self._repair_temps: set = set()
+        # repaired copy -> the file it was made from (see _delete_originals).
+        self._repair_origin: Dict[Path, Path] = {}
 
     # ---- Public entry --------------------------------------------------
 
@@ -1026,6 +1028,7 @@ class Orchestrator:
                 except OSError as exc:  # noqa: BLE001
                     logger.debug("could not remove repair temp %s: %s", tmp, exc)
             self._repair_temps = set()
+            self._repair_origin = {}
             claims.release(folder)
 
     def _process(self, cue_path: Path) -> Optional[Path]:
@@ -8154,6 +8157,7 @@ class Orchestrator:
                 repaired = repair_leadin(cand, self.cfg.ffmpeg_binary)
                 if repaired is not None:
                     self._repair_temps.add(repaired)
+                    self._repair_origin[repaired] = cand
                     rdur = probe_duration(self.cfg.ffmpeg_binary, repaired)
                     if rdur and rdur >= 1.0:
                         logger.info(
@@ -13906,7 +13910,13 @@ class Orchestrator:
         successful import. Only called after we're sure the split files
         are either in the library or accepted by Lidarr.
         """
-        for src in (cue_path, audio_path):
+        # A lead-in-repaired copy was split, not the download's own file: the
+        # original is what must go. Deleting only the copy left the 342 MB
+        # 'Joe Nichols - Man With a Memory ... .iso.wv' behind, the cueless
+        # sweep extracted its embedded cuesheet again, and the job re-ran --
+        # a 342 MB repair written and deleted every few minutes, all evening.
+        origin = getattr(self, "_repair_origin", {}).get(audio_path)
+        for src in (cue_path, audio_path, origin):
             if not src or not src.exists():
                 continue
             try:
