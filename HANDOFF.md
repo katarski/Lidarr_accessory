@@ -32,8 +32,9 @@ build) with the repo's `*.py` and `tools/`, checks `OrchestratorConfig` is
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20260930-compneg`**
-(8f617e9). Earlier tags for rollback: `guard-20260930-lossless`,
+then is the container replaced. Live now: **`guard-20260930-isearch`**
+(a7c09a0). Earlier tags for rollback: `guard-20260930-compneg`,
+`guard-20260930-lossless`,
 `guard-20260930-disccues`,
 `guard-20260930-multidisc`,
 `guard-20260930-titles`, `guard-20260929-songs`, `-asmplan`,
@@ -215,6 +216,11 @@ layer says `http://daniel:11434`.
   returns (results, complete); a partial walk serves one pass and gets no
   cache stamp; a Lidarr failure (generation check) leaves the hunt as it
   was; the audit records nothing for an artist whose album list failed.
+- **A Lidarr failure during the interactive search is not an attempt**
+  (orch3 ISEARCH-AVAIL-1): a failed search or grab (generation check) or
+  `available()` false before a grab ends the album's candidate loop with
+  None -- no candidate burned, no Prowlarr fallback, no cooldown stamp --
+  and the pass stops there; a failed queue read skips the pass.
 - **Nothing is grabbed for an unmonitored album or artist** — Lidarr will not
   import into one either, so the download is wasted twice. Fails open: no id, or
   a lookup error, and the grab proceeds.
@@ -383,9 +389,9 @@ test of a feature whose purpose is removing files.
 
 ## 6. Open items
 
-1. **26 audit findings are open: `docs/AUDIT_OPEN.md`**, in fix order, each
+1. **25 audit findings are open: `docs/AUDIT_OPEN.md`**, in fix order, each
    with evidence, root cause and the agreed fix (the verifier's correction
-   where there was one). Start at item 1 (orch3 ISEARCH-AVAIL-1). 65 are fixed;
+   where there was one). Start at item 1 (orch2 F6). 66 are fixed;
    CLI-04/06/07 were refuted — do not redo them. **The owner compacts
    after every fix: finish one (tests, deploy, verify, these two files),
    then stop.** orch2 F4 (30 Sep) is deployed; its first live
