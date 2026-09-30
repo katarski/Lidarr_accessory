@@ -32,8 +32,9 @@ build) with the repo's `*.py` and `tools/`, checks `OrchestratorConfig` is
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20260930-albumpin`**
-(898f27c). Earlier tags for rollback: `guard-20260930-logtail`,
+then is the container replaced. Live now: **`guard-20260930-repairorigin`**
+(ff737c7). Earlier tags for rollback: `guard-20260930-albumpin`,
+`guard-20260930-logtail`,
 `guard-20260930-recids`,
 `guard-20260930-compbatch`,
 `guard-20260930-datename`,
@@ -287,6 +288,17 @@ layer says `http://daniel:11434`.
   through Docker's update call (no restart). Saved in `/config/cpu_caps.json` and applied again
   at every start, since a deploy recreates cue_pipeline with its template's `--cpus`. Only these
   two containers (Lidarr = `$LIDARR_CONTAINER`, else `lidarr`), 0.1..CPU count.
+- **Overall review vs Lidarr (30 Sep, after the audit list closed at 91/91).** Lidarr API
+  surface: reads album/artist/track/trackfile/command/system/wanted/queue/manualimport; writes
+  only `PUT album` (monitored release, anyReleaseOk), `POST command` and `POST release` (grab); no
+  DELETE, no `/history`. Live findings: (1) **fixed** `guard-20260930-repairorigin`: a split
+  from a lead-in-repaired copy deleted the copy but not the original, so the Joe Nichols
+  `.iso.wv` (342 MB) was re-extracted and re-processed every few minutes since 21:05; (2) open,
+  low: a folder Lidarr refuses (Hildegard Knef `Comps/... [4×CD]`, "no acceptable candidates")
+  is remembered only in memory, so every restart hands it off again (one cached probe, ~5 s);
+  (3) the 102 breaker-open warnings all fall at 22:49, the owner's Lidarr restart; none since,
+  with Lidarr capped at 1 CPU. `lifecycle_state.json` is written; `library_audit.state.json`
+  appears after the first complete audit pass.
 - **Nothing is grabbed for an unmonitored album or artist** — Lidarr will not
   import into one either, so the download is wasted twice. Fails open: no id, or
   a lookup error, and the grab proceeds.
