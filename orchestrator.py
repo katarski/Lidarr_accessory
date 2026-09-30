@@ -10082,8 +10082,11 @@ class Orchestrator:
     _ROMAN = {"ii": "2", "iii": "3", "iv": "4", "vi": "6", "vii": "7",
               "viii": "8", "ix": "9"}
     # On top of the edition words: what a download's folder title carries
-    # beside the album's own name ("Obscure 2 OST", "... (Edt. 2000)").
-    _OVERRIDE_NOISE = frozenset({"ost", "soundtrack", "edt", "ed", "ep", "lp"})
+    # beside the album's own name ("Obscure 2 OST", "... (Edt. 2000)",
+    # "Get Even (Original Soundtrack) (Promo)").
+    _OVERRIDE_NOISE = frozenset({"ost", "soundtrack", "original", "score",
+                                 "motion", "picture", "promo", "edt", "ed",
+                                 "ep", "lp"})
 
     def _override_title_ok(self, theirs: str, ours: str, artist: str = "") -> bool:
         """Is Lidarr's album `theirs` the album this download names (`ours`)?
@@ -10334,6 +10337,20 @@ class Orchestrator:
                 year=self._year_from_name(album_name))
             if (artist_rec and album_name) else None
         )
+        # find_album matches either title inside the other: 'More Abba Gold'
+        # comes back as the 1975 album 'ABBA', and the files Lidarr could not
+        # place were then filed into it by title ('Honey Honey'). The album
+        # the files go to must be the one the download names (the override's
+        # rule), or the record content-identify pinned for this hand-off.
+        pin = getattr(getattr(self, "_tl", None), "album_pin", None)
+        if (album_rec and album_rec is not pin
+                and not self._override_title_ok(
+                    album_rec.get("title"), album_name, artist_name)):
+            logger.info(
+                "Hydrate: Lidarr's %r is not the album this download names "
+                "(%r) -- not filing the unplaced files into it",
+                album_rec.get("title"), album_name)
+            album_rec = None
         tracks_rec: list = []
         release_id: Optional[int] = None
         if album_rec:
