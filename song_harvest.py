@@ -42,9 +42,11 @@ SAFETY
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 import re
+import time
 import unicodedata
 
 import claims
@@ -306,25 +308,45 @@ def _primary_release_id(album: Dict[str, Any]) -> Optional[int]:
 
 # ---------------------------------------------------------------- source scan
 
+# path -> (size, mtime_ns, SourceFile): a file unchanged since it was read is
+# not read again. Every harvest pass reads the same seeding folders.
+_TAG_CACHE: Dict[str, Tuple[int, int, "SourceFile"]] = {}
+_TAG_CACHE_MAX = 50000
+
+
 def read_tags(path: str) -> SourceFile:
-    """Tags + duration for one file. Never raises."""
+    """Tags + duration for one file. Never raises.
+
+    A TYPED open (audio_open.File without easy=True, audio_open.basic_tags):
+    easy=True bypassed the typed open and sniffed every parser, 631 ms vs
+    264 ms per FLAC, over ~2,200 files a pass (loops F9). Cached per (path,
+    size, mtime)."""
+    try:
+        st = os.stat(path)
+        stamp = (st.st_size, st.st_mtime_ns)
+    except OSError:
+        stamp = None
+    if stamp is not None:
+        hit = _TAG_CACHE.get(path)
+        if hit is not None and hit[:2] == stamp:
+            return dataclasses.replace(hit[2])
     sf = SourceFile(path=path)
     try:
-        from audio_open import File as MutagenFile
-        mf = MutagenFile(path, easy=True)
+        import audio_open
+        mf = audio_open.File(path)
         if mf is None:
             return sf
-        def first(k: str) -> str:
-            v = mf.get(k) or []
-            return str(v[0]) if v else ""
-        sf.title = first("title")
-        sf.artist = first("artist") or first("albumartist")
-        sf.album = first("album")
+        sf.title, sf.artist, sf.album = audio_open.basic_tags(mf)
         info = getattr(mf, "info", None)
         if info is not None and getattr(info, "length", None):
             sf.duration_ms = int(float(info.length) * 1000)
     except Exception as exc:  # noqa: BLE001
         logger.debug("harvest: tag read failed for %s: %s", path, exc)
+        return sf                             # a failed read is not cached
+    if stamp is not None:
+        if len(_TAG_CACHE) >= _TAG_CACHE_MAX:
+            _TAG_CACHE.clear()
+        _TAG_CACHE[path] = stamp + (dataclasses.replace(sf),)
     return sf
 
 
@@ -620,16 +642,26 @@ def folder_signature(root: str) -> str:
     return "%d:%d:%d" % (n, total, int(newest))
 
 
-def wanted_signature(index: Dict[str, List[WantedTrack]]) -> str:
+def wanted_signature(index: Dict[str, List[WantedTrack]],
+                     titles: Optional[Iterable[str]] = None) -> str:
     """
-    Fingerprint of what Lidarr currently WANTS.
+    Fingerprint of what Lidarr currently WANTS -- of the wanted tracks under
+    `titles` (normalized titles) when given, else of all of them.
 
     The gate must cover this, not just the folder. A verdict of "no monitored
     album target" is a statement about Lidarr's library, so if only the folder
     were fingerprinted, adding an artist or unmonitoring an album would never
     re-open a parked item -- it would stay stuck forever.
+
+    A source is gated on the wanted tracks ITS titles can match (match_files
+    looks a file up by its normalized title and nothing else). Gated on the
+    whole library's, any import anywhere re-opened every source: every pass on
+    29 Sep said "0 skipped unchanged" and re-read ~2,200 files (loops F9).
     """
-    ids = sorted(w.track_id for ws in index.values() for w in ws)
+    if titles is None:
+        ids = sorted(w.track_id for ws in index.values() for w in ws)
+    else:
+        ids = sorted(w.track_id for k in set(titles) for w in index.get(k, ()))
     import hashlib
     h = hashlib.sha1(repr(ids).encode("utf-8")).hexdigest()[:12]
     return "%d:%s" % (len(ids), h)
@@ -653,6 +685,7 @@ class HarvestLedger:
         # waits here until Lidarr's own state shows every track filed.
         self.pending: Dict[str, Dict[str, Any]] = {}
         self._dirty = False
+        self._saved_at = time.monotonic()
         if path and os.path.exists(path):
             try:
                 import json
@@ -672,12 +705,29 @@ class HarvestLedger:
         if self.pending.pop(source, None) is not None:
             self._dirty = True
 
-    def unchanged(self, source: str, folder_sig: str, want_sig: str) -> bool:
-        return self._seen.get(source) == "%s|%s" % (folder_sig, want_sig)
+    def unchanged(self, source: str, folder_sig: str,
+                  index: Dict[str, List[WantedTrack]]) -> bool:
+        """The folder is as it was judged, and so is what Lidarr wants under
+        the titles found in it. (An entry in the older "folder|wanted"
+        string form is judged again once.)"""
+        rec = self._seen.get(source)
+        if not isinstance(rec, dict) or rec.get("folder") != folder_sig:
+            return False
+        return rec.get("wanted") == wanted_signature(index, rec.get("titles") or [])
 
-    def mark(self, source: str, folder_sig: str, want_sig: str) -> None:
-        self._seen[source] = "%s|%s" % (folder_sig, want_sig)
+    def mark(self, source: str, folder_sig: str, titles: Iterable[str],
+             index: Dict[str, List[WantedTrack]]) -> None:
+        keys = sorted({t for t in titles if t})
+        self._seen[source] = {"folder": folder_sig, "titles": keys,
+                              "wanted": wanted_signature(index, keys)}
         self._dirty = True
+
+    def save_every(self, seconds: float = 30.0) -> None:
+        """save(), at most every `seconds`: a pass is minutes long, and a
+        restart in the middle used to lose every verdict of the pass (they
+        were saved only at its end)."""
+        if time.monotonic() - self._saved_at >= seconds:
+            self.save()
 
     def forget(self, source: str) -> None:
         if self._seen.pop(source, None) is not None:
@@ -693,6 +743,7 @@ class HarvestLedger:
                 json.dump({"checked": self._seen, "pending": self.pending}, fh)
             os.replace(tmp, self.path)
             self._dirty = False
+            self._saved_at = time.monotonic()
         except OSError as exc:
             logger.debug("harvest ledger save failed: %s", exc)
 
@@ -726,9 +777,10 @@ def harvest_pass(
     """
     gen = getattr(lidarr, "failure_generation", 0)
     index = build_wanted_index(lidarr)
-    wsig = wanted_signature(index)
     # A Lidarr failure while the index was built makes "not wanted" unknown,
-    # and the purge deletes on "not wanted". No purge this pass.
+    # and the purge deletes on "not wanted". No purge this pass, and no
+    # source is recorded as judged: its "nothing wanted here" could be a
+    # failed call (list_tracks_for_album answers [] on failure).
     index_ok = getattr(lidarr, "failure_generation", 0) == gen
     if ledger is not None and index_ok and purge_leftovers_enabled:
         settle_pending_purges(
@@ -759,11 +811,14 @@ def harvest_pass(
             stats["sources"] += 1
             fsig = folder_signature(src_dir)
             if (skip_unchanged and ledger is not None
-                    and ledger.unchanged(src_dir, fsig, wsig)):
+                    and ledger.unchanged(src_dir, fsig, index)):
                 stats["skipped_unchanged"] += 1
                 continue
             files = scan_folder(src_dir, limit=budget)
             budget = max(0, budget - len(files))
+            # The file cap may have cut the scan short: then the folder was
+            # not judged whole (folder_signature starts with its file count).
+            whole = len(files) >= int(fsig.split(":", 1)[0])
             rep = match_files(files, index, tolerance_seconds=tolerance_seconds)
             stats["scanned"] += rep.scanned
             stats["matched"] += len(rep.matches)
@@ -818,11 +873,14 @@ def harvest_pass(
                     else:
                         logger.warning("harvest: Lidarr refused the import of "
                                        "%d track(s) from %s", len(entries), src_dir)
-            if ledger is not None:
-                # Only remember a source once it has been fully judged. An import
-                # CHANGES the wanted set, so the next pass re-derives anyway --
+            if ledger is not None and index_ok and whole:
+                # Only remember a source once it has been fully judged, against
+                # an index Lidarr answered in full. An import CHANGES the wanted
+                # set under these titles, so the next pass re-derives anyway --
                 # that is correct, not waste.
-                ledger.mark(src_dir, fsig, wsig)
+                ledger.mark(src_dir, fsig,
+                            (norm_title(f.title) for f in files), index)
+                ledger.save_every()
             if budget <= 0:
                 logger.info("harvest: hit the %d-file cap for this pass", max_files)
                 break

@@ -60,6 +60,39 @@ def _build_map() -> Dict[str, List[Any]]:
 _BY_EXT = _build_map()
 
 
+_TITLE_KEYS = ("title", "TIT2", "\xa9nam", "Title")
+_ARTIST_KEYS = ("artist", "TPE1", "\xa9ART", "Author",
+                "albumartist", "TPE2", "aART")
+_ALBUM_KEYS = ("album", "TALB", "\xa9alb", "WM/AlbumTitle")
+
+
+def basic_tags(mf: Any) -> tuple:
+    """(title, artist, album) from a TYPED open -- Vorbis/APE keys, ID3
+    frames, MP4 atoms, ASF attributes -- blanks where absent. The typed open
+    is what makes File() fast: easy=True skips it and sniffs every parser
+    (631 ms vs 264 ms per FLAC on PARK's share)."""
+    tags = getattr(mf, "tags", None) if mf is not None else None
+    if tags is None:
+        return "", "", ""
+
+    def first(keys):
+        for k in keys:
+            try:
+                v = tags.get(k)
+            except Exception:  # noqa: BLE001 -- a key this format cannot hold
+                v = None
+            if v is None:
+                continue
+            v = getattr(v, "text", v)             # ID3 frame -> its values
+            if isinstance(v, (list, tuple)):
+                v = v[0] if v else ""
+            s = str(v).strip()
+            if s:
+                return s
+        return ""
+    return first(_TITLE_KEYS), first(_ARTIST_KEYS), first(_ALBUM_KEYS)
+
+
 def File(filething: Any, options: Any = None, easy: bool = False):
     """Same contract as mutagen.File, just faster when the extension is honest."""
     if options is not None or easy:
