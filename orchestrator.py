@@ -7227,6 +7227,56 @@ class Orchestrator:
                 )
         return written
 
+    # ---- persistent reconcile verdicts ------------------------------------
+    # {folder: [audio mtime, when probed]} -- "Lidarr's matcher found nothing
+    # to import here". It lived in memory, so every start re-probed up to 60
+    # folders a pass with /manualimport (Lidarr parses every file: 10-20s of
+    # its CPU each) until all were known again: 60-173 probes an hour on 30
+    # Sep. Beside the sweep ledger, written through a tmp file.
+
+    def _reconcile_seen_path(self) -> Optional[Path]:
+        led = getattr(self.cfg, "sweep_ledger_file", None)
+        return Path(led).with_name("reconcile_seen.json") if led else None
+
+    def _reconcile_seen(self) -> Dict[str, Any]:
+        cache = getattr(self, "_reconcile_cache", None)
+        if cache is not None:
+            return cache
+        cache = {}
+        p = self._reconcile_seen_path()
+        if p is not None:
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    cache = {k: list(v) for k, v in data.items()
+                             if isinstance(v, list) and len(v) == 2}
+            except FileNotFoundError:
+                pass
+            except (OSError, ValueError) as exc:
+                logger.debug("reconcile ledger unreadable (%s): %s", p, exc)
+        self._reconcile_cache = cache
+        return cache
+
+    def _reconcile_seen_save(self, every: float = 0.0) -> None:
+        """Write the verdicts; with `every`, at most that often."""
+        p = self._reconcile_seen_path()
+        cache = getattr(self, "_reconcile_cache", None)
+        if p is None or cache is None:
+            return
+        now = time.monotonic()
+        if every and now - getattr(self, "_reconcile_saved_at", 0.0) < every:
+            return
+        self._reconcile_saved_at = now
+        old = time.time() - 7 * 86400
+        keep = {k: list(v) for k, v in list(cache.items())
+                if isinstance(v, (list, tuple)) and len(v) == 2 and v[1] >= old}
+        tmp = p.with_name(p.name + ".tmp")
+        try:
+            tmp.write_text(json.dumps(keep), encoding="utf-8")
+            os.replace(tmp, p)
+        except OSError as exc:
+            logger.debug("reconcile ledger save failed: %s", exc)
+
     def reconcile_monitored_gaps(
         self,
         watch_root: Path,
@@ -7316,13 +7366,7 @@ class Orchestrator:
         # self-healing -- so this scales to a whole library of any genre, not
         # just one artist. Lives on the Orchestrator, surviving across passes.
         self._release_llm_waiting()
-        cache = getattr(self, "_reconcile_cache", None)
-        if cache is None:
-            cache = {}
-            try:
-                self._reconcile_cache = cache
-            except Exception:  # noqa: BLE001 (stand-in self in tests)
-                pass
+        cache = self._reconcile_seen()
 
         try:
             walker = os.walk(watch_root, topdown=True, followlinks=False)
@@ -7456,11 +7500,13 @@ class Orchestrator:
                         cache[key] = (mtime, now_ts)
             finally:
                 claims.release(folder)
+            self._reconcile_seen_save(every=30.0)
             if (self._lidarr_generation() != gen
                     and not self.lidarr.available()):
                 logger.info("reconcile: Lidarr is not answering -- the rest of "
                             "this pass waits for the next one")
                 break
+        self._reconcile_seen_save()
         if imported:
             logger.info("reconcile: imported %d file(s) this pass "
                         "(%d folder(s) probed)", imported, probes)
