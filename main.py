@@ -1884,18 +1884,10 @@ def main() -> int:
             state_file=((isearch_state_path.parent / "convert_queue.json")
                         if isearch_state_path else None))
         orch.work_queue = q   # cue-split queue, shown in the Converter tab
-
-        def _lib_rescan_loop():
-            interval = max(300, int(os.environ.get("LIBRARY_RESCAN", "3600")))
-            while not stop.wait(60 if orch.library_tree._scanned_ts == 0
-                                else interval):
-                try:
-                    orch.library_tree.maybe_scan(interval)
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug("library rescan: %s", exc)
-
-        threading.Thread(target=_lib_rescan_loop, daemon=True,
-                         name="cue-lib-rescan").start()
+        # No rescan timer: the Converter tab refreshes a stale tree when it is
+        # opened (LibraryTree.refresh_in_background). The hourly loop walked
+        # and stat'ed all ~95k library files whether or not anyone looked
+        # (loops F14).
     except Exception as exc:  # noqa: BLE001
         logger.warning("Converter tab disabled: %s", exc)
 

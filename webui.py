@@ -2423,13 +2423,20 @@ def make_handler(store, actions: HeldActions):
                 if lt is None:
                     self._json(503, {"ok": False, "message": "library tree unavailable"})
                     return
+                # The tree is refreshed on demand, here: a cache older than
+                # LIBRARY_RESCAN (default 1 h) starts a background scan and
+                # the tab is served from the cache meanwhile (loops F14).
+                try:
+                    max_age = max(300, int(os.environ.get("LIBRARY_RESCAN",
+                                                          "3600") or 3600))
+                except ValueError:
+                    max_age = 3600
                 if lt._scanned_ts == 0:
                     # First scan not done yet: kick it off and tell the UI.
-                    if not lt._scanning:
-                        threading.Thread(target=lt.scan, daemon=True,
-                                         name="lib-scan").start()
+                    lt.refresh_in_background(max_age)
                     self._json(200, {"scanning": True})
                     return
+                lt.refresh_in_background(max_age)
                 qs = parse_qs(urlparse(self.path).query)
                 rel = (qs.get("path", [""]) or [""])[0]
                 out = lt.list_dir(rel)

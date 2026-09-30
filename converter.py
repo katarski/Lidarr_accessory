@@ -259,9 +259,30 @@ class LibraryTree:
         finally:
             self._scanning = False
 
-    def maybe_scan(self, max_age_seconds: int) -> None:
-        if time.time() - self._scanned_ts >= max_age_seconds:
-            self.scan()
+    def refresh_in_background(self, max_age_seconds: int) -> bool:
+        """Start a scan in a background thread when the cache is older than
+        `max_age_seconds` and none is running; the listing is served from the
+        cache meanwhile. Returns True when one was started.
+
+        The tree is refreshed when someone looks at it. An hourly timer used
+        to walk and stat all ~95k library files whether or not anyone opened
+        the Converter tab (loops F14); conversions and deletes still update
+        it at once (refresh_dir)."""
+        with self._lock:
+            if (self._scanning or getattr(self, "_scan_started", False)
+                    or time.time() - self._scanned_ts < max_age_seconds):
+                return False
+            self._scan_started = True
+
+        def run():
+            try:
+                self.scan()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("library tree: background scan failed: %s", exc)
+            finally:
+                self._scan_started = False
+        threading.Thread(target=run, daemon=True, name="lib-scan").start()
+        return True
 
     # ---------- listing ----------
     def _safe_rel(self, rel: str) -> Optional[Path]:
