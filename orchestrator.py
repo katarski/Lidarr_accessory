@@ -13253,7 +13253,7 @@ class Orchestrator:
                 blocklisted.append(guid)
         return False
 
-    def interactive_search_pass(self, qbt=None) -> int:
+    def interactive_search_pass(self, qbt=None, stop=None) -> int:
         """
         One pass of backlog #10: for monitored albums missing for longer than
         `interactive_search_min_missing_days`, run Lidarr's interactive search,
@@ -13261,6 +13261,13 @@ class Orchestrator:
         qBittorrent (via `qbt`) before committing. Returns the number of albums
         for which a release was accepted (0 in dry-run). `qbt` is a logged-in
         QbtClient or None (no verification -> grabs are accepted as-is).
+
+        The state is checkpointed after every album and every artist fallback,
+        and `stop` (the process's shutdown event) ends the pass between
+        albums. It used to be written once, at the end: the 29 Sep pass ran 4
+        hours (216 grabs, 82 accepted) and a deploy lost all of it, so the
+        next pass began the same 300 albums in the same order
+        (orch3 ISEARCH-STATE-1).
         """
         cfg = self.cfg
         now = time.time()
@@ -13382,7 +13389,7 @@ class Orchestrator:
         # Lidarr failing under an album or artist search is not an attempt:
         # nothing is stamped for it and the pass stops there -- the next pass
         # starts where this one could not go on.
-        lidarr_failed = False
+        lidarr_failed = stopped = False
         # Shared budget so one prolific artist's per-album fallback can't fire
         # a search for every one of its (often unavailable) missing albums; the
         # rest rotate in on later passes.
@@ -13390,6 +13397,9 @@ class Orchestrator:
             name, items = g["name"], g["items"]
             filled = 0
             for alb, st, aid in items:
+                if stop is not None and stop.is_set():
+                    stopped = True
+                    break
                 try:
                     res = self._isearch_one_album(alb, st, qbt)
                 except Exception as exc:  # noqa: BLE001
@@ -13403,7 +13413,8 @@ class Orchestrator:
                     grabbed += 1
                     filled += 1
                 st["last_attempt"] = now
-            if lidarr_failed:
+                self._save_isearch_state(state)
+            if lidarr_failed or stopped:
                 break
             if filled or not cfg.interactive_search_artist_level:
                 continue
@@ -13437,6 +13448,13 @@ class Orchestrator:
             if res and not cfg.interactive_search_dry_run:
                 grabbed += 1
             ast["last_attempt"] = now
+            self._save_isearch_state(state)
+            if stop is not None and stop.is_set():
+                stopped = True
+                break
+        if stopped:
+            logger.info("interactive search: stopping for shutdown -- every "
+                        "album tried so far is saved")
         if lidarr_failed:
             logger.info("interactive search: Lidarr failed mid-pass -- the "
                         "albums not reached are not stamped and go first next "

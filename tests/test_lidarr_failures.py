@@ -417,5 +417,42 @@ class AuditUnknownIsNotEmpty(unittest.TestCase):
         self.assertIsNone(o._resolve_album_by_song_titles(9, audios))
 
 
+class SearchStateIsCheckpointed(unittest.TestCase):
+    """orch3 ISEARCH-STATE-1: the state is written after every album, and
+    the shutdown event ends the pass between albums."""
+
+    def test_each_album_is_saved_and_stop_is_honoured(self):
+        import copy
+        from orchestrator import Orchestrator
+        lid = SimpleNamespace(failure_generation=0, queue_list=lambda: [])
+        lid.wanted_missing = lambda: [
+            {"id": i, "artistId": 9, "title": "A%d" % i,
+             "artist": {"artistName": "X"}} for i in (1, 2, 3)]
+        saved, tried = [], []
+        stop = threading.Event()
+        s = SimpleNamespace(lidarr=lid, cfg=SimpleNamespace(
+            interactive_search_min_missing_days=0,
+            interactive_search_cooldown_seconds=3600,
+            interactive_search_max_albums_per_pass=10,
+            interactive_search_dry_run=False,
+            interactive_search_artist_level=False))
+        s._load_isearch_state = lambda: {}
+        s._save_isearch_state = lambda st: saved.append(copy.deepcopy(st))
+        s._lidarr_generation = Orchestrator._lidarr_generation.__get__(s)
+
+        def one(alb, st, q):
+            tried.append(alb["id"])
+            if alb["id"] == 2:
+                stop.set()                         # SIGTERM during album 2
+            return False
+        s._isearch_one_album = one
+        Orchestrator.interactive_search_pass(s, None, stop=stop)
+        self.assertEqual(tried, [1, 2])
+        self.assertIn("last_attempt", saved[0]["1"])   # written after album 1
+        self.assertNotIn("last_attempt", saved[0].get("2", {}))
+        self.assertIn("last_attempt", saved[-1]["2"])
+        self.assertNotIn("last_attempt", saved[-1].get("3", {}))
+
+
 if __name__ == "__main__":
     unittest.main()

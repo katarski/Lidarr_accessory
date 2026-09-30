@@ -672,7 +672,7 @@ def interactive_search_loop(
                 logger.warning("interactive search: qBittorrent unavailable "
                                "this pass; grabs can't be content-verified")
                 qbt = None
-            orch.interactive_search_pass(qbt)
+            orch.interactive_search_pass(qbt, stop=stop)
         except Exception as exc:  # noqa: BLE001
             logger.exception("interactive search thread: %s", exc)
         delay = cadence
