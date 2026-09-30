@@ -260,5 +260,26 @@ class EachNumberHasItsOwnRange(unittest.TestCase):
                              ["min_match_percent"], 70.0)
 
 
+class SideTablesMatchTheSchema(unittest.TestCase):
+    """orch3 SETTINGS-REC-1: two recommended values were keyed by ids the
+    schema does not have, so Recommended turned the cueless sweep off."""
+
+    def test_every_id_in_a_side_table_is_a_setting(self):
+        from orchestrator import Orchestrator as O
+        ids = {row[0] for row in O._SETTINGS_SCHEMA}
+        grouped = {sid for _g, sids in O._SETTINGS_GROUPS for sid in sids}
+        for name, table in (("_SETTINGS_RECOMMENDED", O._SETTINGS_RECOMMENDED),
+                            ("_SETTINGS_BOUNDS", O._SETTINGS_BOUNDS),
+                            ("_SETTINGS_GROUPS", grouped)):
+            self.assertEqual(set(table) - ids, set(), name)
+
+    def test_recommended_keeps_the_cueless_sweep_on(self):
+        with tempfile.TemporaryDirectory() as d:
+            o = _orch(Path(d) / "ov.json", {})
+            rows = {r["id"]: r for r in o.get_settings()}
+        self.assertIs(rows["watch.sweep_cueless_pre_split"]["recommended"], True)
+        self.assertEqual(rows["watch.sweep_interval_seconds"]["recommended"], 300)
+
+
 if __name__ == "__main__":
     unittest.main()

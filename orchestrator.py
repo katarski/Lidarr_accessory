@@ -15386,8 +15386,12 @@ class Orchestrator:
         "lidarr.interactive_search_max_candidates": 10,
         "lidarr.interactive_search_min_title_ratio": 0.55,
         "lidarr.interactive_search_min_seeders": 2,
-        "lidarr.sweep_cueless_pre_split": True,
-        "lidarr.sweep_interval_seconds": 300,
+        # These two were keyed "lidarr.*" while the schema says "watch.*", so
+        # the tab fell back to the schema defaults (off / 0) and Recommended
+        # + Save turned the cueless sweep off (orch3 SETTINGS-REC-1).
+        # tests/test_settings.py checks every side table against the schema.
+        "watch.sweep_cueless_pre_split": True,
+        "watch.sweep_interval_seconds": 300,
         "lidarr.library_audit_enabled": True,
         "lidarr.library_audit_interval_seconds": 86400,
         "lidarr.queue_reaper_enabled": False,
