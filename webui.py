@@ -1115,7 +1115,13 @@ function loadSettings(){fetch('/api/settings').then(function(r){return r.json();
     var ctl=o.type==='bool'
       ? '<input type="checkbox" data-sid="'+h(o.id)+'" data-type="bool" data-rec="'+(rec?'1':'')+'" data-orig="'+(o.value?'1':'')+'" '+(o.value?'checked':'')+'>'
       : '<input type="'+((o.type==='int'||o.type==='float')?'number':'text')+'"'
-        +(o.type==='float'?' step="0.05" min="0" max="1"':'')
+        // Each row's own range (Orchestrator._SETTINGS_BOUNDS); a float
+        // with none takes any value. All floats used to be min=0 max=1
+        // step=0.05: one wheel step on 'Min track match (%)' 50 made it 1.
+        +(o.bounds?((o.bounds[0]!==null?' min="'+h(o.bounds[0])+'"':'')
+                    +(o.bounds[1]!==null?' max="'+h(o.bounds[1])+'"':'')
+                    +' step="'+h(o.bounds[2])+'"')
+                  :(o.type==='float'?' step="any"':''))
         +' data-sid="'+h(o.id)+'" data-type="'+h(o.type)+'" data-rec="'+h(rec)+'" data-orig="'+h(o.value)+'" value="'+h(o.value)+'" style="width:8rem">';
     var base=o.type==='bool'?(o.base?'on':'off'):String(o.base);
     out+='<div class="setrow"><label><b>'+h(o.label)+'</b></label>'+ctl

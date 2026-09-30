@@ -15180,6 +15180,27 @@ class Orchestrator:
     # dataclass defaults above are safe FIRST-RUN values (search off,
     # dry-run on); these are what a configured library wants. Anything
     # not listed recommends its own default.
+    # (min, max, step) of the numeric settings whose range is not "any
+    # number": the tab's input carries exactly these, and a save outside them
+    # is refused. Every float used to be rendered min=0 max=1 step=0.05, so
+    # one spinner or wheel step on 'Min track match (%)' 50 set it to 1
+    # (orch3 SETTINGS-FLOAT-1). None = unbounded on that side.
+    _SETTINGS_BOUNDS = {
+        "lidarr.interactive_search_max_gb_per_album": (0, None, 0.5),
+        "lidarr.interactive_search_min_title_ratio": (0, 1, 0.05),
+        "lidarr.interactive_search_seeder_weight": (0, None, 0.1),
+        "lidarr.min_match_percent": (0, 100, 1),
+        "lidarr.verify_track_titles_accept": (0, 1, 0.05),
+        "lidarr.verify_track_titles_reject": (0, 1, 0.05),
+        "lidarr.assembly_min_score": (0, 1, 0.01),
+        "lidarr.assembly_min_pct": (0, 100, 1),
+        "lidarr.assembly_lossless_bonus": (0, None, 1),
+        "lidarr.assembly_lossy_penalty": (0, None, 1),
+        "lidarr.comp_hunt_min_title_score": (0, 1, 0.05),
+        "lidarr.harvest_duration_tolerance": (0, None, 1),
+        "lidarr.harvest_acoustid_min_score": (0, 1, 0.05),
+    }
+
     _SETTINGS_RECOMMENDED = {
         "lidarr.interactive_search_enabled": True,
         "lidarr.interactive_search_dry_run": False,
@@ -15411,6 +15432,7 @@ class Orchestrator:
                          "base": base,
                          "recommended": self._SETTINGS_RECOMMENDED.get(
                              sid, default),
+                         "bounds": self._SETTINGS_BOUNDS.get(sid),
                          # anything not listed above still shows up, last
                          "group": group_of.get(sid, "Other")})
         rows.sort(key=lambda r: order.get(r["id"], (len(self._SETTINGS_GROUPS),
@@ -15445,6 +15467,7 @@ class Orchestrator:
             if Path(path).exists():
                 cur = json.loads(Path(path).read_text(encoding="utf-8")) or {}
             n = 0
+            refused: List[str] = []
             for sid, raw in (changes or {}).items():
                 if sid not in schema:
                     continue
@@ -15454,6 +15477,11 @@ class Orchestrator:
                 try:
                     val = self._setting_value(typ, raw)
                 except (TypeError, ValueError):
+                    continue
+                lo, hi, _step = self._SETTINGS_BOUNDS.get(sid, (None, None, None))
+                if (lo is not None and val < lo) or (hi is not None and val > hi):
+                    refused.append("%s (%s..%s)" % (
+                        _l, "" if lo is None else lo, "" if hi is None else hi))
                     continue
                 cur.setdefault(section, {})[key] = val
                 # keep self._raw_cfg in sync so the tab reflects the save
@@ -15488,7 +15516,9 @@ class Orchestrator:
                         n, len(handed_back), ", ".join(handed_back) or "-", path)
             back = (f" {len(handed_back)} now follow config.yaml / the container "
                     f"variables." if handed_back else "")
-            return (True, f"Saved {n} setting(s).{back} Restart to apply.")
+            bad = (" Refused, out of range: %s." % ", ".join(refused)
+                   if refused else "")
+            return (True, f"Saved {n} setting(s).{back}{bad} Restart to apply.")
         except Exception as exc:  # noqa: BLE001
             return (False, f"save failed: {exc}")
 

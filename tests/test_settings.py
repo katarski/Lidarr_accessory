@@ -231,5 +231,34 @@ class EnvIsParsedByTheSchemaType(unittest.TestCase):
             50.0)
 
 
+class EachNumberHasItsOwnRange(unittest.TestCase):
+    """orch3 SETTINGS-FLOAT-1: every float row was rendered min=0 max=1
+    step=0.05, so one wheel step on 'Min track match (%)' 50 made it 1."""
+
+    def test_the_tab_carries_each_rows_range(self):
+        with tempfile.TemporaryDirectory() as d:
+            o = _orch(Path(d) / "ov.json", {"lidarr": {"min_match_percent": 50}})
+            rows = {r["id"]: r for r in o.get_settings()}
+        self.assertEqual(list(rows["lidarr.min_match_percent"]["bounds"]),
+                         [0, 100, 1])
+        self.assertEqual(list(rows["lidarr.assembly_min_score"]["bounds"])[:2],
+                         [0, 1])
+        import webui
+        self.assertNotIn('step="0.05" min="0" max="1"', webui._PAGE)
+
+    def test_a_value_outside_the_range_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            ov = Path(d) / "ov.json"
+            o = _orch(ov, {"lidarr": {"min_match_percent": 50}})
+            ok, msg = o.save_settings({"lidarr.min_match_percent": "150"})
+            self.assertTrue(ok)
+            self.assertIn("Refused", msg)
+            self.assertFalse(ov.exists() and json.loads(ov.read_text())
+                             .get("lidarr", {}).get("min_match_percent"))
+            o.save_settings({"lidarr.min_match_percent": "70"})
+            self.assertEqual(json.loads(ov.read_text())["lidarr"]
+                             ["min_match_percent"], 70.0)
+
+
 if __name__ == "__main__":
     unittest.main()
