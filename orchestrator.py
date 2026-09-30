@@ -14954,6 +14954,34 @@ class Orchestrator:
                 last = str(exc)
         return (False, f"{action} failed: {last}")
 
+    @staticmethod
+    def _tail_bytes(fh, need: int, block: int = 65536) -> bytes:
+        """The last `need` lines of an open binary file, read backwards in
+        blocks until there are enough of them or the file is exhausted (then
+        all of it, and the caller moves on to the next rotation).
+
+        It used to read a guessed need*220 bytes: with longer lines (outage
+        error lines) that held fewer than `need` lines, and the view went on
+        to the rotated file's tail -- the .1 tail, a partial line, then the
+        live tail with the rest of the live file missing and no marker
+        (orch3 LOG-TAIL-1). A 400-line refresh still reads only kilobytes."""
+        fh.seek(0, 2)
+        pos = fh.tell()
+        data = b""
+        while pos > 0 and data.count(b"\n") <= need:
+            step = min(block, pos)
+            pos -= step
+            fh.seek(pos)
+            data = fh.read(step) + data
+        nl = data.count(b"\n")
+        if nl > need:
+            # Drop the extra leading lines, the partial first one among them.
+            idx = 0
+            for _ in range(nl - need):
+                idx = data.find(b"\n", idx) + 1
+            data = data[idx:]
+        return data
+
     def read_log(self, lines: int = 400, which: str = "pipeline") -> str:
         """
         Last `lines` of a log for the WebUI Log tab (`lines` <= 0 -> whole
@@ -14992,21 +15020,7 @@ class Orchestrator:
                     if n <= 0:
                         data = fh.read()
                     else:
-                        # Tail read: seek back only ~enough bytes for the lines
-                        # still needed, so a 400-line refresh never reads MBs.
-                        need = n - got
-                        fh.seek(0, 2)
-                        size = fh.tell()
-                        want = min(size, max(4096, need * 220))
-                        fh.seek(size - want)
-                        data = fh.read()
-                        nl = data.count(b"\n")
-                        if nl > need:
-                            # Drop extra leading lines (and the partial first).
-                            idx = 0
-                            for _ in range(nl - need):
-                                idx = data.find(b"\n", idx) + 1
-                            data = data[idx:]
+                        data = self._tail_bytes(fh, n - got)
             except OSError as exc:  # noqa: BLE001
                 logger.debug("read_log: %s unreadable: %s", q, exc)
                 continue
