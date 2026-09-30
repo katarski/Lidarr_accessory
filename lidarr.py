@@ -885,6 +885,70 @@ class LidarrClient:
             logger.warning("manualimport query failed for %s: %s", folder_path, exc)
             return []
 
+    def _no_orphaning_switch(
+        self, files: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Drop the files whose import would orphan files already filed.
+
+        Lidarr makes the release a ManualImport names the album's monitored
+        release; tracks are per release, so a file-holding track whose
+        recording is not on the new release loses its file -- still on disk,
+        with no Lidarr record. On 30 Sep a compilation forced into 'ABBA'
+        (1975) moved it from its 11-track release to an 18-track one, and 13
+        of its files were orphaned; every later import onto their paths then
+        failed on DestinationAlreadyExists. A file is sent only when its
+        release is the monitored one, or the album holds no file yet, or
+        every file-holding track's recording is also on the new release. An
+        album Lidarr cannot be asked about sends nothing."""
+        targets: Dict[int, set] = {}
+        for f in files:
+            try:
+                targets.setdefault(int(f.get("albumId")), set()).add(
+                    int(f.get("albumReleaseId") or 0))
+            except (TypeError, ValueError):
+                continue
+        refused: set = set()
+        for album_id, rids in targets.items():
+            gen = getattr(self, "failure_generation", 0)
+            album = self.get_album(album_id)
+            if album is None or getattr(self, "failure_generation", 0) != gen:
+                refused |= {(album_id, r) for r in rids}
+                continue
+            monitored = {r.get("id") for r in (album.get("releases") or [])
+                         if r.get("monitored")}
+            held = None
+            for rid in rids:
+                if not rid or rid in monitored:
+                    continue
+                if held is None:
+                    held = [t for t in (self.list_tracks_for_album(album_id) or [])
+                            if t.get("hasFile")]
+                want = {t.get("foreignRecordingId") for t in
+                        (self.list_tracks_for_release(album_id, rid) or [])
+                        if t.get("foreignRecordingId")}
+                if getattr(self, "failure_generation", 0) != gen:
+                    refused.add((album_id, rid))
+                    continue
+                if not held or (want and all(
+                        t.get("foreignRecordingId") in want for t in held)):
+                    continue
+                refused.add((album_id, rid))
+                logger.warning(
+                    "ManualImport: not sending file(s) for album %r (%s) on "
+                    "release %s -- switching to it would orphan %d file(s) "
+                    "already in the library", album.get("title"), album_id,
+                    rid, sum(1 for t in held
+                             if t.get("foreignRecordingId") not in want))
+        if not refused:
+            return files
+
+        def _key(f):
+            try:
+                return (int(f.get("albumId")), int(f.get("albumReleaseId") or 0))
+            except (TypeError, ValueError):
+                return None
+        return [f for f in files if _key(f) not in refused]
+
     def manual_import_positional(
         self,
         candidates: List[Dict[str, Any]],
@@ -948,6 +1012,7 @@ class LidarrClient:
                 "additionalFile": False,
                 "replaceExistingFiles": False,
             })
+        files = self._no_orphaning_switch(files)
         if not files:
             logger.warning("manual_import_positional: no usable file/track pairs")
             return None
@@ -991,6 +1056,7 @@ class LidarrClient:
         """
         payload = [f for f in (files or [])
                    if f.get("path") and f.get("albumId") and f.get("trackIds")]
+        payload = self._no_orphaning_switch(payload)
         if not payload:
             logger.warning("manual_import_apply_files: nothing importable")
             return None
@@ -1059,6 +1125,7 @@ class LidarrClient:
                 "additionalFile": False,
                 "replaceExistingFiles": False,
             })
+        files = self._no_orphaning_switch(files)
         if not files:
             logger.warning("ManualImport: no items have the fields Lidarr requires")
             return None
@@ -1443,6 +1510,7 @@ class LidarrClient:
             files.extend(grp["files"])
             if grp["title"] and grp["title"] not in titles:
                 titles.append(grp["title"])
+        files = self._no_orphaning_switch(files)
         if not files:
             return (None, 0, [])
         payload = {
