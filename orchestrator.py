@@ -2445,6 +2445,52 @@ class Orchestrator:
                 self._delete_orphan_cue(cue_path, reason)
         return True
 
+    def _positional_release(self, album_id: int, cands, who: str):
+        """The release a POSITIONAL import of `cands` may pair against, as
+        (release id, its track rows, the release monitored now), or None.
+
+        Decided before anything is written to Lidarr. Positional pairing zips
+        the candidate files with the release's track rows, so it needs a
+        release with EXACTLY as many tracks as there are candidate files, and
+        rows read for that release (list_tracks_for_release -- the plain
+        /track list is the SELECTED release's). The audit's Step 3 and the
+        positional nudge used to take the closest release within +/-1
+        (find_release_matching_track_count), flip the album to it, refresh
+        the artist, and only then have manual_import_positional refuse the
+        count mismatch: 36 refusals, always the same albums (11/12 'My Kind
+        of Blues', 19/18 'Gloria!', 7/6, 24/23, 13/12), each pass, each after
+        a release PUT and a RefreshArtist (orch2 F10, loops F8). A switch
+        that would orphan files already mapped is refused too
+        (_release_switch_safe), as for the force-import.
+        """
+        n = sum(1 for c in (cands or []) if c.get("path"))
+        if not n:
+            return None
+        full = self.lidarr.get_album(album_id) or {}
+        releases = full.get("releases") or []
+        exact = sorted((r for r in releases
+                        if int(r.get("trackCount") or 0) == n),
+                       key=lambda r: not r.get("monitored"))
+        if not exact:
+            logger.info("%s: no release of album %s has exactly %d tracks -- "
+                        "no positional import", who, album_id, n)
+            return None
+        rid = exact[0].get("id")
+        rows = self.lidarr.list_tracks_for_release(album_id, rid) or []
+        if len(rows) != n:
+            logger.info("%s: release %s of album %s lists %d track rows, not "
+                        "%d -- no positional import", who, rid, album_id,
+                        len(rows), n)
+            return None
+        prev = next((r.get("id") for r in releases if r.get("monitored")), None)
+        if prev != rid and not self._release_switch_safe(full, album_id, rid,
+                                                         rows):
+            logger.info("%s: album %s holds files on release %s; switching it "
+                        "to release %s would unmap them -- no positional "
+                        "import", who, album_id, prev, rid)
+            return None
+        return rid, rows, prev
+
     def _release_switch_safe(self, full: Dict[str, Any], album_id: int,
                              target_rid, rel_rows: List[Dict[str, Any]]) -> bool:
         """May the album's monitored release become `target_rid`? Always for
@@ -8201,38 +8247,27 @@ class Orchestrator:
         """
         Force Lidarr to recognize files on disk when the normal nudges
         (Rescan / Refresh / DownloadedAlbumsScan) can't bridge a
-        count/title mismatch. Finds a release whose trackCount matches
-        disk_file_count (+/- 1), flips to it if it isn't already
-        monitored, then positional-force-imports: each file pinned to
-        one track by sorted order.
+        count/title mismatch. Takes the release with exactly as many tracks
+        as Lidarr lists candidate files (_positional_release), flips to it
+        if it isn't already monitored, then positional-force-imports: each
+        file pinned to one track by sorted order.
 
         Same logic as the audit Step 3, adapted for the post-split
         post-move path. Returns True if a ManualImport command was
         issued, False otherwise.
         """
         try:
-            target_rid = self.lidarr.find_release_matching_track_count(
-                album_id, disk_file_count,
-            )
-            if not target_rid:
-                logger.info(
-                    "Positional nudge: no release in album id=%s has "
-                    "trackCount matching disk=%d; skipping",
-                    album_id, disk_file_count,
-                )
+            lidarr_path = self.lidarr.windows_to_lidarr(album_dir)
+            cands = self.lidarr.manual_import_candidates(lidarr_path)
+            pick = self._positional_release(album_id, cands, "Positional nudge")
+            if pick is None:
                 return False
-
-            live_alb = self.lidarr.get_album(album_id)
-            monitored_rid = None
-            for r in (live_alb or {}).get("releases") or []:
-                if r.get("monitored"):
-                    monitored_rid = r.get("id")
-                    break
+            target_rid, tracks_rel, monitored_rid = pick
             if monitored_rid != target_rid:
                 logger.info(
                     "Positional nudge: flipping album id=%s to release "
-                    "id=%s (trackCount matches disk=%d)",
-                    album_id, target_rid, disk_file_count,
+                    "id=%s (%d tracks, as many as the candidate files)",
+                    album_id, target_rid, len(tracks_rel),
                 )
                 if not self.lidarr.set_album_monitored_release(
                         album_id, target_rid):
@@ -8246,15 +8281,9 @@ class Orchestrator:
                     self.lidarr.wait_for_command(
                         rcmd, timeout_seconds=45, poll_interval=1.5,
                     )
-
-            lidarr_path = self.lidarr.windows_to_lidarr(album_dir)
-            cands = self.lidarr.manual_import_candidates(lidarr_path)
-            tracks_all = self.lidarr.list_tracks_for_album(album_id)
-            tracks_rel = [
-                t for t in tracks_all
-                if (t.get("albumReleaseId") == target_rid
-                    or not t.get("albumReleaseId"))
-            ]
+                # A probe cached before the flip maps files to the OLD release.
+                cands = self.lidarr.manual_import_candidates(
+                    lidarr_path, force=True)
             pos_cmd = self.lidarr.manual_import_positional(
                 cands, tracks_rel, album_id, target_rid, artist_id,
             )
@@ -9268,28 +9297,23 @@ class Orchestrator:
                             # (different title spellings, durations, etc.).
                             if not importable and album_rec is not None:
                                 album_id = int(album_rec["id"])
-                                target_rid = (
-                                    self.lidarr.find_release_matching_track_count(
-                                        album_id, len(audios),
-                                    )
-                                )
-                                if target_rid:
+                                # Exact release and its rows, decided before
+                                # any write (_positional_release).
+                                pick = self._positional_release(
+                                    album_id, cands, "audit")
+                                if pick is not None:
+                                    target_rid, tracks_rel, monitored_rid = pick
                                     _bail_if_green("pre-force-release-set")
                                     # Only flip if not already monitored, so
                                     # we don't re-trigger refresh churn.
-                                    live_alb = self.lidarr.get_album(album_id)
-                                    monitored_rid = None
-                                    for r in (live_alb or {}).get("releases") or []:
-                                        if r.get("monitored"):
-                                            monitored_rid = r.get("id")
-                                            break
                                     if monitored_rid != target_rid:
                                         logger.info(
                                             "audit: positional fallback: flipping "
-                                            "album %s (%r) to release %s (trackCount "
-                                            "matches disk=%d)",
+                                            "album %s (%r) to release %s (%d "
+                                            "tracks, as many as the candidate "
+                                            "files)",
                                             album_id, album_rec.get("title"),
-                                            target_rid, len(audios),
+                                            target_rid, len(tracks_rel),
                                         )
                                         _flip_ok = self.lidarr.set_album_monitored_release(
                                             album_id, target_rid,
@@ -9312,19 +9336,11 @@ class Orchestrator:
                                                 poll_interval=1.5,
                                             )
                                         _bail_if_green("post-force-release-set")
+                                        # A probe cached before the flip maps
+                                        # files to the OLD release.
                                         cands = self.lidarr.manual_import_candidates(
-                                            lidarr_path,
+                                            lidarr_path, force=True,
                                         )
-                                    tracks_all = self.lidarr.list_tracks_for_album(
-                                        album_id,
-                                    )
-                                    # Keep only tracks belonging to the
-                                    # target release.
-                                    tracks_rel = [
-                                        t for t in tracks_all
-                                        if (t.get("albumReleaseId") == target_rid
-                                            or not t.get("albumReleaseId"))
-                                    ]
                                     _bail_if_green("pre-positional-import")
                                     pos_cmd = self.lidarr.manual_import_positional(
                                         cands, tracks_rel, album_id,

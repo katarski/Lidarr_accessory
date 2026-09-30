@@ -138,5 +138,88 @@ class GrabTarget(unittest.TestCase):
         self.assertEqual(called, [])
 
 
+class PositionalNeedsAnExactRelease(unittest.TestCase):
+    """orch2 F10 / loops F8: positional pairing took the closest release
+    within +/-1, flipped the album to it and refreshed the artist, and only
+    then was refused for the count mismatch -- every pass, for the same
+    albums. It now takes an exact release, decided before any write."""
+
+    class Lid:
+        def __init__(self, releases, rows_by_release, files=11):
+            self.releases = releases
+            self.rows = rows_by_release
+            self.cands = [{"path": "/music/A/%02d.flac" % i}
+                          for i in range(1, files + 1)]
+            self.writes = []
+
+        def windows_to_lidarr(self, p):
+            return str(p)
+
+        def manual_import_candidates(self, path, artist_id=None, force=False):
+            return list(self.cands)
+
+        def get_album(self, album_id):
+            return {"id": album_id, "releases": self.releases,
+                    "statistics": {"trackFileCount": 0}}
+
+        def list_tracks_for_release(self, album_id, rid):
+            return self.rows.get(rid, [])
+
+        def find_release_matching_track_count(self, album_id, n):
+            # the real +/-1 pick, which the positional paths used to call
+            import lidarr
+            return lidarr.LidarrClient.find_release_matching_track_count(
+                self, album_id, n)
+
+        def list_tracks_for_album(self, album_id):
+            return [t for r in self.releases if r.get("monitored")
+                    for t in self.rows.get(r["id"], [])]
+
+        def set_album_monitored_release(self, album_id, rid):
+            self.writes.append(("release", rid))
+            return True
+
+        def refresh_artist(self, aid):
+            self.writes.append(("refresh", aid))
+            return None
+
+        def manual_import_positional(self, cands, tracks, album_id, rid, aid):
+            self.writes.append(("import", rid, len(cands), len(tracks)))
+            return 99 if len(cands) == len(tracks) else None
+
+    @staticmethod
+    def rows(rid, n):
+        return [{"id": rid * 100 + i, "albumReleaseId": rid,
+                 "mediumNumber": 1, "absoluteTrackNumber": i}
+                for i in range(1, n + 1)]
+
+    def nudge(self, lid):
+        o = Orchestrator.__new__(Orchestrator)
+        o.lidarr = lid
+        return o._nudge_positional(5, 1, Path("/music/A"), 11)
+
+    def test_a_release_one_track_off_is_never_flipped_to(self):
+        lid = self.Lid([{"id": 1, "trackCount": 10, "monitored": True},
+                        {"id": 2, "trackCount": 12}],
+                       {1: self.rows(1, 10), 2: self.rows(2, 12)})
+        self.assertFalse(self.nudge(lid))
+        self.assertEqual(lid.writes, [])          # no PUT, no refresh
+
+    def test_the_exact_release_is_flipped_to_and_its_rows_are_paired(self):
+        lid = self.Lid([{"id": 1, "trackCount": 12, "monitored": True},
+                        {"id": 2, "trackCount": 11}],
+                       {1: self.rows(1, 12), 2: self.rows(2, 11)})
+        self.assertTrue(self.nudge(lid))
+        self.assertEqual(lid.writes, [("release", 2), ("refresh", 1),
+                                      ("import", 2, 11, 11)])
+
+    def test_a_release_whose_rows_disagree_with_its_count_is_not_used(self):
+        lid = self.Lid([{"id": 1, "trackCount": 12, "monitored": True},
+                        {"id": 2, "trackCount": 11}],
+                       {1: self.rows(1, 12), 2: self.rows(2, 10)})
+        self.assertFalse(self.nudge(lid))
+        self.assertEqual(lid.writes, [])
+
+
 if __name__ == "__main__":
     unittest.main()
