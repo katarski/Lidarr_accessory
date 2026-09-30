@@ -13,6 +13,10 @@ page:
   POST /api/held/keep    {id}  -> discard held files (keep Lidarr's library)
   POST /api/held/move    {id}  -> move held files into the library + rescan
 
+Every POST must carry this process's token in the X-CUE-Token header (the
+page gets it inline; scripts from GET /api/token), and one whose Origin or
+Referer names another site is refused: see _post_refusal in make_handler.
+
 `details` carries the audio profile (formats, lossless/lossy, channels,
 sample-rate/bits, size) so the user can decide from the table alone. The page
 has tabs (Needs attention / In progress), a text filter, condition chips
@@ -29,6 +33,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import threading
 import time
 from pathlib import Path
@@ -458,6 +463,27 @@ _PAGE = r"""<!doctype html>
 <div id="ctx"></div>
 
 <script>
+// Every POST carries this process's token (webui.make_handler refuses one
+// without it). A page on another site can neither read the token nor add a
+// custom header without a CORS preflight, which this server never answers,
+// so it cannot drive these endpoints through the owner's browser. Wrapping
+// fetch stamps every POST the page makes, present and future. A restart
+// changes the token under an open tab: a 403 marked 'token' fetches the new
+// one and retries once -- the server refused before acting, so that is safe.
+var CUE_TOKEN='__CUE_TOKEN__';
+(function(){
+  var raw=window.fetch.bind(window);
+  function post(u,o){var hd=Object.assign({},o.headers||{});hd['X-CUE-Token']=CUE_TOKEN;
+    return raw(u,Object.assign({},o,{headers:hd}));}
+  window.fetch=function(u,o){
+    if(!o||String(o.method||'GET').toUpperCase()!=='POST')return raw(u,o);
+    return post(u,o).then(function(r){
+      if(r.status!==403||r.headers.get('X-CUE-Refused')!=='token')return r;
+      return raw('/api/token').then(function(t){return t.json();})
+        .then(function(j){CUE_TOKEN=j.token||CUE_TOKEN;return post(u,o);});
+    });
+  };
+})();
 var HELD=[], ACT=[], TAB='attention', SEL=new Set(), VISIBLE=[], OPEN=new Set(), SORT={col:'detected',dir:-1}, SETTINGS=[];
 var FILT={lossless:false,lossy:false,multichannel:false,stereo:false,outcomes:{}};
 var COLS=[
@@ -2094,31 +2120,104 @@ def _lidarr_web_url(actions: Any, request_host: str = "") -> str:
     return url
 
 
+_TOKEN_HEADER = "X-CUE-Token"
+
+
+def _origin_matches(source: str, hosts) -> bool:
+    """True when the URL in an Origin/Referer header names one of `hosts`
+    (the Host header, and X-Forwarded-Host behind a proxy): same host name
+    and port, a missing port being the scheme's default. Anything unparsable
+    does not match."""
+    try:
+        u = urlparse(source)
+        if u.scheme not in ("http", "https") or not u.hostname:
+            return False
+        default = 443 if u.scheme == "https" else 80
+        want = (u.hostname.lower(), u.port or default)
+        for h in hosts:
+            h = (h or "").split(",")[0].strip()
+            if not h:
+                continue
+            p = urlparse("//" + h)
+            if p.hostname and (p.hostname.lower(), p.port or default) == want:
+                return True
+    except ValueError:
+        return False
+    return False
+
+
 def make_handler(store, actions: HeldActions):
+    # One token per process. The page is served with it and sends it back on
+    # every POST (see the fetch wrapper at the top of _PAGE's script).
+    token = secrets.token_urlsafe(32)
+
     class Handler(BaseHTTPRequestHandler):
         server_version = "cue_pipeline-webui"
 
         def log_message(self, fmt, *args):
             logger.debug("webui: " + fmt, *args)
 
-        def _send(self, code, body: bytes, ctype):
+        def _send(self, code, body: bytes, ctype, headers=None):
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
+            for k, v in (headers or {}).items():
+                self.send_header(k, v)
             self.end_headers()
             try:
                 self.wfile.write(body)
             except BrokenPipeError:
                 pass
 
-        def _json(self, code, obj):
-            self._send(code, json.dumps(obj).encode("utf-8"), "application/json")
+        def _json(self, code, obj, headers=None):
+            self._send(code, json.dumps(obj).encode("utf-8"), "application/json",
+                       headers)
+
+        def _post_refusal(self) -> Optional[str]:
+            """Why this POST must not run ('origin' / 'token'), or None.
+
+            The WebUI has no login and listens on the LAN, and these POSTs
+            delete library folders, discard held downloads, rewrite settings
+            and stop the container. Before this gate any web page open in a
+            LAN browser could send them: fetch(..., {mode:'no-cors'}) with a
+            text/plain body is a CORS 'simple' request, sent without a
+            preflight, and the server acted on it (the page only could not
+            read the reply). Two independent checks:
+
+            - Origin (Referer when Origin is absent or 'null') must name this
+              server as the browser reached it: the Host header, or
+              X-Forwarded-Host behind a proxy. A browser marks every POST
+              with its origin, so a foreign one is refused outright.
+            - The per-process token must come back in X-CUE-Token. Only a
+              page served from here can read it, and a cross-site page cannot
+              even send a custom header without a preflight, which this
+              server never answers (no do_OPTIONS). This is the check that
+              holds when a browser, an extension or a strict referrer policy
+              sends no Origin or 'null' -- those pass the first check, they
+              are not trusted by it.
+
+            No origin at all plus the right token is a script (curl with the
+            token from GET /api/token): allowed, like any LAN client.
+            """
+            src = (self.headers.get("Origin") or "").strip()
+            if not src or src == "null":
+                src = (self.headers.get("Referer") or "").strip()
+            if src and src != "null" and not _origin_matches(
+                    src, (self.headers.get("Host"),
+                          self.headers.get("X-Forwarded-Host"))):
+                return "origin"
+            sent = (self.headers.get(_TOKEN_HEADER) or "").encode(
+                "utf-8", "replace")
+            if not secrets.compare_digest(sent, token.encode("ascii")):
+                return "token"
+            return None
 
         def do_GET(self):  # noqa: N802
             path = urlparse(self.path).path
             if path in ("/", "/index.html"):
                 page = _PAGE.replace("__LIDARR_URL__", _lidarr_web_url(
-                    actions, self.headers.get("Host", "")))
+                    actions, self.headers.get("Host", ""))).replace(
+                        "__CUE_TOKEN__", token)
                 self._send(200, page.encode("utf-8"),
                            "text/html; charset=utf-8")
             elif path == "/api/held":
@@ -2371,6 +2470,10 @@ def make_handler(store, actions: HeldActions):
                 except TypeError:
                     text = actions.read_log(n)
                 self._send(200, text.encode("utf-8", "replace"), "text/plain; charset=utf-8")
+            elif path == "/api/token":
+                # For the page after a restart, and for scripts. A page on
+                # another site cannot read this reply: no CORS headers.
+                self._json(200, {"token": token})
             elif path == "/healthz":
                 self._json(200, {"ok": True, "held": len(store.list())})
             else:
@@ -2386,6 +2489,32 @@ def make_handler(store, actions: HeldActions):
 
         def do_POST(self):  # noqa: N802
             path = urlparse(self.path).path
+            why = self._post_refusal()
+            if why:
+                # Nothing below has run: the page may safely retry a 'token'
+                # refusal with a fresh token. The unread body is drained
+                # first: closing a socket with unread data sends a reset,
+                # and the browser then sees a network error, not this 403
+                # (measured: the tests lost the reply that way).
+                try:
+                    left = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    left = 0
+                while left > 0:
+                    chunk = self.rfile.read(min(65536, left))
+                    if not chunk:
+                        break
+                    left -= len(chunk)
+                (logger.warning if why == "origin" else logger.info)(
+                    "webui: refused POST %s (%s; Origin=%r Referer=%r Host=%r)",
+                    path, why, self.headers.get("Origin"),
+                    self.headers.get("Referer"), self.headers.get("Host"))
+                self._json(403, {"ok": False, "message": (
+                    "refused: this request came from another site"
+                    if why == "origin" else
+                    "refused: missing or stale page token -- reload the page")},
+                    {"X-CUE-Refused": why})
+                return
             if path == "/api/settings":
                 length = int(self.headers.get("Content-Length") or 0)
                 raw = self.rfile.read(length) if length else b"{}"

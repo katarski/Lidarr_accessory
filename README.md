@@ -412,8 +412,14 @@ POST /api/assembly/add|find|comp|remove
 POST /api/convert/start|pause|resume|cancel|cleardone|mkdir
 POST /api/settings        /api/log/clear
 POST /api/restart         /api/shutdown
-GET  /healthz
+GET  /healthz             /api/token
 ```
+
+Every POST must send the header `X-CUE-Token` with the value from
+`GET /api/token` (the page does this itself; the token changes on every
+restart), and a POST whose `Origin`/`Referer` names another site is refused
+with 403. The WebUI has no login, so without this any web page open in a LAN
+browser could post to it.
 
 ---
 
