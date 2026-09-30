@@ -901,7 +901,8 @@ class TitleNamesTheAlbum(unittest.TestCase):
                 return []
             return [{"id": i, "title": t} for i, t in albums]
         o.lidarr = SimpleNamespace(failure_generation=0,
-                                   list_albums_for_artist=list_albums_for_artist)
+                                   list_albums_for_artist=list_albums_for_artist,
+                                   available=lambda: True)
         return o, asked
 
     def _rel(self, title, seeders=5):

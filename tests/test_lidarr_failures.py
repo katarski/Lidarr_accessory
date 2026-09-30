@@ -250,5 +250,98 @@ class CouldNotAskIsNotAnAnswer(unittest.TestCase):
         self.assertEqual(json.loads(path.read_text("utf-8"))["artists"], {})
 
 
+class SearchDuringAnOutageIsNotAnAttempt(unittest.TestCase):
+    """orch3 ISEARCH-AVAIL-1: a failed search, a grab refused by an open
+    breaker or a failed queue read is not an attempt -- no candidate burned,
+    no Prowlarr fallback, no cooldown stamp."""
+
+    def _orch(self):
+        from orchestrator import Orchestrator
+        o = Orchestrator.__new__(Orchestrator)
+        o.cfg = SimpleNamespace(interactive_search_min_title_ratio=0.45,
+                                interactive_search_dry_run=False,
+                                interactive_search_max_candidates=1000)
+        lid = SimpleNamespace(failure_generation=0, up=True)
+        lid.available = lambda: lid.up
+        o.lidarr = lid
+        o.fallback, o.grabs = [], []
+        o._rank_releases = lambda rels, *a, **k: rels
+        o._queue_download_ids = lambda: set()
+        o._isearch_prowlarr_album = lambda *a, **k: o.fallback.append(1) or False
+        return o, lid
+
+    ALB = {"id": 1, "artistId": 9, "title": "Hoochie",
+           "artist": {"artistName": "Muddy Waters"}}
+    CANDS = [{"guid": "g%d" % i, "indexerId": 1, "title": "Muddy Waters %d" % i,
+              "_title_ratio": 1.0} for i in range(13)]
+
+    def test_a_failed_search_is_no_answer(self):
+        o, lid = self._orch()
+
+        def search(aid):
+            lid.failure_generation += 1
+            return []
+        lid.release_search = search
+        self.assertIsNone(o._isearch_one_album(self.ALB, {}, None))
+        self.assertEqual(o.fallback, [])
+
+    def test_an_open_breaker_burns_no_candidates(self):
+        o, lid = self._orch()
+        lid.release_search = lambda aid: list(self.CANDS)
+
+        def grab(guid, idx, **k):
+            o.grabs.append(guid)
+            lid.failure_generation += 1           # "breaker open"
+            lid.up = False
+            return False
+        lid.release_grab = grab
+        self.assertIsNone(o._isearch_one_album(self.ALB, {}, None))
+        self.assertEqual(o.grabs, ["g0"])
+        self.assertEqual(o.fallback, [])
+
+    def test_a_refused_release_still_moves_on(self):
+        o, lid = self._orch()
+        lid.release_search = lambda aid: list(self.CANDS[:3])
+        lid.release_grab = lambda guid, idx, **k: o.grabs.append(guid) or False
+        self.assertFalse(o._isearch_one_album(self.ALB, {}, None))
+        self.assertEqual(o.grabs, ["g0", "g1", "g2"])
+        self.assertEqual(o.fallback, [1])
+
+    def _pass(self, queue_fails=False):
+        from orchestrator import Orchestrator
+        lid = SimpleNamespace(failure_generation=0)
+        lid.wanted_missing = lambda: [
+            {"id": 1, "artistId": 9, "title": "A", "artist": {"artistName": "X"}},
+            {"id": 2, "artistId": 8, "title": "B", "artist": {"artistName": "Y"}}]
+
+        def queue_list():
+            if queue_fails:
+                lid.failure_generation += 1
+            return []
+        lid.queue_list = queue_list
+        saved, tried = [], []
+        s = SimpleNamespace(lidarr=lid, cfg=SimpleNamespace(
+            interactive_search_min_missing_days=0,
+            interactive_search_cooldown_seconds=3600,
+            interactive_search_max_albums_per_pass=10,
+            interactive_search_dry_run=False,
+            interactive_search_artist_level=True))
+        s._load_isearch_state = lambda: {}
+        s._save_isearch_state = saved.append
+        s._lidarr_generation = Orchestrator._lidarr_generation.__get__(s)
+        s._isearch_one_album = lambda alb, st, q: tried.append(alb["id"])
+        s._try_artist_fill = lambda *a: tried.append("artist")
+        return Orchestrator.interactive_search_pass(s), saved, tried
+
+    def test_a_failed_queue_read_skips_the_pass(self):
+        n, saved, tried = self._pass(queue_fails=True)
+        self.assertEqual((n, saved, tried), (0, [], []))
+
+    def test_an_outage_mid_pass_stamps_nothing_and_stops(self):
+        n, saved, tried = self._pass()
+        self.assertEqual(tried, [1])                    # stopped at the first
+        self.assertFalse(any("last_attempt" in v for v in saved[0].values()))
+
+
 if __name__ == "__main__":
     unittest.main()

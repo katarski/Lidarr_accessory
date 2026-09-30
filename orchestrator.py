@@ -12563,9 +12563,12 @@ class Orchestrator:
                 blocklisted.append(cand.get("guid"))
         return False
 
-    def _isearch_one_album(self, alb: Dict[str, Any], st: Dict[str, Any], qbt) -> bool:
+    def _isearch_one_album(self, alb: Dict[str, Any], st: Dict[str, Any],
+                           qbt) -> Optional[bool]:
         """Search, rank, then grab+verify candidates for one album. True if a
-        release was accepted (or grabbed but unverifiable)."""
+        release was accepted (or grabbed but unverifiable). None when Lidarr
+        failed under it: not an attempt, so the caller stamps nothing and
+        stops the pass (orch3 ISEARCH-AVAIL-1)."""
         cfg = self.cfg
         aid = int(alb["id"])
         artist = (alb.get("artist") or {}).get("artistName", "") or ""
@@ -12573,7 +12576,16 @@ class Orchestrator:
         label = f"{artist} - {album}".strip(" -")
         expected = int((alb.get("statistics") or {}).get("trackCount") or 0)
 
+        # Lidarr's client answers [] when it fails, which read as "no torrent
+        # candidates" and went on to the Prowlarr fallback and the cooldown
+        # stamp. A failed search is no answer at all.
+        gen = self._lidarr_generation()
         releases = self.lidarr.release_search(aid)
+        if self._lidarr_generation() != gen:
+            logger.info("interactive search: %s -- Lidarr failed during the "
+                        "search; not an attempt, tried again when it answers",
+                        label)
+            return None
         cands = self._rank_releases(
             releases, artist, album, st.get("blocklisted") or [],
             album_rec=alb)
@@ -12619,6 +12631,15 @@ class Orchestrator:
             guid, indexer = cand.get("guid"), cand.get("indexerId")
             if not guid or indexer is None:
                 continue
+            # A grab while Lidarr's breaker is open fails at once, and the
+            # loop used to run the whole list that way: 13 Muddy Waters
+            # candidates in 3 ms at 06:10:40 on 29 Sep, then "no torrent
+            # candidates" and a 12 h cooldown for an album never tried. Stop
+            # instead; the candidates are still there when Lidarr answers.
+            if not self.lidarr.available():
+                logger.info("interactive search: %s -- Lidarr is not answering; "
+                            "the remaining candidates wait for it", label)
+                return None
             tried += 1
             logger.info(
                 "interactive search: %s -> grabbing %r (seeders=%s quality=%s)",
@@ -12629,11 +12650,17 @@ class Orchestrator:
             # should still be grabbed against it, exactly as confirming the
             # UI's "Grab Release" dialog does.
             before = self._queue_download_ids()
+            gen = self._lidarr_generation()
             if not self.lidarr.release_grab(
                 guid, indexer, album_id=aid,
                 artist_id=(alb.get("artistId")
                            or (alb.get("artist") or {}).get("id")),
             ):
+                if self._lidarr_generation() != gen:
+                    logger.info("interactive search: %s -- Lidarr failed "
+                                "grabbing %r; the remaining candidates wait "
+                                "for it", label, cand.get("title"))
+                    return None
                 continue
             thash, _rec = self._await_grab(str(cand.get("title") or ""),
                                            album_id=aid, before=before,
@@ -13066,14 +13093,15 @@ class Orchestrator:
 
     def _try_artist_fill(self, artist_id: int, artist_name: str,
                          missing: List[Tuple[str, int, int]],
-                         blocklisted: List[str], qbt) -> bool:
+                         blocklisted: List[str], qbt) -> Optional[bool]:
         """
         Artist-level: search the artist scope and grab whatever best fills the
         MISSING albums -- a discography/collection (verified by album-folder
         count) or a single release matching a missing album (verified by track
         count). `missing` is [(album_title, expected_trackcount, album_id)].
         Returns True when something was accepted (or, in dry-run, would be) so
-        the caller skips per-album search for this artist.
+        the caller skips per-album search for this artist. None when Lidarr
+        failed under it (not an attempt; see _isearch_one_album).
         """
         cfg = self.cfg
         if self._is_placeholder_artist(artist_name):
@@ -13083,9 +13111,14 @@ class Orchestrator:
                 "most compilations, so it matches almost anything)",
                 artist_name)
             return False
+        gen = self._lidarr_generation()
+        found = self.lidarr.release_search_artist(artist_id)
+        if self._lidarr_generation() != gen:
+            logger.info("interactive search: %s -- Lidarr failed during the "
+                        "artist search; not an attempt", artist_name)
+            return None
         cands = self._rank_artist_releases(
-            self.lidarr.release_search_artist(artist_id), artist_name,
-            missing, blocklisted, artist_id=artist_id)
+            found, artist_name, missing, blocklisted, artist_id=artist_id)
         if not cands:
             return False
         if cfg.interactive_search_dry_run:
@@ -13103,6 +13136,10 @@ class Orchestrator:
             guid, indexer = cand.get("guid"), cand.get("indexerId")
             if not guid or indexer is None:
                 continue
+            if not self.lidarr.available():
+                logger.info("interactive search: %s -- Lidarr is not answering; "
+                            "the remaining candidates wait for it", artist_name)
+                return None
             kind = "discography" if cand.get("_is_disco") else "album"
             logger.info(
                 "interactive search: %s -> grabbing %s %r (fills~%s seeders=%s "
@@ -13115,9 +13152,15 @@ class Orchestrator:
             _alb_id = (_m[2] if (not cand.get("_is_disco") and len(_m) > 2)
                        else None)
             before = self._queue_download_ids()
+            gen = self._lidarr_generation()
             if not self.lidarr.release_grab(
                 guid, indexer, album_id=_alb_id, artist_id=artist_id,
             ):
+                if self._lidarr_generation() != gen:
+                    logger.info("interactive search: %s -- Lidarr failed "
+                                "grabbing %r; the remaining candidates wait "
+                                "for it", artist_name, cand.get("title"))
+                    return None
                 continue
             thash, _rec = self._await_grab(cand.get("title") or "",
                                            album_id=_alb_id, before=before,
@@ -13203,8 +13246,16 @@ class Orchestrator:
         # unrelated discography torrent stuck on "Couldn't find similar album".
         _DEAD_STATES = {"importfailed", "failed"}
         queued_ids: set = set()
+        # The queue read fails as [] -- and then every album already
+        # downloading looked eligible for another grab.
+        gen_q = self._lidarr_generation()
+        queue_rows = self.lidarr.queue_list()
+        if self._lidarr_generation() != gen_q:
+            logger.info("interactive search: Lidarr failed while reading its "
+                        "queue -- pass skipped, state kept")
+            return 0
         try:
-            for rec in self.lidarr.queue_list():
+            for rec in queue_rows:
                 aid = rec.get("albumId") or (rec.get("album") or {}).get("id")
                 if aid is None:
                     continue
@@ -13281,6 +13332,10 @@ class Orchestrator:
                 len(picked_albums), len(by_artist))
 
         grabbed = 0
+        # Lidarr failing under an album or artist search is not an attempt:
+        # nothing is stamped for it and the pass stops there -- the next pass
+        # starts where this one could not go on.
+        lidarr_failed = False
         # Shared budget so one prolific artist's per-album fallback can't fire
         # a search for every one of its (often unavailable) missing albums; the
         # rest rotate in on later passes.
@@ -13289,13 +13344,20 @@ class Orchestrator:
             filled = 0
             for alb, st, aid in items:
                 try:
-                    if self._isearch_one_album(alb, st, qbt):
-                        grabbed += 1
-                        filled += 1
+                    res = self._isearch_one_album(alb, st, qbt)
                 except Exception as exc:  # noqa: BLE001
                     logger.exception(
                         "interactive search: album %s failed: %s", aid, exc)
+                    res = False
+                if res is None:
+                    lidarr_failed = True
+                    break
+                if res:
+                    grabbed += 1
+                    filled += 1
                 st["last_attempt"] = now
+            if lidarr_failed:
+                break
             if filled or not cfg.interactive_search_artist_level:
                 continue
             # Nothing could be found album by album. Some albums were only ever
@@ -13315,14 +13377,23 @@ class Orchestrator:
                 "falling back to the artist scope (%d gap(s) it could fill)",
                 name, len(items), len(missing_info))
             try:
-                if self._try_artist_fill(art_id, name, missing_info,
-                                         ast.setdefault("blocklisted", []), qbt):
-                    if not cfg.interactive_search_dry_run:
-                        grabbed += 1
+                res = self._try_artist_fill(art_id, name, missing_info,
+                                            ast.setdefault("blocklisted", []),
+                                            qbt)
             except Exception as exc:  # noqa: BLE001
                 logger.exception(
                     "interactive search: artist %s fill failed: %s", art_id, exc)
+                res = False
+            if res is None:
+                lidarr_failed = True
+                break
+            if res and not cfg.interactive_search_dry_run:
+                grabbed += 1
             ast["last_attempt"] = now
+        if lidarr_failed:
+            logger.info("interactive search: Lidarr failed mid-pass -- the "
+                        "albums not reached are not stamped and go first next "
+                        "pass")
 
         # Prune state for albums/artists that are no longer missing.
         for k in list(state.keys()):
