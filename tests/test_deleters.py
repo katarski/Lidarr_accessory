@@ -953,5 +953,131 @@ class TitleNamesTheAlbum(unittest.TestCase):
         self.assertEqual(grabbed, ["g1"])
 
 
+class HandoffKeepsWhatLidarrDidNotTake(unittest.TestCase):
+    """orch2 F9: a multi-disc album is handed off at its PARENT, audio in
+    CD1/CD2. Success is judged by the files sent, "remaining" by a walk of
+    the whole folder, and the source (folder and .cue) is kept while any
+    audio Lidarr did not take is still in it."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.folder = self.root / "Artist - Album (2CD)"
+        old = time.time() - 600
+        for disc in ("CD1", "CD2"):
+            (self.folder / disc).mkdir(parents=True)
+            for n in ("01.flac", "02.flac"):
+                f = self.folder / disc / n
+                f.write_bytes(b"x")
+                os.utime(f, (old, old))
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _orch(self, offered, moves, delete_folder=True):
+        from types import SimpleNamespace
+        import orchestrator as O
+        o = O.Orchestrator.__new__(O.Orchestrator)
+        o.cfg = SimpleNamespace(
+            sweep_min_stable_seconds=0, transcode_lossless_to_flac=False,
+            pre_split_monitored_gap_only=False, pre_check_lidarr_library=False,
+            manual_import_timeout_seconds=60, cleanup_lidarr_queue=False,
+            verify_library_after_import=True, min_match_percent=50,
+            delete_source_folder_on_success=delete_folder,
+            watch_root=self.root)
+        o._skip_seen, o.acoustid, o.cued = set(), None, []
+
+        def apply(items):
+            for it in items:        # Lidarr MOVES what it imports
+                if Path(it["path"]) in moves:
+                    Path(it["path"]).unlink()
+            return 9
+        o.lidarr = SimpleNamespace(
+            find_artist=lambda n: {"id": 5}, queue_find_for=lambda a, b: None,
+            windows_to_lidarr=str, lidarr_to_windows=str,
+            manual_import_candidates=lambda p, artist_id=None: [
+                {"path": str(f)} for f in offered],
+            manual_import_apply=apply,
+            command_record=lambda c: {"status": "completed",
+                                      "result": "successful"})
+        o._read_audio_tags = lambda a: ("Artist", "Album")
+        o._is_placeholder_identity = lambda a, b: False
+        o._align_release_to_disk = lambda *a: None
+        o._log_rejections = lambda c: None
+        o._filter_acceptable = lambda c: c
+        o._hydrate_candidates = lambda c, *a: [dict(x, artistId=5) for x in c]
+        o._record = lambda *a, **k: None
+        o._trigger_artist_refresh = lambda *a, **k: None
+        o._log_command_record = lambda *a: None
+        # Lidarr's library reads the album complete BY NAME in every case.
+        o._verify_library_reflects_album = lambda *a, **k: True
+        o._delete_orphan_cue = lambda cue, reason: o.cued.append(cue)
+        return o
+
+    def _run(self, o):
+        clock = iter(range(0, 10 ** 6, 7))
+        with mock.patch("orchestrator.time.monotonic",
+                        side_effect=lambda: next(clock)), \
+                mock.patch("orchestrator.time.sleep"):
+            o._handoff_inner(None, self.folder, reason="t")
+
+    def _disc(self, n):
+        return sorted((self.folder / f"CD{n}").glob("*.flac"))
+
+    def test_a_listing_looks_below_the_parent(self):
+        import orchestrator as O
+        o = O.Orchestrator.__new__(O.Orchestrator)
+        exts = O._ALL_AUDIO_EXTS
+        self.assertFalse(o._staging_cleared(self.folder, exts))
+        for f in self._disc(1):
+            f.unlink()
+        self.assertTrue(o._staging_cleared(self.folder, exts,
+                                           [self.folder / "CD1" / "01.flac"]))
+        self.assertFalse(o._staging_cleared(self.folder, exts))
+        for f in self._disc(2):
+            f.unlink()
+        self.assertTrue(o._staging_cleared(self.folder, exts))
+
+    def test_sent_paths_keep_their_disc_folder(self):
+        import orchestrator as O
+        o = O.Orchestrator.__new__(O.Orchestrator)
+        got = o._submitted_paths(self.folder, "/lidarr/Artist - Album (2CD)", [
+            {"path": "/lidarr/Artist - Album (2CD)/CD2/01.flac"}, {"path": ""}])
+        self.assertEqual(got, [self.folder / "CD2" / "01.flac"])
+
+    def test_a_disc_never_sent_keeps_the_source(self):
+        for delete_folder in (True, False):
+            with self.subTest(delete_folder=delete_folder):
+                cd1 = self._disc(1)
+                o = self._orch(cd1, set(cd1), delete_folder)
+                self._run(o)
+                self.assertEqual(len(self._disc(2)), 2)
+                self.assertEqual(o.cued, [])
+                old = time.time() - 600
+                for f in cd1:           # put Disc 1 back for the next round
+                    f.write_bytes(b"x")
+                    os.utime(f, (old, old))
+
+    def test_a_sent_file_still_here_is_not_success(self):
+        cd1 = self._disc(1)
+        o = self._orch(cd1 + self._disc(2), set())
+        self._run(o)
+        self.assertEqual(len(self._disc(1)) + len(self._disc(2)), 4)
+        self.assertEqual(o.cued, [])
+
+    def test_everything_taken_cleans_up(self):
+        every = self._disc(1) + self._disc(2)
+        o = self._orch(every, set(every), delete_folder=False)
+        self._run(o)
+        self.assertEqual(o.cued, [None])
+        self.assertTrue(self.folder.exists())
+        o = self._orch([], set(), delete_folder=True)
+        o._finish_handoff_source(
+            None, self.folder, every, artist_name="Artist",
+            album_name="Album", artist_id=5, expected_tracks=4,
+            context="t", reason="t")
+        self.assertFalse(self.folder.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -6435,6 +6435,10 @@ class Orchestrator:
             "Pre-split handoff: committing ManualImport for %d/%d files",
             len(committable), len(candidates),
         )
+        # The files this command carries, on our side. Success, "remaining"
+        # and the clean-up are judged by them and by a walk of the whole
+        # folder -- never by listing one level of it (orch2 F9).
+        sent = self._submitted_paths(folder, lidarr_path, committable)
         mi_cmd = self.lidarr.manual_import_apply(committable)
         if mi_cmd is None:
             logger.warning(
@@ -6454,12 +6458,12 @@ class Orchestrator:
         if self._wait_for_manual_import(
             mi_cmd, folder,
             timeout=self.cfg.manual_import_timeout_seconds,
-            staging_exts=_ALL_AUDIO_EXTS,
+            staging_exts=_ALL_AUDIO_EXTS, submitted=sent,
         ):
-            remaining = self._sibling_audio_files(folder)
+            left = self._audio_left_after_import(folder, sent)
             logger.info(
-                "Pre-split handoff succeeded for %s (%d audio files remaining)",
-                folder, len(remaining),
+                "Pre-split handoff succeeded for %s (%s audio files remaining)",
+                folder, "?" if left is None else len(left[0]) + len(left[1]),
             )
             # Queue + folder cleanup (mirrors the main-split post-success path).
             if self.cfg.cleanup_lidarr_queue:
@@ -6475,9 +6479,10 @@ class Orchestrator:
                     aid = int(cand_aid)
                     break
             self._trigger_artist_refresh(artist_name, artist_id=aid)
-            # Lidarr reported completed+successful AND the source folder's
-            # audio was moved out (staging cleared) -- that IS "the files
-            # were moved to the library", so we clean up the source now.
+            # Lidarr reported completed+successful AND every file we sent was
+            # moved out -- that IS "the files were moved to the library", so
+            # we clean up the source now, unless audio we did not send (or
+            # that Lidarr left) is still in it: see _finish_handoff_source.
             # The library-reflection check runs only as an ADVISORY nudge
             # (it refreshes Lidarr's cached view and labels the ledger); it
             # no longer BLOCKS cleanup, because Lidarr stores albums under
@@ -6505,18 +6510,11 @@ class Orchestrator:
                 artist=artist_name, album=album_name,
                 reason=f"pre-split handoff ({reason})",
             )
-            if self.cfg.delete_source_folder_on_success:
-                # _delete_source_folder takes a cue_path and removes its
-                # .parent -- for the CUE-less sweep, synthesize a fake
-                # child path so the correct folder is targeted.
-                sentinel = cue_path if cue_path is not None else folder / ".cueless_sweep"
-                self._delete_source_folder(
-                    sentinel, verified=lib_confirms, artist_name=artist_name,
-                    album_name=album_name, artist_id=aid,
-                    expected_tracks=len(audios),
-                    context="pre-split handoff")
-            else:
-                self._delete_orphan_cue(cue_path, reason)
+            self._finish_handoff_source(
+                cue_path, folder, sent, artist_name=artist_name,
+                album_name=album_name, artist_id=aid,
+                expected_tracks=len(audios), context="pre-split handoff",
+                reason=reason)
             return
 
         # ManualImport didn't report clean success within the window. That
@@ -6546,15 +6544,11 @@ class Orchestrator:
                 artist=artist_name, album=album_name,
                 reason=f"pre-split handoff (verified after wait timeout) ({reason})",
             )
-            if self.cfg.delete_source_folder_on_success:
-                sentinel = cue_path if cue_path is not None else folder / ".cueless_sweep"
-                self._delete_source_folder(
-                    sentinel, verified=True, artist_name=artist_name,
-                    album_name=album_name, artist_id=aid,
-                    expected_tracks=len(audios),
-                    context="verified after wait timeout")
-            else:
-                self._delete_orphan_cue(cue_path, reason)
+            self._finish_handoff_source(
+                cue_path, folder, sent, artist_name=artist_name,
+                album_name=album_name, artist_id=aid,
+                expected_tracks=len(audios),
+                context="verified after wait timeout", reason=reason)
             return
 
         logger.warning(
@@ -6567,6 +6561,91 @@ class Orchestrator:
             artist=artist_name, album=album_name,
             reason=f"pre-split handoff: Lidarr terminal state not ok ({reason})",
         )
+
+    def _submitted_paths(self, folder: Path, lidarr_folder: str,
+                         items: Sequence[Dict[str, Any]]) -> List[Path]:
+        """Our paths for the files a ManualImport command carries. Lidarr
+        names them under the folder it was asked about (`lidarr_folder`, its
+        view of `folder`), so each is `folder`'s file at the same place below
+        it: CD2/01.flac stays CD2/01.flac."""
+        base = (lidarr_folder or "").replace("\\", "/").rstrip("/")
+        out: List[Path] = []
+        for it in items or ():
+            p = str(it.get("path") or "").replace("\\", "/")
+            if not p:
+                continue
+            if base and p.startswith(base + "/"):
+                out.append(folder.joinpath(*p[len(base) + 1:].split("/")))
+            else:
+                out.append(Path(self.lidarr.lidarr_to_windows(p)))
+        return out
+
+    def _audio_left_after_import(
+        self, folder: Path, sent: Sequence[Path],
+    ) -> Optional[Tuple[List[Path], List[Path]]]:
+        """
+        What an import left behind: (the sent files still here, the audio at
+        any level below `folder` that was never sent). Lidarr MOVES what it
+        imports, so both are audio it did not take. None when the folder
+        cannot be read -- which is not "nothing left".
+        """
+        stayed = [p for p in sent if p.exists()]
+        keys = {str(p) for p in sent}
+        errors: List[OSError] = []
+        unsent: List[Path] = []
+        for root, _dirs, files in os.walk(str(folder), onerror=errors.append):
+            for f in files:
+                if os.path.splitext(f)[1].lower() in _ALL_AUDIO_EXTS:
+                    p = Path(root) / f
+                    if str(p) not in keys:
+                        unsent.append(p)
+        try:
+            unreadable = bool(errors) and folder.exists()
+        except OSError:
+            unreadable = True
+        return None if unreadable else (stayed, unsent)
+
+    def _finish_handoff_source(
+        self, cue_path: Optional[Path], folder: Path, sent: Sequence[Path], *,
+        artist_name: str, album_name: str, artist_id: Optional[int],
+        expected_tracks: int, context: str, reason: str,
+    ) -> None:
+        """
+        Clean up after a hand-off Lidarr took: the whole folder, or only its
+        orphan .cue (delete_source_folder_on_success off) -- and neither while
+        any audio is left under the folder.
+
+        "Lidarr confirms the album" is no proof about THIS folder's leftovers.
+        A multi-disc album is handed off at its parent; when only a
+        disc-1-sized release is monitored, Disc 1 fills it, the album reads
+        complete by name, and Disc 2 -- never sent, or sent and refused -- is
+        still in CD2 (orch2 F9). That audio is not the album the import
+        covered, so HANDOFF section 3 applies: a source is never deleted while
+        its audio is in it. Its .cue stays too (backlog #6: removed only after
+        a verified import). The folder has changed, so the next sweep pass
+        judges the leftovers on their own; a redundant copy is then disposed
+        of by Lidarr's per-file verdict, never by an album name.
+        """
+        left = self._audio_left_after_import(folder, sent)
+        if left is None or left[0] or left[1]:
+            logger.warning(
+                "Keeping %s and its .cue [%s]: it still holds audio Lidarr "
+                "did not take (%s).", folder, context,
+                "folder unreadable" if left is None else
+                f"{len(left[0])} sent and still here, "
+                f"{len(left[1])} never sent")
+            return
+        if self.cfg.delete_source_folder_on_success:
+            # _delete_source_folder takes a cue_path and removes its .parent --
+            # for the CUE-less sweep, synthesize a child path so the correct
+            # folder is targeted.
+            sentinel = cue_path if cue_path is not None else folder / ".cueless_sweep"
+            self._delete_source_folder(
+                sentinel, artist_name=artist_name, album_name=album_name,
+                artist_id=artist_id, expected_tracks=expected_tracks,
+                context=context)
+        else:
+            self._delete_orphan_cue(cue_path, reason)
 
     def _cue_is_single_image(self, cue_path: Optional[Path]) -> bool:
         """
@@ -9261,10 +9340,15 @@ class Orchestrator:
         return False
 
     def _staging_cleared(
-        self, staging_dir: Path, exts: Optional[frozenset] = None
+        self, staging_dir: Path, exts: Optional[frozenset] = None,
+        submitted: Optional[Sequence[Path]] = None,
     ) -> bool:
         """
-        True if none of the audio files we handed to Lidarr remain in the dir.
+        True if none of the audio files we handed to Lidarr remain.
+
+        `submitted` -- the exact paths the ManualImport command carried -- is
+        the answer whenever the caller knows it: those files are gone, or they
+        are not. Everything below is a listing standing in for it.
 
         Default (`exts=None`) checks `*.flac` -- correct for the MAIN split
         flow, where staging holds our split .flac output and we must ignore
@@ -9274,15 +9358,23 @@ class Orchestrator:
         arbitrary format (.mp3/.m4a/.ape/.wv/...), so they pass the broad
         `_ALL_AUDIO_EXTS` set: globbing only `*.flac` there would ALWAYS report
         "cleared" (no .flac present) and defeat the `require_cleared` safety,
-        letting us delete a source whose tracks never actually moved.
+        letting us delete a source whose tracks never actually moved. That
+        listing looks at every level below the dir, not one: a multi-disc
+        album is handed off at its PARENT with the audio in CD1/CD2, and a
+        one-level listing of the parent read "cleared" before Lidarr had moved
+        a single file (orch2 F9). A folder that cannot be read is not cleared.
         """
         try:
+            if submitted:
+                return not any(p.exists() for p in submitted)
             if exts is None:
                 return not any(staging_dir.glob("*.flac"))
-            for p in staging_dir.iterdir():
-                if p.is_file() and p.suffix.lower() in exts:
+            errors: List[OSError] = []
+            for _root, _dirs, files in os.walk(str(staging_dir),
+                                               onerror=errors.append):
+                if any(os.path.splitext(f)[1].lower() in exts for f in files):
                     return False
-            return True
+            return not errors or not staging_dir.exists()
         except OSError:
             return False
 
@@ -9338,10 +9430,14 @@ class Orchestrator:
         self, command_id: int, staging_dir: Path, timeout: int,
         require_cleared: bool = True,
         staging_exts: Optional[frozenset] = None,
+        submitted: Optional[Sequence[Path]] = None,
     ) -> bool:
         """
         Wait for Lidarr's ManualImport command to reach a terminal state
         and report genuine success.
+
+        `submitted` is the files the command carried. When given, "staging
+        cleared" means exactly those are gone (see _staging_cleared).
 
         History: an earlier version returned True as soon as the staging
         folder emptied. That's unsafe -- Lidarr can move files out of
@@ -9394,12 +9490,12 @@ class Orchestrator:
                     self._log_command_record("ManualImport", rec)
                     result = (rec.get("result") or "").lower()
                     if status == "completed" and result == "successful":
-                        cleared = self._staging_cleared(staging_dir, staging_exts)
+                        cleared = self._staging_cleared(staging_dir, staging_exts, submitted)
                         if not cleared:
                             # Grace window for SMB listing lag before we judge.
                             grace_deadline = time.monotonic() + 30
                             while time.monotonic() < grace_deadline:
-                                if self._staging_cleared(staging_dir, staging_exts):
+                                if self._staging_cleared(staging_dir, staging_exts, submitted):
                                     cleared = True
                                     break
                                 time.sleep(3)
@@ -9434,7 +9530,7 @@ class Orchestrator:
             # informational only -- it does NOT short-circuit the wait.
             # We log it once so you can see Lidarr is making progress,
             # but we keep waiting for the terminal signal.
-            if not staging_empty_noted and self._staging_cleared(staging_dir, staging_exts):
+            if not staging_empty_noted and self._staging_cleared(staging_dir, staging_exts, submitted):
                 logger.info(
                     "ManualImport cmd=%s: staging folder emptied (Lidarr status=%s) -- "
                     "waiting for command to reach terminal state",
@@ -9445,7 +9541,9 @@ class Orchestrator:
             # Progress heartbeat every 30s so long waits don't look frozen.
             now = time.monotonic()
             if now - last_report > 30:
-                staging_count = sum(1 for _ in staging_dir.glob("*.flac"))
+                staging_count = (sum(1 for p in submitted if p.exists())
+                                 if submitted else
+                                 sum(1 for _ in staging_dir.glob("*.flac")))
                 if infinite:
                     logger.info(
                         "Waiting on ManualImport cmd=%s (status=%s, staging has %d files, "
