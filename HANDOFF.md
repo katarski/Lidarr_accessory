@@ -32,8 +32,9 @@ build) with the repo's `*.py` and `tools/`, checks `OrchestratorConfig` is
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20260930-disccues`**
-(08618ec). Earlier tags for rollback: `guard-20260930-multidisc`,
+then is the container replaced. Live now: **`guard-20260930-lossless`**
+(376bc93). Earlier tags for rollback: `guard-20260930-disccues`,
+`guard-20260930-multidisc`,
 `guard-20260930-titles`, `guard-20260929-songs`, `-asmplan`,
 `-f4`, `-claims`, `-assembly`, `-binding`, `-deleters`, `-pairing`,
 `-names`, `pre-gate-20260929`.
@@ -204,6 +205,10 @@ layer says `http://daniel:11434`.
   A single-image .cue in a disc folder still splits on its own; CD folders
   loose in the watch root are never one album. The 4 per-disc held entries
   of Nat King Cole "100 Hits" predate this (it gave up in the old code).
+- **Prefer-lossless works per folder** (`_prefer_lossless_in_album`): a song
+  is (folder, name key), the lossy twin is quarantined in its OWN folder's
+  `_superseded_by_lossless/`, and every folder it changed is rescanned
+  (orch2 F11). Nothing is deleted.
 - **Nothing is grabbed for an unmonitored album or artist** — Lidarr will not
   import into one either, so the download is wasted twice. Fails open: no id, or
   a lookup error, and the grab proceeds.
@@ -372,9 +377,9 @@ test of a feature whose purpose is removing files.
 
 ## 6. Open items
 
-1. **28 audit findings are open: `docs/AUDIT_OPEN.md`**, in fix order, each
+1. **27 audit findings are open: `docs/AUDIT_OPEN.md`**, in fix order, each
    with evidence, root cause and the agreed fix (the verifier's correction
-   where there was one). Start at item 1 (orch2 F11). 63 are fixed;
+   where there was one). Start at item 1 (orch3 COMP-NEG-1). 64 are fixed;
    CLI-04/06/07 were refuted — do not redo them. **The owner compacts
    after every fix: finish one (tests, deploy, verify, these two files),
    then stop.** orch2 F4 (30 Sep) is deployed; its first live
