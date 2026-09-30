@@ -5610,6 +5610,10 @@ class Orchestrator:
                 want.append(t)
         if len(want) < 3:
             return None            # too little to be decisive
+        # A failed read answers [] and would drop that album from the field --
+        # possibly the real competitor, which is what the margin test is for
+        # (orch2 F7). A resolve during a Lidarr failure is no resolve.
+        gen = self._lidarr_generation()
         try:
             albums = self.lidarr.list_albums_for_artist(int(artist_id)) or []
         except Exception:  # noqa: BLE001
@@ -5624,7 +5628,9 @@ class Orchestrator:
             try:
                 tracks = self.lidarr.list_tracks_for_album(int(a["id"])) or []
             except Exception:  # noqa: BLE001
-                continue
+                return None
+            if self._lidarr_generation() != gen:
+                return None
             if not tracks:
                 continue
             pool = list(want)
@@ -8754,10 +8760,15 @@ class Orchestrator:
         # Per-artist album index, lazily built when we first need it.
         album_index_by_artist: Dict[int, Dict[str, Dict[str, Any]]] = {}
 
-        def _album_index(artist_id: int) -> Dict[str, Dict[str, Any]]:
+        def _album_index(artist_id: int) -> Optional[Dict[str, Dict[str, Any]]]:
+            """None when Lidarr could not list the artist's albums. Its client
+            answers [] then, and that was cached for the pass as "this artist
+            has no albums": every album folder of it became "album not in
+            Lidarr" and went down the repair path (orch2 F7). Not cached."""
             cached = album_index_by_artist.get(artist_id)
             if cached is not None:
                 return cached
+            gen = self._lidarr_generation()
             try:
                 albums = self.lidarr.list_albums_for_artist(artist_id) or []
             except Exception as exc:  # noqa: BLE001
@@ -8765,7 +8776,9 @@ class Orchestrator:
                     "audit: list_albums_for_artist(%s) failed: %s",
                     artist_id, exc,
                 )
-                albums = []
+                return None
+            if self._lidarr_generation() != gen:
+                return None
             built: Dict[str, Dict[str, Any]] = {}
             for a in albums:
                 t = (a.get("title") or "").strip()
@@ -8795,7 +8808,7 @@ class Orchestrator:
             target = _match_key(album_name)
             if not target:
                 return None
-            idx = _album_index(artist_id)
+            idx = _album_index(artist_id) or {}
             rec = idx.get(target)
             if rec is not None:
                 return rec
@@ -8867,6 +8880,12 @@ class Orchestrator:
                 last_heartbeat = now
 
             artist_rec = self._lidarr_lookup_artist(artist_dir.name, artist_index)
+            if (artist_rec is not None
+                    and _album_index(int(artist_rec["id"])) is None):
+                # Unknown this pass, not empty: no rows, no repairs.
+                logger.info("audit: Lidarr could not list %s's albums -- "
+                            "skipped this pass", artist_dir.name)
+                continue
 
             try:
                 album_children = self._library_album_dirs(artist_dir)
@@ -9043,12 +9062,19 @@ class Orchestrator:
                             # cases where a working album gets broken by a
                             # follow-up PUT that races with Lidarr's internal
                             # state machine. Raises _AuditSkip to jump out.
-                            def _bail_if_green(reason: str) -> None:
+                            def _bail_if_green(reason: str,
+                                               target=None) -> None:
+                                """`target` is the album about to be acted
+                                on when it is not album_rec -- one resolved
+                                by songs or tags. It is gated too (orch2 F7):
+                                green when it already holds at least as many
+                                files as this folder, or is complete."""
                                 nonlocal action_taken
-                                if album_rec is None:
+                                rec_ = target if target is not None else album_rec
+                                if rec_ is None:
                                     return
                                 try:
-                                    l = self.lidarr.get_album(int(album_rec["id"]))
+                                    l = self.lidarr.get_album(int(rec_["id"]))
                                 except Exception:  # noqa: BLE001
                                     return
                                 # Same exception as the guard above: an
@@ -9056,14 +9082,22 @@ class Orchestrator:
                                 # definition, so "green" must mean "has as many
                                 # as the folder holds", not "has any".
                                 _n = _album_track_file_count(l) if l else 0
-                                if l and _n > 0 and (not _under
-                                                     or _n >= len(audios)):
+                                if target is None:
+                                    green = (l and _n > 0
+                                             and (not _under or _n >= len(audios)))
+                                else:
+                                    _tot = int(((l or {}).get("statistics") or {})
+                                               .get("totalTrackCount") or 0)
+                                    green = (l and _n > 0
+                                             and (_n >= len(audios)
+                                                  or (_tot and _n >= _tot)))
+                                if green:
                                     already_acted.add(album_key)
                                     action_taken = f"green-skip ({reason})"
                                     logger.info(
                                         "audit: %r is green now (%s); stopping "
                                         "to avoid breaking the artist",
-                                        album_rec.get("title"), reason,
+                                        rec_.get("title"), reason,
                                     )
                                     raise _AuditSkip()
 
@@ -9211,6 +9245,7 @@ class Orchestrator:
                                          album_dir.name, album_name_guess],
                                         len(audios), audios=audios)
                                 if rec is not None:
+                                    _bail_if_green("pre-align-resolved", rec)
                                     # Point the album at the release that MATCHES
                                     # THE FILES before mapping them. Lidarr
                                     # monitors the biggest release it knows and
@@ -9229,6 +9264,7 @@ class Orchestrator:
                                         allow_when_populated=True)
                                     rec = (self.lidarr.get_album(int(rec["id"]))
                                            or rec)
+                                    _bail_if_green("pre-tracknumber-import", rec)
                                     tn_cmd = self._import_library_folder_by_tracknumber(
                                         rec, aid, audios)
                                     if tn_cmd:

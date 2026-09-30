@@ -343,5 +343,79 @@ class SearchDuringAnOutageIsNotAnAttempt(unittest.TestCase):
         self.assertFalse(any("last_attempt" in v for v in saved[0].values()))
 
 
+class AuditUnknownIsNotEmpty(unittest.TestCase):
+    """orch2 F7: an artist whose album list failed is unknown for the pass
+    (no rows, no repairs); a song-title resolve that lost an album to a
+    failed read is no resolve."""
+
+    SONGS = ["Alpha Song", "Bravo Song", "Charlie Song", "Delta Song",
+             "Echo Song", "Foxtrot Song"]
+
+    def test_the_audit_skips_an_artist_it_could_not_list(self):
+        import tempfile
+        from orchestrator import Orchestrator
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name) / "Music"
+        (root / "Artist" / "Album").mkdir(parents=True)
+        (root / "Artist" / "Album" / "01.flac").write_bytes(b"x")
+        o = Orchestrator.__new__(Orchestrator)
+        o.cfg = SimpleNamespace(library_root_windows=root,
+                                library_audit_report_file=Path(tmp.name) / "r.csv")
+        touched, rows = [], []
+        lid = SimpleNamespace(failure_generation=0)
+
+        def albums(aid):
+            lid.failure_generation += 1              # the list failed: []
+            return []
+        lid.list_albums_for_artist = albums
+        lid.refresh_artist = lambda aid: touched.append(aid)
+        o.lidarr = lid
+        o._audit_load_report = lambda p: (True, set())      # act mode
+        o._build_lidarr_artist_index = lambda: {"artist": {"id": 5}}
+        o._lidarr_lookup_artist = lambda name, idx: {"id": 5}
+        o._library_album_dirs = lambda d: [p for p in d.iterdir() if p.is_dir()]
+        o._audit_append_rows = lambda f, r: rows.extend(r)
+        self.assertEqual(o.audit_library_vs_lidarr(), 0)
+        self.assertEqual((rows, touched), ([], []))
+
+        # Listed, and truly without this album: the album it resolves to by
+        # songs is gated like album_rec -- complete, so nothing is flipped.
+        lid.list_albums_for_artist = lambda aid: []
+        lid.library_windows_to_lidarr = str
+        lid.manual_import_candidates = lambda p: []
+        lid.get_album = lambda i: {"id": i, "title": "Resolved", "statistics": {
+            "trackFileCount": 1, "totalTrackCount": 1}}
+        acted = []
+        o._album_from_tags = lambda a: ""
+        o._resolve_library_album = lambda *a, **k: {"id": 7, "title": "Resolved"}
+        o._align_release_to_disk = lambda *a, **k: acted.append("align")
+        o._import_library_folder_by_tracknumber = (
+            lambda *a, **k: acted.append("import"))
+        o.audit_library_vs_lidarr()
+        self.assertEqual(acted, [])
+        self.assertIn("green-skip (pre-align-resolved)", rows[-1][-1])
+
+    def test_a_resolve_that_lost_an_album_to_a_failed_read_is_none(self):
+        from orchestrator import Orchestrator
+        o = Orchestrator.__new__(Orchestrator)
+        lid = SimpleNamespace(failure_generation=0)
+        stats = {"trackFileCount": 0, "totalTrackCount": 6}
+        lid.list_albums_for_artist = lambda aid: [
+            {"id": 1, "title": "Hits", "statistics": stats},
+            {"id": 2, "title": "Studio", "statistics": stats}]
+
+        def tracks(aid):
+            if aid == 2:                              # the real competitor
+                lid.failure_generation += 1
+                return []
+            return [{"title": s} for s in self.SONGS]
+        lid.list_tracks_for_album = tracks
+        o.lidarr = lid
+        o._tag_title = lambda p: p.stem
+        audios = [Path("/x/%s.flac" % s) for s in self.SONGS]
+        self.assertIsNone(o._resolve_album_by_song_titles(9, audios))
+
+
 if __name__ == "__main__":
     unittest.main()
