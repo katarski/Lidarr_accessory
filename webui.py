@@ -410,6 +410,7 @@ _PAGE = r"""<!doctype html>
   </div>
   <div id="settings" style="display:none">
     <div class="muted" style="margin-bottom:.6rem">Change grab/behaviour settings here instead of editing the container. Saved settings win over the template and apply on <b>Restart</b>. Only the fields you change are saved; set one back to its template/config value (shown as <i>else</i>) and it follows the template again.</div>
+    <div id="cpubox" style="margin-bottom:.8rem"></div>
     <div id="setform"></div>
     <div style="display:flex;gap:.5rem;margin-top:1rem">
       <button class="b-move" onclick="saveSettings(false)">Save</button>
@@ -1096,7 +1097,29 @@ function asmRender(){
       +'</div></details>';
   }).join('');
 }
-function loadSettings(){fetch('/api/settings').then(function(r){return r.json();}).then(function(j){
+// CPU caps: live Docker updates of this container and Lidarr, no restart.
+function loadCpu(msg){fetch('/api/cpu').then(function(r){return r.json();}).then(function(j){
+  var out='<b>CPU cap</b> <span class="muted">(cores; applied at once, no restart)</span>';
+  [['pipeline','cue_pipeline'],['lidarr','Lidarr']].forEach(function(p){
+    var i=j[p[0]]||{};
+    out+=' <label style="margin-left:.8rem">'+p[1]+' <input type="number" min="0.1" max="'+h(j.max)
+        +'" step="0.1" id="cpu_'+p[0]+'" value="'+h(i.cpus===null||i.cpus===undefined?'':i.cpus)
+        +'" placeholder="none" style="width:5rem"></label>'
+        +(i.cpuset?' <span class="muted">threads '+h(i.cpuset)+'</span>':'')
+        +(i.error?' <span class="muted">('+h(i.error)+')</span>':'');
+  });
+  out+=' <button class="b-move" onclick="saveCpu()">Apply</button> <span id="cpumsg" class="muted">'+h(msg||'')+'</span>';
+  document.getElementById('cpubox').innerHTML=out;
+}).catch(function(e){document.getElementById('cpubox').textContent='CPU cap: '+e;});}
+function saveCpu(){
+  var b={};
+  ['pipeline','lidarr'].forEach(function(k){var v=document.getElementById('cpu_'+k).value;if(v!=='')b[k]=v;});
+  document.getElementById('cpumsg').textContent='applying…';
+  fetch('/api/cpu',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)})
+   .then(function(r){return r.json();}).then(function(j){loadCpu(j.message||'');})
+   .catch(function(e){document.getElementById('cpumsg').textContent='error: '+e;});
+}
+function loadSettings(){loadCpu();fetch('/api/settings').then(function(r){return r.json();}).then(function(j){
   var s=j.settings||[];SETTINGS=s;
   var out='',group=null;
   s.forEach(function(o){
@@ -2474,6 +2497,11 @@ def make_handler(store, actions: HeldActions):
             elif path == "/api/settings":
                 s = actions.get_settings() if hasattr(actions, "get_settings") else []
                 self._json(200, {"settings": s})
+            elif path == "/api/cpu":
+                if not hasattr(actions, "cpu_caps"):
+                    self._json(501, {"error": "not supported"})
+                else:
+                    self._json(200, actions.cpu_caps())
             elif path == "/api/log":
                 qs = parse_qs(urlparse(self.path).query)
                 try:
@@ -2531,6 +2559,19 @@ def make_handler(store, actions: HeldActions):
                     if why == "origin" else
                     "refused: missing or stale page token -- reload the page")},
                     {"X-CUE-Refused": why})
+                return
+            if path == "/api/cpu":
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length else b"{}"
+                try:
+                    caps = json.loads(raw or b"{}") or {}
+                except Exception:  # noqa: BLE001
+                    caps = {}
+                if not hasattr(actions, "set_cpu_caps") or not isinstance(caps, dict):
+                    self._json(400, {"ok": False, "message": "not supported"})
+                    return
+                ok, msg = actions.set_cpu_caps(caps)
+                self._json(200 if ok else 500, {"ok": ok, "message": msg})
                 return
             if path == "/api/settings":
                 length = int(self.headers.get("Content-Length") or 0)

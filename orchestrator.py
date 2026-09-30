@@ -14738,6 +14738,144 @@ class Orchestrator:
         summ["_album"] = album
         return summ
 
+    # ---- CPU caps: set from the WebUI, live, without a restart ------------
+
+    def _docker(self, method: str, path: str, body: Any = None,
+                timeout: float = 15.0) -> Tuple[int, str]:
+        """One Docker Engine API call over /var/run/docker.sock (stdlib only).
+        Returns (HTTP status, body). Raises OSError when the socket is not
+        mounted or does not answer."""
+        import http.client
+        import socket as _socket
+        sock_path = "/var/run/docker.sock"
+        if not os.path.exists(sock_path):
+            raise OSError("Docker socket not mounted")
+
+        class _UnixConn(http.client.HTTPConnection):
+            def connect(self):
+                s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+                s.settimeout(timeout)
+                s.connect(sock_path)
+                self.sock = s
+
+        conn = _UnixConn("localhost")
+        try:
+            data = None if body is None else json.dumps(body).encode("utf-8")
+            conn.request(method, "/v1.41" + path, body=data,
+                         headers={"Content-Type": "application/json"}
+                         if data is not None else {})
+            resp = conn.getresponse()
+            return resp.status, resp.read().decode("utf-8", "replace")
+        finally:
+            conn.close()
+
+    def _cpu_containers(self) -> Dict[str, List[str]]:
+        """The two containers whose CPU cap the WebUI sets, each as the names
+        to try: this one (its id is $HOSTNAME) and Lidarr ($LIDARR_CONTAINER,
+        else 'lidarr'). Nothing else can be touched through this."""
+        me = [c for c in (os.environ.get("HOSTNAME", "").strip(),
+                          getattr(self.cfg, "container_name", "") or
+                          "cue_pipeline") if c]
+        lid = os.environ.get("LIDARR_CONTAINER", "").strip() or "lidarr"
+        return {"pipeline": me, "lidarr": [lid]}
+
+    def _cpu_caps_path(self) -> Optional[Path]:
+        ov = getattr(self.cfg, "webui_overrides_file", None)
+        return Path(ov).parent / "cpu_caps.json" if ov else None
+
+    def _load_cpu_caps(self) -> Dict[str, float]:
+        p = self._cpu_caps_path()
+        try:
+            data = json.loads(p.read_text(encoding="utf-8")) if p else {}
+        except (OSError, ValueError):
+            return {}
+        return {k: float(v) for k, v in (data or {}).items()
+                if k in ("pipeline", "lidarr") and isinstance(v, (int, float))}
+
+    def cpu_caps(self) -> Dict[str, Any]:
+        """What each container runs with now (cores, None = uncapped; the
+        CPU threads it is pinned to) and the caps saved from the WebUI."""
+        out: Dict[str, Any] = {"max": os.cpu_count() or 1,
+                               "saved": self._load_cpu_caps()}
+        for who, names in self._cpu_containers().items():
+            info: Dict[str, Any] = {"cpus": None, "cpuset": "", "error": ""}
+            for name in names:
+                try:
+                    st, body = self._docker("GET", f"/containers/{name}/json")
+                except Exception as exc:  # noqa: BLE001
+                    info["error"] = str(exc)
+                    break
+                if st == 200:
+                    hc = (json.loads(body) or {}).get("HostConfig") or {}
+                    nano = int(hc.get("NanoCpus") or 0)
+                    info.update(cpus=round(nano / 1e9, 2) if nano else None,
+                                cpuset=hc.get("CpusetCpus") or "", error="")
+                    break
+                info["error"] = f"HTTP {st}"
+            out[who] = info
+        return out
+
+    def set_cpu_caps(self, caps: Dict[str, Any],
+                     save: bool = True) -> Tuple[bool, str]:
+        """Cap this container and/or Lidarr at `caps[who]` cores, live --
+        Docker's update call, what `docker update --cpus` does: no restart.
+        Saved (cpu_caps.json) and applied again at every start, because a
+        deploy recreates this container from its template. A value outside
+        0.1..(CPU count) is refused."""
+        top = os.cpu_count() or 1
+        applied: Dict[str, float] = {}
+        msgs: List[str] = []
+        ok = True
+        names = self._cpu_containers()
+        for who in ("pipeline", "lidarr"):
+            raw = (caps or {}).get(who)
+            if raw in (None, ""):
+                continue
+            label = "cue_pipeline" if who == "pipeline" else "Lidarr"
+            try:
+                v = round(float(raw), 2)
+            except (TypeError, ValueError):
+                ok = False
+                msgs.append(f"{label}: not a number")
+                continue
+            if not 0.1 <= v <= top:
+                ok = False
+                msgs.append(f"{label}: {v:g} is outside 0.1..{top}")
+                continue
+            err = "no container"
+            for name in names[who]:
+                try:
+                    st, body = self._docker("POST", f"/containers/{name}/update",
+                                            {"NanoCpus": int(v * 1e9)})
+                except Exception as exc:  # noqa: BLE001
+                    err = str(exc)
+                    break
+                if st == 200:
+                    err = ""
+                    break
+                err = f"HTTP {st}: {body[:120]}"
+            if err:
+                ok = False
+                msgs.append(f"{label}: {err}")
+            else:
+                applied[who] = v
+                msgs.append(f"{label} capped at {v:g} CPU")
+        if applied and save:
+            p = self._cpu_caps_path()
+            saved = self._load_cpu_caps()
+            saved.update(applied)
+            try:
+                if p is not None:
+                    tmp = p.with_name(p.name + ".tmp")
+                    tmp.write_text(json.dumps(saved), encoding="utf-8")
+                    os.replace(tmp, p)
+            except OSError as exc:
+                ok = False
+                msgs.append(f"not saved for the next start: {exc}")
+        msg = "; ".join(msgs) or "nothing to change"
+        logger.info("CPU caps: %s", msg)
+        return ok, msg
+
     def container_action(self, action: str) -> Tuple[bool, str]:
         """
         Restart or stop THIS container via the Docker socket (WebUI buttons).

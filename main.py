@@ -1756,6 +1756,15 @@ def main() -> int:
         logger.debug('MusicBrainz alias lookup unavailable: %s', _exc)
     orch = Orchestrator(orch_cfg, lidarr, ollama_client, acoustid=acoustid_client,
                         raw_cfg=cfg, base_cfg=base_cfg)
+    # CPU caps set in the WebUI outlive a recreate: a deploy starts this
+    # container with its template's --cpus, and Lidarr may have been
+    # recreated too. Applied again here, once.
+    try:
+        _caps = orch._load_cpu_caps()
+        if _caps:
+            orch.set_cpu_caps(_caps, save=False)
+    except Exception as _exc:  # noqa: BLE001
+        logger.warning("CPU caps not re-applied: %s", _exc)
     q: "queue.Queue[Path]" = queue.Queue()
     stop = threading.Event()
     # WebUI Converter tab (library browser + AAC/MP3/Opus conversion) --
