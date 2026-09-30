@@ -32,8 +32,9 @@ build) with the repo's `*.py` and `tools/`, checks `OrchestratorConfig` is
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20260930-titles`**
-(4a04c4b). Earlier tags for rollback: `guard-20260929-songs`, `-asmplan`,
+then is the container replaced. Live now: **`guard-20260930-multidisc`**
+(53992f2). Earlier tags for rollback: `guard-20260930-titles`,
+`guard-20260929-songs`, `-asmplan`,
 `-f4`, `-claims`, `-assembly`, `-binding`, `-deleters`, `-pairing`,
 `-names`, `pre-gate-20260929`.
 
@@ -182,6 +183,14 @@ layer says `http://daniel:11434`.
   The two WebUI actions (resolve/discard) bypass it on purpose — a human
   decided. This came from `Hans Zimmer/Crimson Tide`: 10 mp3s deleted seven
   seconds after "content-identify 10/10", album left at 0/10.
+  A hand-off is judged by the files it SENT (`_submitted_paths`) and its
+  leftovers by a walk of the whole folder, never one level: a multi-disc
+  album is handed off at its parent, and a one-level listing read "cleared"
+  with Disc 2 still in CD2 (orch2 F9). `_finish_handoff_source` keeps the
+  folder and its .cue while any audio Lidarr did not take is under it
+  (logs "Keeping ... and its .cue"). Folder deletion is OFF live
+  (`delete_source_folder_on_success: false` in the Settings overrides), so
+  a successful hand-off removes only the orphan .cue.
 - **Nothing is grabbed for an unmonitored album or artist** — Lidarr will not
   import into one either, so the download is wasted twice. Fails open: no id, or
   a lookup error, and the grab proceeds.
@@ -350,9 +359,9 @@ test of a feature whose purpose is removing files.
 
 ## 6. Open items
 
-1. **31 audit findings are open: `docs/AUDIT_OPEN.md`**, in fix order, each
+1. **30 audit findings are open: `docs/AUDIT_OPEN.md`**, in fix order, each
    with evidence, root cause and the agreed fix (the verifier's correction
-   where there was one). Start at item 1 (orch2 F9). 60 are fixed;
+   where there was one). Start at item 1 (orch2 F3). 61 are fixed;
    CLI-04/06/07 were refuted — do not redo them. **The owner compacts
    after every fix: finish one (tests, deploy, verify, these two files),
    then stop.** orch2 F4 (30 Sep) is deployed; its first live
