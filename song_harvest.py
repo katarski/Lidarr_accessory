@@ -189,6 +189,8 @@ class WantedTrack:
     release_id: Optional[int]
     duration_ms: int = 0
     track_number: int = 0
+    recording_id: str = ""        # MusicBrainz recording (foreignRecordingId)
+    artist_mbid: str = ""         # MusicBrainz artist (foreignArtistId)
 
 
 @dataclass
@@ -293,6 +295,9 @@ def build_wanted_index(lidarr, artist_id: Optional[int] = None,
                     release_id=rid,
                     duration_ms=int(t.get("duration") or 0),
                     track_number=int(t.get("absoluteTrackNumber") or 0),
+                    recording_id=str(t.get("foreignRecordingId") or ""),
+                    artist_mbid=str(art.get("foreignArtistId")
+                                    or a.get("foreignArtistId") or ""),
                 ))
     return index
 
@@ -491,6 +496,28 @@ def quality_map(lidarr, folders: Iterable[str]) -> Dict[str, Dict[str, Any]]:
     return out
 
 
+# Spoken forms a tag and a database spell differently: "Cheatin'" /
+# "Cheating", "Gonna" / "Going to".
+_COLLOQUIAL = (
+    (re.compile(r"(?i)\b(\w+?)in['\u2019]"), r"\1ing"),
+    (re.compile(r"(?i)\bgonna\b"), "going to"),
+    (re.compile(r"(?i)\bwanna\b"), "want to"),
+    (re.compile(r"(?i)\bgotta\b"), "got to"),
+)
+
+
+def _same_song_title(a: Any, b: Any) -> bool:
+    if norm_title(a) == norm_title(b):
+        return True
+
+    def spoken(s):
+        s = str(s or "")
+        for rx, rep in _COLLOQUIAL:
+            s = rx.sub(rep, s)
+        return norm_title(s)
+    return spoken(a) == spoken(b)
+
+
 def acoustid_verify(
     matches: Iterable[Match],
     acoustid,
@@ -537,11 +564,21 @@ def acoustid_verify(
         if score < min_score:
             bad.append((m, "AcoustID score %.2f below %.2f" % (score, min_score)))
             continue
+        # The fingerprint IS the wanted recording (MusicBrainz id): proven,
+        # whatever either side spells.
+        if (m.want.recording_id
+                and m.want.recording_id in (res.get("recording_ids") or ())):
+            ok.append(m)
+            continue
         # The fingerprint must name the SAME song. A mismatch here means the
         # tags lied -- exactly the garbage this gate exists to stop.
-        if got_t and norm_title(got_t) != norm_title(m.want.title):
+        if got_t and not _same_song_title(got_t, m.want.title):
             bad.append((m, "AcoustID says %r, not %r"
                         % (str(got_t)[:34], m.want.title[:34])))
+            continue
+        if (m.want.artist_mbid
+                and m.want.artist_mbid in (res.get("artist_ids") or ())):
+            ok.append(m)          # the same artist, under any credited name
             continue
         if got_a and m.want.artist_name:
             ak, wk = artist_key(got_a), artist_key(m.want.artist_name)

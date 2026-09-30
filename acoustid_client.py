@@ -198,7 +198,8 @@ class AcoustIDClient:
         recs = top.get("recordings") or []
         if not recs:
             return {"artist": "", "title": "", "album": "",
-                    "recording_id": top.get("id"), "score": top.get("score", 0)}
+                    "recording_id": top.get("id"), "score": top.get("score", 0),
+                    "recording_ids": [], "artist_ids": []}
         rec = recs[0]
         artist = ""
         for a in (rec.get("artists") or []):
@@ -210,6 +211,15 @@ class AcoustIDClient:
             "album": (rgs[0].get("title", "") if rgs else ""),
             "recording_id": rec.get("id"),
             "score": top.get("score", 0),
+            # Every MusicBrainz recording and artist the fingerprint maps to:
+            # the same ids Lidarr keeps (foreignRecordingId / foreignArtistId),
+            # so a match can be proven without comparing spellings --
+            # 'Hildegarde Neff' is Hildegard Knef, 'Your Cheating Heart' is
+            # 'Your Cheatin' Heart'.
+            "recording_ids": [r.get("id") for r in recs if r.get("id")],
+            "artist_ids": sorted({x.get("id") for r in recs
+                                  for x in (r.get("artists") or [])
+                                  if x.get("id")}),
         }
 
     def identify_file(self, path: str) -> Optional[Dict[str, Any]]:
@@ -265,7 +275,9 @@ class AcoustIDClient:
         if not isinstance(entry, dict):
             return True
         if entry.get("result"):
-            return False
+            # A hit stored before the MusicBrainz ids were kept is asked once
+            # more, so it carries them.
+            return "recording_ids" not in entry["result"]
         return (time.time() - float(entry.get("at") or 0)) > self._MISS_TTL
 
     def _load_cache(self) -> None:
