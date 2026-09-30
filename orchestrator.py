@@ -3343,11 +3343,27 @@ class Orchestrator:
 
     def _sweep_ledger_mark(self, folder: Path, audios: List[Path],
                            now_ts: float) -> None:
-        """Record that this folder was handed off at its current content."""
+        """Record that this folder was handed off at its current content.
+
+        A multi-disc album is handed off at its parent with every disc's audio
+        (_unify_multidisc_eligible), but the sweep DISCOVERS it disc by disc
+        and asks the ledger about each disc folder. Only the parent was
+        recorded, so no disc was ever skipped: every pass and every restart
+        found the four discs of Hildegard Knef's 'Ich Bin Den Weiten Weg
+        Gegangen [4xCD]' again and handed the album to Lidarr again -- 50
+        refusals in two days. Each disc folder below `folder` is recorded at
+        its own content too; a disc that changes is found, and the unify step
+        then hands the whole album off again."""
         if not getattr(self.cfg, "sweep_ledger_enabled", True):
             return
         led = self._sweep_ledger()
         led[str(folder)] = [self._folder_signature(audios), now_ts]
+        discs: Dict[Path, List[Path]] = {}
+        for a in audios:
+            if a.parent != folder and folder in a.parent.parents:
+                discs.setdefault(a.parent, []).append(a)
+        for d, auds in discs.items():
+            led[str(d)] = [self._folder_signature(auds), now_ts]
         self._sweep_led_dirty = True
 
     # ---- persistent CUE ledger ------------------------------------------
