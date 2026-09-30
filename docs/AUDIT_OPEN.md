@@ -2,8 +2,8 @@
 
 Generated 29 Sep 2026 from the read-only audit (6 areas, each finding
 adversarially verified). 91 findings were confirmed and 3 refuted
-(CLI-04, CLI-06, CLI-07: do not redo them). **80 are fixed and pushed**;
-the 11 below are open, in the order to fix them (data loss first).
+(CLI-04, CLI-06, CLI-07: do not redo them). **81 are fixed and pushed**;
+the 10 below are open, in the order to fix them (data loss first).
 
 **Line numbers are from commit 98d2656, the commit the audit read.** They
 have shifted since, so find the code by the function or the quoted text.
@@ -95,17 +95,7 @@ orch2 F4 did over Lidarr's 31,496 past grabs) and read the changed rows.
 
 **Fix:** Read the current file backwards in blocks until it yields `need` newlines or offset 0, and move to the next rotation only after the current file is exhausted. Drop the leading partial line whenever the read did not start at offset 0. Must not break: small reads for a 400-line refresh (no multi-MB reads), whole-file mode for lines<=0.
 
-## 9. orch3 SETTINGS-FLOAT-1 (low) -- Every float setting is rendered with min=0 max=1 step=0.05, so one spinner or wheel step on 'Min track match (%)' 50 sets it to 1
-
-`webui.py:1091`
-
-**Evidence:** webui.py:1091 adds step="0.05" min="0" max="1" to every type=='float' row. Six float settings are not 0-1 ratios: min_match_percent (live 50), assembly_min_pct 10, interactive_search_max_gb_per_album 2.5, harvest_duration_tolerance 10, assembly_lossless_bonus 30, assembly_lossy_penalty 15. On a number input whose value exceeds max, the browser's step-down clamps it to max (1). Save then accepts that value, since save_settings only float()s it (14567-14573). A single down-arrow on 'Min track match (%)' makes 1% of tracks enough to treat a download as the album.
-
-**Root cause:** Input bounds come from the value's type, not from each setting's meaning.
-
-**Fix:** Give each schema row an optional (min, max, step) and emit those attributes per row, with no bounds when none is declared. Keep float() parsing server-side, and optionally clamp there to the same declared range. Must not break: the 0-1 ratio fields keep their 0..1 bounds.
-
-## 10. llm LLM-5 (medium) -- Content-identify's LLM 'tie-break' is given the leader alone (the rival is filtered out) and answers by title, and the result drove...
+## 9. llm LLM-5 (medium) -- Content-identify's LLM 'tie-break' is given the leader alone (the rival is filtered out) and answers by title, and the result drove...
 
 `orchestrator.py:4045`
 
@@ -117,7 +107,7 @@ orch2 F4 did over Lidarr's 31,496 past grabs) and read the changed rows.
 
 **Fix:** Build the tie-break set from the same rule that made clear_margin false: every result within the margin of the leader. Do not accept a pick below min_cov, though. If the LLM picks a rival under min_cov, return None (undecided) rather than accept an album that failed the coverage floor. The clause 'if that set has one member, return None' can never fire, because when clear_margin is false results[1] is always within the margin, so the set always has at least 2 members. Drop it. Offer numbered options carrying year and track count, map the index back to the album record, and have _identify_album_by_content return the album id so callers stop re-matching by title. The same title-to-record collapse exists in dedup_downloads' LLM fallback (see the missed finding). Use one title/record resolver for both.
 
-## 11. llm missed (medium) -- The LLM's owned-album pick is resolved to the FIRST album with that title, skipping the same-title guard, so a missing edition can be...
+## 10. llm missed (medium) -- The LLM's owned-album pick is resolved to the FIRST album with that title, skipping the same-title guard, so a missing edition can be...
 
 `dedup_downloads.py:277`
 
