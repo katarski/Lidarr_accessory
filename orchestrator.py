@@ -915,12 +915,17 @@ class Orchestrator:
         ollama: Optional[OllamaClient],
         acoustid=None,
         raw_cfg: Optional[Dict[str, Any]] = None,
+        base_cfg: Optional[Dict[str, Any]] = None,
     ):
         self.cfg = cfg
         self.lidarr = lidarr
         self.ollama = ollama
         # Effective config dict (for the WebUI Settings tab to read live values).
         self._raw_cfg: Dict[str, Any] = raw_cfg or {}
+        # The config as config.yaml and the container variables give it,
+        # BEFORE the Settings tab's overrides: what a saved tab value is
+        # compared against (save_settings keeps only real differences).
+        self._base_cfg: Dict[str, Any] = base_cfg or {}
         # Optional AcoustID fingerprint identifier (best-effort). Used to
         # recover artist/album for a pre-split folder whose tags can't
         # identify it. None = disabled.
@@ -14889,9 +14894,12 @@ class Orchestrator:
     # Curated tunables the user changes most; saved to webui_overrides.json
     # (highest precedence) and applied on the next restart.
     _SETTINGS_SCHEMA = [
-        ("lidarr.interactive_search_enabled", "lidarr", "interactive_search_enabled", "Interactive search", "bool", True,
+        # Defaults here are what the tab shows when nothing sets a key, so they
+        # must be main.py's (tests/test_settings.py checks): these two said
+        # on / live while an unset pipeline ran off / dry.
+        ("lidarr.interactive_search_enabled", "lidarr", "interactive_search_enabled", "Interactive search", "bool", False,
          "Proactively grab monitored albums Lidarr left missing."),
-        ("lidarr.interactive_search_dry_run", "lidarr", "interactive_search_dry_run", "Interactive search: dry run", "bool", False,
+        ("lidarr.interactive_search_dry_run", "lidarr", "interactive_search_dry_run", "Interactive search: dry run", "bool", True,
          "Only log what it WOULD grab; don't actually grab."),
         ("lidarr.interactive_search_min_missing_days", "lidarr", "interactive_search_min_missing_days", "Min days missing", "int", 3,
          "Wait this many days before grabbing, so Lidarr's own search goes first. 0 = act immediately."),
@@ -15315,6 +15323,36 @@ class Orchestrator:
     def _is_secret_key(key: str) -> bool:
         return bool(re.search(r"(?:api_?key|token|password|secret)$", str(key or "")))
 
+    @staticmethod
+    def _setting_value(typ: str, raw: Any) -> Any:
+        """A Settings-tab value as its schema type (raises TypeError or
+        ValueError when it is not one). The same parse for a submitted value
+        and for the config/template value it is compared with, so 50 and
+        "50", or "false" and False, are one value."""
+        if typ == "bool":
+            if isinstance(raw, str):
+                return raw.strip().lower() in ("1", "true", "yes", "on")
+            return bool(raw)
+        if typ == "int":
+            return int(raw)
+        if typ == "float":
+            # int() here would quietly round 0.45 to 0 and disable the
+            # title check entirely
+            return float(raw)
+        return "" if raw is None else str(raw)
+
+    def _read_overrides(self) -> Dict[str, Any]:
+        """The Settings tab's saved values ({} when absent or unreadable)."""
+        path = getattr(self.cfg, "webui_overrides_file", None)
+        if not path:
+            return {}
+        try:
+            import json
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
     def get_settings(self):
         """Current values of the curated settings (for the WebUI Settings tab).
 
@@ -15328,14 +15366,22 @@ class Orchestrator:
                 group_of[sid] = gname
                 order[sid] = (gi, si)
         rows = []
+        saved = self._read_overrides()
+        base_cfg = getattr(self, "_base_cfg", None) or {}
         for sid, section, key, label, typ, default, help_ in self._SETTINGS_SCHEMA:
             val = (self._raw_cfg.get(section) or {}).get(key, default)
+            # What applies without the tab's value: config.yaml / the
+            # container variable, else the default.
+            base = (base_cfg.get(section) or {}).get(key, default)
             if self._is_secret_key(key):
                 # The WebUI has no authentication and port 8830 is on the LAN:
                 # a secret is shown only as set / not set, never its value.
                 val = self._SECRET_SET if val else ""
+                base = self._SECRET_SET if base else ""
             rows.append({"id": sid, "label": label, "type": typ,
                          "value": val, "help": help_,
+                         "overridden": key in (saved.get(section) or {}),
+                         "base": base,
                          "recommended": self._SETTINGS_RECOMMENDED.get(
                              sid, default),
                          # anything not listed above still shows up, last
@@ -15348,6 +15394,19 @@ class Orchestrator:
         """
         Merge changed settings into the WebUI overrides file (highest-precedence
         config). Applied on the next restart. `changes` is {id: value}.
+
+        The file keeps only values that DIFFER from what config.yaml and the
+        container variables give (self._base_cfg). The tab used to post
+        every field and this wrote each one: live, the file held all 125
+        schema keys, so every template variable was frozen at the value the
+        tab showed that day (ISEARCH_INTERVAL 3600 lost to 1000,
+        QBIT_DEAD_GRAB_GRACE_MINUTES 360 to 1440, DELETE_SOURCE_FOLDER True
+        to False), and changing the template did nothing. Now the page sends
+        only edited fields, and on every save any key equal to its
+        config/template value is dropped -- so setting a field back to that
+        value hands it back to the template. A key that nothing below sets
+        is kept: its fallback may not be the schema default (e.g. the legacy
+        dead_grab_grace_hours).
         """
         path = getattr(self.cfg, "webui_overrides_file", None)
         if not path:
@@ -15365,32 +15424,44 @@ class Orchestrator:
                 _sid, section, key, _l, typ, _d, _h = schema[sid]
                 if self._is_secret_key(key) and raw in (self._SECRET_SET, "", None):
                     continue       # the form echoed the placeholder: unchanged
-                if typ == "bool":
-                    val = raw in (True, "true", "True", "1", 1, "on")
-                elif typ == "int":
-                    try:
-                        val = int(raw)
-                    except (TypeError, ValueError):
-                        continue
-                elif typ == "float":
-                    # int() here would quietly round 0.45 to 0 and disable the
-                    # title check entirely
-                    try:
-                        val = float(raw)
-                    except (TypeError, ValueError):
-                        continue
-                else:
-                    val = str(raw)
+                try:
+                    val = self._setting_value(typ, raw)
+                except (TypeError, ValueError):
+                    continue
                 cur.setdefault(section, {})[key] = val
                 # keep self._raw_cfg in sync so the tab reflects the save
                 self._raw_cfg.setdefault(section, {})[key] = val
                 n += 1
+            # Drop every saved value the lower layers already give, submitted
+            # or not: it changes nothing today and would freeze the template.
+            base_cfg = getattr(self, "_base_cfg", None) or {}
+            handed_back = []
+            for sid, section, key, _l, typ, _d, _h in self._SETTINGS_SCHEMA:
+                sec = cur.get(section)
+                base = base_cfg.get(section) or {}
+                if not isinstance(sec, dict) or key not in sec or key not in base:
+                    continue
+                try:
+                    same = (self._setting_value(typ, sec[key])
+                            == self._setting_value(typ, base[key]))
+                except (TypeError, ValueError):
+                    continue
+                if same:
+                    del sec[key]
+                    if not sec:
+                        del cur[section]
+                    self._raw_cfg.setdefault(section, {})[key] = base[key]
+                    handed_back.append(sid)
             Path(path).parent.mkdir(parents=True, exist_ok=True)
             tmp = Path(str(path) + ".tmp")
             tmp.write_text(json.dumps(cur, indent=2), encoding="utf-8")
             tmp.replace(path)
-            logger.info("WebUI settings saved (%d change(s)) to %s", n, path)
-            return (True, f"Saved {n} setting(s). Restart to apply.")
+            logger.info("WebUI settings saved (%d change(s); %d now follow "
+                        "config.yaml / the container variables: %s) to %s",
+                        n, len(handed_back), ", ".join(handed_back) or "-", path)
+            back = (f" {len(handed_back)} now follow config.yaml / the container "
+                    f"variables." if handed_back else "")
+            return (True, f"Saved {n} setting(s).{back} Restart to apply.")
         except Exception as exc:  # noqa: BLE001
             return (False, f"save failed: {exc}")
 

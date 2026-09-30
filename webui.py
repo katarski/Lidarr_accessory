@@ -409,7 +409,7 @@ _PAGE = r"""<!doctype html>
     <pre id="logbox" style="background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:.6rem;max-height:70vh;overflow:auto;font-size:.72rem;white-space:pre-wrap"></pre>
   </div>
   <div id="settings" style="display:none">
-    <div class="muted" style="margin-bottom:.6rem">Change grab/behaviour settings here instead of editing the container. Saved settings win over the template and apply on <b>Restart</b>.</div>
+    <div class="muted" style="margin-bottom:.6rem">Change grab/behaviour settings here instead of editing the container. Saved settings win over the template and apply on <b>Restart</b>. Only the fields you change are saved; set one back to its template/config value (shown as <i>else</i>) and it follows the template again.</div>
     <div id="setform"></div>
     <div style="display:flex;gap:.5rem;margin-top:1rem">
       <button class="b-move" onclick="saveSettings(false)">Save</button>
@@ -1111,13 +1111,17 @@ function loadSettings(){fetch('/api/settings').then(function(r){return r.json();
       group=g;
     }
     var rec=(o.recommended===undefined?o.value:o.recommended);
+    // data-orig: the value as loaded, so Save can send only what was edited.
     var ctl=o.type==='bool'
-      ? '<input type="checkbox" data-sid="'+h(o.id)+'" data-type="bool" data-rec="'+(rec?'1':'')+'" '+(o.value?'checked':'')+'>'
+      ? '<input type="checkbox" data-sid="'+h(o.id)+'" data-type="bool" data-rec="'+(rec?'1':'')+'" data-orig="'+(o.value?'1':'')+'" '+(o.value?'checked':'')+'>'
       : '<input type="'+((o.type==='int'||o.type==='float')?'number':'text')+'"'
         +(o.type==='float'?' step="0.05" min="0" max="1"':'')
-        +' data-sid="'+h(o.id)+'" data-type="'+h(o.type)+'" data-rec="'+h(rec)+'" value="'+h(o.value)+'" style="width:8rem">';
+        +' data-sid="'+h(o.id)+'" data-type="'+h(o.type)+'" data-rec="'+h(rec)+'" data-orig="'+h(o.value)+'" value="'+h(o.value)+'" style="width:8rem">';
+    var base=o.type==='bool'?(o.base?'on':'off'):String(o.base);
     out+='<div class="setrow"><label><b>'+h(o.label)+'</b></label>'+ctl
-        +'<span class="muted">'+h(o.help)+'</span>'
+        +'<span class="muted">'+h(o.help)
+        +(o.overridden?' <i title="Saved in this tab: it beats config.yaml and the container variable. Set it to this value and Save to follow them again.">(saved here; else '+h(base)+')</i>':'')
+        +'</span>'
         +'<span class="muted setrecv" title="Recommended value">rec: '+h(String(rec))+'</span>'
         +'</div>';
   });
@@ -1141,13 +1145,20 @@ function setRecommended(ev,btn){
     n+' field(s) set to recommended -- press Save to apply';
 }
 function saveSettings(restart){
+  // Only the fields edited since the tab loaded. Posting the whole form put
+  // every field -- all 125 -- into webui_overrides.json, which beats the
+  // container template, so each template variable froze at the value shown
+  // that day and editing the template did nothing (orch3 SETTINGS-SAVE-1).
   var changes={};
   document.querySelectorAll('#setform [data-sid]').forEach(function(el){
-    changes[el.getAttribute('data-sid')] = el.getAttribute('data-type')==='bool'? el.checked : el.value;
+    var isBool=el.getAttribute('data-type')==='bool';
+    if((isBool?(el.checked?'1':''):el.value)===el.getAttribute('data-orig'))return;
+    changes[el.getAttribute('data-sid')] = isBool? el.checked : el.value;
   });
   document.getElementById('setmsg').textContent='saving…';
   fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(changes)})
    .then(function(r){return r.json();}).then(function(j){
+     if(j.ok)loadSettings();       // new baseline for the next Save
      document.getElementById('setmsg').textContent=j.message||'';
      if(j.ok&&restart){if(confirm('Saved. Restart the container now to apply?'))ctrl('restart');}
    }).catch(function(e){document.getElementById('setmsg').textContent='error: '+e;});}

@@ -10,6 +10,7 @@ Orchestrator via a background worker thread. Handles SIGINT gracefully.
 from __future__ import annotations
 
 import argparse
+import copy
 import logging
 import logging.handlers
 import os
@@ -320,11 +321,14 @@ def apply_webui_overrides(cfg: Dict[str, Any], path: Path) -> Dict[str, Any]:
                         # The Settings tab wins, silently: a stale saved
                         # ollama.model once overrode LLM_MODEL for weeks and the
                         # template showed a model that was never used.
-                        secret = any(w in k.lower() for w in ("key", "token", "pass"))
+                        # The orchestrator's secret test: a substring "pass"
+                        # hid the values of *_per_pass settings.
+                        secret = Orchestrator._is_secret_key(k)
                         logging.getLogger("cue_pipeline").warning(
                             "Settings tab value for %s.%s%s overrides the container "
-                            "variable %s%s -- clear it in the Settings tab to use "
-                            "the variable", section, k,
+                            "variable %s%s -- set it to the variable's value in "
+                            "the Settings tab and Save to use the variable",
+                            section, k,
                             "" if secret else " (%r)" % (v,), env,
                             "" if secret else " (%r)" % (cfg[section].get(k),))
                     cfg[section][k] = v
@@ -1197,9 +1201,17 @@ def main() -> int:
 
     cfg = load_config(args.config)
     cfg = apply_env_overrides(cfg)
+    # config.yaml + container variables, before the Settings tab: what a tab
+    # value is compared with when it is saved (Orchestrator.save_settings).
+    base_cfg = copy.deepcopy(cfg)
+    # Logging BEFORE the tab's overrides: apply_webui_overrides warns when a
+    # tab value beats a container variable, and configured after it those
+    # warnings reached only stderr -- 0 of them in pipeline.log or any
+    # rotation. The tab has no logging settings, so none of its values is
+    # missed here.
+    configure_logging(cfg.get("logging", {}))
     webui_overrides_path = Path(args.config).parent / "webui_overrides.json"
     cfg = apply_webui_overrides(cfg, webui_overrides_path)
-    configure_logging(cfg.get("logging", {}))
 
     # Permissions: create every file/dir group- AND other-writable (0666/0777),
     # matching Unraid's "Docker Safe New Permissions" convention. Set process-
@@ -1730,7 +1742,7 @@ def main() -> int:
     except Exception as _exc:  # noqa: BLE001
         logger.debug('MusicBrainz alias lookup unavailable: %s', _exc)
     orch = Orchestrator(orch_cfg, lidarr, ollama_client, acoustid=acoustid_client,
-                        raw_cfg=cfg)
+                        raw_cfg=cfg, base_cfg=base_cfg)
     q: "queue.Queue[Path]" = queue.Queue()
     stop = threading.Event()
     # WebUI Converter tab (library browser + AAC/MP3/Opus conversion) --
