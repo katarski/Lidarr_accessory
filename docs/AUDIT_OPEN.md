@@ -2,8 +2,8 @@
 
 Generated 29 Sep 2026 from the read-only audit (6 areas, each finding
 adversarially verified). 91 findings were confirmed and 3 refuted
-(CLI-04, CLI-06, CLI-07: do not redo them). **87 are fixed and pushed**;
-the 4 below are open, in the order to fix them (data loss first).
+(CLI-04, CLI-06, CLI-07: do not redo them). **88 are fixed and pushed**;
+the 3 below are open, in the order to fix them (data loss first).
 
 **Line numbers are from commit 98d2656, the commit the audit read.** They
 have shifted since, so find the code by the function or the quoted text.
@@ -17,17 +17,7 @@ symbol first: green tests that never call it prove nothing. Where a fix
 changes a verdict, diff old against new over real data before shipping (as
 orch2 F4 did over Lidarr's 31,496 past grabs) and read the changed rows.
 
-## 1. orch3 SETTINGS-REC-1 (low) -- The 'Recommended' button in Library & sweeps turns the cueless sweep off (recommended keys use the wrong section)
-
-`orchestrator.py:14351`
-
-**Evidence:** _SETTINGS_RECOMMENDED has 'lidarr.sweep_cueless_pre_split': True and 'lidarr.sweep_interval_seconds': 300 (14351-14352). The schema ids are 'watch.sweep_cueless_pre_split' and 'watch.sweep_interval_seconds' (14310-14313). get_settings looks the value up by id (14531) and falls back to the schema default (False, 0). Live values are True / 60 (config and overrides). Recommended then Save writes sweep off with interval 0 ('only at startup'), so cueless downloads sit forever. A cross-check of all registry ids finds these two and no other drift.
-
-**Root cause:** Recommended values live in a separate dict keyed by hand-typed ids, so nothing ties them to the schema.
-
-**Fix:** Key them by the real ids. Better, make 'recommended' a column of the _SETTINGS_SCHEMA tuple and check at class load that every id in _SETTINGS_GROUPS and any remaining side table exists in the schema. Must not break: 'anything not listed recommends its own default'.
-
-## 2. orch3 LOG-TAIL-1 (low) -- The Log tab's 400-line view splices the tail of the rotated log in front of the live tail and skips the middle
+## 1. orch3 LOG-TAIL-1 (low) -- The Log tab's 400-line view splices the tail of the rotated log in front of the live tail and skips the middle
 
 `orchestrator.py:13986`
 
@@ -37,7 +27,7 @@ orch2 F4 did over Lidarr's 31,496 past grabs) and read the changed rows.
 
 **Fix:** Read the current file backwards in blocks until it yields `need` newlines or offset 0, and move to the next rotation only after the current file is exhausted. Drop the leading partial line whenever the read did not start at offset 0. Must not break: small reads for a 400-line refresh (no multi-MB reads), whole-file mode for lines<=0.
 
-## 3. llm LLM-5 (medium) -- Content-identify's LLM 'tie-break' is given the leader alone (the rival is filtered out) and answers by title, and the result drove...
+## 2. llm LLM-5 (medium) -- Content-identify's LLM 'tie-break' is given the leader alone (the rival is filtered out) and answers by title, and the result drove...
 
 `orchestrator.py:4045`
 
@@ -49,7 +39,7 @@ orch2 F4 did over Lidarr's 31,496 past grabs) and read the changed rows.
 
 **Fix:** Build the tie-break set from the same rule that made clear_margin false: every result within the margin of the leader. Do not accept a pick below min_cov, though. If the LLM picks a rival under min_cov, return None (undecided) rather than accept an album that failed the coverage floor. The clause 'if that set has one member, return None' can never fire, because when clear_margin is false results[1] is always within the margin, so the set always has at least 2 members. Drop it. Offer numbered options carrying year and track count, map the index back to the album record, and have _identify_album_by_content return the album id so callers stop re-matching by title. The same title-to-record collapse exists in dedup_downloads' LLM fallback (see the missed finding). Use one title/record resolver for both.
 
-## 4. llm missed (medium) -- The LLM's owned-album pick is resolved to the FIRST album with that title, skipping the same-title guard, so a missing edition can be...
+## 3. llm missed (medium) -- The LLM's owned-album pick is resolved to the FIRST album with that title, skipping the same-title guard, so a missing edition can be...
 
 `dedup_downloads.py:277`
 
