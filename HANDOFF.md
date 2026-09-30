@@ -32,8 +32,9 @@ build) with the repo's `*.py` and `tools/`, checks `OrchestratorConfig` is
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20260930-floatrange`**
-(bb848ab). Earlier tags for rollback: `guard-20260930-harvestgate`,
+then is the container replaced. Live now: **`guard-20260930-cpucap`**
+(9a88678). Earlier tags for rollback: `guard-20260930-floatrange`,
+`guard-20260930-harvestgate`,
 `guard-20260930-cuecodec`,
 `guard-20260930-posexact`,
 `guard-20260930-onepath`,
@@ -272,6 +273,11 @@ layer says `http://daniel:11434`.
   cue_pipeline `--cpus 0.5 --cpu-shares 128`, both applied live (`docker update`) and in the
   templates' ExtraParams (backups `*.bak-20260930-cpu`); the owner's own pinning is lidarr `2,8`,
   cue_pipeline `1,7`. deploy.sh recreates from the template, so the cap survives deploys.
+- **CPU caps are set in the WebUI** (Settings tab, top row; `guard-20260930-cpucap`): the
+  current cap and pinned threads of cue_pipeline and Lidarr, and Apply, which changes them live
+  through Docker's update call (no restart). Saved in `/config/cpu_caps.json` and applied again
+  at every start, since a deploy recreates cue_pipeline with its template's `--cpus`. Only these
+  two containers (Lidarr = `$LIDARR_CONTAINER`, else `lidarr`), 0.1..CPU count.
 - **Nothing is grabbed for an unmonitored album or artist** — Lidarr will not
   import into one either, so the download is wasted twice. Fails open: no id, or
   a lookup error, and the grab proceeds.
