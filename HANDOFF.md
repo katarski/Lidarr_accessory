@@ -32,8 +32,9 @@ build) with the repo's `*.py` and `tools/`, checks `OrchestratorConfig` is
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20260930-setsave`**
-(62db388). Earlier tags for rollback: `guard-20260930-auditstate`,
+then is the container replaced. Live now: **`guard-20260930-envbool`**
+(9a74cb9). Earlier tags for rollback: `guard-20260930-setsave`,
+`guard-20260930-auditstate`,
 `guard-20260930-csrf`,
 `guard-20260930-cli03`,
 `guard-20260930-isstate`,
@@ -430,9 +431,9 @@ test of a feature whose purpose is removing files.
 
 ## 6. Open items
 
-1. **17 audit findings are open: `docs/AUDIT_OPEN.md`**, in fix order, each
+1. **16 audit findings are open: `docs/AUDIT_OPEN.md`**, in fix order, each
    with evidence, root cause and the agreed fix (the verifier's correction
-   where there was one). Start at item 1 (orch3 ENV-BOOL-1). 74 are fixed;
+   where there was one). Start at item 1 (orch2 F8). 75 are fixed;
    CLI-04/06/07 were refuted — do not redo them. **The owner compacts
    after every fix: finish one (tests, deploy, verify, these two files),
    then stop.** orch2 F4 (30 Sep) is deployed; its first live
