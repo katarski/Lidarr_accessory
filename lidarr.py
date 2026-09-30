@@ -1189,7 +1189,14 @@ class LidarrClient:
         remove_from_client: bool = False,
         blocklist: bool = False,
     ) -> bool:
-        """DELETE /api/v1/queue/{id}. Returns True on success."""
+        """DELETE /api/v1/queue/{id}. Returns True on success.
+
+        A row Lidarr answers NotFound for is remembered and not asked about
+        again: it stays in the queue list, and every pass re-sent the DELETE
+        (and Lidarr logged a Fatal each time)."""
+        gone = self.__dict__.setdefault("_queue_gone", set())
+        if queue_id in gone:
+            return False
         url = self._url(f"/api/v1/queue/{queue_id}")
         params = {
             "removeFromClient": "true" if remove_from_client else "false",
@@ -1197,10 +1204,14 @@ class LidarrClient:
         }
         try:
             r = self.session.delete(url, params=params, timeout=30)
-            if r.status_code == 404:
+            if r.status_code == 404 or (r.status_code >= 500
+                                        and self._is_not_found(r)):
                 # Row already gone -- common with grouped downloads where
-                # removing one entry collapses the whole download's grouping.
-                logger.debug("queue_remove(%s): already gone (404)", queue_id)
+                # removing one entry collapses the whole download's grouping
+                # -- or listed but not removable by id.
+                logger.debug("queue_remove(%s): not found -- not asked again",
+                             queue_id)
+                gone.add(queue_id)
                 return False
             r.raise_for_status()
             return True
@@ -1251,11 +1262,44 @@ class LidarrClient:
         except (requests.ConnectionError, requests.Timeout) as exc:
             self._went_down(exc)
             raise
-        if r.status_code >= 500:
-            self._went_down("HTTP %d" % r.status_code)
+        if r.status_code >= 500 and not self._is_not_found(r):
+            if self._is_lidarr_error(r):
+                # Lidarr answered, with its own error ("Failed to connect to
+                # qBittorrent", "database is locked"): this call failed, so
+                # it is counted, but Lidarr is up and the rest may go on.
+                with self._down_lock:
+                    self.failure_generation += 1
+                self._answered()
+            else:
+                self._went_down("HTTP %d" % r.status_code)
         else:
             self._answered()
         return r
+
+    @staticmethod
+    def _is_lidarr_error(r) -> bool:
+        """A 5xx carrying Lidarr's error body ({"message": ...}) -- Lidarr's
+        error pipeline speaking, not a proxy or a dead process. 114 release
+        grabs refused with "Failed to connect to qBittorrent" each opened
+        the breaker for every thread."""
+        try:
+            body = r.json()
+        except Exception:  # noqa: BLE001
+            return False
+        return isinstance(body, dict) and "message" in body
+
+    @staticmethod
+    def _is_not_found(r) -> bool:
+        """Lidarr's answer "no such thing", sent as HTTP 500: a DELETE of a
+        queue row it lists but cannot look up (QueueController
+        .GetTrackedDownload -> NotFoundException). That is Lidarr answering,
+        not Lidarr down. Counted as an outage, one stale row (575591606,
+        retried every 10 minutes) opened the breaker for every thread and
+        threw away whatever they had in flight."""
+        try:
+            return "NotFound" in (r.text or "")[:4000]
+        except Exception:  # noqa: BLE001
+            return False
 
     def _went_down(self, why) -> None:
         with self._down_lock:
