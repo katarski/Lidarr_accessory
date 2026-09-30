@@ -32,8 +32,9 @@ build) with the repo's `*.py` and `tools/`, checks `OrchestratorConfig` is
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20260930-cli03`**
-(4ea7eb0). Earlier tags for rollback: `guard-20260930-isstate`,
+then is the container replaced. Live now: **`guard-20260930-csrf`**
+(b38ede9). Earlier tags for rollback: `guard-20260930-cli03`,
+`guard-20260930-isstate`,
 `guard-20260930-auditidx`,
 `guard-20260930-reconcile`,
 `guard-20260930-isearch`,
@@ -243,6 +244,10 @@ layer says `http://daniel:11434`.
   `_monitored_album_status` answers "unknown" (not "skip") when the
   generation moved under it; edition dedup defers a group Lidarr could not
   rank (`_editions_deferred`) instead of recording losers.
+- **WebUI POSTs need the page token** (orch3 WEBUI-CSRF-1, `guard-20260930-csrf`). Every
+  POST to :8830 must send `X-CUE-Token` (the page has it inline; scripts `GET /api/token`
+  first), and one whose Origin/Referer names another site is refused 403 and logged
+  "webui: refused POST". The token changes on every restart; an open tab refreshes it itself.
 - **Nothing is grabbed for an unmonitored album or artist** — Lidarr will not
   import into one either, so the download is wasted twice. Fails open: no id, or
   a lookup error, and the grab proceeds.
@@ -411,9 +416,9 @@ test of a feature whose purpose is removing files.
 
 ## 6. Open items
 
-1. **20 audit findings are open: `docs/AUDIT_OPEN.md`**, in fix order, each
+1. **19 audit findings are open: `docs/AUDIT_OPEN.md`**, in fix order, each
    with evidence, root cause and the agreed fix (the verifier's correction
-   where there was one). Start at item 1 (orch3 WEBUI-CSRF-1). 71 are fixed;
+   where there was one). Start at item 1 (orch3 SETTINGS-SAVE-1). 72 are fixed;
    CLI-04/06/07 were refuted — do not redo them. **The owner compacts
    after every fix: finish one (tests, deploy, verify, these two files),
    then stop.** orch2 F4 (30 Sep) is deployed; its first live
