@@ -962,6 +962,31 @@ def settle_pending_purges(lidarr, ledger, index, tolerance_seconds: float = 10.0
     return done
 
 
+def _is_within(path: str, root: str) -> bool:
+    p, r = os.path.abspath(path), os.path.abspath(root)
+    return p == r or p.startswith(r.rstrip(os.sep) + os.sep)
+
+
+def _unrepeat_keep_name(full: str, keep_dir: str) -> Optional[str]:
+    """Undo the names the keep-folder loop inflated: a file already in the
+    keep folder was "consolidated" onto itself every pass, and the collision
+    branch added " (<keep folder>)" each time -- '10. Going To The River
+    (_harvest_pending) (_harvest_pending) ...' up to 255 characters, then
+    [Errno 36] (loops F12). Renames it back to the name without those
+    suffixes when that name is free; returns the new path, else None."""
+    tag = " (%s)" % os.path.basename(keep_dir.rstrip("/\\"))
+    stem, ext = os.path.splitext(os.path.basename(full))
+    if not stem.endswith(tag):
+        return None
+    while stem.endswith(tag):
+        stem = stem[: -len(tag)]
+    dest = os.path.join(os.path.dirname(full), stem + ext)
+    if not stem or os.path.exists(dest):
+        return None
+    os.replace(full, dest)
+    return dest
+
+
 def purge_leftovers(
     src_dir: str,
     imported_paths: Iterable[str],
@@ -1021,7 +1046,17 @@ def purge_leftovers(
                     # dissolved entirely and its torrent dropped, instead of
                     # leaving one wanted file behind pinning the whole thing.
                     stats["kept_wanted"] += 1
-                    if keep_dir:
+                    if keep_dir and _is_within(dirpath, keep_dir):
+                        # Already consolidated: it stays as it is. It used to
+                        # be "moved" onto itself, and the collision branch
+                        # below renamed it every pass (loops F12).
+                        try:
+                            if _unrepeat_keep_name(full, keep_dir):
+                                stats["kept_renamed_back"] = stats.get(
+                                    "kept_renamed_back", 0) + 1
+                        except OSError as exc:
+                            logger.debug("harvest keep: %s -- %s", full, exc)
+                    elif keep_dir:
                         try:
                             dest = os.path.join(keep_dir, os.path.basename(full))
                             os.makedirs(keep_dir, exist_ok=True)
