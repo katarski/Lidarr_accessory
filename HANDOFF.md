@@ -32,9 +32,9 @@ build) with the repo's `*.py` and `tools/`, checks `OrchestratorConfig` is
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20260930-multidisc`**
-(53992f2). Earlier tags for rollback: `guard-20260930-titles`,
-`guard-20260929-songs`, `-asmplan`,
+then is the container replaced. Live now: **`guard-20260930-disccues`**
+(08618ec). Earlier tags for rollback: `guard-20260930-multidisc`,
+`guard-20260930-titles`, `guard-20260929-songs`, `-asmplan`,
 `-f4`, `-claims`, `-assembly`, `-binding`, `-deleters`, `-pairing`,
 `-names`, `pre-gate-20260929`.
 
@@ -191,6 +191,19 @@ layer says `http://daniel:11434`.
   (logs "Keeping ... and its .cue"). Folder deletion is OFF live
   (`delete_source_folder_on_success: false` in the Settings overrides), so
   a successful hand-off removes only the orphan .cue.
+- **A multi-disc album is ONE unit of work** (`_multidisc_cue_unit`): a .cue
+  in CD1/Disc 2/... of a root with two or more such folders belongs to the
+  root. Its job holds the root; the album hand-off's verdict goes to every
+  disc .cue in the cue ledger (own signature each, one shared attempt
+  count, the root as a fifth field) and to `_skip_seen`; the held entry is
+  one, at the root; after a clean import every disc .cue goes, and folder
+  deletion targets the handed-off folder (`_source_sentinel`), never the
+  .cue's own folder. Before this, each disc .cue handed the whole root off
+  again (Nat King Cole 4-CD: 12 hand-offs in an hour) and the emptied disc
+  folders were recorded "No companion audio" failures (orch2 F3, loops F6).
+  A single-image .cue in a disc folder still splits on its own; CD folders
+  loose in the watch root are never one album. The 4 per-disc held entries
+  of Nat King Cole "100 Hits" predate this (it gave up in the old code).
 - **Nothing is grabbed for an unmonitored album or artist** — Lidarr will not
   import into one either, so the download is wasted twice. Fails open: no id, or
   a lookup error, and the grab proceeds.
@@ -359,9 +372,9 @@ test of a feature whose purpose is removing files.
 
 ## 6. Open items
 
-1. **30 audit findings are open: `docs/AUDIT_OPEN.md`**, in fix order, each
+1. **28 audit findings are open: `docs/AUDIT_OPEN.md`**, in fix order, each
    with evidence, root cause and the agreed fix (the verifier's correction
-   where there was one). Start at item 1 (orch2 F3). 61 are fixed;
+   where there was one). Start at item 1 (orch2 F11). 63 are fixed;
    CLI-04/06/07 were refuted — do not redo them. **The owner compacts
    after every fix: finish one (tests, deploy, verify, these two files),
    then stop.** orch2 F4 (30 Sep) is deployed; its first live
