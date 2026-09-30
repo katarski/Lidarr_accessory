@@ -11634,7 +11634,15 @@ class Orchestrator:
         plan["comp"] = comp
         store.upsert(album_id, plan)
         ok, msg = self._assembly_grab_for_songs(
-            album_id, artist, missing, batch, hunt=comp)
+            album_id, artist, missing, batch, hunt=comp, cap=len(batch))
+        # Whatever of the batch was not tried (a success returns early) goes
+        # back to the front of the queue: nothing handed over is lost.
+        tried_now = set(comp.get("tried") or [])
+        back = [r for r in batch
+                if r.get("guid") and r["guid"] not in tried_now]
+        if back:
+            queue = back + queue
+            comp["queue"] = queue
         # `_assembly_grab_for_songs` clears `active` on success; a failure leaves
         # the hunt live so the next pass tries the next candidate.
         if not ok:
@@ -11779,11 +11787,20 @@ class Orchestrator:
             logger.debug("assembly owned-albums lookup failed: %s", exc)
         return out
 
-    def _assembly_grab_for_songs(self, album_id, artist, missing, cands, hunt=None):
+    def _assembly_grab_for_songs(self, album_id, artist, missing, cands, hunt=None,
+                                 cap: Optional[int] = None):
         """
         Grab candidates in turn until one actually contains a missing song.
         Anything that doesn't is removed and blocklisted, so the next attempt
         tries something else instead of the same dud.
+
+        At most `cap` candidates are tried: by default one when resuming a
+        hunt (the artist-scope hunt hands over every untried release and
+        takes one per pass), else interactive_search_max_candidates. The
+        compilation hunt passes its own batch size (comp_hunt_grabs_per_pass):
+        with the cap fixed at one here, it sliced a batch off its queue and
+        all but the first were never tried and never queued again (orch3
+        COMP-BATCH-1).
         """
         from assembly import norm_title, similarity
         want = [norm_title(t) for t in missing]
@@ -11797,9 +11814,10 @@ class Orchestrator:
         # ONE grab per invocation: each attempt costs a grab + a metadata wait, so
         # a long in-process loop just blocks (and dies on restart). The hunt is
         # resumed by the periodic assembly pass instead.
-        cap = 1 if hunt is not None else max(1, int(getattr(
-            self.cfg, "interactive_search_max_candidates", 5)))
-        for r in cands[:cap]:
+        if cap is None:
+            cap = 1 if hunt is not None else max(1, int(getattr(
+                self.cfg, "interactive_search_max_candidates", 5)))
+        for r in cands[:max(1, int(cap))]:
             if hunt is not None and r.get("guid"):
                 hunt.setdefault("tried", [])
                 if r["guid"] not in hunt["tried"]:
