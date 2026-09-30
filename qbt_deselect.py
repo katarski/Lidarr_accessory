@@ -50,7 +50,19 @@ _LEAD_NUM = re.compile(r"^\s*\d+\s*[.\-]\s*")
 # with no prefix is left alone) and be FOLLOWED by a - or . separator (so it's
 # clearly a prefix, not part of the title). Lazy prefix + leftmost match means
 # the FIRST such " - YYYY - " wins, and the album keeps any internal " - ".
-_ARTIST_YEAR_ALBUM = re.compile(r"(?i)^.*?\s-\s*(?:19|20)\d{2}\s*[-.]\s*(.+)$")
+#
+# What follows the year must be a TITLE, not the rest of a date (a title may
+# be all digits: "1999", "25"). 'Hidden Figures (Original Score) - 2017.01.06' was read as
+# artist 'Hidden Figures', year 2017, album '01.06', no Lidarr lookup could
+# find that, and the lifecycle deleted the folder as an unwanted leftover
+# (loops missed). A full date may stand for the year: 'Bonnie Raitt -
+# 1971-03-27 - The Jabberwocky Club' is that show.
+_ARTIST_YEAR_ALBUM = re.compile(
+    r"(?i)^.*?\s-\s*(?:19|20)\d{2}(?:[-.]\d{1,2}[-.]\d{1,2})?\s*[-.]\s*"
+    r"(?!\d{1,2}[-.]\d{1,2}(?:\D|$))(.+)$")
+# A release DATE at the end, 'Title - 2017.01.06' / 'Title - 2017-01-06':
+# dropped from the album title.
+_TRAIL_DATE = re.compile(r"\s-\s*(?:19|20)\d{2}[-.]\d{1,2}[-.]\d{1,2}\s*$")
 # A disc subfolder: "CD1", "CD 1", "Disc 2", "disc-3", "DVD1", a bare "1"/"2",
 # or a titled disc like "Disc 1 - Shout Sister Shout" / "CD2 Rock Me". Requires
 # a digit right after the keyword so real albums ("Discovery") aren't matched.
@@ -203,6 +215,7 @@ def _clean_album(name: str, artist: str = "") -> str:
     m = _ARTIST_YEAR_ALBUM.match(s)      # 'Artist - 2005 - Gospel Train' -> 'Gospel Train'
     if m:
         s = m.group(1)
+    s = _TRAIL_DATE.sub("", s)           # 'Title - 2017.01.06' -> 'Title'
     if artist:
         na = re.escape(artist.strip())
         # 'Etta James - ...' or 'Etta James & Eddie ... - ...' at the start.
