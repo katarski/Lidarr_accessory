@@ -205,6 +205,77 @@ class Qbt(unittest.TestCase):
         self.assertEqual(sum("authorized without login" in m for m in cm.output), 1)
 
 
+class PathTranslation(unittest.TestCase):
+    """orch2 F8: one translator for every path we hand Lidarr -- the downloads
+    mapping and the library each through their own pair, whole components,
+    the longest root first, the same pairs back -- and a path under no root
+    is refused, never sent unchanged."""
+
+    def client(self, dl=("V:/Dan/Internet Downloads", "/downloads/dan"),
+               lib=("//PARK/Audio/Music", "/music/Music")):
+        from types import SimpleNamespace
+        import lidarr as L
+        cfg = SimpleNamespace(
+            base_url="http://lidarr", api_key="k",
+            path_mapping_from=dl[0], path_mapping_to=dl[1],
+            library_root_windows=lib[0], library_root_lidarr=lib[1],
+            manualimport_cache_seconds=0)
+        return L.LidarrClient(cfg)
+
+    def test_each_root_maps_through_its_own_pair(self):
+        c = self.client()
+        self.assertEqual(c.windows_to_lidarr(
+            Path("V:/Dan/Internet Downloads/A - B/01.flac")),
+            "/downloads/dan/A - B/01.flac")
+        self.assertEqual(c.windows_to_lidarr("V:\\Dan\\Internet Downloads"),
+                         "/downloads/dan")
+        self.assertEqual(c.windows_to_lidarr("//PARK/Audio/Music/Artist/Album"),
+                         "/music/Music/Artist/Album")
+        # ... and back: a library path Lidarr reports is ours again.
+        self.assertEqual(c.lidarr_to_windows("/music/Music/Artist/01.flac"),
+                         "//PARK/Audio/Music/Artist/01.flac")
+        self.assertEqual(c.lidarr_to_windows("/downloads/dan/A/01.flac"),
+                         "V:/Dan/Internet Downloads/A/01.flac")
+
+    def test_a_path_under_no_root_is_refused(self):
+        import lidarr as L
+        c = self.client(dl=("/downloads", "/data/downloads"))
+        for p in ("/elsewhere/Album", "/downloads2/Album"):   # a sibling too
+            with self.assertRaises(L.UnmappedPath):
+                c.windows_to_lidarr(p)
+        self.assertEqual(c.lidarr_to_windows("/data/downloads2/x"),
+                         "/data/downloads2/x")
+
+    def test_a_nested_root_maps_through_its_own_pair(self):
+        c = self.client(dl=("/mnt/user", "/data"),
+                        lib=("/mnt/user/Audio/Music", "/music/Music"))
+        self.assertEqual(c.windows_to_lidarr("/mnt/user/Audio/Music/A/B"),
+                         "/music/Music/A/B")
+        self.assertEqual(c.windows_to_lidarr("/mnt/user/downloads/X"),
+                         "/data/downloads/X")
+
+    def test_no_caller_chooses_a_translator(self):
+        import inspect
+        import lidarr as L
+        import orchestrator
+        self.assertFalse(hasattr(L.LidarrClient, "library_windows_to_lidarr"))
+        self.assertNotIn("library_windows_to_lidarr",
+                         inspect.getsource(orchestrator))
+
+    def test_redundancy_never_asks_about_a_folder_lidarr_cannot_see(self):
+        import dedup_downloads
+        c = self.client(dl=("/downloads", "/downloads"),
+                        lib=("/music/Music", "/music/Music"))
+        asked = []
+        c.manual_import_candidates = lambda p, **k: asked.append(p) or []
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "01.flac"
+            f.write_bytes(b"x")
+            owned, why = dedup_downloads.folder_fully_owned(c, Path(d), [f], 5)
+        self.assertEqual((owned, asked), (False, []))
+        self.assertIn("cannot see", why)
+
+
 class LidarrLink(unittest.TestCase):
     def link(self, base, host):
         import webui

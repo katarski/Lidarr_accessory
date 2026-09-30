@@ -110,7 +110,7 @@ def _extra_words_are_noise(dl_words: set, ow_words: set) -> bool:
         return False
     return True
 
-from lidarr import LidarrClient, LidarrConfig
+from lidarr import LidarrClient, LidarrConfig, UnmappedPath
 
 logger = logging.getLogger("dedup")
 
@@ -456,8 +456,12 @@ def folder_fully_owned(lidarr, folder: Path, audios, artist_id=None):
         return False, "it holds no audio"
     if not artist_id:
         return False, "Lidarr does not know the artist"
+    try:
+        lidarr_folder = lidarr.windows_to_lidarr(folder)
+    except UnmappedPath as exc:
+        return False, "Lidarr cannot see it (%s)" % exc
     cands = lidarr.manual_import_candidates(
-        lidarr.windows_to_lidarr(folder), artist_id=int(artist_id))
+        lidarr_folder, artist_id=int(artist_id))
     if not cands:
         return False, "Lidarr's import check returned nothing (or failed)"
     by_path = {str(c.get("path") or ""): c for c in cands}

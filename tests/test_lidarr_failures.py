@@ -382,7 +382,7 @@ class AuditUnknownIsNotEmpty(unittest.TestCase):
         # Listed, and truly without this album: the album it resolves to by
         # songs is gated like album_rec -- complete, so nothing is flipped.
         lid.list_albums_for_artist = lambda aid: []
-        lid.library_windows_to_lidarr = str
+        lid.windows_to_lidarr = str
         lid.manual_import_candidates = lambda p: []
         lid.get_album = lambda i: {"id": i, "title": "Resolved", "statistics": {
             "trackFileCount": 1, "totalTrackCount": 1}}

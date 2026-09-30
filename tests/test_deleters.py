@@ -517,7 +517,10 @@ class ClaimsEveryActor(unittest.TestCase):
             list_all_albums=lambda: [{
                 "id": 1, "monitored": True, "artist": {"artistName": "Some Artist"},
                 "statistics": {"totalTrackCount": 2, "trackFileCount": 0}}],
-            manual_import_folder=lambda f, **k: calls.append(f) or (77, 2, ["Album"]))
+            manual_import_folder=lambda f, **k: calls.append(f) or (77, 2, ["Album"]),
+            # Lidarr is asked about ITS view of the folder (orch2 F8: the
+            # probe used to send our own path untranslated).
+            windows_to_lidarr=lambda p: "/lidarr-view" + str(p))
         o._release_llm_waiting = lambda: None
         o._llm_blocked = lambda f: False
         o._wait_for_manual_import = lambda c, f, timeout, **k: landed
@@ -540,7 +543,7 @@ class ClaimsEveryActor(unittest.TestCase):
                 self.assertEqual(o.reconcile_monitored_gaps(Path(root)), 0)
             self.assertEqual((calls, o._reconcile_cache), ([], {}))
             self.assertEqual(o.reconcile_monitored_gaps(Path(root)), 2)
-            self.assertEqual(calls, [str(f)])
+            self.assertEqual(calls, ["/lidarr-view" + str(f)])
 
     def test_reconcile_counts_only_an_import_that_landed(self):
         with tempfile.TemporaryDirectory() as root:
@@ -550,7 +553,7 @@ class ClaimsEveryActor(unittest.TestCase):
             self.assertIn(str(f), o._reconcile_cache)
             # Not submitted again while Lidarr may still be on it.
             self.assertEqual(o.reconcile_monitored_gaps(Path(root)), 0)
-            self.assertEqual(calls, [str(f)])
+            self.assertEqual(calls, ["/lidarr-view" + str(f)])
 
     def test_reconcile_caches_no_verdict_reached_while_lidarr_failed(self):
         with tempfile.TemporaryDirectory() as root:
@@ -569,7 +572,7 @@ class ClaimsEveryActor(unittest.TestCase):
                 calls.append(folder) or (None, 0, []))
             o.reconcile_monitored_gaps(Path(root))
             self.assertIn(str(f), o._reconcile_cache)  # a real answer is kept
-            self.assertEqual(calls, [str(f), str(f)])
+            self.assertEqual(calls, ["/lidarr-view" + str(f)] * 2)
 
     def test_audit_skips_a_library_folder_a_worker_holds(self):
         import inspect

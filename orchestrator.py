@@ -2146,6 +2146,9 @@ class Orchestrator:
         pmin = (max(1, int(self.cfg.force_import_partial_min_percent))
                 if self.cfg.force_import_partial else (100 - tol))
         try:
+            # Before the release flip below: a folder Lidarr cannot see
+            # (UnmappedPath) must not get as far as changing the album.
+            lidarr_path = self.lidarr.windows_to_lidarr(folder)
             arec = self.lidarr.find_artist(artist_name)
             if not arec:
                 return False
@@ -2246,7 +2249,6 @@ class Orchestrator:
                 self.lidarr.wait_for_command(
                     rcmd, timeout_seconds=45, poll_interval=1.5,
                 )
-            lidarr_path = self.lidarr.windows_to_lidarr(folder)
             # force=True: a probe cached before the flip maps files to the OLD
             # release's tracks.
             cands = self.lidarr.manual_import_candidates(
@@ -7271,7 +7273,7 @@ class Orchestrator:
                 probes += 1
                 try:
                     _cmd, n, titles = self.lidarr.manual_import_folder(
-                        str(folder),
+                        self.lidarr.windows_to_lidarr(folder),
                         allowed_album_ids=gap_ids,
                         import_mode=import_mode,
                         album_track_totals=gap_totals,
@@ -8245,7 +8247,7 @@ class Orchestrator:
                         rcmd, timeout_seconds=45, poll_interval=1.5,
                     )
 
-            lidarr_path = self.lidarr.library_windows_to_lidarr(album_dir)
+            lidarr_path = self.lidarr.windows_to_lidarr(album_dir)
             cands = self.lidarr.manual_import_candidates(lidarr_path)
             tracks_all = self.lidarr.list_tracks_for_album(album_id)
             tracks_rel = [
@@ -8427,7 +8429,7 @@ class Orchestrator:
             #    disk. This is the "re-import what's here" hammer -- Lidarr
             #    treats the folder as a finished download and parses it.
             elif not scan_tried:
-                lidarr_album_path = self.lidarr.library_windows_to_lidarr(album_dir)
+                lidarr_album_path = self.lidarr.windows_to_lidarr(album_dir)
                 self.lidarr.downloaded_albums_scan_rescan(lidarr_album_path)
                 scan_tried = True
             # 3) Positional force-import: when the nudges fail because disk
@@ -9212,9 +9214,11 @@ class Orchestrator:
                                     )
                                     raise _AuditSkip()
 
+                            # Before any write: a folder Lidarr cannot see
+                            # raises here, not after a refresh.
+                            lidarr_path = self.lidarr.windows_to_lidarr(album_dir)
                             _bail_if_green("pre-refresh")
                             self.lidarr.refresh_artist(aid)
-                            lidarr_path = self.lidarr.library_windows_to_lidarr(album_dir)
                             # Ask Lidarr what IT would import from this folder.
                             def _pick_importable(cs):
                                 return [
@@ -15894,7 +15898,8 @@ class Orchestrator:
             # onto a filled track (an "Upgrade" that deletes) is ever issued.
             forced = self._force_import_library_folder(target, art, fresh)
             if replaced or not forced:
-                self.lidarr.downloaded_albums_scan_rescan(str(target))
+                self.lidarr.downloaded_albums_scan_rescan(
+                    self.lidarr.windows_to_lidarr(target))
             if art:
                 self.lidarr.refresh_artist(art["id"])
             self.lidarr.process_monitored_downloads()

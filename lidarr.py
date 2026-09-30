@@ -81,6 +81,12 @@ class LidarrUnavailable(requests.ConnectionError):
     client's breaker is open (see LidarrClient._send)."""
 
 
+class UnmappedPath(ValueError):
+    """A path under no root we share with Lidarr (LidarrClient.windows_to_lidarr).
+    Lidarr cannot see it, and its empty answer about it would read as "nothing
+    there", so it is never sent."""
+
+
 class _TrackedSession:
     """The client's session, with every request passed through
     LidarrClient._send so a failure is counted wherever it happens."""
@@ -176,28 +182,51 @@ class LidarrClient:
 
     # ---- Path translation ------------------------------------------------
 
+    def _path_roots(self) -> List[Tuple[str, str]]:
+        """Every (our root, Lidarr's root) pair: the downloads mapping and the
+        library. Longest of ours first, so a root nested inside another maps
+        through its own pair."""
+        pairs = []
+        for ours, theirs in (
+                (self.cfg.path_mapping_from, self.cfg.path_mapping_to),
+                (getattr(self.cfg, "library_root_windows", ""),
+                 getattr(self.cfg, "library_root_lidarr", ""))):
+            ours, theirs = str(ours or ""), str(theirs or "")
+            if ours and theirs:
+                pairs.append((ours.replace("\\", "/").rstrip("/"),
+                              theirs.replace("\\", "/").rstrip("/")))
+        return sorted(pairs, key=lambda p: len(p[0]), reverse=True)
+
+    @staticmethod
+    def _below(norm: str, root: str) -> Optional[str]:
+        """What `norm` holds below `root` ('' for the root itself), or None when
+        it is not under it. Whole components only: /downloads2 is not under
+        /downloads (the old prefix test made it /downloads/2). Case-blind, for
+        Windows roots."""
+        n, r = norm.lower(), root.lower()
+        if n == r:
+            return ""
+        if n.startswith(r + "/"):
+            return norm[len(root) + 1:].lstrip("/")
+        return None
+
     def windows_to_lidarr(self, windows_path: Path) -> str:
-        """Translate a Windows path under `path_mapping.from` to Lidarr's view."""
+        """Our path -> the path Lidarr sees, through whichever root it is under
+        (_path_roots). The ONE translator: callers used to choose between this,
+        which knew only the downloads mapping, and a library-only twin. The
+        audit's per-file imports, its quality probe and prefer-lossless's
+        rescan chose this one for library paths -- 1,612 "not under mapped
+        prefix /downloads" warnings, and correct only because the library is
+        /music/Music on both sides (orch2 F8). Raises UnmappedPath under no
+        known root: it used to warn and send the path unchanged."""
         norm = str(windows_path).replace("\\", "/")
-        src = self.cfg.path_mapping_from.replace("\\", "/").rstrip("/")
-        dst = self.cfg.path_mapping_to.rstrip("/")
-        if norm.lower().startswith(src.lower()):
-            remainder = norm[len(src):].lstrip("/")
-            return f"{dst}/{remainder}" if remainder else dst
-        # The LIBRARY is the other root both sides know: a library path maps
-        # through library_root_windows -> library_root_lidarr (the same path
-        # when the mounts agree). It used to fall through to the warning below
-        # -- 1,612 false warnings for /music paths Lidarr accepted fine.
-        lsrc = str(getattr(self.cfg, "library_root_windows", "") or "").replace("\\", "/").rstrip("/")
-        ldst = str(getattr(self.cfg, "library_root_lidarr", "") or "").rstrip("/")
-        if lsrc and ldst and (norm.lower() == lsrc.lower()
-                              or norm.lower().startswith(lsrc.lower() + "/")):
-            remainder = norm[len(lsrc):].lstrip("/")
-            return f"{ldst}/{remainder}" if remainder else ldst
-        # Under no known root -- return as-is; Lidarr will likely reject it.
-        logger.warning("Path %s is not under mapped prefix %s (nor the library "
-                       "root %s)", norm, src, lsrc or "(unset)")
-        return norm
+        roots = self._path_roots()
+        for ours, theirs in roots:
+            rest = self._below(norm, ours)
+            if rest is not None:
+                return f"{theirs}/{rest}" if rest else theirs
+        raise UnmappedPath("%s is under no root Lidarr shares (%s)" % (
+            norm, ", ".join(o for o, _ in roots) or "none configured"))
 
     # ---- HTTP helpers ----------------------------------------------------
 
@@ -577,7 +606,11 @@ class LidarrClient:
 
         Returns the command id on success, None on failure.
         """
-        lidarr_path = self.windows_to_lidarr(staging_dir)
+        try:
+            lidarr_path = self.windows_to_lidarr(staging_dir)
+        except UnmappedPath as exc:
+            logger.error("DownloadedAlbumsScan not sent: %s", exc)
+            return None
         payload: Dict[str, Any] = {
             "name": "DownloadedAlbumsScan",
             "path": lidarr_path,
@@ -1668,28 +1701,12 @@ class LidarrClient:
             return None
 
     def lidarr_to_windows(self, lidarr_path: str) -> str:
-        """Inverse of `windows_to_lidarr` -- map Lidarr's path back to Windows."""
+        """Inverse of `windows_to_lidarr`, through the same root pairs (longest
+        of Lidarr's first). A path under none comes back unchanged."""
         norm = (lidarr_path or "").replace("\\", "/").rstrip("/")
-        src = self.cfg.path_mapping_to.replace("\\", "/").rstrip("/")
-        dst = self.cfg.path_mapping_from.rstrip("/")
-        if norm.lower().startswith(src.lower()):
-            remainder = norm[len(src):].lstrip("/")
-            return f"{dst}/{remainder}" if remainder else dst
-        return norm
-
-    def library_windows_to_lidarr(self, windows_path: Path) -> str:
-        """
-        Translate a path under the music LIBRARY root (not downloads) to
-        Lidarr's view, using `library_root_windows` -> `library_root_lidarr`
-        mapping. This is independent of the downloads path_mapping.
-        """
-        norm = str(windows_path).replace("\\", "/")
-        src = self.cfg.library_root_windows.replace("\\", "/").rstrip("/")
-        dst = self.cfg.library_root_lidarr.rstrip("/")
-        if norm.lower().startswith(src.lower()):
-            remainder = norm[len(src):].lstrip("/")
-            return f"{dst}/{remainder}" if remainder else dst
-        logger.debug(
-            "library_windows_to_lidarr: %s not under %s", norm, src,
-        )
+        for ours, theirs in sorted(self._path_roots(),
+                                   key=lambda p: len(p[1]), reverse=True):
+            rest = self._below(norm, theirs)
+            if rest is not None:
+                return f"{ours}/{rest}" if rest else ours
         return norm
