@@ -701,7 +701,15 @@ def wanted_signature(index: Dict[str, List[WantedTrack]],
         ids = sorted(w.track_id for k in set(titles) for w in index.get(k, ()))
     import hashlib
     h = hashlib.sha1(repr(ids).encode("utf-8")).hexdigest()[:12]
-    return "%d:%s" % (len(ids), h)
+    return "v%d:%d:%s" % (JUDGE_VERSION, len(ids), h)
+
+
+# Bumped when what a pass would conclude about an unchanged folder changes
+# (the matching or verification rules): every recorded verdict then differs
+# once and each source is judged again under the new rules. 2: AcoustID by
+# MusicBrainz id (1 Oct) -- songs it had wrongly rejected sat in sources the
+# ledger skipped as unchanged.
+JUDGE_VERSION = 2
 
 
 class HarvestLedger:

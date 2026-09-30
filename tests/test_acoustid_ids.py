@@ -72,6 +72,17 @@ class AcoustIdGate(unittest.TestCase):
              "artist_ids": ["other"]}))
 
 
+class NewRulesJudgeAgain(unittest.TestCase):
+
+    def test_a_verdict_under_older_rules_is_not_unchanged(self):
+        led = SH.HarvestLedger(None)
+        led._seen["/src"] = {"folder": "1:2:3", "titles": [],
+                             "wanted": "0:97d170e1550e"}     # before the bump
+        self.assertFalse(led.unchanged("/src", "1:2:3", {}))
+        led.mark("/src", "1:2:3", [], {})
+        self.assertTrue(led.unchanged("/src", "1:2:3", {}))
+
+
 class AcoustIdKeepsTheIds(unittest.TestCase):
 
     def test_best_carries_every_recording_and_artist_id(self):
