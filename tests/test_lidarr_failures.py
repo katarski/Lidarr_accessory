@@ -454,5 +454,77 @@ class SearchStateIsCheckpointed(unittest.TestCase):
         self.assertNotIn("last_attempt", saved[-1].get("3", {}))
 
 
+class CouldNotAskLidarr(unittest.TestCase):
+    """clients CLI-03: "could not ask Lidarr" is never an empty answer."""
+
+    def _wanted(self, pages):
+        c = L.LidarrClient.__new__(L.LidarrClient)
+
+        def get(path, **kw):
+            p = pages[kw["page"] - 1]
+            if isinstance(p, Exception):
+                raise p
+            return p
+        c._get = get
+        return c
+
+    @staticmethod
+    def _page(n, total):
+        return {"records": [{"id": i} for i in range(n)], "totalRecords": total}
+
+    def test_wanted_missing_is_whole_or_raises(self):
+        ok = self._wanted([self._page(1000, 1500), self._page(500, 1500)])
+        self.assertEqual(len(ok.wanted_missing()), 1500)
+        for pages in ([self._page(1000, 1500), requests.ConnectionError("x")],
+                      [self._page(1000, 2500), self._page(500, 2500)],
+                      [self._page(1000, 1500), "garbage"]):
+            with self.assertRaises(L.LidarrUnavailable):
+                self._wanted(pages).wanted_missing()
+
+    def test_a_partial_missing_list_skips_the_search_pass(self):
+        from orchestrator import Orchestrator
+        saved = []
+        lid = SimpleNamespace(failure_generation=0)
+
+        def wanted_missing():
+            raise L.LidarrUnavailable("wanted/missing incomplete: 1000 of 2500")
+        lid.wanted_missing = wanted_missing
+        s = SimpleNamespace(lidarr=lid, cfg=SimpleNamespace())
+        s._load_isearch_state = lambda: {"12": {"first_missing": 1.0}}
+        s._save_isearch_state = saved.append
+        s._lidarr_generation = Orchestrator._lidarr_generation.__get__(s)
+        self.assertEqual(Orchestrator.interactive_search_pass(s), 0)
+        self.assertEqual(saved, [])
+
+    def test_a_failed_lookup_is_not_unmonitored(self):
+        from orchestrator import Orchestrator
+        o = Orchestrator.__new__(Orchestrator)
+        lid = SimpleNamespace(failure_generation=0)
+
+        def find_artist(name):
+            lid.failure_generation += 1           # the artist list failed
+            return None
+        lid.find_artist = find_artist
+        o.lidarr = lid
+        self.assertEqual(o._monitored_album_status("Bon Jovi", "Crush")[0],
+                         "unknown")
+        lid.find_artist = lambda name: None       # answered: no such artist
+        self.assertEqual(o._monitored_album_status("Bon Jovi", "Crush")[0],
+                         "skip")
+
+    def test_editions_wait_when_lidarr_cannot_say_which_fits(self):
+        from orchestrator import Orchestrator
+        o = Orchestrator.__new__(Orchestrator)
+        o._read_audio_tags = lambda a: ("Bon Jovi", "Crush")
+        o._monitored_album_status = lambda a, b: ("unknown", 0, 0)
+        recorded = []
+        o._record = lambda *a, **k: recorded.append(a)
+        eligible = [(Path("/d/Crush (2000)"), [Path("/d/a.flac")] * 12),
+                    (Path("/d/Crush (Japan)"), [Path("/d/b.flac")] * 14)]
+        self.assertEqual(o._drop_duplicate_editions(eligible), set())
+        self.assertEqual(o._editions_deferred, {e[0] for e in eligible})
+        self.assertEqual(recorded, [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -4113,6 +4113,11 @@ class Orchestrator:
           ("unknown",   0, 0)         Lidarr lookup failed -> caller shouldn't
                                       skip (fall through to a normal attempt)
 
+        Lidarr's client answers None/[] when it fails, which read as "no such
+        artist" / "no such album" -> "skip": an outage looked like "not
+        monitored" (clients CLI-03). Any failure under this check (the
+        generation moved) is "unknown".
+
         "skip" is the important one: compilations / live / best-of that the
         metadata profile excludes have no monitored album, so we return early
         instead of handing them to Lidarr just to be rejected.
@@ -4121,14 +4126,19 @@ class Orchestrator:
         album_name = (album_name or "").strip()
         if not artist_name or not album_name:
             return ("unknown", 0, 0)
+        gen = self._lidarr_generation()
         try:
             artist = self.lidarr.find_artist(artist_name)
             if not artist:
+                if self._lidarr_generation() != gen:
+                    return ("unknown", 0, 0)
                 return ("skip", 0, 0)
             albums = self.lidarr.list_albums_for_artist(artist["id"]) or []
         except Exception as exc:  # noqa: BLE001
             logger.warning("Gap check: Lidarr lookup failed for %s: %s",
                            artist_name, exc)
+            return ("unknown", 0, 0)
+        if self._lidarr_generation() != gen:
             return ("unknown", 0, 0)
         target = _match_key(album_name)
         match = None
@@ -4711,7 +4721,14 @@ class Orchestrator:
         the most tracks (the most complete). Folders whose tags can't be read
         are never grouped -- they pass through untouched for the handoff to
         sort out. Returns a set of folders to skip.
+
+        When Lidarr could not be ASKED (the gap check says "unknown"), no
+        edition is chosen: the whole group waits in `self._editions_deferred`
+        for the next pass. Choosing by track count then recorded the losers
+        "skipped_duplicate_edition" on no evidence -- 10 at once on 26 Sep
+        20:19, "(Lidarr count unknown)" (clients CLI-03).
         """
+        self._editions_deferred = set()
         groups: Dict[str, list] = {}
         for folder, audios in eligible:
             artist = album = ""
@@ -4736,7 +4753,14 @@ class Orchestrator:
                     artist, album
                 )
             except Exception:  # noqa: BLE001
-                total = 0
+                _verdict, total = "unknown", 0
+            if _verdict == "unknown":
+                self._editions_deferred.update(m[0] for m in members)
+                logger.info(
+                    "cueless sweep: %s / %s has %d editions, and Lidarr could "
+                    "not be asked which fits -- all wait for the next pass",
+                    artist, album, len(members))
+                continue
             if total and total > 0:
                 best = min(members, key=lambda m: abs(m[1] - total))
                 crit = f"closest to Lidarr's {total} tracks"
@@ -7715,8 +7739,10 @@ class Orchestrator:
             # handled and unchanged" -- including every Weezer disc -- and the
             # sweep then handed off 0 for pass after pass.
             self._skip_seen.add(folder)
+        deferred = getattr(self, "_editions_deferred", set())
 
-        surviving = [(f, a) for (f, a) in eligible if f not in self._skip_seen]
+        surviving = [(f, a) for (f, a) in eligible
+                     if f not in self._skip_seen and f not in deferred]
         # IDENTIFY-FIRST ORDERING. A pass can hold 80+ folders and each handoff
         # costs Lidarr (and sometimes LLM) round trips, so a full pass takes the
         # better part of an hour -- and `_skip_seen` is in-memory, so any restart
@@ -13274,7 +13300,12 @@ class Orchestrator:
         self._isearch_albums = {}       # _artist_album_titles, per pass
         state = self._load_isearch_state()
         gen0 = self._lidarr_generation()
-        missing = self.lidarr.wanted_missing()
+        try:
+            missing = self.lidarr.wanted_missing()
+        except Exception as exc:  # noqa: BLE001 (LidarrUnavailable: partial)
+            logger.info("interactive search: the missing-album list could not "
+                        "be read whole (%s) -- pass skipped, state kept", exc)
+            return 0
         if self._lidarr_generation() != gen0:
             # Lidarr failed while listing: an empty or partial list is not
             # "nothing is missing". Treating it so pruned every album's state

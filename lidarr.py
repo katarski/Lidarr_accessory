@@ -345,10 +345,14 @@ class LidarrClient:
         all, because the pass never reached it to start its clock.
 
         `max_pages` is a runaway guard, not a limit anyone should hit; a short
-        page (or a failed request mid-walk) ends the walk. Returns [] on error.
+        page ends the walk. Raises LidarrUnavailable when the walk could not
+        be completed -- a failed or malformed page, or fewer records than
+        Lidarr's own totalRecords. It used to return the part it had, and the
+        caller took that as EVERY missing album and pruned the search state of
+        the rest (clients CLI-03).
         """
         out: List[Dict[str, Any]] = []
-        page = 1
+        page, total = 1, 0
         while page <= max(1, int(max_pages)):
             try:
                 data = self._get(
@@ -362,23 +366,27 @@ class LidarrClient:
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("wanted/missing page %d failed: %s", page, exc)
-                break
+                raise LidarrUnavailable(
+                    "wanted/missing page %d failed: %s" % (page, exc)) from exc
             if isinstance(data, list):
                 # Older/odd responses come back unpaged -- take them as final.
                 return data
             if not isinstance(data, dict):
-                break
+                raise LidarrUnavailable(
+                    "wanted/missing page %d: unexpected answer %r"
+                    % (page, type(data).__name__))
             records = data.get("records") or []
             out.extend(records)
             total = int(data.get("totalRecords") or 0)
             if len(records) < page_size or (total and len(out) >= total):
                 break
             page += 1
-        else:
+        if total and len(out) < total:
             logger.warning(
-                "wanted/missing: stopped at the %d-page guard with %d album(s) "
-                "collected -- some missing albums were not considered",
-                max_pages, len(out))
+                "wanted/missing: %d of %d album(s) collected -- not a complete "
+                "answer", len(out), total)
+            raise LidarrUnavailable("wanted/missing incomplete: %d of %d"
+                                    % (len(out), total))
         return out
 
     def release_search(self, album_id: int) -> List[Dict[str, Any]]:
