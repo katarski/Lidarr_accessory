@@ -310,6 +310,18 @@ layer says `http://daniel:11434`.
   (3) the 102 breaker-open warnings all fall at 22:49, the owner's Lidarr restart; none since,
   with Lidarr capped at 1 CPU. `lifecycle_state.json` is written; `library_audit.state.json`
   appears after the first complete audit pass.
+- **Library audio Lidarr has no record of (1 Oct scan, owner's call).**
+  1,364 audio files in 163 album folders are on disk but neither mapped nor
+  in Lidarr's unmapped list -- mostly a second disc left behind when an
+  album's release moved to a single-disc edition (Pablo Honey CD 02, Pet
+  Shop Boys CD 02s, The Beatles (1968)), plus old-numbering copies from an
+  earlier switch (The Drifters (2001): 11 files from 24 Apr beside the 12
+  filed ones). The music plays; Lidarr just does not track it. Where the
+  album is short of exactly those tracks (ABBA (1975): 8/18 with its 13
+  originals present) the audit's under-registered repair re-files them;
+  complete albums are left alone -- registering a second disc means choosing
+  the deluxe release, and removing copies means moving audio out of the
+  library. Per-folder counts: /config/_orphan_scan.json.
 - **Lidarr load and failure accounting (1 Oct, night).** `find_artist`'s
   spelling fallback now requires the same number of words ('J. D.
   Blackfoot' was taken for 'Blackfoot' 49 times). A Lidarr 5xx that is its
