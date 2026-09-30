@@ -32,8 +32,12 @@ build) with the repo's `*.py` and `tools/`, checks `OrchestratorConfig` is
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20260930-repairorigin`**
-(ff737c7). Earlier tags for rollback: `guard-20260930-albumpin`,
+then is the container replaced. Live now: **`guard-20260930-hydratealbum`**
+(4cf1ea5). Earlier tags for rollback: `guard-20260930-noorphan`,
+`guard-20260930-overridealbum`,
+`guard-20260930-discledger`,
+`guard-20260930-repairorigin`,
+`guard-20260930-albumpin`,
 `guard-20260930-logtail`,
 `guard-20260930-recids`,
 `guard-20260930-compbatch`,
@@ -299,6 +303,20 @@ layer says `http://daniel:11434`.
   (3) the 102 breaker-open warnings all fall at 22:49, the owner's Lidarr restart; none since,
   with Lidarr capped at 1 CPU. `lifecycle_state.json` is written; `library_audit.state.json`
   appears after the first complete audit pass.
+- **Wrong-album imports and orphaned library files (30 Sep, second session).**
+  At 11:52 the sweep forced the compilation 'More Abba Gold' into the 1975
+  album 'ABBA' on a 50.2% match (override floor 50%), the import switched
+  that album to an 18-track release, and 13 of its files were left on disk
+  with no Lidarr record; every harvest import onto their paths then failed
+  on DestinationAlreadyExists and re-ran each pass. Three guards: the
+  match-% override and the hydrate lookup accept only the album the
+  download names (edition/soundtrack noise, a year, the artist's name and
+  roman numerals allowed), and every ManualImport the client sends drops
+  files whose release switch would orphan filed tracks. The library
+  audit's "under-registered" repair re-files the ABBA files on its next
+  pass (it starts 1300 s after a start). A multi-disc album handed off at
+  its parent is now recorded disc by disc in the sweep ledger (the Knef
+  4-CD box was handed to Lidarr 50 times in two days).
 - **Nothing is grabbed for an unmonitored album or artist** — Lidarr will not
   import into one either, so the download is wasted twice. Fails open: no id, or
   a lookup error, and the grab proceeds.
