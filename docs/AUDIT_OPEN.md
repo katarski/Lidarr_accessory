@@ -2,8 +2,8 @@
 
 Generated 29 Sep 2026 from the read-only audit (6 areas, each finding
 adversarially verified). 91 findings were confirmed and 3 refuted
-(CLI-04, CLI-06, CLI-07: do not redo them). **88 are fixed and pushed**;
-the 3 below are open, in the order to fix them (data loss first).
+(CLI-04, CLI-06, CLI-07: do not redo them). **89 are fixed and pushed**;
+the 2 below are open, in the order to fix them (data loss first).
 
 **Line numbers are from commit 98d2656, the commit the audit read.** They
 have shifted since, so find the code by the function or the quoted text.
@@ -17,17 +17,7 @@ symbol first: green tests that never call it prove nothing. Where a fix
 changes a verdict, diff old against new over real data before shipping (as
 orch2 F4 did over Lidarr's 31,496 past grabs) and read the changed rows.
 
-## 1. orch3 LOG-TAIL-1 (low) -- The Log tab's 400-line view splices the tail of the rotated log in front of the live tail and skips the middle
-
-`orchestrator.py:13986`
-
-**Evidence:** read_log reads want = max(4096, need*220) bytes from the end (13983-13988). If that chunk holds fewer than `need` lines (average line over 220 bytes), it keeps the chunk, including its partial first line (it trims only when nl > need), and moves on to pipeline.log.1 (13999-14002). The result is the .1 tail, a partial line, then the live tail, with the rest of the live file missing and no marker. Measured on PARK: 400-line windows over 88,000 bytes occur 1,048 times in the live pipeline.log, 17,055 times in .1 and 18,086 in .2 (outage error lines). The UI default is 'last 400 lines' (webui.py:395).
-
-**Root cause:** A fixed bytes-per-line estimate stands in for reading backwards until enough newlines are found in the current file.
-
-**Fix:** Read the current file backwards in blocks until it yields `need` newlines or offset 0, and move to the next rotation only after the current file is exhausted. Drop the leading partial line whenever the read did not start at offset 0. Must not break: small reads for a 400-line refresh (no multi-MB reads), whole-file mode for lines<=0.
-
-## 2. llm LLM-5 (medium) -- Content-identify's LLM 'tie-break' is given the leader alone (the rival is filtered out) and answers by title, and the result drove...
+## 1. llm LLM-5 (medium) -- Content-identify's LLM 'tie-break' is given the leader alone (the rival is filtered out) and answers by title, and the result drove...
 
 `orchestrator.py:4045`
 
@@ -39,7 +29,7 @@ orch2 F4 did over Lidarr's 31,496 past grabs) and read the changed rows.
 
 **Fix:** Build the tie-break set from the same rule that made clear_margin false: every result within the margin of the leader. Do not accept a pick below min_cov, though. If the LLM picks a rival under min_cov, return None (undecided) rather than accept an album that failed the coverage floor. The clause 'if that set has one member, return None' can never fire, because when clear_margin is false results[1] is always within the margin, so the set always has at least 2 members. Drop it. Offer numbered options carrying year and track count, map the index back to the album record, and have _identify_album_by_content return the album id so callers stop re-matching by title. The same title-to-record collapse exists in dedup_downloads' LLM fallback (see the missed finding). Use one title/record resolver for both.
 
-## 3. llm missed (medium) -- The LLM's owned-album pick is resolved to the FIRST album with that title, skipping the same-title guard, so a missing edition can be...
+## 2. llm missed (medium) -- The LLM's owned-album pick is resolved to the FIRST album with that title, skipping the same-title guard, so a missing edition can be...
 
 `dedup_downloads.py:277`
 
