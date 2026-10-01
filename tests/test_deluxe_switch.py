@@ -26,12 +26,13 @@ class _Lidarr:
         self.monitored = STD
         self.switches = []
         self.filed = 2
+        self.stale_stats = False  # GET /album/{id} still describing the old release
         self.lag = 0          # reads after a switch that still show the old release
         self.pending = 0
 
     def get_album(self, i):
         return {"id": i, "title": "Album",
-                "statistics": {"trackFileCount": self.filed,
+                "statistics": {"trackFileCount": 0 if self.stale_stats else self.filed,
                                "totalTrackCount": 2 if self.monitored == STD else 4},
                 "releases": [{"id": STD, "trackCount": 2,
                               "monitored": self.monitored == STD},
@@ -122,6 +123,17 @@ class DeluxeSwitch(unittest.TestCase):
         # The restore re-files what Lidarr held, not the folder's other files.
         self.assertEqual(imported[1], ["Artist - Album - 01 - Alpha.flac",
                                        "Artist - Album - 02 - Beta.flac"])
+
+    def test_what_the_album_holds_is_counted_from_its_files(self):
+        # After a switch Lidarr's GET /album/{id} kept the old release's
+        # statistics (Allred / Covers: 0 of 10 while 12 of 12 were filed);
+        # measured against 0, a switch that lost files was kept.
+        d, o, root, lid, imported = _setup(lands=False)
+        self.addCleanup(d.cleanup)
+        lid.stale_stats = True
+        out = o._switch_to_fitting_release({"id": 5, "title": "Album"}, 3, root)
+        self.assertEqual(lid.switches, [DLX, STD])
+        self.assertIn("held 0 of 2 before -- restored release 1", out)
 
     def test_a_second_copy_of_the_album_is_not_switched(self):
         # Aaliyah: '(2003) - Aaliyah - Age Ain't Nothing But A Number' beside

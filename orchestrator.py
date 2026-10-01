@@ -5910,7 +5910,6 @@ class Orchestrator:
         full = self.lidarr.get_album(album_id) or {}
         rels = full.get("releases") or []
         prev = next((r.get("id") for r in rels if r.get("monitored")), None)
-        before = _album_track_file_count(full)
         held = set()
         for tf in (self.lidarr.list_trackfiles_for_album(album_id) or []):
             try:
@@ -5920,6 +5919,11 @@ class Orchestrator:
                 continue
         if not full or self._lidarr_generation() != gen:
             return "Lidarr did not answer -- not switched"
+        # Counted from its files, not GET /album/{id}'s statistics: after the
+        # switch to `Allred / Covers, Volume II` those still described the
+        # old release (0 of 10) while the album held 12 of 12 -- a later
+        # switch measured against 0 would never be undone.
+        before = len(held)
         every = self._album_audio_everywhere(album_dir)
         untracked = [p for p in every if str(p) not in held]
         tracked = [p for p in every if str(p) in held]
