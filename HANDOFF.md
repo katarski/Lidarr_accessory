@@ -32,8 +32,9 @@ build) with the repo's `*.py` and `tools/`, checks `OrchestratorConfig` is
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20261001-catalogue`**
-(c3480ab). Earlier tags for rollback: `guard-20261001-riptail`,
+then is the container replaced. Live now: **`guard-20261001-mbident`**
+(79c7330). Earlier tags for rollback: `guard-20261001-catalogue`,
+`guard-20261001-riptail`,
 `guard-20261001-llmanswers`,
 `guard-20261001-tagrule`,
 `guard-20261001-nollmpick`,
@@ -499,6 +500,13 @@ layer says `http://daniel:11434`.
   Edition' taken for the owned 'Breathe', and 'Quartet + Lament' for the
   owned 'Lament' (Ultravox Quartet still 0/118). Replay of 16 real names:
   4 verdicts change, all corrections, none needs the model.
+  Then MusicBrainz (`_musicbrainz_identity`, release groups of every type,
+  cached a week; `guard-20261001-mbident`): a download it names as a record
+  Lidarr lists (foreignAlbumId) is that album; as one Lidarr does not list,
+  not owned (Lidarr cannot hold it). VOCES8 'A Choral Christmas' (2023) had
+  been taken for the owned 'Christmas' (2012). Replay of 19 names: no
+  verdict change; 4 more need no model. Still for the model: soundtracks
+  titled 'X: Original Motion Picture Soundtrack', names the browse misses.
   SearXNG (br2.2, 192.168.4.7) is NOT reachable from the pipeline: Park's
   containers cannot reach that VLAN (No route to host). Reaching it needs a
   network change on Park (a host route via the router, or a second network
