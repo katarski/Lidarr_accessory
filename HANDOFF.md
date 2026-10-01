@@ -32,8 +32,9 @@ build) with the repo's `*.py` and `tools/`, checks `OrchestratorConfig` is
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20261001-searxnglink`**
-(4455dad). Earlier tags for rollback: `guard-20261001-disjoint`,
+then is the container replaced. Live now: **`guard-20261001-webevidence`**
+(128f778). Earlier tags for rollback: `guard-20261001-searxnglink`,
+`guard-20261001-disjoint`,
 `guard-20261001-mbident`,
 `guard-20261001-catalogue`,
 `guard-20261001-riptail`,
@@ -522,7 +523,12 @@ layer says `http://daniel:11434`.
   192.168.1.1) the host gets 200, but NATed container traffic fails --
   bridged conntrack (bridge-nf-call-iptables=1) remaps the source port as
   the packet re-crosses br2.2. The engines rate-limit (brave "too many
-  requests" on the first query): keep queries few and cached.
+  requests" on the first query): keep queries few and cached. Used for:
+  web evidence in the model's `pick_owned_album` prompt, searched only when
+  the model is about to be asked (`websearch.py`, 20 s apart, 30/hour,
+  /config/websearch_cache.json for a month, blocked = no evidence, never
+  kept; `guard-20261001-webevidence`). Live: 'Breathe In' shows as an
+  album of its own beside 'Breathe'.
 - **Encodes appear only complete** (`_encode_flac`: `.partial`, verify, tag,
   rename); DVD-Audio publishes the whole disc or nothing.
 - **Titles compare in any script** (`titlematch.py`) — see README.
