@@ -32,8 +32,9 @@ build) with the repo's `*.py` and `tools/`, checks `OrchestratorConfig` is
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20261001-heldcount`**
-(c4967ae). Earlier tags for rollback: `guard-20261001-edition`,
+then is the container replaced. Live now: **`guard-20261001-passbudget`**
+(1c2f636). Earlier tags for rollback: `guard-20261001-heldcount`,
+`guard-20261001-edition`,
 `guard-20261001-webevidence`,
 `guard-20261001-searxnglink`,
 `guard-20261001-disjoint`,
@@ -377,7 +378,9 @@ layer says `http://daniel:11434`.
   tracks than now, exactly as many as the untracked files (or tracked +
   untracked), >=90% of their titles on it; then filed by title. Fewer files
   after than before restores the old release, re-filing the files Lidarr
-  held. 10 attempts per audit pass. First live pass (07:12, 1 Oct): Aaliyah /
+  held. At most 10 switches per audit pass; every album is looked at
+  (`guard-20261001-passbudget` -- the budget used to be spent on looks too,
+  10 of 303 per pass; the 1 Oct replay finds 32 switches due). First live pass (07:12, 1 Oct): Aaliyah /
   Age Ain't Nothing but a Number switched to its 14-track release, 14/14; 8
   others had no fitting release; the rest deferred. It first acted on the
   album's second copy '(2003) - Aaliyah - ...' and judged the switch 0.4 s
