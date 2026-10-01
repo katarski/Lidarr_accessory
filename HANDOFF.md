@@ -32,8 +32,9 @@ build) with the repo's `*.py` and `tools/`, checks `OrchestratorConfig` is
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20261001-leftover`**
-(eb2890a). Earlier tags for rollback: `guard-20261001-weaktitle`,
+then is the container replaced. Live now: **`guard-20261001-artistid`**
+(cd7b1b5). Earlier tags for rollback: `guard-20261001-leftover`,
+`guard-20261001-weaktitle`,
 `guard-20261001-conflict`,
 `guard-20261001-verifyfolder`,
 `guard-20261001-deluxe`,
@@ -334,10 +335,15 @@ layer says `http://daniel:11434`.
   '<sheet> (Side N)/(CD N)/(Disc N)' where a .cue sat that `ledger.csv` last
   records as imported/already in the library, while Lidarr holds the album
   complete (else kept, asked again in 6 h). Side 2 went at 06:35 on 1 Oct;
-  the dry run over /downloads matched only that file. The post-import
-  check also looks the album up under the artist folder it landed in (CUE
-  performer 'Ray Parker Jr. And Raydio', Lidarr's 'Ray Parker Jr.';
-  `guard-20261001-verifyfolder`).
+  the dry run over /downloads matched only that file. A Woman Needs Love
+  was recorded imported_unverified: the post-import check never got the
+  artist Lidarr filed it under, because ManualImport candidates carry it as
+  `artist.id` and two call sites read `artistId` (absent on every live
+  candidate), so it fell back to the CUE performer 'Ray Parker Jr. And
+  Raydio'. `_committed_artist_id` now reads both (`guard-20261001-artistid`;
+  live probe: Cream candidates -> 817). Second layer: the check also tries
+  the artist folder the album landed in (`guard-20261001-verifyfolder`;
+  live re-run on Raydio: 8/8, old path 0/0).
 - **Library audio Lidarr has no record of (1 Oct scan, owner's call).**
   1,364 audio files in 163 album folders are on disk but neither mapped nor
   in Lidarr's unmapped list -- mostly a second disc left behind when an
