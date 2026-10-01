@@ -360,7 +360,12 @@ layer says `http://daniel:11434`.
   connect to qBittorrent" on a grab is qBittorrent's 409 Conflict (the
   torrent is already there -- all 232 in Lidarr's logs): an answer about that
   release, so the search tries the next candidate (`guard-20261001-conflict`;
-  Fehlfarben - Monarchie und Alltag, held uncategorised, ended 11 passes). Reconcile's "nothing importable" verdicts persist
+  Fehlfarben - Monarchie und Alltag, held uncategorised, ended 11 passes).
+  That grab was itself wrong: the album is '?0??', and when artist + album
+  hold under two real words the match was mostly the artist's name (~0.5
+  for any Fehlfarben release). The album's own words must now be in the
+  release title (`guard-20261001-weaktitle`; 5 of 586 missing albums have
+  this shape: Fehlfarben ?0??, P.I.F. 3/5/6, D2 6). Reconcile's "nothing importable" verdicts persist
   (`reconcile_seen.json`, was 60-173 /manualimport probes an hour after
   restarts), and the library audit remembers what it did to each folder
   (`library_audit.seen.json`): unchanged on disk and in Lidarr, the repair is
