@@ -1627,11 +1627,8 @@ class Orchestrator:
                             timeout=self.cfg.manual_import_timeout_seconds,
                         ):
                             outcome = "imported_via_manual"
-                            for h in committable:
-                                aid = h.get("artistId")
-                                if aid:
-                                    imported_artist_id = int(aid)
-                                    break
+                            imported_artist_id = self._committed_artist_id(
+                                committable)
                 else:
                     logger.warning(
                         "No ManualImport candidate met the %.0f%% match floor; "
@@ -6871,12 +6868,7 @@ class Orchestrator:
             # this, the web UI often shows an empty discography even though
             # the trackfiles are inserted on disk and in the DB -- same
             # reason we do it after the main-split ManualImport path.
-            aid: Optional[int] = None
-            for h in committable:
-                cand_aid = h.get("artistId")
-                if cand_aid:
-                    aid = int(cand_aid)
-                    break
+            aid = self._committed_artist_id(committable)
             self._trigger_artist_refresh(artist_name, artist_id=aid)
             # Lidarr reported completed+successful AND every file we sent was
             # moved out -- that IS "the files were moved to the library", so
@@ -6921,12 +6913,7 @@ class Orchestrator:
         # command shortly after our wait elapses. If we blindly "leave audio
         # in place", the next sweep re-imports the same folder => duplicates.
         # So verify against the library before giving up.
-        aid: Optional[int] = None
-        for h in committable:
-            cand_aid = h.get("artistId") or (h.get("artist") or {}).get("id")
-            if cand_aid:
-                aid = int(cand_aid)
-                break
+        aid = self._committed_artist_id(committable)
         if self.cfg.verify_library_after_import and self._verify_library_reflects_album(
             artist_name, album_name, len(audios), imported_artist_id=aid,
         ):
@@ -8617,6 +8604,22 @@ class Orchestrator:
                 "Positional nudge failed for album id=%s: %s", album_id, exc,
             )
             return False
+
+    @staticmethod
+    def _committed_artist_id(committable: list) -> Optional[int]:
+        """The artist Lidarr filed a ManualImport under. A candidate carries
+        it as `artist.id` (`artistId` is only how the commit is SENT); reading
+        `artistId` alone found none, so the post-import check fell back to
+        the CUE's performer -- 'Ray Parker Jr. And Raydio', no such artist --
+        and recorded 8/8 under 'Ray Parker Jr.' as imported_unverified."""
+        for h in committable or []:
+            aid = (h or {}).get("artistId") or ((h or {}).get("artist") or {}).get("id")
+            if aid:
+                try:
+                    return int(aid)
+                except (TypeError, ValueError):
+                    continue
+        return None
 
     def _lidarr_album_is_imported(
         self,
