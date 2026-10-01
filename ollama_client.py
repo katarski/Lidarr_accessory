@@ -568,12 +568,27 @@ class OllamaClient:
         """
         if not download_name or not owned_titles:
             return None
-        if not self.enabled:
-            return UNAVAILABLE
         cache_key = ("owned", download_name.strip().lower(),
                      frozenset(t.strip().lower() for t in owned_titles))
         if cache_key in self._match_cache:
             return self._match_cache[cache_key]
+        # Decided without the model when it cannot change the answer. Any pick
+        # is refused below unless the two titles share evidence and the
+        # download has no release-type word the owned title lacks; when no
+        # owned title passes both, every possible answer ends in None. So
+        # None IS the answer -- with the model, without it, or while the GPU
+        # is busy (an answer then, not a deferral). 9 in 10 of the 324 asks
+        # of 28 Sep-1 Oct came back NONE.
+        if not any(titlematch.same_record_evidence(download_name, t)
+                   and not _release_type_mismatch(download_name, t)
+                   for t in owned_titles):
+            logger.info("pick_owned_album: %r vs %d owned -> none, without the "
+                        "model (no owned title shares evidence with it)",
+                        download_name, len(owned_titles))
+            self._match_cache[cache_key] = None
+            return None
+        if not self.enabled:
+            return UNAVAILABLE
         listing = "\n".join(f"- {t}" for t in owned_titles)
         prompt = (
             f"Downloaded album folder name:\n  {download_name}\n\n"

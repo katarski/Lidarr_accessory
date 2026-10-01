@@ -215,6 +215,25 @@ class ClientBehaviour(unittest.TestCase):
         self.assertIsNone(c.pick_owned_album("Blackstar", ["Heathen"]))
         self.assertEqual(list(c._match_cache.values()), [None])
 
+    def test_no_answer_could_stand_so_none_without_the_model(self):
+        # The GPU is busy (gate closed) and no owned title shares evidence
+        # with the download: none, decided here, nothing sent.
+        c = client(verdict(False), [])
+        self.assertIsNone(c.pick_owned_album("Lotos Land - 1990",
+                                             ["Moonlight Shadow", "Crises"]))
+        self.assertEqual(c.session.sent, [])
+        # A release-type word the owned title lacks refuses it too.
+        self.assertIsNone(c.pick_owned_album("Blackstar Karaoke", ["Blackstar"]))
+        self.assertEqual(c.session.sent, [])
+
+    def test_a_title_that_could_stand_still_goes_to_the_model(self):
+        c = client(verdict(resident=True), [Resp(200, {"response": "NONE"})])
+        self.assertIsNone(c.pick_owned_album("A Choral Christmas", ["Christmas", "Arrival"]))
+        self.assertEqual(len(c.session.sent), 1)
+        c = client(verdict(False), [])
+        self.assertIs(c.pick_owned_album("A Choral Christmas", ["Christmas"]),
+                      oc.UNAVAILABLE)
+
     def test_pick_guard_refuses_contradicted_titles(self):
         c = client(verdict(resident=True), [Resp(200, {"response": "The Album"})])
         self.assertIsNone(c.pick_owned_album("A", ["The Album", "Arrival"]))
