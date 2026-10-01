@@ -1693,6 +1693,37 @@ class LidarrClient:
             logger.warning("get_album(%s) failed: %s", album_id, exc)
             return None
 
+    def grab_download_id(self, artist_id: int, guid: str,
+                         since_epoch: float) -> Optional[str]:
+        """The downloadId Lidarr recorded when it grabbed release `guid` (the
+        newest grab at or after `since_epoch`), read from the ARTIST's grab
+        history -- filtered by artist and event type, never the whole
+        history. The exact binding for a guid with no infohash (a RuTracker
+        topic link), whose queue row carries the torrent's own name rather
+        than the release title."""
+        if not artist_id or not guid:
+            return None
+        try:
+            rows = self._get("/api/v1/history/artist",
+                             artistId=int(artist_id), eventType=1) or []
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("grab history for artist %s failed: %s", artist_id, exc)
+            return None
+        from datetime import datetime
+        best = None
+        for e in rows if isinstance(rows, list) else []:
+            if str((e.get("data") or {}).get("guid") or "") != str(guid):
+                continue
+            did = str(e.get("downloadId") or "")
+            try:
+                ts = datetime.fromisoformat(
+                    str(e.get("date") or "").replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                continue
+            if did and ts >= since_epoch and (best is None or ts > best[0]):
+                best = (ts, did)
+        return best[1].lower() if best else None
+
     def list_trackfiles_for_album(self, album_id: int) -> List[Dict[str, Any]]:
         """Every imported file Lidarr has for this album (id + path). Used to
         target a RenameFiles command at exactly one album."""

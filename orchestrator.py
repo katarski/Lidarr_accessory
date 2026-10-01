@@ -11396,7 +11396,7 @@ class Orchestrator:
                 if r.get("downloadId")}
 
     def _await_grab(self, release_title: str, album_id=None, before=None,
-                    guid: str = "", timeout: int = 90):
+                    guid: str = "", timeout: int = 90, artist_id=None):
         """
         (downloadId_hash, record) of the queue row this grab created, else
         (None, None). Bound exactly: the infohash in the guid when it has
@@ -11405,13 +11405,30 @@ class Orchestrator:
         download's title -- that bound Priscilla Ahn's 'La La La' grab to
         Confidence Man's live '5AM (LA LA LA)', which was then verified
         against the wrong album and deleted.
+
+        A guid with no infohash (a RuTracker topic link) is bound through
+        Lidarr's grab history for the artist, which records that guid's
+        downloadId. Its queue row carries the torrent's own name ('Olivier
+        Derivière - 2007 - Obscure 2' for '(Score) ... Obscure 2 (Olivier
+        Derivière) - 2007, MP3, 320 kbps') and often no album, so 61 grabs in
+        four days were never verified.
         """
         from qbittorrent_client import btih_from_magnet, magnet_from_guid
         magnet = magnet_from_guid(guid or "") if guid else None
         ih = (btih_from_magnet(magnet) or "").lower() if magnet else ""
         norm = self._norm_title(release_title or "")
+        since = time.time() - 300
+        tries = 0
         deadline = time.time() + max(5, int(timeout))
         while time.time() < deadline:
+            if not ih and guid and artist_id and tries % 3 == 0:
+                did = self.lidarr.grab_download_id(int(artist_id), guid, since)
+                if did:
+                    rec = next((r for r in (self.lidarr.queue_list() or [])
+                                if str(r.get("downloadId") or "").lower() == did),
+                               None)
+                    return did, rec
+            tries += 1
             try:
                 for rec in self.lidarr.queue_list() or []:
                     did = str(rec.get("downloadId") or "").lower()
@@ -13413,9 +13430,11 @@ class Orchestrator:
                                 "for it", label, cand.get("title"))
                     return None
                 continue
-            thash, _rec = self._await_grab(str(cand.get("title") or ""),
-                                           album_id=aid, before=before,
-                                           guid=str(guid), timeout=90)
+            thash, _rec = self._await_grab(
+                str(cand.get("title") or ""), album_id=aid, before=before,
+                guid=str(guid), timeout=90,
+                artist_id=(alb.get("artistId")
+                           or (alb.get("artist") or {}).get("id")))
             if not thash:
                 logger.warning(
                     "interactive search: %s -- grabbed but no queue hash "
@@ -13915,7 +13934,8 @@ class Orchestrator:
                 continue
             thash, _rec = self._await_grab(cand.get("title") or "",
                                            album_id=_alb_id, before=before,
-                                           guid=str(guid), timeout=90)
+                                           guid=str(guid), timeout=90,
+                                           artist_id=artist_id)
             if not thash:
                 logger.warning(
                     "interactive search: %s -- grabbed %s but no queue hash; "
