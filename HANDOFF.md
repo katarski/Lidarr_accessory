@@ -466,8 +466,9 @@ layer says `http://daniel:11434`.
   send it to lidarr and mark as owned". The metadata profile ("Standard":
   Album; Studio + Soundtrack) leaves out live albums, compilations, EPs and
   singles, so such folders stayed "album not in Lidarr" every pass. When
-  nothing else placed the folder (rec and album_rec both None), the audit
-  calls `_give_lidarr_the_record` -> `record_adder.identify_record`:
+  nothing filed such a folder (also when Lidarr's fuzzy match named an
+  album that filed nothing, `-askall`), the audit calls
+  `_give_lidarr_the_record` -> `record_adder.identify_record`:
   - a folder whose files Lidarr already owns, under any album
     (`list_trackfiles_for_artist`, matched on the last 3 path parts), gets
     nothing ("record: Lidarr already owns this folder as ..."; partly owned:
@@ -482,17 +483,37 @@ layer says `http://daniel:11434`.
     folder or carry the folder's name ('Paint the Sky With Stars: The Best
     of Enya' is 11 of 16, named); another artist's record never; a tie is
     no answer; MusicBrainz down is "not judged" (deferred);
-  - added `addType: manual` (survives refreshes), unmonitored, no search;
-    the monitored release set if the album holds nothing; forced artist
-    refresh links the files; the title-paired import fills the rest; an
-    added album that files nothing is removed (files untouched); a listed
-    album already full from another folder makes this one "a copy" (no
-    refresh). At most `_RECORDS_PER_PASS` = 40 per pass.
+  - added `addType: manual`, unmonitored, no search; forced artist
+    refresh (a second one if the album still has no releases: our client
+    hands back a refresh of that artist already running, `-relafter`);
+    THEN the release the folder fits is monitored and read settled, and
+    the title-paired import files the rest. An added album that files
+    nothing is removed (files untouched); an import still queued in Lidarr
+    leaves it in place (`-queued`). A listed album already holding as many
+    as the folder fits makes it "a copy"; one holding another edition is
+    "another edition ... not switched", no refresh (`-edition`); one that
+    files nothing is not counted handled. At most `_RECORDS_PER_PASS` = 40
+    per pass; the rest "deferred (per-pass limit)" -- each still costs a
+    ~30 s ManualImport probe before it reaches the limit.
+  **Lidarr trap (`-manualmark`):** a refresh deletes an album the metadata
+  profile leaves out that is not addType manual AND holds no files
+  (RefreshAlbumService.ShouldDelete). PUT /api/v1/album copies addOptions
+  from its body and the GET never returns them, so ANY release switch
+  drops the manual mark: Lorde's 'Te ao mārama' was switched before the
+  refresh and that refresh deleted it. The step never switches before the
+  refresh, and `set_album_monitored_release(keep_manual=True)` sends
+  addOptions {addType: manual}. Once it holds files an album is safe.
   Write-blocked replay over the 197 not-in-Lidarr folders: 19 to add (7
   EPs, 2 live, 9 compilations, 1 single), 7 listed under another name, 34
   already owned. Donny Hathaway ' In Performance (1980)' was added by hand
-  first (album 46993, 6/6). Watch the first live pass for "record: added"
-  rows; each added album must be unmonitored with its files linked.
+  first (album 46993, 6/6). First live pass (11:39-15:14): 9 added and
+  verified (unmonitored, files linked, no history): Allred 'Sunrise/
+  Sunset', Celia Cruz 'A Night Of Salsa', Enya 'Paint the Sky With
+  Stars', Farmer Boys, Gorillaz 'Meanwhile EP', Isaac Hayes 'Wattstax' and
+  'Ultimate', Kaki King, plus 'Te ao mārama' (47008) and 'Wonderful'
+  (47009) by the fixed code in traces; 'Instrumentals' still to come
+  (its import sat queued). Pass line: "515 discrepancies found: 75
+  handled, 314 unchanged, 126 deferred, 0 failed".
 - **Nothing is grabbed for an unmonitored album or artist** — Lidarr will not
   import into one either, so the download is wasted twice. Fails open: no id, or
   a lookup error, and the grab proceeds.
@@ -755,6 +776,19 @@ test of a feature whose purpose is removing files.
     the old number-only pairing). Nothing detects a file owned by an album
     whose track it is not; the record step trusts Lidarr's ownership and
     reports that folder as owned. Needs a mis-filed-file check.
+13. **Christina Aguilera / Greatest Hits CD1+CD2** (/downloads/Christina
+    Aguilera_Greatest_Hits): Lidarr matches 'Christina Aguilera' (1999),
+    the import is rightly refused (strict_import_only), and every restart
+    splits both CUEs again (~10 min each; 7 times on 1 Oct, 5 right after
+    deploys) -- the failure lives in the ledger, the skip set in memory.
+    The compilation is not in Lidarr: the record step's add-then-import
+    would place it, but runs only for library folders.
+14. **Artist folders Lidarr keeps no artist in go by name** (19 of 782):
+    'Pink' -> Pink Floyd, 'Paul Schwartz' and 'Le Mystère des Voix
+    Bulgares ...' -> Aria (its disambiguation; 'bulgARIAn'), 'Queen of The
+    Damned OST' -> Queen. Next fix: no disambiguation keys; the fallback
+    only when the artist's words open the folder name; VA names ->
+    Various Artists. Diffed: 3 change, all to none.
 
 ---
 
