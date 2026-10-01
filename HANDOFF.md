@@ -32,8 +32,9 @@ build) with the repo's `*.py` and `tools/`, checks `OrchestratorConfig` is
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20261001-summary`**
-(b7a5bac). Earlier tags for rollback: `guard-20261001-passbudget`,
+then is the container replaced. Live now: **`guard-20261001-record`**
+(298277b). Earlier tags for rollback: `guard-20261001-summary`,
+`guard-20261001-passbudget`,
 `guard-20261001-heldcount`,
 `guard-20261001-edition`,
 `guard-20261001-webevidence`,
@@ -454,6 +455,38 @@ layer says `http://daniel:11434`.
   DownloadedAlbumsScan actions triggered" for rows that were nearly all
   "unchanged -- not repeated" or "deferred". The log watcher keys on the
   "Library audit: scanned" prefix only (`guard-20261001-summary`).
+- **A folder Lidarr does not list is given its record (1 Oct,
+  `guard-20261001-record`, 298277b).** Owner: "figure out where it goes,
+  send it to lidarr and mark as owned". The metadata profile ("Standard":
+  Album; Studio + Soundtrack) leaves out live albums, compilations, EPs and
+  singles, so such folders stayed "album not in Lidarr" every pass. When
+  nothing else placed the folder (rec and album_rec both None), the audit
+  calls `_give_lidarr_the_record` -> `record_adder.identify_record`:
+  - a folder whose files Lidarr already owns, under any album
+    (`list_trackfiles_for_artist`, matched on the last 3 path parts), gets
+    nothing ("record: Lidarr already owns this folder as ..."; partly owned:
+    "record: none given"). Lidarr's album lookup never offered the Beatles'
+    own Abbey Road or Magical Mystery Tour, only tributes and bootlegs;
+  - candidates: Lidarr's lookup by the folder's names, then MusicBrainz
+    song votes (every voted release group read, or past 3 none -- Édith
+    Piaf's song-named folders vote for 9-42 and set order picked which 3),
+    then SearXNG; no model;
+  - a release must carry >= 90% of the folder's titled songs and the folder
+    >= half of it; a record Lidarr does NOT list must be >= 90% in the
+    folder or carry the folder's name ('Paint the Sky With Stars: The Best
+    of Enya' is 11 of 16, named); another artist's record never; a tie is
+    no answer; MusicBrainz down is "not judged" (deferred);
+  - added `addType: manual` (survives refreshes), unmonitored, no search;
+    the monitored release set if the album holds nothing; forced artist
+    refresh links the files; the title-paired import fills the rest; an
+    added album that files nothing is removed (files untouched); a listed
+    album already full from another folder makes this one "a copy" (no
+    refresh). At most `_RECORDS_PER_PASS` = 40 per pass.
+  Write-blocked replay over the 197 not-in-Lidarr folders: 19 to add (7
+  EPs, 2 live, 9 compilations, 1 single), 7 listed under another name, 34
+  already owned. Donny Hathaway ' In Performance (1980)' was added by hand
+  first (album 46993, 6/6). Watch the first live pass for "record: added"
+  rows; each added album must be unmonitored with its files linked.
 - **Nothing is grabbed for an unmonitored album or artist** — Lidarr will not
   import into one either, so the download is wasted twice. Fails open: no id, or
   a lookup error, and the grab proceeds.
@@ -710,6 +743,12 @@ test of a feature whose purpose is removing files.
    CLI-08). Ask the owner; never rotate it yourself.
 11. The owner sometimes **pauses the Lidarr container on purpose**; the
     pipeline then waits ("Lidarr not reachable ... no deadline"). Don't unpause.
+12. **Don Davis / '1999 - The Matrix (Complete Original Motion Picture
+    Score)'**: its 10 disc-2 files (2-01 Choices, Exit Mr. Hat, Cypher's
+    Burnout ...) are owned by 'The Matrix Reloaded' (added 29 Sep 03:45,
+    the old number-only pairing). Nothing detects a file owned by an album
+    whose track it is not; the record step trusts Lidarr's ownership and
+    reports that folder as owned. Needs a mis-filed-file check.
 
 ---
 
