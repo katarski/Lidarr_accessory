@@ -32,8 +32,9 @@ build) with the repo's `*.py` and `tools/`, checks `OrchestratorConfig` is
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20261001-riptail`**
-(520b0dd). Earlier tags for rollback: `guard-20261001-llmanswers`,
+then is the container replaced. Live now: **`guard-20261001-catalogue`**
+(c3480ab). Earlier tags for rollback: `guard-20261001-riptail`,
+`guard-20261001-llmanswers`,
 `guard-20261001-tagrule`,
 `guard-20261001-nollmpick`,
 `guard-20261001-albumid`,
@@ -489,6 +490,15 @@ layer says `http://daniel:11434`.
   matched to owned albums (`strip_rip_tail`): 'Black Roses 320' is the owned
   'Black Roses'. Replayed on the 17 logged rip-tag questions: no verdict
   change, 4 need no model (`guard-20261001-riptail`).
+  The artist's catalogue identifies a download before the model is asked
+  (`_core`, `_records_named`; `guard-20261001-catalogue`): a title that,
+  without edition words and years (numbers kept), IS one of the artist's
+  Lidarr albums is that album, owned or not; a name carrying 2+ of the
+  artist's titles is a multi-album release, not owned while one is missing.
+  The model had removed two torrents on 29 Sep: 'Breathe In (2024) Extended
+  Edition' taken for the owned 'Breathe', and 'Quartet + Lament' for the
+  owned 'Lament' (Ultravox Quartet still 0/118). Replay of 16 real names:
+  4 verdicts change, all corrections, none needs the model.
   SearXNG (br2.2, 192.168.4.7) is NOT reachable from the pipeline: Park's
   containers cannot reach that VLAN (No route to host). Reaching it needs a
   network change on Park (a host route via the router, or a second network
