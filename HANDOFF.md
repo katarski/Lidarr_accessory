@@ -32,8 +32,9 @@ build) with the repo's `*.py` and `tools/`, checks `OrchestratorConfig` is
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20261001-webevidence`**
-(128f778). Earlier tags for rollback: `guard-20261001-searxnglink`,
+then is the container replaced. Live now: **`guard-20261001-edition`**
+(03531c4). Earlier tags for rollback: `guard-20261001-webevidence`,
+`guard-20261001-searxnglink`,
 `guard-20261001-disjoint`,
 `guard-20261001-mbident`,
 `guard-20261001-catalogue`,
@@ -385,6 +386,20 @@ layer says `http://daniel:11434`.
   the pass's 305 flagged); after a switch, import and count wait until
   Lidarr's track list is the new release, read the same twice. Live check on
   the copy: "a second copy, not switched".
+  An edition carries the record Lidarr holds (`guard-20261001-edition`): when
+  the untracked files alone make up the bigger release, >=90% of the tracked
+  files' titles must be on it too, else "another record, not switched". The
+  08:48 pass had switched Allred / Covers (MusicBrainz groups Covers, Volume
+  II, III and IV in one release group) from Covers III (tracked) to Volume II
+  (untracked, same folder). Replay of the 303 untracked-file albums,
+  write-blocked: 288 same, 2 changed, both correct (Allred; Daft Punk TRON:
+  Legacy, whose 5 held files on 'Enhanced CD 02' carry tags Crash / Fragile /
+  Prestige / Synopsis / TRON Legacy Theme but are filed as Encom I-II, Round
+  One, Castor, Reflections -- no release fits all 27). **Lidarr trap:** after
+  that switch GET /api/v1/album/5291 kept the OLD release's statistics (0 of
+  10) while the artist's album list and the track files said 12 of 12 (1 of
+  244 sampled albums differ, only that one). Count what an album holds from
+  its track files where it matters.
   Per-folder counts: /config/_orphan_scan.json.
 - **Lidarr load and failure accounting (1 Oct, night).** `find_artist`'s
   spelling fallback now requires the same number of words ('J. D.
