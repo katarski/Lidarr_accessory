@@ -99,6 +99,35 @@ _EDITION_WORDS = frozenset({
 })
 
 
+# Rip tags a download name ENDS with: a bitrate ('320', '192-320', '320
+# kbps', 'V0'), a bit depth and sample rate ('24-44.1', '24-96'), a codec word,
+# a trailing symbol ('⭐️') -- not codec names that are words ('Magnum Opus',
+# "Charlotte's Web"). Never part of WHICH album -- 'Black Roses 320' is
+# the 'Black Roses' Inner Circle owns, and four such names went to the model
+# on 28 Sep-1 Oct only for the number. Only the TAIL is cut, so a number in a
+# title ('Room 192 Blues', '21') stays.
+_RIP_TOKEN = (
+    r"(?:(?:16|24|32)\s*[-/_]\s*(?:44(?:[.,]1)?|48|88(?:[.,]2)?|96|176(?:[.,]4)?"
+    r"|192)(?:\s*khz)?"
+    r"|(?:320|256|224|192|160|128)(?:\s*[-/]\s*(?:320|256|224|192|160|128))*"
+    r"(?:\s*kbps|k)?"
+    r"|v[02]|flac|mp3|aac|alac|wv|wav|ogg|lossless|cbr|vbr|kbps)")
+_RIP_TAIL_RE = re.compile(r"(?i)(?:[\s_.\-]+" + _RIP_TOKEN + r")+$")
+_SYMBOL_TAIL_RE = re.compile(r"[^\w)\]]+$")
+
+
+def strip_rip_tail(name: str) -> str:
+    """`name` without the rip tags it ends with; `name` itself if that would
+    leave nothing."""
+    s = (name or "").strip()
+    while True:
+        cut = _RIP_TAIL_RE.sub("", _SYMBOL_TAIL_RE.sub("", s)).strip()
+        if cut == s:
+            break
+        s = cut
+    return s or (name or "").strip()
+
+
 def _extra_words_are_noise(dl_words: set, ow_words: set) -> bool:
     """True if every download word NOT in the owned title is an edition/format
     token or a 4-digit year (i.e. not a real distinguishing title word)."""
@@ -238,7 +267,7 @@ def album_complete_in_library(
     100-folder discography doesn't hammer the API.
     """
     artist = (artist or "").strip()
-    album = (album or "").strip()
+    album = strip_rip_tail(album)
     if not artist or not album:
         return False, 0, 0
     try:
