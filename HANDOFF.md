@@ -32,8 +32,9 @@ build) with the repo's `*.py` and `tools/`, checks `OrchestratorConfig` is
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20261001-tagrule`**
-(f8c284b). Earlier tags for rollback: `guard-20261001-nollmpick`,
+then is the container replaced. Live now: **`guard-20261001-llmanswers`**
+(e626f9e). Earlier tags for rollback: `guard-20261001-tagrule`,
+`guard-20261001-nollmpick`,
 `guard-20261001-albumid`,
 `guard-20261001-grabbind`,
 `guard-20261001-switchsafe`,
@@ -479,7 +480,9 @@ layer says `http://daniel:11434`.
   Split tracks are tagged by rule (`tagger.clean_tag` strips bracketed rip
   junk); the model is no longer asked: Lidarr rewrites all imported tags from
   MusicBrainz (writeAudioTags=sync, scrub on), and 5 of its 8 runs were
-  unusable (`guard-20261001-tagrule`).
+  unusable (`guard-20261001-tagrule`). The model's answers persist in
+  /config/llm_answers.json (per question and model, 30 days; UNAVAILABLE
+  never stored), so a restart does not re-ask (`guard-20261001-llmanswers`).
 - **Encodes appear only complete** (`_encode_flac`: `.partial`, verify, tag,
   rename); DVD-Audio publishes the whole disc or nothing.
 - **Titles compare in any script** (`titlematch.py`) — see README.
