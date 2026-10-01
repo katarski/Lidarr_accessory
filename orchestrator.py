@@ -1029,6 +1029,7 @@ class Orchestrator:
                     logger.debug("could not remove repair temp %s: %s", tmp, exc)
             self._repair_temps = set()
             self._repair_origin = {}
+            self._image_set = {}
             claims.release(folder)
 
     def _process(self, cue_path: Path) -> Optional[Path]:
@@ -1345,6 +1346,28 @@ class Orchestrator:
                 reason=reason, artist=cue.performer, album=cue.title,
             )
             return None
+
+        # One sheet, several images (vinyl sides): every track is cut from its
+        # own image, all into one staging folder, and the album is imported
+        # whole. Each image is deleted with the sheet after a verified import.
+        if cue.is_multi_image:
+            images = self._resolve_cue_images(cue_path, cue)
+            if images is None:
+                logger.warning(
+                    "%s describes %d images and not all of them are here -- "
+                    "leaving it", cue_path.name, len(cue.audio_files))
+                self._record(cue_path, outcome="failed", pre_split=False,
+                             reason="multi-image cue: an image is missing",
+                             artist=cue.performer, album=cue.title)
+                return None
+            for t in cue.tracks:
+                t.source = images[t.file_index]
+            self._image_set = getattr(self, "_image_set", None) or {}
+            self._image_set[audio_path] = list(images)
+            logger.info(
+                "%s: %d images (%s), %d tracks -- each split from its own image",
+                cue_path.name, len(images), ", ".join(p.name for p in images),
+                len(cue.tracks))
 
         # DTS-in-WAV disc image? ffmpeg decodes it to SILENCE, so a normal split
         # would emit silent tracks. Decode it to real 5.1 PCM with libdca first
@@ -3456,11 +3479,26 @@ class Orchestrator:
         if outcome not in self._CUE_RETRYABLE:
             return f"already handled ({outcome} at {when}{with_album})"
         cap = max(1, int(getattr(self.cfg, "cue_ledger_max_attempts", 3)))
+        if (attempts == cap and float(ts) < self._MULTI_IMAGE_SINCE
+                and self._cue_is_multi_image(cue_path)):
+            # Given up before one sheet for several images could be split:
+            # one more try under the rules that can (the attempt is counted
+            # again, so a second failure gives up for good).
+            return None
         if attempts >= cap:
             return (f"gave up after {attempts} attempt(s) ({outcome} at "
                     f"{when}{with_album}); it is in the WebUI needs-attention "
                     f"list -- replace or edit the .cue to retry")
         return None
+
+    # 1 Oct 2026 02:00 CEST: multi-image sheets became splittable.
+    _MULTI_IMAGE_SINCE = 1790812800.0
+
+    def _cue_is_multi_image(self, cue_path: Path) -> bool:
+        try:
+            return bool(parse_cue(cue_path, None, ollama=None).is_multi_image)
+        except Exception:  # noqa: BLE001
+            return False
 
     def _cue_ledger_mark(self, cue_path: Path, outcome: str) -> None:
         """Record a DECIDED verdict for this CUE and flush it immediately.
@@ -6919,6 +6957,11 @@ class Orchestrator:
             return False
         files = getattr(cue, "audio_files", None) or []
         tracks = getattr(cue, "tracks", None) or []
+        if getattr(cue, "is_multi_image", False):
+            # One sheet for several images (vinyl sides): it needs splitting
+            # just as much, and its images are the folder's "similarly sized"
+            # files that made it look pre-split.
+            return self._resolve_cue_images(cue_path, cue) is not None
         if len(files) != 1 or len(tracks) < 2:
             return False
         parent = cue_path.parent
@@ -6928,6 +6971,37 @@ class Orchestrator:
         stem = Path(ref_name).stem.lower()
         return any(s.stem.lower() == stem
                    for s in self._sibling_audio_files(parent))
+
+    def _resolve_cue_images(self, cue_path: Path, cue) -> Optional[List[Path]]:
+        """The file on disk for each FILE of a sheet, in order: the name it
+        gives, else the same stem with another audio extension (the 32-bit
+        .wv sides of a vinyl rip arrive converted to .flac). None when one is
+        missing or two FILEs land on one file."""
+        parent = cue_path.parent
+        order = [str(e).lower() for e in (self.cfg.audio_extensions or [])]
+        out: List[Path] = []
+        for ref in (getattr(cue, "audio_files", None) or []):
+            norm = str(ref).replace("\\", "/")
+            base = norm.rsplit("/", 1)[-1] or norm
+            hit = None
+            for cand in (parent / norm, parent / base):
+                try:
+                    if cand.is_file():
+                        hit = cand
+                        break
+                except OSError:
+                    continue
+            if hit is None:
+                stem = Path(base).stem.lower()
+                same = {p.suffix.lower(): p for p in self._sibling_audio_files(parent)
+                        if p.stem.lower() == stem}
+                hit = next((same[e] for e in order if e in same), None)
+                if hit is None and same:
+                    hit = sorted(same.values())[0]
+            if hit is None:
+                return None
+            out.append(hit)
+        return out if out and len(set(out)) == len(out) else None
 
     _WANTED_IDX = None
     _WANTED_IDX_TS = 0.0
@@ -14121,7 +14195,10 @@ class Orchestrator:
         # sweep extracted its embedded cuesheet again, and the job re-ran --
         # a 342 MB repair written and deleted every few minutes, all evening.
         origin = getattr(self, "_repair_origin", {}).get(audio_path)
-        for src in (cue_path, audio_path, origin):
+        # Every image of a multi-image sheet (vinyl side 2 too).
+        others = [p for v in (getattr(self, "_image_set", None) or {}).values()
+                  for p in v]
+        for src in (cue_path, audio_path, origin, *others):
             if not src or not src.exists():
                 continue
             try:
@@ -16892,7 +16969,9 @@ class Orchestrator:
         """
         parked = self.cfg.staging_root / "_processed"
         parked.mkdir(parents=True, exist_ok=True)
-        for src in (cue_path, audio_path):
+        others = [p for v in (getattr(self, "_image_set", None) or {}).values()
+                  for p in v]
+        for src in (cue_path, audio_path, *others):
             if not src.exists():
                 continue
             dst = parked / src.name

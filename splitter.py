@@ -185,7 +185,8 @@ def split_cue(
             "-hide_banner",
             "-loglevel", "warning",
             "-y",
-            "-i", str(audio_path),
+            # A multi-image sheet: the track's own image (vinyl side).
+            "-i", str(getattr(track, "source", None) or audio_path),
             "-ss", f"{track.start_seconds:.6f}",
         ]
         if track.end_seconds is not None:

@@ -43,6 +43,11 @@ class Track:
     start_seconds: float = 0.0
     end_seconds: Optional[float] = None  # None = until EOF
     isrc: str = ""
+    # Which FILE of the sheet the track's INDEX 01 sits in (0-based), and --
+    # once the orchestrator has resolved it -- that image on disk. Only a
+    # multi-image sheet needs either.
+    file_index: int = 0
+    source: Optional[Path] = None
 
 
 @dataclass
@@ -60,6 +65,21 @@ class Cue:
         """First FILE reference (backwards-compat helper)."""
         return self.audio_files[0] if self.audio_files else ""
 
+    @property
+    def is_multi_image(self) -> bool:
+        """Several FILEs, each holding two or more tracks: one sheet for both
+        sides of a vinyl rip (Ray Parker Jr. - After Dark: FILE '(Side 1)'
+        with tracks 1-5, FILE '(Side 2)' with 6-10, each side timed from
+        00:00). An EAC per-track sheet has one track per FILE (its pregap
+        may sit at the end of the previous FILE) and is not one."""
+        if len(self.audio_files) < 2 or not self.tracks:
+            return False
+        per: dict = {}
+        for t in self.tracks:
+            per[t.file_index] = per.get(t.file_index, 0) + 1
+        return (set(per) == set(range(len(self.audio_files)))
+                and all(n >= 2 for n in per.values()))
+
     def is_valid(self) -> bool:
         """
         Structural validity only: did the parser understand enough of the
@@ -71,13 +91,14 @@ class Cue:
             return False
         if not self.title:
             return False
-        # Track starts must be monotonically non-decreasing. Multi-FILE
-        # CUEs legitimately have all starts at 0; that's fine here.
-        last = -1.0
+        # Track starts must be monotonically non-decreasing WITHIN each FILE.
+        # Multi-FILE CUEs legitimately have all starts at 0, and a
+        # multi-image sheet starts each image again at 0.
+        last: dict = {}
         for t in self.tracks:
-            if t.start_seconds < last:
+            if t.start_seconds < last.get(t.file_index, -1.0):
                 return False
-            last = t.start_seconds
+            last[t.file_index] = t.start_seconds
         return True
 
     def is_disc_image(self, audio_duration: Optional[float] = None) -> tuple[bool, str]:
@@ -98,6 +119,18 @@ class Cue:
         """
         if not self.audio_files:
             return False, "CUE has no FILE reference"
+        if self.is_multi_image:
+            # Each image is a disc image of its own: positions strictly
+            # increasing inside it. (No length check: `audio_duration` is
+            # the length of one image.)
+            prev: dict = {}
+            for t in self.tracks:
+                if t.start_seconds <= prev.get(t.file_index, -1.0):
+                    return False, (
+                        f"Track {t.number} start ({t.start_seconds:.3f}s) is "
+                        f"not after the previous track of its FILE -- corrupt")
+                prev[t.file_index] = t.start_seconds
+            return True, ""
         if len(self.audio_files) > 1:
             return False, (
                 f"CUE references {len(self.audio_files)} separate audio files "
@@ -530,17 +563,25 @@ def parse_cue_text(text: str) -> Cue:
             # INDEX 01 is the track start; INDEX 00 is the pregap (ignore).
             if idx_num == 1:
                 current.start_seconds = secs
+                current.file_index = max(0, len(cue.audio_files) - 1)
             continue
 
     return cue
 
 
 def _fill_end_times(cue: Cue, audio_duration_seconds: Optional[float]) -> None:
+    # A multi-image sheet: a track ends where the next one of ITS image
+    # starts, and the last of each image at that image's end (None = EOF;
+    # the given duration is one image's).
+    multi = cue.is_multi_image
     for i, track in enumerate(cue.tracks):
-        if i + 1 < len(cue.tracks):
-            track.end_seconds = cue.tracks[i + 1].start_seconds
-        else:
+        nxt = cue.tracks[i + 1] if i + 1 < len(cue.tracks) else None
+        if nxt is not None and (not multi or nxt.file_index == track.file_index):
+            track.end_seconds = nxt.start_seconds
+        elif nxt is None and not multi:
             track.end_seconds = audio_duration_seconds  # may be None
+        else:
+            track.end_seconds = None
 
 
 def _promote_album_fields(cue: Cue) -> None:
