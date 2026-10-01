@@ -28,7 +28,7 @@ class Summary(unittest.TestCase):
         import inspect
         src = inspect.getsource(Orchestrator)
         self.assertIn("self._audit_outcome_summary(discrepancies)", src)
-        self.assertNotIn("DownloadedAlbumsScan actions", src)
+        self.assertNotIn('"%d discrepancies found, %d DownloadedAlbumsScan', src)
 
 
 if __name__ == "__main__":
