@@ -5996,7 +5996,14 @@ class Orchestrator:
             rec = self.lidarr.get_album(album_id) or full
             imp = self._import_library_folder_by_tracknumber(rec, artist_id, audios)
             if imp:
-                self.lidarr.wait_for_command(int(imp), timeout_seconds=600)
+                done = self.lidarr.wait_for_command(int(imp), timeout_seconds=600) or {}
+                state = str(done.get("status") or "").lower()
+                if state not in ("completed", "failed", "aborted"):
+                    # Still queued behind Lidarr's work: Isaac Hayes's
+                    # 'Instrumentals' import sat queued for 10 minutes, the
+                    # step read 0 filed and removed the album it was for.
+                    return ("record: %s -- its import (command %s) is still %s "
+                            "in Lidarr (%s)" % (how, imp, state or "unread", res["via"]))
             filled = sum(1 for t in (self.lidarr.list_tracks_for_album(album_id) or [])
                          if t.get("hasFile"))
         if not alb.get("id") and not filled:

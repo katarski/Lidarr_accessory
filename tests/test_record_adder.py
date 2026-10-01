@@ -188,8 +188,10 @@ class _Lidarr:
             self.filled = 6
         return 5
 
+    cmd_status = "completed"
+
     def wait_for_command(self, cmd, timeout_seconds=60):
-        return {}
+        return {"status": self.cmd_status}
 
     def set_album_monitored_release(self, a, r, keep_manual=False):
         self.switches.append((self.refreshed, r, keep_manual))
@@ -316,6 +318,19 @@ class GiveLidarrTheRecord(unittest.TestCase):
                               "Lidarr, unmonitored -- 6 of 6 track(s) filed "
                               "(its name)")
         self.assertEqual(lid.switches, [(1, 9, True)])   # after the refresh, mark kept
+
+    def test_an_import_still_queued_does_not_take_the_album_back(self):
+        # Isaac Hayes / 'Instrumentals': the title import sat queued in
+        # Lidarr for 10 minutes; 0 filed was read and the album removed.
+        lid = _Lidarr(links=False)
+        lid.cmd_status = "queued"
+        o = _orch(lid)
+        o._import_library_folder_by_tracknumber = lambda *a, **k: 77
+        out = o._give_lidarr_the_record(113, ARTIST, self.audios, ["In Performance"])
+        self.assertEqual(out, "record: added 'In Performance' (Album/Live) to "
+                              "Lidarr, unmonitored -- its import (command 77) is "
+                              "still queued in Lidarr (its name)")
+        self.assertEqual(lid.removed, [])
 
     def test_a_bigger_edition_of_a_listed_record_is_not_called_a_copy(self):
         # Don Davis / '2008 - The Matrix The Deluxe Edition': 30 songs, while
