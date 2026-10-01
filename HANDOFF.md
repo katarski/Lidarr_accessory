@@ -515,6 +515,15 @@ layer says `http://daniel:11434`.
   (47009) by the fixed code in traces; 'Instrumentals' still to come
   (its import sat queued). Pass line: "515 discrepancies found: 75
   handled, 314 unchanged, 126 deferred, 0 failed".
+- **The audit's artist for a library folder (1 Oct, `-artistpath`,
+  `-artistnames`).** The Lidarr artist whose path is that folder; else
+  one whose name or sort name is the folder's; else the longest whose
+  name's words open the folder name ('Kenny Wayne Shepherd Band');
+  'Various'/'VA' -> Various Artists (MusicBrainz id). Disambiguations
+  are not names: George Harrison's ('The Beatles') took the Beatles
+  folder, Rob Thomas's took Matchbox Twenty, Aria's took 'Paul
+  Schwartz'; a substring gave 'Pink' to Pink Floyd. Left as is:
+  'Queen of The Damned OST' -> Queen (its name opens it).
 - **Nothing is grabbed for an unmonitored album or artist** — Lidarr will not
   import into one either, so the download is wasted twice. Fails open: no id, or
   a lookup error, and the grab proceeds.
@@ -778,18 +787,14 @@ test of a feature whose purpose is removing files.
     whose track it is not; the record step trusts Lidarr's ownership and
     reports that folder as owned. Needs a mis-filed-file check.
 13. **Christina Aguilera / Greatest Hits CD1+CD2** (/downloads/Christina
-    Aguilera_Greatest_Hits): Lidarr matches 'Christina Aguilera' (1999),
-    the import is rightly refused (strict_import_only), and every restart
-    splits both CUEs again (~10 min each; 7 times on 1 Oct, 5 right after
-    deploys) -- the failure lives in the ledger, the skip set in memory.
-    The compilation is not in Lidarr: the record step's add-then-import
-    would place it, but runs only for library folders.
-14. **Artist folders Lidarr keeps no artist in go by name** (19 of 782):
-    'Pink' -> Pink Floyd, 'Paul Schwartz' and 'Le Mystère des Voix
-    Bulgares ...' -> Aria (its disambiguation; 'bulgARIAn'), 'Queen of The
-    Damned OST' -> Queen. Next fix: no disambiguation keys; the fallback
-    only when the artist's words open the folder name; VA names ->
-    Various Artists. Diffed: 3 change, all to none.
+    Aguilera_Greatest_Hits): Lidarr matches 'Christina Aguilera' (1999)
+    and the import is rightly refused (strict_import_only). The CUE
+    ledger (/config/cue_seen.json) caps it at 3 attempts; 7 splits on
+    1 Oct because 5 runs were killed by deploys before a verdict (CD2 at
+    2 attempts, CD1 at 1 at 17:10). Each retry is a full ~10 min split
+    though nothing changed. The compilation is not in Lidarr: the record
+    step's add-then-import would place it, but runs for library folders
+    only -- worth extending to downloads.
 
 ---
 
