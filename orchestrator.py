@@ -10976,6 +10976,13 @@ class Orchestrator:
         # 1.0 and was grabbed. Require at least two tokens of >= 2 characters
         # before containment may speak; otherwise fall back to the ratio.
         if len([w for w in want if len(w) >= 2]) < 2:
+            # Then the ratio is mostly the artist's name: every Fehlfarben
+            # release scored ~0.5 for the album '?0??' ('0'), over the 0.45
+            # floor -- 'Monarchie und Alltag' was grabbed for it -- and
+            # 'P.I.F. 5' for 'P.I.F. 6'. The album's own words must be there.
+            own = cls._norm_title(album).split()
+            if own and not set(own) <= set(title_norm.split()):
+                return 0.0
             return seq
         have = set(title_norm.split())
         if not all(w in have for w in want):
