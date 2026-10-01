@@ -32,8 +32,9 @@ build) with the repo's `*.py` and `tools/`, checks `OrchestratorConfig` is
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20261001-disjoint`**
-(4d75d7a). Earlier tags for rollback: `guard-20261001-mbident`,
+then is the container replaced. Live now: **`guard-20261001-searxnglink`**
+(4455dad). Earlier tags for rollback: `guard-20261001-disjoint`,
+`guard-20261001-mbident`,
 `guard-20261001-catalogue`,
 `guard-20261001-riptail`,
 `guard-20261001-llmanswers`,
@@ -511,13 +512,17 @@ layer says `http://daniel:11434`.
   been taken for the owned 'Christmas' (2012). Replay of 19 names: no
   verdict change; 4 more need no model. Still for the model: soundtracks
   titled 'X: Original Motion Picture Soundtrack', names the browse misses.
-  SearXNG (br2.2, 192.168.4.7) is NOT reachable from the pipeline: Park has
-  its own leg on that VLAN (br2.2, 192.168.4.188), so it sends straight to
-  SearXNG's macvlan, which the host cannot reach (No route to host). The
-  router already passes Park to it (curl --interface br0: HTTP 200, 10 ms),
-  as it does HA. Needed: a host route on Park, 192.168.4.7/32 via
-  192.168.1.1 (Unraid Settings -> Network Settings -> Routing Table) --
-  left to the owner (system network setting).
+  **SearXNG is reached at http://SearXNG:8080 over `searxng_link`**, an
+  --internal bridge network joining cue_pipeline and SearXNG, created and
+  attached by tools/deploy.sh on every deploy (re-attaches a recreated
+  SearXNG too; `guard-20261001-searxnglink`). Internal = no gateway: SearXNG
+  still egresses on br2.2, the pipeline via the bridge and the VPN. Why not
+  routing: Park has its own leg on br2.2 (192.168.4.188) and cannot reach
+  its ipvlan children; with the owner's host route (192.168.4.7/32 via
+  192.168.1.1) the host gets 200, but NATed container traffic fails --
+  bridged conntrack (bridge-nf-call-iptables=1) remaps the source port as
+  the packet re-crosses br2.2. The engines rate-limit (brave "too many
+  requests" on the first query): keep queries few and cached.
 - **Encodes appear only complete** (`_encode_flac`: `.partial`, verify, tag,
   rename); DVD-Audio publishes the whole disc or nothing.
 - **Titles compare in any script** (`titlematch.py`) — see README.
