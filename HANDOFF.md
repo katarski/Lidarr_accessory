@@ -32,8 +32,9 @@ build) with the repo's `*.py` and `tools/`, checks `OrchestratorConfig` is
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20261001-albumid`**
-(68287dc). Earlier tags for rollback: `guard-20261001-grabbind`,
+then is the container replaced. Live now: **`guard-20261001-nollmpick`**
+(c74b893). Earlier tags for rollback: `guard-20261001-albumid`,
+`guard-20261001-grabbind`,
 `guard-20261001-switchsafe`,
 `guard-20261001-artistid`,
 `guard-20261001-leftover`,
@@ -468,6 +469,12 @@ layer says `http://daniel:11434`.
   None means only "assembly off").
 - **An unanswered LLM question is not a "no"** (`UNAVAILABLE`, `llm_gate.py`):
   the item waits and is re-examined when the gate reopens.
+- **The 3090 only for what needs it (owner, 1 Oct).** 28 Sep-1 Oct: 324
+  `pick_owned_album` asks (132 distinct, 9 in 10 NONE), 8 `normalize_tags`,
+  3 `confirm_album`, no CUE repair or folder parse. `pick_owned_album` now
+  answers none itself when no owned title passes its own guards
+  (`same_record_evidence`, release type) -- verdict-identical, and an answer
+  rather than a deferral while the GPU is busy (`guard-20261001-nollmpick`).
 - **Encodes appear only complete** (`_encode_flac`: `.partial`, verify, tag,
   rename); DVD-Audio publishes the whole disc or nothing.
 - **Titles compare in any script** (`titlematch.py`) — see README.
