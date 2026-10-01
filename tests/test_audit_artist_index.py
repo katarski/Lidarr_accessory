@@ -44,5 +44,39 @@ class ArtistFolder(unittest.TestCase):
         self.assertIsNone(self.o._lidarr_lookup_artist("Nobody At All", self.idx))
 
 
+class _Others:
+    def artists(self):
+        def a(i, name, sort, dis="", fid=""):
+            return {"id": i, "artistName": name, "sortName": sort,
+                    "disambiguation": dis, "foreignArtistId": fid,
+                    "path": "/music/Music/" + name}
+        return [a(1, "Aria", "aria", "ambient, operatic electro project of Paul Schwartz"),
+                a(2, "Pink Floyd", "pink floyd"),
+                a(3, "P!nk", "p!nk"),
+                a(4, "Kenny Wayne Shepherd", "shepherd, kenny wayne"),
+                a(5, "Various Artists", "various artists",
+                  fid="89ad4ac3-39f7-470e-963a-56509c546377"),
+                a(6, "Deep Forest", "deep forest")]
+
+
+class FolderLidarrKeepsNoArtistIn(unittest.TestCase):
+
+    def test_a_name_opens_the_folder_or_it_is_no_one(self):
+        # 1 Oct: 'Pink' was Pink Floyd's, 'Paul Schwartz' and 'Le Mystere
+        # Des Voix Bulgares ...' Aria's (its disambiguation; 'bulgARIAn').
+        o = Orchestrator.__new__(Orchestrator)
+        o.lidarr = _Others()
+        idx = o._build_lidarr_artist_index()
+        got = {n: (o._lidarr_lookup_artist(n, idx) or {}).get("artistName") for n in (
+            "Pink", "Paul Schwartz",
+            "Le Mystere Des Voix Bulgares & The Mystery Of Bulgarian Voices",
+            "Kenny Wayne Shepherd Band", "Deep Forest & Projects", "Various")}
+        self.assertEqual(got, {
+            "Pink": None, "Paul Schwartz": None,
+            "Le Mystere Des Voix Bulgares & The Mystery Of Bulgarian Voices": None,
+            "Kenny Wayne Shepherd Band": "Kenny Wayne Shepherd",
+            "Deep Forest & Projects": "Deep Forest", "Various": "Various Artists"})
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -131,6 +131,15 @@ def _match_key(value: str) -> str:
     return s
 
 
+def _name_words(value: str) -> List[str]:
+    """_match_key's words: what the audit's artist fallback compares."""
+    return _match_key(value).split()
+
+
+# MusicBrainz's "Various Artists" (special purpose artist).
+_VARIOUS_ARTISTS_MBID = "89ad4ac3-39f7-470e-963a-56509c546377"
+
+
 # These substrings identify an `is_disc_image(...)` reason as "definitely
 # already split," meaning the .cue is orphan metadata and can be deleted
 # without losing anything. Ambiguous reasons ("CUE points to already-split
@@ -9137,15 +9146,14 @@ class Orchestrator:
             return {}
         idx: Dict[str, Dict[str, Any]] = {}
         for a in artists or []:
-            # Index under every name we can get: artistName (canonical),
-            # sortName (alphabetized form, e.g. "Beatles, The"), and the
-            # disambiguation field (rarely useful but cheap). This gives
-            # us multiple keys pointing at the same record so cross-script
-            # or punctuation quirks can still hit.
+            # Index under its names: artistName (canonical) and sortName
+            # (alphabetized form, e.g. "Beatles, The"). Not the
+            # disambiguation, which describes the artist and names others:
+            # Aria's is "ambient, operatic electro project of Paul Schwartz",
+            # George Harrison's "The Beatles".
             names = [
                 a.get("artistName") or "",
                 a.get("sortName") or "",
-                a.get("disambiguation") or "",
             ]
             if not any(n.strip() for n in names):
                 continue
@@ -9156,6 +9164,11 @@ class Orchestrator:
                 key = _match_key(nm)
                 if key and key not in idx:
                     idx[key] = a
+                words = tuple(_name_words(nm))
+                if len("".join(words)) >= 4:
+                    idx.setdefault(self._ARTIST_WORDS_KEY, {}).setdefault(words, a)
+            if str(a.get("foreignArtistId") or "") == _VARIOUS_ARTISTS_MBID:
+                idx[self._ARTIST_VA_KEY] = a
             # The folder Lidarr keeps the artist in answers before any name:
             # George Harrison's disambiguation is "The Beatles" and Rob
             # Thomas's "Matchbox Twenty", and came first in the list, so
@@ -9167,6 +9180,9 @@ class Orchestrator:
         return idx
 
     _ARTIST_PATH_KEY = "\x00path"
+    _ARTIST_WORDS_KEY = "\x00words"
+    _ARTIST_VA_KEY = "\x00va"
+    _VA_FOLDER_NAMES = frozenset({"various", "various artists", "va", "v.a.", "v/a"})
 
     def _lidarr_lookup_artist(
         self,
@@ -9174,28 +9190,29 @@ class Orchestrator:
         index: Dict[str, Dict[str, Any]],
     ) -> Optional[Dict[str, Any]]:
         """
-        Find the Lidarr artist record matching a library folder name.
-        Same fuzzy rules as `_find_album_on_disk`: exact, then substring
-        either direction.
+        Find the Lidarr artist record matching a library folder name: the
+        artist Lidarr keeps in that folder, else one whose name is the
+        folder's, else the longest whose name OPENS the folder name, word
+        for word ('Kenny Wayne Shepherd Band'). A substring either way gave
+        'Pink' to Pink Floyd, and 'Le Mystere Des Voix Bulgares ...' to Aria
+        ('bulgARIAn').
         """
         owner = (index.get(self._ARTIST_PATH_KEY) or {}).get(folder_name.casefold())
         if owner is not None:
             return owner
+        if folder_name.strip().casefold() in self._VA_FOLDER_NAMES:
+            return index.get(self._ARTIST_VA_KEY)
         target = _match_key(folder_name)
         if not target:
             return None
         if target in index:
             return index[target]
-        # Substring match either direction (handles "Beatles" vs "The Beatles"
-        # after leading-article stripping still differs, or folder-abbreviations).
-        # Gate by a minimum length so 2-char noise doesn't spuriously match.
-        if len(target) >= 4:
-            for key, rec in index.items():
-                if len(key) < 4 or key == self._ARTIST_PATH_KEY:
-                    continue
-                if target in key or key in target:
-                    return rec
-        return None
+        fw = tuple(_name_words(folder_name))
+        best: Optional[Tuple[Tuple[str, ...], Dict[str, Any]]] = None
+        for words, rec in (index.get(self._ARTIST_WORDS_KEY) or {}).items():
+            if fw[:len(words)] == words and (best is None or len(words) > len(best[0])):
+                best = (words, rec)
+        return best[1] if best else None
 
     def _audit_state_path(self) -> Optional[Path]:
         """library_audit.state.json beside the report: the first-run marker
