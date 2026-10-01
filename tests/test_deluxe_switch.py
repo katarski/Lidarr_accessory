@@ -136,6 +136,21 @@ class DeluxeSwitch(unittest.TestCase):
         self.assertEqual((lid.switches, imported), ([], []))
         self.assertIn("second copy", out)
 
+    def test_another_record_in_the_folder_is_not_an_edition(self):
+        # Allred / Covers: MusicBrainz groups `Covers, Volume II` with it, the
+        # folder held both, and Volume II's untracked files were switched to.
+        d, o, root, lid, imported = _setup(dlx_titles=("W", "X", "Y", "Z"))
+        self.addCleanup(d.cleanup)
+        for sub in ("CD 01", "CD 02"):
+            for p in (root / sub).iterdir():
+                p.unlink()
+            (root / sub).rmdir()
+        for n in ("01 - W", "02 - X", "03 - Y", "04 - Z"):
+            (root / ("Artist - Album - %s.flac" % n)).write_bytes(b"x")
+        out = o._switch_to_fitting_release({"id": 5, "title": "Album"}, 3, root)
+        self.assertEqual((lid.switches, imported), ([], []))
+        self.assertIn("another record, not switched", out)
+
     def test_nothing_is_filed_or_counted_before_lidarr_takes_the_switch(self):
         d, o, root, lid, imported = _setup()
         self.addCleanup(d.cleanup)

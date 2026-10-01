@@ -5895,8 +5895,9 @@ class Orchestrator:
 
         Switch to the release those files ARE: more tracks than the album
         now holds, exactly as many as the untracked files (or as the tracked
-        and untracked together), and at least 90% of their song titles on it.
-        Then file them by title (_import_library_folder_by_tracknumber only
+        and untracked together), and at least 90% of their song titles on it
+        -- and of the tracked files' titles too: an edition carries the record
+        Lidarr holds. Then file them by title (_import_library_folder_by_tracknumber only
         fills empty tracks). If the album ends up holding fewer files than
         before, the old release is restored and its files filed again.
         Returns what was done, for the audit report."""
@@ -5933,7 +5934,8 @@ class Orchestrator:
             return ("Lidarr's files for it are in another folder -- a second "
                     "copy, not switched")
         titles = {p: norm_title(self._read_audio_title(p)) for p in every}
-        best = None
+        kept = Counter(titles[p] for p in tracked if titles[p])
+        best = other = None
         for r in rels:
             rid, n = r.get("id"), int(r.get("trackCount") or 0)
             if not rid or rid == prev or n <= before:
@@ -5947,10 +5949,27 @@ class Orchestrator:
                 want = Counter(norm_title(x.get("title")) for x in rows)
                 got = Counter(titles[p] for p in files if titles[p])
                 hit = sum((want & got).values())
-                if hit >= 0.9 * n and (best is None or hit > best[0]):
+                if hit < 0.9 * n:
+                    continue
+                # A bigger EDITION carries the record Lidarr holds now. On
+                # MusicBrainz `Allred / Covers` shares its release group with
+                # `Covers, Volume II`; the folder held both, and the 12-track
+                # Volume II was switched to for its 12 untracked files --
+                # trading the album for another record.
+                if (files is untracked
+                        and sum((want & kept).values()) < 0.9 * len(tracked)):
+                    other = other or r
+                    continue
+                if best is None or hit > best[0]:
                     best = (hit, r, files)
         if self._lidarr_generation() != gen:
             return "Lidarr failed while the releases were compared -- not switched"
+        if best is None and other is not None:
+            return ("the %d untracked file(s) are release %s (%s), which lacks "
+                    "the %d file(s) Lidarr holds -- another record, not switched"
+                    % (len(untracked), other.get("id"),
+                       other.get("title") or other.get("disambiguation") or "",
+                       len(tracked)))
         if best is None:
             return ("no bigger release fits the %d untracked file(s) by count "
                     "and titles" % len(untracked))
