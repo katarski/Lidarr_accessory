@@ -5852,6 +5852,108 @@ class Orchestrator:
             int(round(hits / cov)) if cov else 0, runner)
         return alb
 
+    # Bigger-edition switches one audit pass may make (each is a release PUT
+    # and an import Lidarr parses); the rest wait for the next pass.
+    _DELUXE_PER_PASS = 10
+
+    def _album_audio_everywhere(self, album_dir: Path) -> List[Path]:
+        """Every audio file of an album folder, its disc folders included,
+        minus what prefer-lossless set aside."""
+        return [p for p in self._audio_files_recursive(album_dir, cap=2000)
+                if self.QUARANTINE_DIR not in p.parts]
+
+    def _switch_to_fitting_release(self, album_rec: Dict[str, Any],
+                                   artist_id: int, album_dir: Path) -> str:
+        """An album Lidarr holds complete whose folder holds more: the files
+        of a bigger edition sit beside it, untracked. `Radiohead / Pablo
+        Honey`: the 12-track release is filed at the top of the folder, and
+        `CD 01` + `CD 02` hold the 34-track deluxe Lidarr dropped when the
+        album was moved to the standard release -- 1,364 such files in 163
+        folders on 1 Oct.
+
+        Switch to the release those files ARE: more tracks than the album
+        now holds, exactly as many as the untracked files (or as the tracked
+        and untracked together), and at least 90% of their song titles on it.
+        Then file them by title (_import_library_folder_by_tracknumber only
+        fills empty tracks). If the album ends up holding fewer files than
+        before, the old release is restored and its files filed again.
+        Returns what was done, for the audit report."""
+        from collections import Counter
+        from song_harvest import norm_title
+        album_id = int(album_rec.get("id") or 0)
+        if not album_id:
+            return "no album id"
+        gen = self._lidarr_generation()
+        full = self.lidarr.get_album(album_id) or {}
+        rels = full.get("releases") or []
+        prev = next((r.get("id") for r in rels if r.get("monitored")), None)
+        before = _album_track_file_count(full)
+        held = set()
+        for tf in (self.lidarr.list_trackfiles_for_album(album_id) or []):
+            try:
+                held.add(str(Path(self.lidarr.lidarr_to_windows(
+                    str(tf.get("path") or "")))))
+            except Exception:  # noqa: BLE001
+                continue
+        if not full or self._lidarr_generation() != gen:
+            return "Lidarr did not answer -- not switched"
+        every = self._album_audio_everywhere(album_dir)
+        untracked = [p for p in every if str(p) not in held]
+        tracked = [p for p in every if str(p) in held]
+        if not untracked:
+            return "no untracked files"
+        titles = {p: norm_title(self._read_audio_title(p)) for p in every}
+        best = None
+        for r in rels:
+            rid, n = r.get("id"), int(r.get("trackCount") or 0)
+            if not rid or rid == prev or n <= before:
+                continue
+            for files in (untracked, tracked + untracked):
+                if len(files) != n:
+                    continue
+                rows = self.lidarr.list_tracks_for_release(album_id, int(rid)) or []
+                if len(rows) != n:
+                    continue
+                want = Counter(norm_title(x.get("title")) for x in rows)
+                got = Counter(titles[p] for p in files if titles[p])
+                hit = sum((want & got).values())
+                if hit >= 0.9 * n and (best is None or hit > best[0]):
+                    best = (hit, r, files)
+        if self._lidarr_generation() != gen:
+            return "Lidarr failed while the releases were compared -- not switched"
+        if best is None:
+            return ("no bigger release fits the %d untracked file(s) by count "
+                    "and titles" % len(untracked))
+        hit, r, files = best
+        rid, n = int(r["id"]), int(r.get("trackCount") or 0)
+        if not self.lidarr.set_album_monitored_release(album_id, rid):
+            return "Lidarr refused the switch to release %s" % rid
+        rec = self.lidarr.get_album(album_id) or full
+        cmd = self._import_library_folder_by_tracknumber(rec, artist_id, files)
+        if cmd:
+            self.lidarr.wait_for_command(int(cmd), timeout_seconds=600)
+        after = _album_track_file_count(self.lidarr.get_album(album_id) or {})
+        if after < before:
+            if prev and self.lidarr.set_album_monitored_release(album_id, int(prev)):
+                rec = self.lidarr.get_album(album_id) or full
+                back = self._import_library_folder_by_tracknumber(
+                    rec, artist_id, tracked or every)
+                if back:
+                    self.lidarr.wait_for_command(int(back), timeout_seconds=600)
+            logger.warning(
+                "audit: %r on the %d-track release %s held %d file(s) against "
+                "%d before -- release %s restored", album_rec.get("title"), n,
+                rid, after, before, prev)
+            return ("switch to the %d-track release %s held %d of %d before "
+                    "-- restored release %s" % (n, rid, after, before, prev))
+        logger.info(
+            "audit: %r switched to the %d-track release %s (%s, %d/%d titles); "
+            "%d file(s) filed, %d before", album_rec.get("title"), n, rid,
+            r.get("title") or r.get("disambiguation") or "", hit, n, after,
+            before)
+        return ("switched to the %d-track release %s (%d/%d titles); %d file(s) "
+                "filed, %d before" % (n, rid, hit, n, after, before))
+
     def _import_library_folder_by_tracknumber(
         self, album_rec: Dict[str, Any], artist_id: int, audios: List[Path],
     ) -> Optional[int]:
@@ -9118,6 +9220,7 @@ class Orchestrator:
         first_run_done, already_acted = self._audit_load_report(report_file)
         in_act_mode = first_run_done
         audit_seen = self._audit_seen_load()
+        deluxe_budget = [self._DELUXE_PER_PASS]
 
         logger.info(
             "Library audit starting: root=%s mode=%s report=%s acted_so_far=%d",
@@ -9397,6 +9500,23 @@ class Orchestrator:
                                 )
                             else:
                                 reason = "album in Lidarr but no tracks imported"
+                        elif wanted and files_in_lidarr >= wanted:
+                            # Complete -- unless its folder (disc folders
+                            # included) holds more audio than Lidarr tracks:
+                            # a bigger edition's files, untracked.
+                            try:
+                                subdirs = any(
+                                    c.is_dir() and c.name != self.QUARANTINE_DIR
+                                    for c in album_dir.iterdir())
+                            except OSError:
+                                subdirs = False
+                            if subdirs or len(audios) > files_in_lidarr:
+                                n_all = len(self._album_audio_everywhere(album_dir))
+                                if n_all > files_in_lidarr:
+                                    reason = (
+                                        "album has untracked files: %d on disk, "
+                                        "Lidarr has %d of %d"
+                                        % (n_all, files_in_lidarr, wanted))
                 if reason is None:
                     continue
 
@@ -9427,6 +9547,15 @@ class Orchestrator:
                     try:
                         if artist_rec is not None:
                             aid = int(artist_rec["id"])
+                            if (album_rec is not None and reason.startswith(
+                                    "album has untracked files")):
+                                if deluxe_budget[0] <= 0:
+                                    action_taken = "deferred (per-pass limit)"
+                                else:
+                                    deluxe_budget[0] -= 1
+                                    action_taken = self._switch_to_fitting_release(
+                                        album_rec, aid, album_dir)
+                                raise _AuditSkip()
                             # Re-check album state LIVE before acting.
                             # The cached index may be stale; if Lidarr now
                             # shows tracks imported, skip -- don't touch
@@ -9712,7 +9841,8 @@ class Orchestrator:
                     # Remembered at the state it was acted on -- unless
                     # Lidarr failed meanwhile (then nothing was learned).
                     if (self._lidarr_generation() == gen_act
-                            and not action_taken.startswith("exception")):
+                            and not action_taken.startswith(("exception",
+                                                             "deferred"))):
                         audit_seen[album_key] = [disk_sig, lidarr_n, time.time(),
                                                  action_taken]
                         self._audit_seen_save(audit_seen, every=30.0)
