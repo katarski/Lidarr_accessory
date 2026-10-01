@@ -217,7 +217,10 @@ def _core(title: str) -> list:
 def _records_named(core: list, albums: list, artist_words: set) -> list:
     """The artist's albums whose whole core appears in `core` as consecutive
     words, one per title, dropping any found only inside a longer one ('Blue'
-    within 'Blue Train')."""
+    within 'Blue Train') -- and [] unless two of them sit on separate words:
+    'Unforgettable' and 'The Unforgettable' both found on the same word of
+    'The Unforgettable Nat King Cole' are two readings of one title, not a
+    two-in-one."""
     spans = []
     for a in albums:
         c = _core(a.get("title") or "")
@@ -234,8 +237,11 @@ def _records_named(core: list, albums: list, artist_words: set) -> list:
         k = norm_title(a.get("title"))
         if k not in seen:
             seen.add(k)
-            out.append(a)
-    return out
+            out.append((s, e, a))
+    if not any(e1 <= s2 or e2 <= s1
+               for i, (s1, e1, _) in enumerate(out) for s2, e2, _ in out[i + 1:]):
+        return []
+    return [a for _s, _e, a in out]
 
 
 def _musicbrainz_identity(lidarr, arec, album: str, albums: list):

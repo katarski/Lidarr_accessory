@@ -56,7 +56,20 @@ class CatalogueIdentity(unittest.TestCase):
         named = D._records_named(D._core("Blue Train Live"),
                                  [alb(1, "Blue", 9, 9), alb(2, "Blue Train", 0, 5)],
                                  {"artist"})
-        self.assertEqual([a["title"] for a in named], ["Blue Train"])
+        self.assertEqual(named, [])
+
+    def test_two_readings_of_one_title_are_not_a_two_in_one(self):
+        # 1 Oct, live: 'The Unforgettable Nat King Cole' was held to carry
+        # both 'Unforgettable' and 'The Unforgettable'.
+        named = D._records_named(
+            D._core("The Unforgettable Nat King Cole"),
+            [alb(1, "Unforgettable", 0, 12), alb(2, "The Unforgettable", 0, 10)],
+            {"nat", "king", "cole"})
+        self.assertEqual(named, [])
+        two = D._records_named(D._core("Ultravox_Quartet_Lament_2000"),
+                               [alb(1, "Quartet", 0, 9), alb(2, "Lament", 9, 9)],
+                               {"ultravox"})
+        self.assertEqual(sorted(a["title"] for a in two), ["Lament", "Quartet"])
 
 
 if __name__ == "__main__":
