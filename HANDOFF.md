@@ -5,6 +5,15 @@ below is current. `README.md` explains what the pipeline does; this is what a
 fresh session needs — how to deploy, what is true now, what is still open, and
 the mistakes worth not repeating.
 
+**THE RULE (owner, repeated 1 Oct): only the pipeline fixes things; you fix
+the pipeline.** Never add, import, switch, remove or repair anything in
+Lidarr, qBittorrent or the library yourself -- not by API call, and not by
+running the pipeline's own functions by hand (1 Oct: traces of
+`_give_lidarr_the_record` added three albums; that was handling it). A
+diagnostic may only read: refuse every non-GET Lidarr request in it. The
+deliverable is always a code change, tested, deployed, and then watched
+while the live pipeline does the work on its own pass.
+
 ---
 
 ## 1. Deployment (use exactly this)
@@ -506,15 +515,16 @@ layer says `http://daniel:11434`.
   addOptions {addType: manual}. Once it holds files an album is safe.
   Write-blocked replay over the 197 not-in-Lidarr folders: 19 to add (7
   EPs, 2 live, 9 compilations, 1 single), 7 listed under another name, 34
-  already owned. Donny Hathaway ' In Performance (1980)' was added by hand
-  first (album 46993, 6/6). First live pass (11:39-15:14): 9 added and
-  verified (unmonitored, files linked, no history): Allred 'Sunrise/
+  already owned. First live pass (11:39-15:14): 8 added by the pipeline
+  and verified (unmonitored, files linked, no history): Allred 'Sunrise/
   Sunset', Celia Cruz 'A Night Of Salsa', Enya 'Paint the Sky With
   Stars', Farmer Boys, Gorillaz 'Meanwhile EP', Isaac Hayes 'Wattstax' and
-  'Ultimate', Kaki King, plus 'Te ao mārama' (47008) and 'Wonderful'
-  (47009) by the fixed code in traces; 'Instrumentals' still to come
-  (its import sat queued). Pass line: "515 discrepancies found: 75
-  handled, 314 unchanged, 126 deferred, 0 failed".
+  'Ultimate', Kaki King. Pass line: "515 discrepancies found: 75 handled,
+  314 unchanged, 126 deferred, 0 failed". Added by hand, against THE RULE
+  above, and left as they are: Donny Hathaway 'In Performance' (46993),
+  Lorde 'Te ao mārama' (47008), Isaac Hayes 'Wonderful' (47009) and
+  'Instrumentals' (47011). Second pass (17:42, `-artistnames`): the
+  pipeline added Melody Gardot 'Sayonara Meu Amor' (EP) 6/6 on its own.
 - **The audit's artist for a library folder (1 Oct, `-artistpath`,
   `-artistnames`).** The Lidarr artist whose path is that folder; else
   one whose name or sort name is the folder's; else the longest whose
