@@ -5916,14 +5916,8 @@ class Orchestrator:
                         "file(s))" % (name, n, len(audios)))
             return ("record: none given -- Lidarr owns %d of its %d file(s) as %r"
                     % (n, len(audios), name))
-        songs = []
-        for p in audios:
-            title = next((t for t in [self._tag_title(p)]
-                          + self._title_candidates_from_name(p)
-                          if t and not self._GENERIC_TITLE_RE.match(norm_title(t))),
-                         "")
-            if title:
-                songs.append((title, float(self._audio_duration_seconds(p) or 0.0)))
+        songs = [(title, float(self._audio_duration_seconds(p) or 0.0))
+                 for p, title in self._record_song_titles(audios)]
         gen = self._lidarr_generation()
         res, why = identify_record(
             self.lidarr, artist_rec, names, songs, len(audios), norm_title,
@@ -6028,6 +6022,36 @@ class Orchestrator:
                     "%d; %s)" % (title, filled, res["tracks"], res["via"]))
         return "record: %s -- %d of %d track(s) filed (%s)" % (
             how, filled, res["tracks"], res["via"])
+
+    def _record_song_titles(self, audios: List[Path]) -> List[Tuple[Path, str]]:
+        """(file, song title) for identifying a folder's record: its tag's
+        title, else its file name's. Tags another file carries too -- the
+        same title, disc and track -- were copied, and where the file's name
+        ('... - 01 - X', '01 - X') does not hold that title, the name is the
+        title: James Blake's '200 Press' 7" files carry the 12" files' tags
+        and are named 'Building It Still' and 'Words That We Both Know', and
+        Isaac Hayes's 'A Man and a Woman' LP 2 carries LP 1's; read by tag,
+        neither record fit. A title merely repeated ('Silent Night' as
+        tracks 6 and 20, an instrumental tagged like its song) keeps its
+        tag."""
+        from collections import Counter
+        from song_harvest import norm_title
+        tags = {p: self._tag_title(p) for p in audios}
+        pos = {p: self._tag_disc_and_track(p) for p in audios}
+        copies = Counter((tags[p].strip().casefold(), pos[p]) for p in audios
+                         if tags[p].strip() and pos[p][1])
+        out: List[Tuple[Path, str]] = []
+        for p in audios:
+            tag, named = tags[p], self._title_candidates_from_name(p)
+            first = [tag]
+            if (tag.strip() and pos[p][1] and copies[(tag.strip().casefold(), pos[p])] > 1
+                    and len(named) > 1 and norm_title(tag) not in norm_title(named[0])):
+                first = [named[0], tag]
+            title = next((t for t in first + named
+                          if t and not self._GENERIC_TITLE_RE.match(norm_title(t))), "")
+            if title:
+                out.append((p, title))
+        return out
 
     # Bigger-edition switches one audit pass may make (each is a release PUT
     # and an import Lidarr parses); the rest wait for the next pass. Only a

@@ -236,6 +236,45 @@ class GiveLidarrTheRecord(unittest.TestCase):
                               "Lidarr, unmonitored -- 6 of 6 track(s) filed "
                               "(its name)")
 
+    def test_tags_copied_across_files_give_way_to_their_names(self):
+        # James Blake's '200 Press': the 7" files carry the 12" files' tags.
+        lid = _Lidarr()
+        o = _orch(lid)
+        tags = dict(zip((p.name for p in self.audios),
+                        [(s, (1, i)) for i, s in enumerate(SONGS[:4], 1)]
+                        + [(SONGS[0], (1, 1)), (SONGS[1], (1, 2))]))
+        o._tag_title = lambda p: tags[p.name][0]
+        o._tag_disc_and_track = lambda p: tags[p.name][1]
+        out = o._give_lidarr_the_record(113, ARTIST, self.audios, ["In Performance"])
+        self.assertEqual(lid.added, [("perf", 113)])
+        self.assertIn("6 of 6 track(s) filed", out)
+
+    def test_a_title_merely_repeated_keeps_its_tag(self):
+        o = _orch(_Lidarr())
+        d = self.audios[0].parent
+        tags = {
+            # copied: same title, disc and track; the name says another
+            "James Blake - 200 Press - 01 - Building It Still.mp3": ("200 Press", (1, 1)),
+            "James Blake - 200 Press - 01 - 200 Press.mp3": ("200 Press", (1, 1)),
+            # repeated on two tracks (Vanessa Williams's 'Silent Night')
+            "06 - Silent Night - Christmas In Vienna - 2001.mp3": ("Silent Night", (0, 6)),
+            "20 - Silent Night - Christmas In Vienna - 2001.mp3": ("Silent Night", (0, 20)),
+            # alike once folded ('Ameno', 'Ameno (Remix)'), not the same tags
+            "08. Era - Ameno.mp3": ("Ameno", (0, 8)),
+            "02. Era - Ameno (Remix).mp3": ("Ameno (remix)", (0, 8)),
+            # the name holds the tag's title ('1-21 Niobe's Run')
+            "1-21 Niobe's Run.m4a": ("Niobe's Run", (1, 21)),
+            "1-21 Niobe's Run (alt).m4a": ("Niobe's Run", (1, 21)),
+            # no track number: nothing says they were copied
+            "intro take 1.flac": ("Theme", (0, 0)),
+            "01 - Other.flac": ("Theme", (0, 0)),
+        }
+        o._tag_title = lambda p: tags[p.name][0]
+        o._tag_disc_and_track = lambda p: tags[p.name][1]
+        got = {p.name: t for p, t in o._record_song_titles([d / n for n in tags])}
+        self.assertEqual(got, {n: (("Building It Still" if "Building" in n else t[0]))
+                               for n, t in tags.items()})
+
     def test_an_added_album_that_owns_nothing_is_taken_back(self):
         lid = _Lidarr(links=False)
         out = _orch(lid)._give_lidarr_the_record(113, ARTIST, self.audios,
