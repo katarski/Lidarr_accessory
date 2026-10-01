@@ -32,8 +32,9 @@ build) with the repo's `*.py` and `tools/`, checks `OrchestratorConfig` is
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20261001-passbudget`**
-(1c2f636). Earlier tags for rollback: `guard-20261001-heldcount`,
+then is the container replaced. Live now: **`guard-20261001-summary`**
+(b7a5bac). Earlier tags for rollback: `guard-20261001-passbudget`,
+`guard-20261001-heldcount`,
 `guard-20261001-edition`,
 `guard-20261001-webevidence`,
 `guard-20261001-searxnglink`,
@@ -447,6 +448,12 @@ layer says `http://daniel:11434`.
   pass (it starts 1300 s after a start). A multi-disc album handed off at
   its parent is now recorded disc by disc in the sweep ledger (the Knef
   4-CD box was handed to Lidarr 50 times in two days).
+- **Audit pass summary (1 Oct).** The pass line reads "N discrepancies
+  found: H handled this pass, U unchanged since last handled, D deferred, F
+  failed" (`_audit_outcome_summary`). It used to say "531
+  DownloadedAlbumsScan actions triggered" for rows that were nearly all
+  "unchanged -- not repeated" or "deferred". The log watcher keys on the
+  "Library audit: scanned" prefix only (`guard-20261001-summary`).
 - **Nothing is grabbed for an unmonitored album or artist** — Lidarr will not
   import into one either, so the download is wasted twice. Fails open: no id, or
   a lookup error, and the grab proceeds.
