@@ -32,8 +32,9 @@ build) with the repo's `*.py` and `tools/`, checks `OrchestratorConfig` is
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20261001-mbident`**
-(79c7330). Earlier tags for rollback: `guard-20261001-catalogue`,
+then is the container replaced. Live now: **`guard-20261001-disjoint`**
+(4d75d7a). Earlier tags for rollback: `guard-20261001-mbident`,
+`guard-20261001-catalogue`,
 `guard-20261001-riptail`,
 `guard-20261001-llmanswers`,
 `guard-20261001-tagrule`,
@@ -498,7 +499,10 @@ layer says `http://daniel:11434`.
   artist's titles is a multi-album release, not owned while one is missing.
   The model had removed two torrents on 29 Sep: 'Breathe In (2024) Extended
   Edition' taken for the owned 'Breathe', and 'Quartet + Lament' for the
-  owned 'Lament' (Ultravox Quartet still 0/118). Replay of 16 real names:
+  owned 'Lament' (Ultravox Quartet still 0/118; searched again 1 Oct). A
+  two-in-one needs its titles on separate words ('The Unforgettable Nat King
+  Cole' is not 'Unforgettable' + 'The Unforgettable';
+  `guard-20261001-disjoint`). Replay of 16 real names:
   4 verdicts change, all corrections, none needs the model.
   Then MusicBrainz (`_musicbrainz_identity`, release groups of every type,
   cached a week; `guard-20261001-mbident`): a download it names as a record
@@ -507,10 +511,13 @@ layer says `http://daniel:11434`.
   been taken for the owned 'Christmas' (2012). Replay of 19 names: no
   verdict change; 4 more need no model. Still for the model: soundtracks
   titled 'X: Original Motion Picture Soundtrack', names the browse misses.
-  SearXNG (br2.2, 192.168.4.7) is NOT reachable from the pipeline: Park's
-  containers cannot reach that VLAN (No route to host). Reaching it needs a
-  network change on Park (a host route via the router, or a second network
-  on the container, whose egress would skip the VPN) -- the owner's call.
+  SearXNG (br2.2, 192.168.4.7) is NOT reachable from the pipeline: Park has
+  its own leg on that VLAN (br2.2, 192.168.4.188), so it sends straight to
+  SearXNG's macvlan, which the host cannot reach (No route to host). The
+  router already passes Park to it (curl --interface br0: HTTP 200, 10 ms),
+  as it does HA. Needed: a host route on Park, 192.168.4.7/32 via
+  192.168.1.1 (Unraid Settings -> Network Settings -> Routing Table) --
+  left to the owner (system network setting).
 - **Encodes appear only complete** (`_encode_flac`: `.partial`, verify, tag,
   rename); DVD-Audio publishes the whole disc or nothing.
 - **Titles compare in any script** (`titlematch.py`) — see README.
