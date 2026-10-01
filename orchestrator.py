@@ -5967,10 +5967,33 @@ class Orchestrator:
         cmd = self.lidarr.refresh_artist(artist_id, force=True)
         if cmd:
             self.lidarr.wait_for_command(int(cmd), timeout_seconds=300)
+        full = self.lidarr.get_album(album_id) or full
+        if not full.get("releases"):
+            # An added album has no releases until a refresh has read it, and
+            # Lidarr answers with a refresh of this artist that was already
+            # running: Isaac Hayes's 'Wonderful' was added at 12:40:19, got
+            # the refresh started for 'Wattstax', and still had none after it.
+            cmd = self.lidarr.refresh_artist(artist_id, force=True)
+            if cmd:
+                self.lidarr.wait_for_command(int(cmd), timeout_seconds=300)
+            full = self.lidarr.get_album(album_id) or full
+        rels = full.get("releases") or []
+        rid = next((r.get("id") for r in rels
+                    if r.get("foreignReleaseId") == rel.get("foreignReleaseId")), None)
         before = filled
         filled = sum(1 for t in (self.lidarr.list_tracks_for_album(album_id) or [])
                      if t.get("hasFile"))
         if filled < res["hit"]:
+            if not before and rid and not next(
+                    (r.get("monitored") for r in rels if r.get("id") == rid), False):
+                # The refresh picks its own release: Lorde's 'Te ao mārama'
+                # was given the 5-track one titled in Māori alone, and the
+                # files ('Te ara tika + The Path') contradicted it. The
+                # folder is filed on the release it fits.
+                self.lidarr.set_album_monitored_release(album_id, int(rid))
+                self._settled_tracks(album_id, int(next(
+                    (r.get("trackCount") for r in rels if r.get("id") == rid), 0)
+                    or res["tracks"]))
             rec = self.lidarr.get_album(album_id) or full
             imp = self._import_library_folder_by_tracknumber(rec, artist_id, audios)
             if imp:

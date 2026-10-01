@@ -140,12 +140,14 @@ class Identify(unittest.TestCase):
 class _Lidarr:
     failure_generation = 0
 
-    def __init__(self, links=True, listed=None, held=()):
+    def __init__(self, links=True, listed=None, held=(), bare_until=0):
         self.links, self.added, self.removed, self.filled = links, [], [], 0
         self.mb = _MB({"r6": SONGS})
         self.web = None
         self.listed, self.refreshed = listed, 0
         self.held = None if held is None else list(held)
+        self.releases = [{"id": 9, "foreignReleaseId": "r6", "monitored": True}]
+        self.bare_until = bare_until     # refreshes before an album has releases
 
     def lookup_albums(self, term):
         if term != "Donny Hathaway In Performance":
@@ -161,9 +163,9 @@ class _Lidarr:
         self.added.append((resource["foreignAlbumId"], artist_id))
         return {"id": 46993}
 
-    releases = [{"id": 9, "foreignReleaseId": "r6", "monitored": True}]
-
     def get_album(self, i):
+        if self.refreshed < self.bare_until:
+            return {"id": i, "title": "In Performance", "releases": []}
         return {"id": i, "title": "In Performance", "releases": self.releases}
 
     def list_tracks_for_album(self, i):
@@ -179,6 +181,8 @@ class _Lidarr:
         return {}
 
     def set_album_monitored_release(self, a, r):
+        for rel in self.releases:
+            rel["monitored"] = rel["id"] == r
         return True
 
     def remove_added_album(self, i):
@@ -189,6 +193,7 @@ class _Lidarr:
 def _orch(lid):
     o = Orchestrator.__new__(Orchestrator)
     o.lidarr = lid
+    o._SETTLE_POLL = 0
     o._import_library_folder_by_tracknumber = lambda *a, **k: None
     return o
 
@@ -253,6 +258,29 @@ class GiveLidarrTheRecord(unittest.TestCase):
         self.assertEqual(out, "record: a copy of 'In Performance' (its name; "
                               "Lidarr holds 6 of 6)")
         self.assertEqual(lid.refreshed, 0)
+
+    def test_an_added_record_is_filed_on_the_release_it_fits(self):
+        # Lorde / 'Te ao mārama': no releases until a refresh read the added
+        # album; the refresh monitored a release whose titles the files
+        # contradicted. Isaac Hayes / 'Wonderful': the refresh that answered
+        # was one already running, and the album still had no releases.
+        for bare in (1, 2):
+            lid = _Lidarr(links=False, bare_until=bare)
+            lid.releases = [{"id": 8, "foreignReleaseId": "r5", "monitored": True},
+                            {"id": 9, "foreignReleaseId": "r6", "monitored": False}]
+            o = _orch(lid)
+
+            def by_title(rec, aid, audios, lid=lid):
+                mon = [r["foreignReleaseId"] for r in rec["releases"] if r["monitored"]]
+                if mon == ["r6"]:
+                    lid.filled = 6
+                return 77 if mon == ["r6"] else None
+            o._import_library_folder_by_tracknumber = by_title
+            out = o._give_lidarr_the_record(113, ARTIST, self.audios, ["In Performance"])
+            self.assertEqual(out, "record: added 'In Performance' (Album/Live) to "
+                                  "Lidarr, unmonitored -- 6 of 6 track(s) filed "
+                                  "(its name)", bare)
+            self.assertEqual((lid.refreshed, lid.removed), (bare, []))
 
     def test_a_bigger_edition_of_a_listed_record_is_not_called_a_copy(self):
         # Don Davis / '2008 - The Matrix The Deluxe Edition': 30 songs, while
