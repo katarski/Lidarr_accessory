@@ -26,7 +26,7 @@ class FolderNamesTheArtist(unittest.TestCase):
             refresh_artist=lambda aid: None,
             windows_to_lidarr=str,
             downloaded_albums_scan_rescan=lambda p: None)
-        o._lidarr_album_is_imported = lambda a, b, artist_id=None: (
+        o._lidarr_album_is_imported = lambda a, b, artist_id=None, album_id=None: (
             (True, 8, 8, 7, 99) if artist_id == 7 else (False, 0, 0, None, None))
         self.assertTrue(o._verify_library_reflects_album(
             "Ray Parker Jr. And Raydio", "A Woman Needs Love", 8))

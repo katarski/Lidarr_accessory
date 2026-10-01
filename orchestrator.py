@@ -1560,6 +1560,7 @@ class Orchestrator:
         # Track any artistId we learn during import so the post-success
         # RefreshArtist can target it directly without a second lookup.
         imported_artist_id: Optional[int] = None
+        imported_album_id: Optional[int] = None
         # DTS-CD decode? Its 5.1 FLACs must NOT go through DownloadedAlbumsScan.
         # Lidarr's download-tied folder scan fails on them ("Failed to import"),
         # copying each file into the library then rolling it back out, and that
@@ -1628,6 +1629,8 @@ class Orchestrator:
                         ):
                             outcome = "imported_via_manual"
                             imported_artist_id = self._committed_artist_id(
+                                committable)
+                            imported_album_id = self._committed_album_id(
                                 committable)
                 else:
                     logger.warning(
@@ -1731,6 +1734,7 @@ class Orchestrator:
             verified = self._verify_library_reflects_album(
                 artist_name, album_name, len(splits),
                 imported_artist_id=imported_artist_id,
+                imported_album_id=imported_album_id,
             )
             if not verified:
                 logger.warning(
@@ -6922,6 +6926,7 @@ class Orchestrator:
                 lib_confirms = self._verify_library_reflects_album(
                     artist_name, album_name, len(audios),
                     imported_artist_id=aid,
+                    imported_album_id=self._committed_album_id(committable),
                 )
                 if not lib_confirms:
                     final_outcome = "imported_unverified"
@@ -6952,6 +6957,7 @@ class Orchestrator:
         aid = self._committed_artist_id(committable)
         if self.cfg.verify_library_after_import and self._verify_library_reflects_album(
             artist_name, album_name, len(audios), imported_artist_id=aid,
+            imported_album_id=self._committed_album_id(committable),
         ):
             logger.info(
                 "Pre-split handoff: wait window elapsed but Lidarr DID import "
@@ -8642,6 +8648,21 @@ class Orchestrator:
             return False
 
     @staticmethod
+    def _committed_album_id(committable: list) -> Optional[int]:
+        """The album Lidarr filed a ManualImport under, when every candidate
+        agrees on it (else None: the names decide). Carried as `album.id`."""
+        ids = set()
+        for h in committable or []:
+            aid = (h or {}).get("albumId") or ((h or {}).get("album") or {}).get("id")
+            if not aid:
+                continue
+            try:
+                ids.add(int(aid))
+            except (TypeError, ValueError):
+                continue
+        return ids.pop() if len(ids) == 1 else None
+
+    @staticmethod
     def _committed_artist_id(committable: list) -> Optional[int]:
         """The artist Lidarr filed a ManualImport under. A candidate carries
         it as `artist.id` (`artistId` is only how the commit is SENT); reading
@@ -8662,6 +8683,7 @@ class Orchestrator:
         artist_name: str,
         album_name: str,
         artist_id: Optional[int] = None,
+        album_id: Optional[int] = None,
     ) -> tuple[bool, int, int, Optional[int], Optional[int]]:
         """
         Ask Lidarr whether its DB reflects the album as imported.
@@ -8672,9 +8694,21 @@ class Orchestrator:
 
         is_imported is False when we can't even find the artist/album --
         the caller is expected to use that as a signal to rescan/refresh.
+
+        `album_id` (the album an import was filed under) is asked for
+        directly; the names are only the way in when it is not known.
         """
+        album_rec: Optional[Dict[str, Any]] = None
+        if album_id:
+            try:
+                album_rec = self.lidarr.get_album(int(album_id)) or None
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("verify: get_album(%s) failed: %s", album_id, exc)
+            if album_rec and not artist_id:
+                artist_id = (album_rec.get("artistId")
+                             or (album_rec.get("artist") or {}).get("id"))
         try:
-            if artist_id is None and artist_name:
+            if album_rec is None and artist_id is None and artist_name:
                 a = self.lidarr.find_artist(artist_name)
                 if a:
                     artist_id = int(a.get("id")) if a.get("id") is not None else None
@@ -8683,16 +8717,16 @@ class Orchestrator:
         if not artist_id:
             return False, 0, 0, None, None
 
-        album_rec: Optional[Dict[str, Any]] = None
-        try:
-            # No file count in scope here (this only asks whether Lidarr already
-            # reflects the album), but the year still separates same-titled
-            # albums -- Weezer has seven called "Weezer".
-            album_rec = self._find_album(
-                artist_id, album_name,
-                year=self._year_from_name(album_name))
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("verify: find_album %r failed: %s", album_name, exc)
+        if album_rec is None:
+            try:
+                # No file count in scope here (this only asks whether Lidarr
+                # already reflects the album), but the year still separates
+                # same-titled albums -- Weezer has seven called "Weezer".
+                album_rec = self._find_album(
+                    artist_id, album_name,
+                    year=self._year_from_name(album_name))
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("verify: find_album %r failed: %s", album_name, exc)
         if not album_rec:
             return False, 0, 0, artist_id, None
 
@@ -8730,9 +8764,14 @@ class Orchestrator:
         album_name: str,
         expected_tracks: int,
         imported_artist_id: Optional[int] = None,
+        imported_album_id: Optional[int] = None,
     ) -> bool:
         """
         Don't declare victory until disk AND Lidarr agree.
+
+        `imported_album_id` is the album Lidarr filed the import under; with
+        it the album is asked for directly, not found again by the CUE's
+        title ('Five-O-Five', filed by Lidarr as 'Five‐O').
 
         Phase 1: confirm the album folder is physically on disk under
         `library_root_windows`. If it's NOT there, the "successful" import
@@ -8792,6 +8831,7 @@ class Orchestrator:
             attempt += 1
             imported, have, want, aid, album_id = self._lidarr_album_is_imported(
                 artist_name, album_name, artist_id=artist_id,
+                album_id=imported_album_id,
             )
             if aid:
                 artist_id = aid
