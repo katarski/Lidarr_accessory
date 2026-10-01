@@ -5853,6 +5853,26 @@ class Orchestrator:
             int(round(hits / cov)) if cov else 0, runner)
         return alb
 
+    @staticmethod
+    def _audit_outcome_summary(discrepancies: List[List[str]]) -> str:
+        """What a pass did with its discrepancies, by outcome. It used to say
+        "531 DownloadedAlbumsScan actions triggered" for 531 rows that were
+        mostly "unchanged -- not repeated" and "deferred"."""
+        unchanged = deferred = failed = 0
+        for d in discrepancies:
+            a = str(d[-1] or "")
+            if a.startswith("unchanged since"):
+                unchanged += 1
+            elif a.startswith("deferred"):
+                deferred += 1
+            elif a.startswith("exception"):
+                failed += 1
+        return ("%d discrepancies found: %d handled this pass, %d unchanged "
+                "since last handled, %d deferred, %d failed"
+                % (len(discrepancies),
+                   len(discrepancies) - unchanged - deferred - failed,
+                   unchanged, deferred, failed))
+
     # Bigger-edition switches one audit pass may make (each is a release PUT
     # and an import Lidarr parses); the rest wait for the next pass. Only a
     # switch is counted: the look that finds no edition is a few reads, and
@@ -10016,13 +10036,10 @@ class Orchestrator:
                 else "repeat the dry run",
             )
         else:
-            acted_this_pass = sum(1 for d in discrepancies if d[-1] and not d[-1].startswith("exception"))
             logger.info(
                 "Library audit: scanned %d artist folders, %d album folders; "
-                "%d discrepancies found, %d DownloadedAlbumsScan actions "
-                "triggered. Report: %s",
-                scanned_artists, scanned_albums, len(discrepancies),
-                acted_this_pass, report_file,
+                "%s. Report: %s", scanned_artists, scanned_albums,
+                self._audit_outcome_summary(discrepancies), report_file,
             )
         return len(discrepancies), complete
 
