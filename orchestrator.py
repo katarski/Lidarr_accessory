@@ -10085,6 +10085,15 @@ class Orchestrator:
                                             "record: Lidarr failed")):
                                         action_taken = "deferred (%s)" % record
                                         raise _AuditSkip()
+                                elif reason == "album not in Lidarr":
+                                    # Lidarr's own album took the folder and
+                                    # filed none of it: no record is asked
+                                    # for. Unmarked, the verdict read as one
+                                    # from before this step and was judged
+                                    # again every pass (Andy LaPlegua's
+                                    # 'Hellblade', 1 Oct).
+                                    record = ("record: not asked -- Lidarr's %r took it"
+                                              % str((rec or album_rec or {}).get("title") or ""))
                                 # No usable candidates -- log rejections so
                                 # the user can see WHY Lidarr refused.
                                 rej = []
