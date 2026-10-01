@@ -1471,7 +1471,7 @@ class Orchestrator:
             duration = next_duration
             tried_audio.add(audio_path)
 
-        plans = tag_splits(cue, splits, ollama=self.ollama)
+        plans = tag_splits(cue, splits)
         # Re-name files using the final (post-Ollama) plan so filenames
         # reflect any title cleanup the LLM did.
         splits = self._rename_to_plan(splits, plans, cue)

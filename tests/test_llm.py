@@ -250,25 +250,5 @@ class ClientBehaviour(unittest.TestCase):
         self.assertTrue(oc.is_unavailable(a) and oc.is_unavailable(b))
 
 
-class TagMerge(unittest.TestCase):
-    def plan(self, n, title):
-        from tagger import TagPlan
-        fields = {f: "" for f in TagPlan.__dataclass_fields__}
-        fields.update(tracknumber=str(n), title=title, album="Album", artist="Artist",
-                      albumartist="Artist")
-        return TagPlan(**fields)
-
-    def test_only_cosmetic_fixes_paired_by_track_number(self):
-        plans = [self.plan(1, "hello world [320 kbps]"), self.plan(2, "second")]
-        out = oc._merge_cosmetic(plans, [
-            {"tracknumber": "2", "title": "Something Else"},
-            {"tracknumber": "01", "title": "Hello World"}])
-        self.assertEqual([p.title for p in out], ["Hello World", "second"])
-
-    def test_numbers_that_do_not_pair_discard_everything(self):
-        plans = [self.plan(1, "a"), self.plan(2, "b")]
-        self.assertIsNone(oc._merge_cosmetic(plans, [{"tracknumber": "1", "title": "A"}]))
-
-
 if __name__ == "__main__":
     unittest.main()

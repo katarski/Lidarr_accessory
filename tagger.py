@@ -9,6 +9,7 @@ artist/title strings before tagging.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class TagPlan:
-    """What we're about to write, per track. Exposed so Ollama can rewrite it."""
+    """What we're about to write, per track."""
     tracknumber: str
     tracktotal: str
     title: str
@@ -109,23 +110,42 @@ def _apply(flac_path: Path, plan: TagPlan) -> None:
     audio.save()
 
 
+# Bracketed rip/format junk in a sheet's titles: '[320 kbps]', '(FLAC)',
+# '(2CD)', '(Vinyl Rip)'.
+_TAG_JUNK_RE = re.compile(
+    r"[\[\(\{][^\]\)\}]*\b(?:\d{2,4}\s*kbps|kbps|flac|mp3|ape|wav|lossless|"
+    r"cd\s*rip|web|vinyl\s*rip|\d+\s*cd|remaster(?:ed)?\s+bonus)\b[^\]\)\}]*[\]\)\}]",
+    re.I)
+_SPACES_RE = re.compile(r"\s{2,}")
+_COSMETIC_FIELDS = ("title", "album", "artist", "albumartist")
+
+
+def clean_tag(value: str) -> str:
+    """`value` without bracketed rip/format junk, spaces collapsed; nothing
+    else changes, and a tag is never emptied."""
+    if not value:
+        return value
+    out = _SPACES_RE.sub(" ", _TAG_JUNK_RE.sub("", value)).strip()
+    return out or value
+
+
 def tag_splits(
     cue: Cue,
     splits: List[SplitResult],
-    ollama=None,
 ) -> List[TagPlan]:
     """
-    Tag every split file. If `ollama` is given, it may normalize the plan
-    (cleaner capitalization, remove junk like "[320k]", unify featured artists).
+    Tag every split file, its titles cleaned of rip junk by rule (clean_tag).
     Returns the plans actually written -- useful for downstream folder naming.
+
+    The model is not asked: Lidarr rewrites every imported file's tags from
+    MusicBrainz (writeAudioTags=sync, scrub on), so its re-casing never
+    outlived the import, and of 8 runs (9-78 s each on the 3090) 5 answered
+    nothing usable. The junk is the one part Lidarr's import match reads.
     """
     plans = _build_plans(cue, splits)
-
-    if ollama is not None:
-        try:
-            plans = ollama.normalize_tags(plans) or plans
-        except Exception as exc:  # never let LLM failure break tagging
-            logger.warning("Ollama tag normalization failed: %s", exc)
+    for plan in plans:
+        for f in _COSMETIC_FIELDS:
+            setattr(plan, f, clean_tag(getattr(plan, f)))
 
     for split, plan in zip(splits, plans):
         try:

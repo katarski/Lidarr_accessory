@@ -1,12 +1,15 @@
 """
 Ollama HTTP client.
 
-Two jobs:
-  * repair_cue(text)        -> clean .cue text (or "" on failure)
-  * normalize_tags(plans)   -> tweaked TagPlan list (or None to keep original)
+Questions the deterministic code cannot settle:
+  * repair_cue(text)              -> clean .cue text (or "" on failure)
+  * parse_artist_album(folder)    -> (artist, album) of an unseparated name
+  * pick_owned_album(name, owned) -> the owned album a download is, or None
+  * confirm_album_match(...)      -> which candidate album a folder holds
 
-Both calls are best-effort: if Ollama is down or returns garbage, callers
-fall back to the deterministic path.
+All are best-effort: if Ollama is down or returns garbage, callers fall back
+to the deterministic path. Tags are cleaned by rule (tagger.clean_tag), never
+here: Lidarr rewrites every imported file's tags from MusicBrainz.
 
 UNAVAILABLE is not "no". When the model could not be asked -- the GPU gate is
 closed (see llm_gate.py), the PC is asleep, the call timed out, the model is not
@@ -23,15 +26,11 @@ import json
 import logging
 import re
 import time
-from dataclasses import asdict, replace
-from typing import List, Optional, TYPE_CHECKING
+from typing import List, Optional
 
 import requests
 
 import titlematch
-
-if TYPE_CHECKING:
-    from tagger import TagPlan
 
 logger = logging.getLogger(__name__)
 
@@ -86,43 +85,6 @@ def keep_alive_seconds(value) -> float:
     return total if not num else total + float(num)
 
 
-# Keys a JSON-forcing LLM is likely to use when it wraps an array in an
-# object despite being told not to. Ordered by how common they are in
-# qwen2.5 output.
-_COMMON_WRAPPER_KEYS = (
-    "tracks", "items", "data", "result", "results",
-    "tags", "array", "list", "output",
-)
-
-
-def _coerce_to_list(parsed, expected_len: int):
-    """
-    Normalise LLM JSON output into a list. Handles three shapes:
-        [...]                          -> as-is
-        {"tracks": [...]}              -> unwrap the obvious key
-        {"0": {...}, "1": {...}, ...}  -> values() if keys are index-like
-    Falls through unchanged if nothing matches.
-    """
-    if isinstance(parsed, list):
-        return parsed
-    if isinstance(parsed, dict):
-        # 1. Single-key dict whose value is a list of the right length.
-        for key in _COMMON_WRAPPER_KEYS:
-            val = parsed.get(key)
-            if isinstance(val, list):
-                return val
-        # 2. Any single-key dict wrapping a list.
-        if len(parsed) == 1:
-            only = next(iter(parsed.values()))
-            if isinstance(only, list):
-                return only
-        # 3. Dict keyed by "0","1",... -- return ordered values.
-        keys = list(parsed.keys())
-        if keys and all(k.isdigit() for k in keys) and len(keys) == expected_len:
-            return [parsed[k] for k in sorted(keys, key=int)]
-    return parsed
-
-
 # Prompts are intentionally short and strict about output format.
 # Keep them terse; big prompts slow down small local models.
 
@@ -133,18 +95,6 @@ _CUE_REPAIR_SYSTEM = (
     "no code fences. Preserve all FILE, TRACK, TITLE, PERFORMER, INDEX "
     "lines. Ensure every TRACK has an INDEX 01 line in MM:SS:FF form. "
     "Make sure track numbers are sequential starting at 01."
-)
-
-
-_TAG_NORMALIZE_SYSTEM = (
-    "You clean up music metadata for a library. Input is a JSON array of "
-    "track tag objects. Return ONLY a JSON array with the same length and "
-    "same keys. Rules: "
-    "1) Use proper title case for titles and album names. "
-    "2) Remove junk tokens like [320kbps], (FLAC), (2CD Remaster Bonus). "
-    "3) Unify featured-artist style to 'feat. X' (not 'ft.' or 'featuring'). "
-    "4) Do NOT invent dates, ISRCs, or genres. "
-    "5) Do NOT change artist names beyond obvious capitalisation fixes."
 )
 
 
@@ -722,124 +672,3 @@ class OllamaClient:
                     ans)
         self._match_cache[cache_key] = result
         return result
-
-    # ---------- tag normalization ---------------------------------------
-
-    def normalize_tags(self, plans: List[TagPlan]) -> Optional[List[TagPlan]]:
-        if not plans:
-            return plans
-        input_json = json.dumps([asdict(p) for p in plans], ensure_ascii=False)
-        # Be very explicit about shape to reduce wrapped-object responses.
-        prompt = (
-            "Return a pure JSON array (starts with '[' and ends with ']'), "
-            f"same length ({len(plans)}) and same keys as the input. "
-            "Do NOT wrap in an object. Do NOT add 'tracks' or 'result' keys.\n\n"
-            f"INPUT:\n{input_json}"
-        )
-        # Output should be roughly the same size as input_json. Add a
-        # generous headroom (~2x + 256) for whitespace differences and
-        # title-case changes, but cap hard at 8192 so a pathological
-        # generation loop can't run forever. Empirically a 20-track
-        # album needs ~1.5-2 KB of JSON out.
-        estimated_input_tokens = max(1, len(input_json) // 3)  # ~3 chars/token
-        token_cap = min(8192, estimated_input_tokens * 2 + 256)
-        # Tag normalization is cosmetic. 90 seconds is more than enough
-        # for a warm model and quick to fall back from if something's off.
-        out = self._generate(
-            _TAG_NORMALIZE_SYSTEM,
-            prompt,
-            format_json=True,
-            num_predict=token_cap,
-            timeout=90.0,
-            label="normalize_tags",
-            subject=f"{len(plans)} track(s)",
-        )
-        if not out:
-            return None
-        try:
-            parsed = json.loads(out)
-        except json.JSONDecodeError as exc:
-            logger.warning("Ollama returned invalid JSON for tag normalize: %s", exc)
-            return None
-
-        parsed = _coerce_to_list(parsed, expected_len=len(plans))
-        if not isinstance(parsed, list) or not parsed:
-            # Truly unusable (not a non-empty list) -- keep the original tags.
-            preview = (out[:300] + "...") if len(out) > 300 else out
-            logger.debug(
-                "Ollama tag normalize: unusable output (not a non-empty list); "
-                "keeping original tags. Preview: %s", preview.replace("\n", " "),
-            )
-            return None
-        return _merge_cosmetic(plans, parsed)
-
-
-# Fields the LLM may touch, and only cosmetically (see _merge_cosmetic). Track
-# numbers, totals, dates, ISRCs, genres and comments are facts it cannot know
-# better than the CUE -- they are never taken from it.
-_COSMETIC_FIELDS = ("title", "album", "artist", "albumartist")
-
-# Bracketed rip/format junk the prompt asks the model to remove.
-_TAG_JUNK_RE = re.compile(
-    r"[\[\(\{][^\]\)\}]*\b(?:\d{2,4}\s*kbps|kbps|flac|mp3|ape|wav|lossless|"
-    r"cd\s*rip|web|vinyl\s*rip|\d+\s*cd|remaster(?:ed)?\s+bonus)\b[^\]\)\}]*[\]\)\}]",
-    re.I)
-_FEAT_RE = re.compile(r"\b(?:featuring|feat\.?|ft\.?)(?=\s)", re.I)
-
-
-def _tag_core(s: str) -> str:
-    """What a tag SAYS, with case, punctuation and 'feat.' spelling removed."""
-    s = _FEAT_RE.sub("feat", s or "")
-    return "".join(ch for ch in s.casefold() if ch.isalnum())
-
-
-def _is_cosmetic(before: str, after: str) -> bool:
-    """`after` is `before` re-cased/re-punctuated, or with junk tags removed."""
-    if not isinstance(after, str) or not after.strip():
-        return False
-    core = _tag_core(after)
-    return core == _tag_core(before) or core == _tag_core(_TAG_JUNK_RE.sub("", before))
-
-
-def _merge_cosmetic(plans, parsed):
-    """
-    Take the model's cosmetic fixes and nothing else. Output is paired with
-    input by TRACK NUMBER, never by position: a model that drops one element of
-    twelve used to shift every later title and number onto the wrong file.
-    Unless the numbers pair one to one, the whole normalization is discarded.
-    """
-    def key(v) -> str:
-        return str(v or "").strip().lstrip("0") or "0"
-
-    by_no = {}
-    for item in parsed:
-        if not isinstance(item, dict):
-            return None
-        k = key(item.get("tracknumber"))
-        if k in by_no:
-            logger.debug("Ollama tag normalize: duplicate track %s -- ignored", k)
-            return None
-        by_no[k] = item
-    want = [key(p.tracknumber) for p in plans]
-    if len(set(want)) != len(want) or set(by_no) != set(want):
-        logger.debug("Ollama tag normalize: track numbers do not pair one to one "
-                     "(got %d, expected %d) -- keeping original tags",
-                     len(by_no), len(plans))
-        return None
-    merged: List[TagPlan] = []
-    changed = 0
-    for original in plans:
-        item = by_no[key(original.tracknumber)]
-        fix = {}
-        for f in _COSMETIC_FIELDS:
-            before = getattr(original, f)
-            after = item.get(f, before)
-            if isinstance(after, str) and after != before and _is_cosmetic(before, after):
-                fix[f] = after.strip()
-        if fix:
-            changed += 1
-        merged.append(replace(original, **fix) if fix else original)
-    if changed:
-        logger.info("Ollama tag normalize: cosmetic fixes on %d of %d track(s)",
-                    changed, len(plans))
-    return merged
