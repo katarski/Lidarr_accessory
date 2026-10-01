@@ -32,8 +32,9 @@ build) with the repo's `*.py` and `tools/`, checks `OrchestratorConfig` is
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20261001-artistid`**
-(cd7b1b5). Earlier tags for rollback: `guard-20261001-leftover`,
+then is the container replaced. Live now: **`guard-20261001-switchsafe`**
+(6e5d541). Earlier tags for rollback: `guard-20261001-artistid`,
+`guard-20261001-leftover`,
 `guard-20261001-weaktitle`,
 `guard-20261001-conflict`,
 `guard-20261001-verifyfolder`,
@@ -358,7 +359,17 @@ layer says `http://daniel:11434`.
   deluxe"; `guard-20261001-deluxe`) to the release those files are: more
   tracks than now, exactly as many as the untracked files (or tracked +
   untracked), >=90% of their titles on it; then filed by title. Fewer files
-  after than before restores the old release. 10 switches per audit pass.
+  after than before restores the old release, re-filing the files Lidarr
+  held. 10 attempts per audit pass. First live pass (07:12, 1 Oct): Aaliyah /
+  Age Ain't Nothing but a Number switched to its 14-track release, 14/14; 8
+  others had no fitting release; the rest deferred. It first acted on the
+  album's second copy '(2003) - Aaliyah - ...' and judged the switch 0.4 s
+  after the PUT, while Lidarr was still unlinking (read 0 files, "undone",
+  the copy's files imported; nothing lost). `guard-20261001-switchsafe`: a
+  folder holding none of Lidarr's files is a second copy, not switched (9 of
+  the pass's 305 flagged); after a switch, import and count wait until
+  Lidarr's track list is the new release, read the same twice. Live check on
+  the copy: "a second copy, not switched".
   Per-folder counts: /config/_orphan_scan.json.
 - **Lidarr load and failure accounting (1 Oct, night).** `find_artist`'s
   spelling fallback now requires the same number of words ('J. D.
