@@ -266,7 +266,7 @@ class GiveLidarrTheRecord(unittest.TestCase):
         import inspect
         src = inspect.getsource(Orchestrator)
         self.assertIn('elif reason == "album not in Lidarr":\n', src)
-        self.assertIn('record = ("record: not asked -- Lidarr\'s %r took it"', src)
+        self.assertIn('record = ("record: not asked -- matched to Lidarr\'s "', src)
 
 
 class AddedBody(unittest.TestCase):

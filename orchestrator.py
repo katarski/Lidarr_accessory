@@ -10092,7 +10092,8 @@ class Orchestrator:
                                     # from before this step and was judged
                                     # again every pass (Andy LaPlegua's
                                     # 'Hellblade', 1 Oct).
-                                    record = ("record: not asked -- Lidarr's %r took it"
+                                    record = ("record: not asked -- matched to Lidarr's "
+                                              "%r, nothing filed"
                                               % str((rec or album_rec or {}).get("title") or ""))
                                 # No usable candidates -- log rejections so
                                 # the user can see WHY Lidarr refused.
