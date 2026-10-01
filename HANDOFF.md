@@ -32,8 +32,9 @@ build) with the repo's `*.py` and `tools/`, checks `OrchestratorConfig` is
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20261001-edition`**
-(03531c4). Earlier tags for rollback: `guard-20261001-webevidence`,
+then is the container replaced. Live now: **`guard-20261001-heldcount`**
+(c4967ae). Earlier tags for rollback: `guard-20261001-edition`,
+`guard-20261001-webevidence`,
 `guard-20261001-searxnglink`,
 `guard-20261001-disjoint`,
 `guard-20261001-mbident`,
@@ -399,7 +400,9 @@ layer says `http://daniel:11434`.
   that switch GET /api/v1/album/5291 kept the OLD release's statistics (0 of
   10) while the artist's album list and the track files said 12 of 12 (1 of
   244 sampled albums differ, only that one). Count what an album holds from
-  its track files where it matters.
+  its track files where it matters: the switch does
+  (`guard-20261001-heldcount`), so a switch that loses files is undone even
+  when those statistics read 0.
   Per-folder counts: /config/_orphan_scan.json.
 - **Lidarr load and failure accounting (1 Oct, night).** `find_artist`'s
   spelling fallback now requires the same number of words ('J. D.
