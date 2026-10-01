@@ -5873,6 +5873,110 @@ class Orchestrator:
                    len(discrepancies) - unchanged - deferred - failed,
                    unchanged, deferred, failed))
 
+    # Records one audit pass may identify for folders Lidarr does not list
+    # (each costs a few MusicBrainz reads at 1/s; answers are cached).
+    _RECORDS_PER_PASS = 40
+
+    def _give_lidarr_the_record(self, artist_id: int, artist_rec: Dict[str, Any],
+                                audios: List[Path], names: List[str]) -> str:
+        """A library folder Lidarr matched to none of its albums: find the
+        record its songs are (record_adder.identify_record), give it to
+        Lidarr -- one album, added by hand, unmonitored -- and file the
+        folder into it. Returns what was done; "record: " leads every
+        answer, so the audit can tell this was tried."""
+        from collections import Counter
+        from record_adder import identify_record
+        from song_harvest import norm_title
+        # Lidarr may own this folder already, under a name the audit did not
+        # match: Clannad / 'Live in Philadelphia' is its 'Live in Concert',
+        # The Beatles / 'Abbey Road (1969)' its 'Abbey Road' (17 of 17) --
+        # whose album lookup offered only bootlegs, 'The Alternate Abbey
+        # Road' among them. Nothing to give it.
+        held = self.lidarr.list_trackfiles_for_artist(artist_id)
+        if held is None:
+            return "record: Lidarr failed to list its files -- not judged"
+        mine = {p.parts[-3:] for p in audios}
+        owned = Counter(f.get("albumId") for f in held
+                        if Path(str(f.get("path") or "")).parts[-3:] in mine)
+        if owned:
+            top = owned.most_common(1)[0][0]
+            name = str((self.lidarr.get_album(int(top)) or {}).get("title") or top)
+            n = sum(owned.values())
+            if n >= len(audios):
+                return ("record: Lidarr already owns this folder as %r (%d of %d "
+                        "file(s))" % (name, n, len(audios)))
+            return ("record: none given -- Lidarr owns %d of its %d file(s) as %r"
+                    % (n, len(audios), name))
+        songs = []
+        for p in audios:
+            title = next((t for t in [self._tag_title(p)]
+                          + self._title_candidates_from_name(p)
+                          if t and not self._GENERIC_TITLE_RE.match(norm_title(t))),
+                         "")
+            if title:
+                songs.append((title, float(self._audio_duration_seconds(p) or 0.0)))
+        gen = self._lidarr_generation()
+        res, why = identify_record(
+            self.lidarr, artist_rec, names, songs, len(audios), norm_title,
+            mb=getattr(self.lidarr, "mb", None), web=getattr(self.lidarr, "web", None))
+        if self._lidarr_generation() != gen:
+            return "record: Lidarr failed meanwhile -- not judged"
+        if res is None:
+            return "record: %s" % why
+        alb, rel = res["album"], res["release"]
+        title = str(alb.get("title") or "")
+        kind = "/".join([str(alb.get("albumType") or "")]
+                        + [str(s) for s in (alb.get("secondaryTypes") or [])])
+        if alb.get("id"):
+            album_id, how = int(alb["id"]), "listed by Lidarr as %r" % title
+        else:
+            added = self.lidarr.add_album_unmonitored(alb, artist_id)
+            if not added or not added.get("id"):
+                return "record: %r (%s) -- Lidarr refused to add it" % (title, kind)
+            album_id, how = int(added["id"]), "added %r (%s) to Lidarr, unmonitored" % (title, kind)
+            logger.info("audit: %s -- %s, %d of %d song(s) on release %s",
+                        how, res["via"], res["hit"], len(songs),
+                        rel.get("foreignReleaseId"))
+        full = self.lidarr.get_album(album_id) or {}
+        rid = next((r.get("id") for r in (full.get("releases") or [])
+                    if r.get("foreignReleaseId") == rel.get("foreignReleaseId")), None)
+        filled = sum(1 for t in (self.lidarr.list_tracks_for_album(album_id) or [])
+                     if t.get("hasFile"))
+        if alb.get("id") and filled >= res["hit"]:
+            # Held from another folder (Ed Sheeran's '×' and 'X [FLAC]'):
+            # this one is a copy, and a refresh would file nothing.
+            return ("record: a copy of %r (%s; Lidarr holds %d of %d)"
+                    % (title, res["via"], filled, res["tracks"]))
+        if not filled and rid and not next(
+                (r.get("monitored") for r in full.get("releases") or []
+                 if r.get("id") == rid), False):
+            self.lidarr.set_album_monitored_release(album_id, int(rid))
+        # Lidarr's refresh rescans the artist folder and links files that
+        # fit; what it leaves is filed by title.
+        cmd = self.lidarr.refresh_artist(artist_id, force=True)
+        if cmd:
+            self.lidarr.wait_for_command(int(cmd), timeout_seconds=300)
+        before = filled
+        filled = sum(1 for t in (self.lidarr.list_tracks_for_album(album_id) or [])
+                     if t.get("hasFile"))
+        if filled < res["hit"]:
+            rec = self.lidarr.get_album(album_id) or full
+            imp = self._import_library_folder_by_tracknumber(rec, artist_id, audios)
+            if imp:
+                self.lidarr.wait_for_command(int(imp), timeout_seconds=600)
+            filled = sum(1 for t in (self.lidarr.list_tracks_for_album(album_id) or [])
+                         if t.get("hasFile"))
+        if not alb.get("id") and not filled:
+            # Ours, and nothing landed in it: take it back.
+            self.lidarr.remove_added_album(album_id)
+            return ("record: %r (%s) fits its songs, but Lidarr filed none of "
+                    "them -- the album was removed again" % (title, kind))
+        if alb.get("id") and 0 < filled <= before:
+            return ("record: a copy of %r (%s; Lidarr holds %d of %d)"
+                    % (title, res["via"], filled, res["tracks"]))
+        return "record: %s -- %d of %d track(s) filed (%s)" % (
+            how, filled, res["tracks"], res["via"])
+
     # Bigger-edition switches one audit pass may make (each is a release PUT
     # and an import Lidarr parses); the rest wait for the next pass. Only a
     # switch is counted: the look that finds no edition is a few reads, and
@@ -9367,6 +9471,7 @@ class Orchestrator:
         in_act_mode = first_run_done
         audit_seen = self._audit_seen_load()
         deluxe_budget = [self._DELUXE_PER_PASS]
+        record_budget = [self._RECORDS_PER_PASS]
 
         logger.info(
             "Library audit starting: root=%s mode=%s report=%s acted_so_far=%d",
@@ -9680,7 +9785,12 @@ class Orchestrator:
                 unchanged = (artist_rec is not None
                              and isinstance(prev, list) and len(prev) >= 4
                              and prev[0] == disk_sig and prev[1] == lidarr_n
-                             and time.time() - float(prev[2]) < self._AUDIT_SEEN_TTL)
+                             and time.time() - float(prev[2]) < self._AUDIT_SEEN_TTL
+                             # judged before the record step existed
+                             and not (reason == "album not in Lidarr"
+                                      and str(prev[3]).startswith(("no-importable",
+                                                                   "no-candidates"))
+                                      and "record: " not in str(prev[3])))
                 if unchanged:
                     action_taken = ("unchanged since it was last acted on (%s) "
                                     "-- not repeated" % str(prev[3] or "?")[:60])
@@ -9949,6 +10059,32 @@ class Orchestrator:
                                         new_actions.append(
                                             (album_dir, len(discrepancies)))
                                         raise _AuditSkip()
+                                # None of Lidarr's albums: the record its
+                                # songs are, given to Lidarr (owner, 1 Oct:
+                                # "figure out where it goes, send it to
+                                # lidarr and mark as owned").
+                                record = ""
+                                if rec is None and album_rec is None:
+                                    if record_budget[0] <= 0:
+                                        action_taken = "deferred (per-pass limit)"
+                                        raise _AuditSkip()
+                                    record_budget[0] -= 1
+                                    record = self._give_lidarr_the_record(
+                                        aid, artist_rec, audios,
+                                        [self._album_from_tags(audios),
+                                         album_name_guess, album_dir.name])
+                                    if record.startswith(("record: added",
+                                                          "record: listed",
+                                                          "record: a copy",
+                                                          "record: Lidarr already owns")):
+                                        action_taken = record
+                                        already_acted.add(album_key)
+                                        raise _AuditSkip()
+                                    if record.startswith((
+                                            "record: MusicBrainz could not",
+                                            "record: Lidarr failed")):
+                                        action_taken = "deferred (%s)" % record
+                                        raise _AuditSkip()
                                 # No usable candidates -- log rejections so
                                 # the user can see WHY Lidarr refused.
                                 rej = []
@@ -9959,6 +10095,8 @@ class Orchestrator:
                                     f"no-importable (rejections={rej[:3]})"
                                     if rej else "no-candidates"
                                 )
+                                if record:
+                                    action_taken += " | " + record
                                 cmd_id = None
                             else:
                                 cmd_id = self.lidarr.manual_import_apply(importable)

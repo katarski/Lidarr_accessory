@@ -323,6 +323,48 @@ class LidarrClient:
             logger.error("set_album_monitored_release failed: %s", exc)
             return False
 
+    def lookup_albums(self, term: str) -> List[Dict[str, Any]]:
+        """Lidarr's album search (its metadata server, not the library):
+        "<artist> <title>", or "lidarr:<release-group mbid>". A result Lidarr
+        already holds carries its "id"."""
+        return self._get("/api/v1/album/lookup", term=term) or []
+
+    def add_album_unmonitored(self, resource: Dict[str, Any],
+                              artist_id: int) -> Optional[Dict[str, Any]]:
+        """Add ONE record (a lookup result) to an artist Lidarr has, outside
+        the metadata profile. addType "manual" is what keeps it through the
+        next refresh; unmonitored and with no search, so nothing is wanted or
+        downloaded for it -- the files on disk make it owned."""
+        body = dict(resource)
+        body.pop("id", None)
+        body.update({"artistId": int(artist_id), "monitored": False,
+                     "anyReleaseOk": True,
+                     "addOptions": {"addType": "manual",
+                                    "searchForNewAlbum": False}})
+        try:
+            return self._post("/api/v1/album", body)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("adding album %r failed: %s", resource.get("title"), exc)
+            return None
+
+    def remove_added_album(self, album_id: int) -> bool:
+        """Take back an album add_album_unmonitored made that holds no file.
+        Never deletes files (deleteFiles=false), and refuses an album that
+        has any."""
+        try:
+            tracks = self.list_tracks_for_album(int(album_id)) or []
+            if any(t.get("hasFile") for t in tracks):
+                return False
+            r = self.session.delete(self._url(f"/api/v1/album/{int(album_id)}"),
+                                    params={"deleteFiles": "false",
+                                            "addImportListExclusion": "false"},
+                                    timeout=30)
+            r.raise_for_status()
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("removing added album %s failed: %s", album_id, exc)
+            return False
+
     def set_album_monitored(self, album_id: int, monitored: bool) -> bool:
         """
         PUT /api/v1/album/{id} with the album's `monitored` flag set.
@@ -1733,6 +1775,16 @@ class LidarrClient:
             logger.warning("list_trackfiles_for_album(%s) failed: %s",
                            album_id, exc)
             return []
+
+    def list_trackfiles_for_artist(self, artist_id: int) -> Optional[List[Dict[str, Any]]]:
+        """Every imported file Lidarr has for this artist (path + albumId);
+        None when Lidarr could not be asked."""
+        try:
+            return self._get("/api/v1/trackfile", artistId=int(artist_id)) or []
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("list_trackfiles_for_artist(%s) failed: %s",
+                           artist_id, exc)
+            return None
 
     def list_tracks_for_album(self, album_id: int) -> List[Dict[str, Any]]:
         """Return the track list for an album (SELECTED release only)."""

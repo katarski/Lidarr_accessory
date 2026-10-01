@@ -444,6 +444,7 @@ class MusicBrainzClient:
                 out.append({
                     "title": rtitle,
                     "norm": key,
+                    "rg": rg.get("id"),
                     "type": str(rg.get("primary-type") or "").lower(),
                     "secondary_types": [str(s or "").lower()
                                         for s in (rg.get("secondary-types") or [])],
@@ -451,6 +452,18 @@ class MusicBrainzClient:
                     "mbid": rel.get("id"),
                 })
         return out
+
+    def release_track_titles(self, release_mbid: str) -> Optional[List[str]]:
+        """The track titles of one release, every medium in order. None when
+        MusicBrainz could not be asked ("couldn't check", never "no tracks")."""
+        if not release_mbid:
+            return []
+        data = self._get("/release/%s" % release_mbid, inc="recordings")
+        if data is None:
+            return None
+        return [str(t.get("title") or "")
+                for m in (data.get("media") or [])
+                for t in (m.get("tracks") or [])]
 
     def compilations_for_tracks(
         self, tracks: Iterable[Dict[str, Any]], artist_mbid: str,
