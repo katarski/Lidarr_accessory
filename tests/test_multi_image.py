@@ -133,6 +133,12 @@ class OrchestratorSides(unittest.TestCase):
         o._delete_originals(self.cue, self.sides[0])
         self.assertEqual(sorted(os.listdir(self.dir)), [])
 
+    def test_the_images_are_known_before_the_already_owned_skip(self):
+        import inspect
+        src = inspect.getsource(Orchestrator._process)
+        self.assertLess(src.index("cue.is_multi_image"),
+                        src.index("self._already_in_library(cue)"))
+
     def test_a_sheet_given_up_before_gets_one_more_try(self):
         o = _orch()
         sig = o._cue_signature(self.cue)

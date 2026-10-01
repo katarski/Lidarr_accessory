@@ -1248,6 +1248,30 @@ class Orchestrator:
                          reason=f"unparseable: {exc}")
             return None
 
+        # One sheet, several images (vinyl sides): every track is cut from its
+        # own image, all into one staging folder, and the album is imported
+        # whole. Each image goes with the sheet wherever the sheet is removed --
+        # the already-in-library skip below included: 'After Dark' was
+        # complete, and only its .cue and Side 1 were deleted.
+        if cue.is_multi_image:
+            images = self._resolve_cue_images(cue_path, cue)
+            if images is None:
+                logger.warning(
+                    "%s describes %d images and not all of them are here -- "
+                    "leaving it", cue_path.name, len(cue.audio_files))
+                self._record(cue_path, outcome="failed", pre_split=False,
+                             reason="multi-image cue: an image is missing",
+                             artist=cue.performer, album=cue.title)
+                return None
+            for t in cue.tracks:
+                t.source = images[t.file_index]
+            self._image_set = getattr(self, "_image_set", None) or {}
+            self._image_set[audio_path] = list(images)
+            logger.info(
+                "%s: %d images (%s), %d tracks -- each split from its own image",
+                cue_path.name, len(images), ", ".join(p.name for p in images),
+                len(cue.tracks))
+
         # --- Pre-flight: is it already in Lidarr with files? -----------
         # Cheapest skip possible. Covers two cases:
         #   1. Backlog: CUEs we split before but never deleted the source.
@@ -1346,28 +1370,6 @@ class Orchestrator:
                 reason=reason, artist=cue.performer, album=cue.title,
             )
             return None
-
-        # One sheet, several images (vinyl sides): every track is cut from its
-        # own image, all into one staging folder, and the album is imported
-        # whole. Each image is deleted with the sheet after a verified import.
-        if cue.is_multi_image:
-            images = self._resolve_cue_images(cue_path, cue)
-            if images is None:
-                logger.warning(
-                    "%s describes %d images and not all of them are here -- "
-                    "leaving it", cue_path.name, len(cue.audio_files))
-                self._record(cue_path, outcome="failed", pre_split=False,
-                             reason="multi-image cue: an image is missing",
-                             artist=cue.performer, album=cue.title)
-                return None
-            for t in cue.tracks:
-                t.source = images[t.file_index]
-            self._image_set = getattr(self, "_image_set", None) or {}
-            self._image_set[audio_path] = list(images)
-            logger.info(
-                "%s: %d images (%s), %d tracks -- each split from its own image",
-                cue_path.name, len(images), ", ".join(p.name for p in images),
-                len(cue.tracks))
 
         # DTS-in-WAV disc image? ffmpeg decodes it to SILENCE, so a normal split
         # would emit silent tracks. Decode it to real 5.1 PCM with libdca first
