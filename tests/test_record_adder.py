@@ -161,9 +161,10 @@ class _Lidarr:
         self.added.append((resource["foreignAlbumId"], artist_id))
         return {"id": 46993}
 
+    releases = [{"id": 9, "foreignReleaseId": "r6", "monitored": True}]
+
     def get_album(self, i):
-        return {"id": i, "title": "In Performance",
-                "releases": [{"id": 9, "foreignReleaseId": "r6", "monitored": True}]}
+        return {"id": i, "title": "In Performance", "releases": self.releases}
 
     def list_tracks_for_album(self, i):
         return [{"id": k, "hasFile": k < self.filled} for k in range(6)]
@@ -252,6 +253,29 @@ class GiveLidarrTheRecord(unittest.TestCase):
         self.assertEqual(out, "record: a copy of 'In Performance' (its name; "
                               "Lidarr holds 6 of 6)")
         self.assertEqual(lid.refreshed, 0)
+
+    def test_a_bigger_edition_of_a_listed_record_is_not_called_a_copy(self):
+        # Don Davis / '2008 - The Matrix The Deluxe Edition': 30 songs, while
+        # Lidarr held 10 on its 10-track release from another folder.
+        lid = _Lidarr(listed=46993)
+        lid.releases = [{"id": 9, "foreignReleaseId": "r6", "monitored": False},
+                        {"id": 8, "foreignReleaseId": "r3", "monitored": True,
+                         "trackCount": 3}]
+        lid.filled = 3
+        out = _orch(lid)._give_lidarr_the_record(113, ARTIST, self.audios,
+                                                 ["In Performance"])
+        self.assertEqual(out, "record: another edition of 'In Performance' -- "
+                              "Lidarr holds 3 file(s) on its 3-track release; "
+                              "this folder is the 6-track one (its name), not "
+                              "switched")
+        self.assertEqual(lid.refreshed, 0)
+
+    def test_a_listed_record_that_files_nothing_is_not_handled(self):
+        lid = _Lidarr(links=False, listed=46993)
+        out = _orch(lid)._give_lidarr_the_record(113, ARTIST, self.audios,
+                                                 ["In Performance"])
+        self.assertEqual(out, "record: Lidarr's 'In Performance' filed none of "
+                              "this folder (holds 0 of 6; its name)")
 
     def test_the_audit_asks_for_it_and_rejudges_older_verdicts(self):
         import inspect

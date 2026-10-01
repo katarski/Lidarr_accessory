@@ -5947,6 +5947,17 @@ class Orchestrator:
             # this one is a copy, and a refresh would file nothing.
             return ("record: a copy of %r (%s; Lidarr holds %d of %d)"
                     % (title, res["via"], filled, res["tracks"]))
+        mon = next((r for r in full.get("releases") or [] if r.get("monitored")), None)
+        if alb.get("id") and filled and rid and mon is not None and mon.get("id") != rid:
+            # Lidarr holds another edition of it, from another folder: Don
+            # Davis's 'The Matrix: Original Motion Picture Score' held 10 on
+            # its 10-track release while '2008 - The Matrix The Deluxe
+            # Edition' is the 30-track one. A refresh files nothing, and a
+            # switch would unlink what it holds.
+            return ("record: another edition of %r -- Lidarr holds %d file(s) "
+                    "on its %s-track release; this folder is the %d-track one "
+                    "(%s), not switched" % (title, filled, mon.get("trackCount") or "?",
+                                            res["tracks"], res["via"]))
         if not filled and rid and not next(
                 (r.get("monitored") for r in full.get("releases") or []
                  if r.get("id") == rid), False):
@@ -5971,9 +5982,12 @@ class Orchestrator:
             self.lidarr.remove_added_album(album_id)
             return ("record: %r (%s) fits its songs, but Lidarr filed none of "
                     "them -- the album was removed again" % (title, kind))
-        if alb.get("id") and 0 < filled <= before:
-            return ("record: a copy of %r (%s; Lidarr holds %d of %d)"
-                    % (title, res["via"], filled, res["tracks"]))
+        if alb.get("id") and filled <= before:
+            # Listed, and nothing of this folder landed: not owned, so not
+            # handled ("a copy" was said of the Matrix Deluxe Edition's 30
+            # songs while Lidarr held 10 from another folder).
+            return ("record: Lidarr's %r filed none of this folder (holds %d of "
+                    "%d; %s)" % (title, filled, res["tracks"], res["via"]))
         return "record: %s -- %d of %d track(s) filed (%s)" % (
             how, filled, res["tracks"], res["via"])
 
