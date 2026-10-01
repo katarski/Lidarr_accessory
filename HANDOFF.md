@@ -294,9 +294,10 @@ layer says `http://daniel:11434`.
   A save drops every saved value equal to config.yaml/the container variable, so setting a
   field back to that value hands it to the template again; the tab marks values "saved here;
   else X". Live, all 125 keys are still saved from before (38 equal the template and go at
-  the next save). **Owner's call:** 4 saved values beat the template and stay until changed in
-  the tab: max albums/pass 300 (template 15), search interval 1000 s (3600), dead-grab grace
-  1440 min (360), delete source folder off (template on). Their warnings now reach pipeline.log.
+  the next save). The 4 saved values that beat the template (max albums/pass 300, search
+  interval 1000 s, dead-grab grace 1440 min, delete source folder off) are now the template's
+  values too (1 Oct, owner: keep the tab's; backup `my-cue_pipeline.xml.bak-20261001-settings`),
+  so no "overrides the container variable" warning since `guard-20261001-imagesfirst`.
 - **CPU caps (30 Sep, owner: "as quiet as possible")**: lidarr `--cpus 1.0 --cpu-shares 256`,
   cue_pipeline `--cpus 0.5 --cpu-shares 128`, both applied live (`docker update`) and in the
   templates' ExtraParams (backups `*.bak-20260930-cpu`); the owner's own pinning is lidarr `2,8`,
@@ -317,16 +318,21 @@ layer says `http://daniel:11434`.
   (3) the 102 breaker-open warnings all fall at 22:49, the owner's Lidarr restart; none since,
   with Lidarr capped at 1 CPU. `lifecycle_state.json` is written; `library_audit.state.json`
   appears after the first complete audit pass.
-- **Not supported yet: one CUE describing several images (vinyl sides).**
-  `Ray Parker Jr. - After Dark` (and `A Woman Needs Love`, `I Love You Like
-  You Are`, all 32/192 vinyl rips) ship one .cue with FILE "... (Side 1)" and
-  FILE "... (Side 2)", five tracks each. The parser has no track-to-FILE
-  link, so the side-2 restart at 00:00 reads as "invalid", the folder looks
-  pre-split, and the two whole sides go to Lidarr, which refuses them; all
-  three sit in needs-attention. A scan of /downloads found only these three
-  (the other 21 multi-FILE cues are per-track EAC cues with the pregap at
-  the end of the previous file -- already handled). Fix when wanted: give
-  Track a file index, gate/split per image, hand off as one album.
+- **One CUE describing several images (vinyl sides), 1 Oct.** `Ray Parker
+  Jr. - After Dark`, `A Woman Needs Love`, `I Love You Like You Are` (32/192
+  vinyl rips) ship one .cue with FILE "... (Side 1)" and "... (Side 2)". Each
+  track now carries its FILE index (`Cue.is_multi_image`: >=2 FILEs, >=2
+  tracks each; EAC per-track cues are not), is cut from its own image
+  (found by name, or same stem with another audio extension), and the album
+  is imported whole; every image goes with the sheet. Sheets given up before
+  `_MULTI_IMAGE_SINCE` get one more try. Live: I Love You Like You Are 12/12,
+  A Woman Needs Love 8/8. After Dark was already owned and, before
+  `guard-20261001-imagesfirst`, only its .cue and Side 1 were deleted: its
+  `(Side 2).flac` remains, alone, in `/downloads/Ray Parker Jr. - After Dark
+  -1987 (wv 32-192)/wv/` (the sweep ignores a lone file). The post-import
+  check also looks the album up under the artist folder it landed in (CUE
+  performer 'Ray Parker Jr. And Raydio', Lidarr's 'Ray Parker Jr.';
+  `guard-20261001-verifyfolder`).
 - **Library audio Lidarr has no record of (1 Oct scan, owner's call).**
   1,364 audio files in 163 album folders are on disk but neither mapped nor
   in Lidarr's unmapped list -- mostly a second disc left behind when an
@@ -335,18 +341,25 @@ layer says `http://daniel:11434`.
   earlier switch (The Drifters (2001): 11 files from 24 Apr beside the 12
   filed ones). The music plays; Lidarr just does not track it. Where the
   album is short of exactly those tracks (ABBA (1975): 8/18 with its 13
-  originals present) the audit's under-registered repair re-files them;
-  complete albums are left alone -- registering a second disc means choosing
-  the deluxe release, and removing copies means moving audio out of the
-  library. Per-folder counts: /config/_orphan_scan.json.
+  originals present) the audit's under-registered repair re-files them. A
+  complete album whose folder (disc folders included) holds more audio is
+  reported "album has untracked files" and switched (owner, 1 Oct: "switch to
+  deluxe"; `guard-20261001-deluxe`) to the release those files are: more
+  tracks than now, exactly as many as the untracked files (or tracked +
+  untracked), >=90% of their titles on it; then filed by title. Fewer files
+  after than before restores the old release. 10 switches per audit pass.
+  Per-folder counts: /config/_orphan_scan.json.
 - **Lidarr load and failure accounting (1 Oct, night).** `find_artist`'s
   spelling fallback now requires the same number of words ('J. D.
   Blackfoot' was taken for 'Blackfoot' 49 times). A Lidarr 5xx that is its
   own answer no longer opens the breaker: NotFound (a queue row it lists but
   cannot delete -- 845 Fatals in its log, one row retried every 10 min) is an
   answer and that row is not asked about again; another 5xx with Lidarr's
-  JSON error ("Failed to connect to qBittorrent") counts as a failed call
-  with the breaker shut. Reconcile's "nothing importable" verdicts persist
+  JSON error counts as a failed call with the breaker shut. "Failed to
+  connect to qBittorrent" on a grab is qBittorrent's 409 Conflict (the
+  torrent is already there -- all 232 in Lidarr's logs): an answer about that
+  release, so the search tries the next candidate (`guard-20261001-conflict`;
+  Fehlfarben - Monarchie und Alltag, held uncategorised, ended 11 passes). Reconcile's "nothing importable" verdicts persist
   (`reconcile_seen.json`, was 60-173 /manualimport probes an hour after
   restarts), and the library audit remembers what it did to each folder
   (`library_audit.seen.json`): unchanged on disk and in Lidarr, the repair is
