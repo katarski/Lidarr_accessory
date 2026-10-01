@@ -26,6 +26,8 @@ class _Lidarr:
         self.monitored = STD
         self.switches = []
         self.filed = 2
+        self.lag = 0          # reads after a switch that still show the old release
+        self.pending = 0
 
     def get_album(self, i):
         return {"id": i, "title": "Album",
@@ -48,8 +50,17 @@ class _Lidarr:
 
     def set_album_monitored_release(self, i, rid):
         self.switches.append(rid)
-        self.monitored = rid
+        self.old, self.monitored = self.monitored, rid
+        self.pending = self.lag
         return True
+
+    def list_tracks_for_album(self, i):
+        rel = self.monitored
+        if self.pending > 0:
+            self.pending -= 1
+            rel = self.old
+        n = 2 if rel == STD else 4
+        return [{"id": rel * 100 + k, "hasFile": k < self.filed} for k in range(n)]
 
     def wait_for_command(self, cmd, timeout_seconds=60):
         return {}
@@ -67,10 +78,12 @@ def _setup(dlx_titles=None, lands=True):
     lid = _Lidarr(root, **({"dlx_titles": dlx_titles} if dlx_titles else {}))
     o = Orchestrator.__new__(Orchestrator)
     o.lidarr = lid
+    o._SETTLE_POLL = 0
     imported = []
 
     def imp(rec, aid, files):
         imported.append(sorted(p.name for p in files))
+        lid.settled_at_import = lid.pending == 0
         if lands and lid.monitored == DLX:
             lid.filed = 4
         elif lid.monitored == STD:
@@ -106,6 +119,31 @@ class DeluxeSwitch(unittest.TestCase):
         self.assertEqual(lid.switches, [DLX, STD])
         self.assertEqual(lid.filed, 2)
         self.assertIn("restored release 1", out)
+        # The restore re-files what Lidarr held, not the folder's other files.
+        self.assertEqual(imported[1], ["Artist - Album - 01 - Alpha.flac",
+                                       "Artist - Album - 02 - Beta.flac"])
+
+    def test_a_second_copy_of_the_album_is_not_switched(self):
+        # Aaliyah: '(2003) - Aaliyah - Age Ain't Nothing But A Number' beside
+        # Lidarr's own folder -- none of Lidarr's files are in it.
+        d, o, root, lid, imported = _setup()
+        self.addCleanup(d.cleanup)
+        copy = root.parent / "(2003) - Album"
+        copy.mkdir()
+        for n in ("01 - Alpha", "02 - Beta", "03 - Gamma", "04 - Delta"):
+            (copy / ("Artist - Album - %s.flac" % n)).write_bytes(b"x")
+        out = o._switch_to_fitting_release({"id": 5, "title": "Album"}, 3, copy)
+        self.assertEqual((lid.switches, imported), ([], []))
+        self.assertIn("second copy", out)
+
+    def test_nothing_is_filed_or_counted_before_lidarr_takes_the_switch(self):
+        d, o, root, lid, imported = _setup()
+        self.addCleanup(d.cleanup)
+        lid.lag = 3
+        out = o._switch_to_fitting_release({"id": 5, "title": "Album"}, 3, root)
+        self.assertTrue(lid.settled_at_import)
+        self.assertEqual(lid.switches, [DLX])
+        self.assertIn("switched to the 4-track release 2", out)
 
 
 if __name__ == "__main__":

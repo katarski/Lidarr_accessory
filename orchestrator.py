@@ -5859,6 +5859,27 @@ class Orchestrator:
         return [p for p in self._audio_files_recursive(album_dir, cap=2000)
                 if self.QUARANTINE_DIR not in p.parts]
 
+    _SETTLE_POLL = 3.0
+
+    def _settled_tracks(self, album_id: int, n: int,
+                        timeout: float = 45.0) -> List[Dict[str, Any]]:
+        """The album's tracks once a release switch has taken: the new
+        release's `n` rows, read the same twice. Lidarr unlinks the old
+        release's files after the PUT returns: 0.4 s after switching Aaliyah's
+        album nothing paired, a moment later it held 0 files, and the switch
+        was "undone" on that reading."""
+        deadline = time.monotonic() + timeout
+        last = None
+        while True:
+            rows = self.lidarr.list_tracks_for_album(album_id) or []
+            sig = sorted((t.get("id"), bool(t.get("hasFile"))) for t in rows)
+            if len(rows) == n and sig == last:
+                return rows
+            last = sig if len(rows) == n else None
+            if time.monotonic() >= deadline:
+                return rows
+            time.sleep(self._SETTLE_POLL)
+
     def _switch_to_fitting_release(self, album_rec: Dict[str, Any],
                                    artist_id: int, album_dir: Path) -> str:
         """An album Lidarr holds complete whose folder holds more: the files
@@ -5899,6 +5920,14 @@ class Orchestrator:
         tracked = [p for p in every if str(p) in held]
         if not untracked:
             return "no untracked files"
+        if not tracked:
+            # Lidarr files this album in another folder: this one is a second
+            # copy, not a bigger edition. `Aaliyah / (2003) - Aaliyah - Age
+            # Ain't Nothing But A Number` beside Lidarr's `Age Ain't Nothing
+            # but a Number (1994)` was switched, and its restore imported the
+            # copy's files into the album.
+            return ("Lidarr's files for it are in another folder -- a second "
+                    "copy, not switched")
         titles = {p: norm_title(self._read_audio_title(p)) for p in every}
         best = None
         for r in rels:
@@ -5923,18 +5952,25 @@ class Orchestrator:
                     "and titles" % len(untracked))
         hit, r, files = best
         rid, n = int(r["id"]), int(r.get("trackCount") or 0)
+        prev_n = next((int(x.get("trackCount") or 0) for x in rels
+                       if x.get("id") == prev), 0)
         if not self.lidarr.set_album_monitored_release(album_id, rid):
             return "Lidarr refused the switch to release %s" % rid
+        self._settled_tracks(album_id, n)
         rec = self.lidarr.get_album(album_id) or full
         cmd = self._import_library_folder_by_tracknumber(rec, artist_id, files)
         if cmd:
             self.lidarr.wait_for_command(int(cmd), timeout_seconds=600)
-        after = _album_track_file_count(self.lidarr.get_album(album_id) or {})
+        after = sum(1 for t in self._settled_tracks(album_id, n)
+                    if t.get("hasFile"))
         if after < before:
             if prev and self.lidarr.set_album_monitored_release(album_id, int(prev)):
+                self._settled_tracks(album_id, prev_n)
                 rec = self.lidarr.get_album(album_id) or full
+                # The files Lidarr held before -- never the folder's others.
                 back = self._import_library_folder_by_tracknumber(
-                    rec, artist_id, tracked or every)
+                    rec, artist_id, [p for p in map(Path, sorted(held))
+                                     if p.is_file()])
                 if back:
                     self.lidarr.wait_for_command(int(back), timeout_seconds=600)
             logger.warning(
