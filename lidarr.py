@@ -579,8 +579,14 @@ class LidarrClient:
             # URL) per attempt and read like a fault, so an ordinary, handled
             # outcome looked like the pipeline breaking. Anything that is NOT a
             # 404 is still a real problem and still warns.
-            status = getattr(getattr(exc, "response", None), "status_code", None)
-            if status == 404:
+            resp = getattr(exc, "response", None)
+            status = getattr(resp, "status_code", None)
+            if resp is not None and self._is_client_conflict(resp):
+                logger.info(
+                    "release grab declined: qBittorrent already holds this "
+                    "torrent (409 Conflict) -- a copy the pipeline leaves "
+                    "alone; next candidate")
+            elif status == 404:
                 logger.info(
                     "release grab declined by Lidarr (404 -- it cannot match "
                     "this release to a library artist/album%s); caller will add "
@@ -1262,7 +1268,8 @@ class LidarrClient:
         except (requests.ConnectionError, requests.Timeout) as exc:
             self._went_down(exc)
             raise
-        if r.status_code >= 500 and not self._is_not_found(r):
+        if (r.status_code >= 500 and not self._is_not_found(r)
+                and not self._is_client_conflict(r)):
             if self._is_lidarr_error(r):
                 # Lidarr answered, with its own error ("Failed to connect to
                 # qBittorrent", "database is locked"): this call failed, so
@@ -1298,6 +1305,19 @@ class LidarrClient:
         threw away whatever they had in flight."""
         try:
             return "NotFound" in (r.text or "")[:4000]
+        except Exception:  # noqa: BLE001
+            return False
+
+    @staticmethod
+    def _is_client_conflict(r) -> bool:
+        """qBittorrent's 409 Conflict to Lidarr's torrents/add, passed on as
+        HTTP 500 "Failed to connect to qBittorrent": the torrent is already
+        in qBittorrent. That is an answer about one release. Counted as a
+        failure, one such release (Fehlfarben - Monarchie und Alltag, held
+        uncategorised) ended every interactive-search pass at the album it
+        reached -- all 232 such refusals in Lidarr's logs were 409s."""
+        try:
+            return "[409:Conflict]" in (r.text or "")[:8000]
         except Exception:  # noqa: BLE001
             return False
 
