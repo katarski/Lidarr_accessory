@@ -10073,12 +10073,17 @@ class Orchestrator:
                                         new_actions.append(
                                             (album_dir, len(discrepancies)))
                                         raise _AuditSkip()
-                                # None of Lidarr's albums: the record its
-                                # songs are, given to Lidarr (owner, 1 Oct:
+                                # None of Lidarr's albums filed it: the record
+                                # its songs are, given to Lidarr (owner, 1 Oct:
                                 # "figure out where it goes, send it to
-                                # lidarr and mark as owned").
+                                # lidarr and mark as owned"). Also when a
+                                # Lidarr album was matched by name and filed
+                                # nothing: Isaac Hayes's 'Wonderful' and
+                                # 'Instrumentals' (compilations, 9/9 and
+                                # 13/13 in the replay) were matched so and
+                                # never asked.
                                 record = ""
-                                if rec is None and album_rec is None:
+                                if reason == "album not in Lidarr":
                                     if record_budget[0] <= 0:
                                         action_taken = "deferred (per-pass limit)"
                                         raise _AuditSkip()
@@ -10099,16 +10104,6 @@ class Orchestrator:
                                             "record: Lidarr failed")):
                                         action_taken = "deferred (%s)" % record
                                         raise _AuditSkip()
-                                elif reason == "album not in Lidarr":
-                                    # Lidarr's own album took the folder and
-                                    # filed none of it: no record is asked
-                                    # for. Unmarked, the verdict read as one
-                                    # from before this step and was judged
-                                    # again every pass (Andy LaPlegua's
-                                    # 'Hellblade', 1 Oct).
-                                    record = ("record: not asked -- matched to Lidarr's "
-                                              "%r, nothing filed"
-                                              % str((rec or album_rec or {}).get("title") or ""))
                                 # No usable candidates -- log rejections so
                                 # the user can see WHY Lidarr refused.
                                 rej = []

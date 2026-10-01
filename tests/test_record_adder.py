@@ -284,13 +284,15 @@ class GiveLidarrTheRecord(unittest.TestCase):
         self.assertIn('and "record: " not in str(prev[3])))', src)
         self.assertIn('not (reason == "album not in Lidarr"', src)
 
-    def test_a_folder_lidarrs_own_album_took_says_so_and_is_not_rejudged(self):
-        # Unmarked, Andy LaPlegua's 'Hellblade' (Lidarr's album resolved it,
-        # nothing filed) read as a pre-record-step verdict every pass.
+    def test_a_folder_a_matched_album_filed_nothing_of_is_asked_too(self):
+        # Isaac Hayes's 'Wonderful' was matched to a Lidarr album by name,
+        # nothing was filed, and the record step was never asked; its
+        # verdict, without "record: ", was then judged again every pass.
         import inspect
         src = inspect.getsource(Orchestrator)
-        self.assertIn('elif reason == "album not in Lidarr":\n', src)
-        self.assertIn('record = ("record: not asked -- matched to Lidarr\'s "', src)
+        self.assertIn('record = ""\n                                '
+                      'if reason == "album not in Lidarr":\n', src)
+        self.assertNotIn("if rec is None and album_rec is None:", src)
 
 
 class AddedBody(unittest.TestCase):
