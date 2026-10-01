@@ -334,8 +334,16 @@ class LidarrClient:
     def lookup_albums(self, term: str) -> List[Dict[str, Any]]:
         """Lidarr's album search (its metadata server, not the library):
         "<artist> <title>", or "lidarr:<release-group mbid>". A result Lidarr
-        already holds carries its "id"."""
-        return self._get("/api/v1/album/lookup", term=term) or []
+        already holds carries its "id". A search whose answer Lidarr cannot
+        read (`_is_unreadable_search`) finds no records."""
+        try:
+            return self._get("/api/v1/album/lookup", term=term) or []
+        except requests.HTTPError as exc:
+            if exc.response is None or not self._is_unreadable_search(exc.response):
+                raise
+            logger.info("album search %r: Lidarr cannot read its metadata "
+                        "server's answer -- no records by that search", term)
+            return []
 
     def add_album_unmonitored(self, resource: Dict[str, Any],
                               artist_id: int) -> Optional[Dict[str, Any]]:
@@ -1319,7 +1327,8 @@ class LidarrClient:
             self._went_down(exc)
             raise
         if (r.status_code >= 500 and not self._is_not_found(r)
-                and not self._is_client_conflict(r)):
+                and not self._is_client_conflict(r)
+                and not self._is_unreadable_search(r)):
             if self._is_lidarr_error(r):
                 # Lidarr answered, with its own error ("Failed to connect to
                 # qBittorrent", "database is locked"): this call failed, so
@@ -1368,6 +1377,22 @@ class LidarrClient:
         reached -- all 232 such refusals in Lidarr's logs were 409s."""
         try:
             return "[409:Conflict]" in (r.text or "")[:8000]
+        except Exception:  # noqa: BLE001
+            return False
+
+    @staticmethod
+    def _is_unreadable_search(r) -> bool:
+        """Lidarr's metadata server answered a search and Lidarr could not
+        read the answer: HTTP 503 "Search for '...' failed. Invalid response
+        received from LidarrAPI" (an artist the reply names is missing from
+        it -- all 42 in Lidarr's logs). The same every time for that search:
+        every 'James Blake ...' album search since 12:50 on 1 Oct, while
+        'Enya Watermark' and 'lidarr:<id>' answered. Counted as a failure,
+        James Blake's '200 Press' was "not judged" on every audit pass.
+        "Unable to communicate with LidarrAPI" (the metadata server erroring
+        or out of reach) still counts."""
+        try:
+            return "Invalid response received from LidarrAPI" in (r.text or "")[:4000]
         except Exception:  # noqa: BLE001
             return False
 
