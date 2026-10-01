@@ -7940,6 +7940,10 @@ class Orchestrator:
                 folder / fn for fn in filenames
                 if Path(fn).suffix.lower() in set(self.cfg.audio_extensions)
             ]
+            # An image a finished sheet left behind ('... (Side 2)').
+            if self._drop_leftover_images(folder, audio_here, now_ts, min_stable):
+                continue
+
             extracted = self._materialize_embedded_cues(audio_here)
             if extracted:
                 logger.info(
@@ -14333,6 +14337,108 @@ class Orchestrator:
                     )
             except OSError as exc:
                 logger.warning("Could not delete orphan CUE %s: %s", c, exc)
+
+    # What a sheet's image is called beside it: '<sheet> (Side 2)', '- CD2'.
+    _LEFTOVER_IMAGE_RE = re.compile(
+        r"(?i)^\s*[-_.]?\s*[(\[]?\s*(?:side|disc|disk|cd|lp|part)\s*"
+        r"[0-9a-d]{1,2}\s*[)\]]?\s*$")
+    # A leftover Lidarr did not confirm is asked about again after this long.
+    _LEFTOVER_RECHECK = 6 * 3600
+
+    def _done_sheets(self) -> Dict[str, Dict[str, Tuple[str, str, str]]]:
+        """Folder -> {sheet stem, lowercased: (artist, album, outcome)} for
+        every .cue whose last outcome-ledger row says imported or already in
+        the library. ledger.csv only grows (9 MB, 40k rows on 1 Oct), so it is
+        read once and then from where the last read stopped."""
+        import io
+        idx = getattr(self, "_done_idx", None)
+        if idx is None:
+            idx = self._done_idx = {}
+            self._done_off = 0
+        path = getattr(self.cfg, "ledger_file", None)
+        if not path:
+            return idx
+        try:
+            with self._ledger_lock:
+                size = Path(path).stat().st_size
+                if size < self._done_off:        # replaced: read it again
+                    idx.clear()
+                    self._done_off = 0
+                if size == self._done_off:
+                    return idx
+                with Path(path).open("rb") as fh:
+                    fh.seek(self._done_off)
+                    data = fh.read(size - self._done_off)
+        except OSError:
+            return idx
+        self._done_off += len(data)
+        for row in csv.reader(io.StringIO(data.decode("utf-8", "replace"))):
+            if len(row) < 7 or not row[1].lower().endswith(".cue"):
+                continue
+            p = Path(row[1])
+            per = idx.setdefault(str(p.parent), {})
+            if row[6] == "already_in_lidarr" or row[6].startswith("imported"):
+                per[p.stem.lower()] = (row[2], row[3], row[6])
+            else:
+                per.pop(p.stem.lower(), None)
+        return idx
+
+    def _drop_leftover_images(self, folder: Path, audios: List[Path],
+                              now_ts: float, min_stable: int) -> bool:
+        """Delete the images a finished sheet left behind, as its originals
+        would have been. Before the images were known ahead of the
+        already-owned skip, 'Ray Parker Jr. - After Dark -1987.cue' (Side 1 +
+        Side 2) lost its .cue and Side 1 and left '... (Side 2).flac' alone
+        in a folder with no .cue -- which no path looks at again.
+
+        An image is a file named '<sheet> (Side N)' / '(CD N)' / '(Disc N)'
+        beside where a .cue the ledger last recorded as imported or already
+        in the library sat, the .cue gone; it is deleted only while Lidarr
+        holds that album complete. True when something was deleted."""
+        if not audios or not getattr(self.cfg, "delete_originals_on_success", False):
+            return False
+        sheets = self._done_sheets().get(str(folder))
+        if not sheets:
+            return False
+        waits = getattr(self, "_leftover_wait", None)
+        if waits is None:
+            waits = self._leftover_wait = {}
+        dropped = False
+        for a in audios:
+            low = a.stem.lower()
+            stem = next((s for s in sheets if len(low) > len(s)
+                         and low.startswith(s)
+                         and self._LEFTOVER_IMAGE_RE.match(low[len(s):])), None)
+            if stem is None or now_ts - waits.get(str(a), 0.0) < self._LEFTOVER_RECHECK:
+                continue
+            try:
+                if now_ts - a.stat().st_mtime < min_stable:
+                    continue
+            except OSError:
+                continue
+            artist, album, outcome = sheets[stem]
+            gen = self._lidarr_generation()
+            ok, have, want, _aid, _alb = self._lidarr_album_is_imported(artist, album)
+            if self._lidarr_generation() != gen:
+                continue
+            if not (ok and want and have >= want):
+                waits[str(a)] = now_ts
+                logger.info(
+                    "cueless sweep: %s looks like an image of %s.cue (%s), but "
+                    "Lidarr has %d/%d of %s / %s -- kept", a.name, stem, outcome,
+                    have, want, artist, album)
+                continue
+            try:
+                a.unlink()
+            except OSError as exc:
+                logger.warning("cueless sweep: could not delete %s: %s", a, exc)
+                continue
+            dropped = True
+            logger.info(
+                "cueless sweep: deleted %s -- an image of %s.cue (%s), whose "
+                "album %s / %s Lidarr holds complete (%d/%d)", a.name, stem,
+                outcome, artist, album, have, want)
+        return dropped
 
     def _delete_originals(self, cue_path: Path, audio_path: Path) -> None:
         """
