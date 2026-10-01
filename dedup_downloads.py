@@ -201,6 +201,43 @@ def _album_full(a: Dict[str, Any]) -> bool:
     return f > 0 and t > 0 and f >= t
 
 
+# Words that make another EDITION of a record, not another record: the edition
+# words above, numbers excepted ('24 Hours' is not 'Hours'), and 'extended'.
+_CORE_NOISE = frozenset(w for w in _EDITION_WORDS if not w.isdigit()) | {"extended"}
+
+
+def _core(title: str) -> list:
+    """The words that say WHICH record a title is, in order: bracketed text,
+    edition words and years dropped. 'Breathe In Extended Edition' and
+    'Breathe In' share one core; 'Breathe' has another."""
+    return [w for w in titlematch.tokens(_BRACKETS_RE.sub(" ", title or ""))
+            if w not in _CORE_NOISE and not re.fullmatch(r"(?:19|20)\d{2}", w)]
+
+
+def _records_named(core: list, albums: list, artist_words: set) -> list:
+    """The artist's albums whose whole core appears in `core` as consecutive
+    words, one per title, dropping any found only inside a longer one ('Blue'
+    within 'Blue Train')."""
+    spans = []
+    for a in albums:
+        c = _core(a.get("title") or "")
+        if not c or set(c) <= artist_words:
+            continue
+        for i in range(len(core) - len(c) + 1):
+            if core[i:i + len(c)] == c:
+                spans.append((i, i + len(c), a))
+                break
+    out, seen = [], set()
+    for s, e, a in spans:
+        if any(s2 <= s and e <= e2 and (e2 - s2) > (e - s) for s2, e2, _ in spans):
+            continue
+        k = norm_title(a.get("title"))
+        if k not in seen:
+            seen.add(k)
+            out.append(a)
+    return out
+
+
 def _pick_among_same_title(same_title, album: str, folder_hint):
     """
     The album a download names, from the albums that share its title, as
@@ -290,6 +327,33 @@ def album_complete_in_library(
             album, folder_hint)
         if verdict is not None:
             return verdict
+        # The artist's catalogue says which record a download is before any
+        # guess does. A title that, without its edition words, IS one of the
+        # artist's albums -- owned or not -- is that album: 'Breathe In
+        # Extended Edition' is Armin van Buuren's 'Breathe In', which the
+        # model took for the owned 'Breathe' (29 Sep: torrent removed).
+        if alb is None and _core(album):
+            alb, verdict = _pick_among_same_title(
+                [a for a in albums if _core(a.get("title") or "") == _core(album)],
+                album, folder_hint)
+            if verdict is not None:
+                return verdict
+        # A name carrying two or more of the artist's titles is a multi-album
+        # release; it is not owned while one of them is missing. 'Ultravox_
+        # Quartet_Lament_2000' was taken for the owned 'Lament' and its
+        # torrent removed, with Quartet at 0/118. (Only ever a "not owned":
+        # when all are owned the usual matching goes on.)
+        if alb is None:
+            named = _records_named(_core(album), albums,
+                                   set(titlematch.tokens(artist)))
+            short = [a.get("title") for a in named if not _album_full(a)]
+            if len(named) >= 2 and short:
+                logger.info(
+                    "  %r carries %d of the artist's titles (%s) -- %s not "
+                    "complete, so not owned", album[:60], len(named),
+                    ", ".join(str(a.get("title")) for a in named)[:80],
+                    ", ".join(map(str, short))[:60])
+                return False, 0, 0
         def _owned(a: Dict[str, Any]) -> bool:
             st = a.get("statistics") or {}
             f = int(st.get("trackFileCount") or 0)
