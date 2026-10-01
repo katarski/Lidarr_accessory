@@ -32,8 +32,9 @@ build) with the repo's `*.py` and `tools/`, checks `OrchestratorConfig` is
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20261001-weaktitle`**
-(11664dd). Earlier tags for rollback: `guard-20261001-conflict`,
+then is the container replaced. Live now: **`guard-20261001-leftover`**
+(eb2890a). Earlier tags for rollback: `guard-20261001-weaktitle`,
+`guard-20261001-conflict`,
 `guard-20261001-verifyfolder`,
 `guard-20261001-deluxe`,
 `guard-20261001-imagesfirst`,
@@ -328,9 +329,12 @@ layer says `http://daniel:11434`.
   is imported whole; every image goes with the sheet. Sheets given up before
   `_MULTI_IMAGE_SINCE` get one more try. Live: I Love You Like You Are 12/12,
   A Woman Needs Love 8/8. After Dark was already owned and, before
-  `guard-20261001-imagesfirst`, only its .cue and Side 1 were deleted: its
-  `(Side 2).flac` remains, alone, in `/downloads/Ray Parker Jr. - After Dark
-  -1987 (wv 32-192)/wv/` (the sweep ignores a lone file). The post-import
+  `guard-20261001-imagesfirst`, only its .cue and Side 1 were deleted. The
+  sweep now deletes such a leftover (`guard-20261001-leftover`): a file named
+  '<sheet> (Side N)/(CD N)/(Disc N)' where a .cue sat that `ledger.csv` last
+  records as imported/already in the library, while Lidarr holds the album
+  complete (else kept, asked again in 6 h). Side 2 went at 06:35 on 1 Oct;
+  the dry run over /downloads matched only that file. The post-import
   check also looks the album up under the artist folder it landed in (CUE
   performer 'Ray Parker Jr. And Raydio', Lidarr's 'Ray Parker Jr.';
   `guard-20261001-verifyfolder`).
