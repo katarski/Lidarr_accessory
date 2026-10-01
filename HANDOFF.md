@@ -32,8 +32,9 @@ build) with the repo's `*.py` and `tools/`, checks `OrchestratorConfig` is
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20261001-switchsafe`**
-(6e5d541). Earlier tags for rollback: `guard-20261001-artistid`,
+then is the container replaced. Live now: **`guard-20261001-grabbind`**
+(04861a5). Earlier tags for rollback: `guard-20261001-switchsafe`,
+`guard-20261001-artistid`,
 `guard-20261001-leftover`,
 `guard-20261001-weaktitle`,
 `guard-20261001-conflict`,
@@ -493,7 +494,12 @@ layer says `http://daniel:11434`.
   row new since the pre-grab snapshot whose album id or whole title is the
   release's. Never a substring: Priscilla Ahn's "La La La" once bound to, and
   deleted, Confidence Man's live "5AM (LA LA LA)". A reject removes only the
-  row with that hash, and only our torrent.
+  row with that hash, and only our torrent. A guid with no infohash (RuTracker
+  topic links) is bound through the artist's grab history (`grab_download_id`,
+  filtered by artist + eventType=1), which records that guid's downloadId:
+  its queue row carries the torrent's own name and often no album, so 61
+  grabs in four days went unverified ("no queue hash";
+  `guard-20261001-grabbind`).
 - **WebUI Add/Overwrite** imports only the files it copied (title pairing onto
   empty tracks), refuses two held files with one name, and deletes the held
   folder only when every song has an equal copy in the library. Discard never
