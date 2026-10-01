@@ -32,8 +32,9 @@ build) with the repo's `*.py` and `tools/`, checks `OrchestratorConfig` is
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20261001-grabbind`**
-(04861a5). Earlier tags for rollback: `guard-20261001-switchsafe`,
+then is the container replaced. Live now: **`guard-20261001-albumid`**
+(68287dc). Earlier tags for rollback: `guard-20261001-grabbind`,
+`guard-20261001-switchsafe`,
 `guard-20261001-artistid`,
 `guard-20261001-leftover`,
 `guard-20261001-weaktitle`,
@@ -343,7 +344,11 @@ layer says `http://daniel:11434`.
   `artist.id` and two call sites read `artistId` (absent on every live
   candidate), so it fell back to the CUE performer 'Ray Parker Jr. And
   Raydio'. `_committed_artist_id` now reads both (`guard-20261001-artistid`;
-  live probe: Cream candidates -> 817). Second layer: the check also tries
+  live probe: Cream candidates -> 817). The album likewise: Hank Williams,
+  Jr. / Five-O-Five was filed 10/10 into Lidarr's 'Five‐O' and then not
+  found by the CUE title; the check now asks for the album the candidates
+  name (`album.id`, when they agree; `guard-20261001-albumid`; live: by
+  title nothing, by id 46065 10/10). Second layer: the check also tries
   the artist folder the album landed in (`guard-20261001-verifyfolder`;
   live re-run on Raydio: 8/8, old path 0/0).
 - **Library audio Lidarr has no record of (1 Oct scan, owner's call).**
