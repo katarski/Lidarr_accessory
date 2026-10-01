@@ -32,8 +32,9 @@ build) with the repo's `*.py` and `tools/`, checks `OrchestratorConfig` is
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20261001-llmanswers`**
-(e626f9e). Earlier tags for rollback: `guard-20261001-tagrule`,
+then is the container replaced. Live now: **`guard-20261001-riptail`**
+(520b0dd). Earlier tags for rollback: `guard-20261001-llmanswers`,
+`guard-20261001-tagrule`,
 `guard-20261001-nollmpick`,
 `guard-20261001-albumid`,
 `guard-20261001-grabbind`,
@@ -483,6 +484,15 @@ layer says `http://daniel:11434`.
   unusable (`guard-20261001-tagrule`). The model's answers persist in
   /config/llm_answers.json (per question and model, 30 days; UNAVAILABLE
   never stored), so a restart does not re-ask (`guard-20261001-llmanswers`).
+  A download name's trailing rip tags ('320', '192-320', '24-44.1', codec
+  words that are not English words, a trailing '⭐️') are cut before it is
+  matched to owned albums (`strip_rip_tail`): 'Black Roses 320' is the owned
+  'Black Roses'. Replayed on the 17 logged rip-tag questions: no verdict
+  change, 4 need no model (`guard-20261001-riptail`).
+  SearXNG (br2.2, 192.168.4.7) is NOT reachable from the pipeline: Park's
+  containers cannot reach that VLAN (No route to host). Reaching it needs a
+  network change on Park (a host route via the router, or a second network
+  on the container, whose egress would skip the VPN) -- the owner's call.
 - **Encodes appear only complete** (`_encode_flac`: `.partial`, verify, tag,
   rename); DVD-Audio publishes the whole disc or nothing.
 - **Titles compare in any script** (`titlematch.py`) — see README.
