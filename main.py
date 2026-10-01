@@ -1854,6 +1854,12 @@ def main() -> int:
         lidarr.mb = _MB()
     except Exception as _exc:  # noqa: BLE001
         logger.debug('MusicBrainz alias lookup unavailable: %s', _exc)
+    # SearXNG over the private searxng_link network (tools/deploy.sh): web
+    # evidence for the few ownership questions the model still gets.
+    from websearch import WebSearch
+    lidarr.web = WebSearch(
+        os.environ.get("SEARXNG_URL") or "http://SearXNG:8080",
+        cache_file=str(Path(args.config).parent / "websearch_cache.json"))
     orch = Orchestrator(orch_cfg, lidarr, ollama_client, acoustid=acoustid_client,
                         raw_cfg=cfg, base_cfg=base_cfg)
     # CPU caps set in the WebUI outlive a recreate: a deploy starts this

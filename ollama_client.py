@@ -561,12 +561,18 @@ class OllamaClient:
             return "", ""
         return artist, album
 
-    def pick_owned_album(self, download_name: str, owned_titles: List[str]) -> Optional[str]:
+    def pick_owned_album(self, download_name: str, owned_titles: List[str],
+                         evidence=None) -> Optional[str]:
         """
         Ask the LLM which OWNED album (from `owned_titles`) is the same release
         as the downloaded folder `download_name`. Returns a title copied from
         `owned_titles`, or None. Hallucination-safe: the answer must map back
         to one of the supplied titles (exact or normalized) or we return None.
+
+        `evidence`, when given, is called only if the model is about to be
+        asked and returns web result titles for the download: the model took
+        'Breathe In (2024) Extended Edition' for the owned 'Breathe' without
+        knowing 'Breathe In' is an album of its own.
         """
         if not download_name or not owned_titles:
             return None
@@ -592,9 +598,19 @@ class OllamaClient:
         if not self.enabled:
             return UNAVAILABLE
         listing = "\n".join(f"- {t}" for t in owned_titles)
+        web: List[str] = []
+        if evidence is not None:
+            try:
+                web = [str(t) for t in (evidence() or [])][:8]
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("pick_owned_album: no web evidence: %s", exc)
+        seen = ("Web search results for the download (they can show it is a "
+                "record of its own, or an edition of an owned one):\n%s\n\n"
+                % "\n".join(f"- {t}" for t in web)) if web else ""
         prompt = (
             f"Downloaded album folder name:\n  {download_name}\n\n"
             f"Albums the user already owns by this artist:\n{listing}\n\n"
+            f"{seen}"
             "Which one is the SAME album as the download? "
             "Reply with the exact owned title, or NONE."
         )

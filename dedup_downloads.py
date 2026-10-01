@@ -442,7 +442,13 @@ def album_complete_in_library(
             owned = sorted({a.get("title", "") for a in albums
                             if a.get("title") and _owned(a)})
             if owned:
-                picked = llm.pick_owned_album(album, owned)
+                web = getattr(lidarr, "web", None)
+                if web is not None:
+                    picked = llm.pick_owned_album(
+                        album, owned,
+                        evidence=lambda: web.titles("%s %s album" % (artist, album)))
+                else:
+                    picked = llm.pick_owned_album(album, owned)
                 if is_unavailable(picked):
                     if out is not None:
                         out["llm_deferred"] = True
