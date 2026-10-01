@@ -32,8 +32,9 @@ build) with the repo's `*.py` and `tools/`, checks `OrchestratorConfig` is
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20261001-artistpath`**
-(24e76fd). Earlier tags for rollback: `guard-20261001-queued`,
+then is the container replaced. Live now: **`guard-20261001-artistnames`**
+(10017ac). Earlier tags for rollback: `guard-20261001-artistpath`,
+`guard-20261001-queued`,
 `guard-20261001-manualmark`,
 `guard-20261001-relafter`,
 `guard-20261001-askall`,
