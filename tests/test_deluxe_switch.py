@@ -163,6 +163,30 @@ class DeluxeSwitch(unittest.TestCase):
         self.assertEqual((lid.switches, imported), ([], []))
         self.assertIn("another record, not switched", out)
 
+    def test_only_a_switch_spends_the_pass_budget(self):
+        # 303 albums had untracked files; looking at one that has no edition
+        # spent the 10-per-pass budget all the same.
+        d, o, root, lid, imported = _setup(dlx_titles=("W", "X", "Y", "Z"))
+        self.addCleanup(d.cleanup)
+        budget = [1]
+        out = o._switch_to_fitting_release({"id": 5, "title": "Album"}, 3, root,
+                                           budget=budget)
+        self.assertIn("no bigger release fits", out)
+        self.assertEqual(budget, [1])
+        lid.dlx_titles = ("Alpha", "Beta", "Gamma", "Delta")
+        o._switch_to_fitting_release({"id": 5, "title": "Album"}, 3, root,
+                                     budget=budget)
+        self.assertEqual((budget, lid.switches), ([0], [DLX]))
+        lid.monitored, lid.filed = STD, 2
+        out = o._switch_to_fitting_release({"id": 5, "title": "Album"}, 3, root,
+                                           budget=budget)
+        self.assertEqual((out, lid.switches), ("deferred (per-pass limit)", [DLX]))
+        # ... and the audit hands it the budget instead of spending it first.
+        import inspect
+        src = inspect.getsource(Orchestrator)
+        self.assertIn("album_rec, aid, album_dir, budget=deluxe_budget)", src)
+        self.assertNotIn("deluxe_budget[0] -= 1", src)
+
     def test_nothing_is_filed_or_counted_before_lidarr_takes_the_switch(self):
         d, o, root, lid, imported = _setup()
         self.addCleanup(d.cleanup)

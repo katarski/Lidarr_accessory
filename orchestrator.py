@@ -5854,7 +5854,9 @@ class Orchestrator:
         return alb
 
     # Bigger-edition switches one audit pass may make (each is a release PUT
-    # and an import Lidarr parses); the rest wait for the next pass.
+    # and an import Lidarr parses); the rest wait for the next pass. Only a
+    # switch is counted: the look that finds no edition is a few reads, and
+    # charged to the budget it let 10 of 303 albums be looked at per pass.
     _DELUXE_PER_PASS = 10
 
     def _album_audio_everywhere(self, album_dir: Path) -> List[Path]:
@@ -5885,7 +5887,8 @@ class Orchestrator:
             time.sleep(self._SETTLE_POLL)
 
     def _switch_to_fitting_release(self, album_rec: Dict[str, Any],
-                                   artist_id: int, album_dir: Path) -> str:
+                                   artist_id: int, album_dir: Path,
+                                   budget: Optional[List[int]] = None) -> str:
         """An album Lidarr holds complete whose folder holds more: the files
         of a bigger edition sit beside it, untracked. `Radiohead / Pablo
         Honey`: the 12-track release is filed at the top of the folder, and
@@ -5900,6 +5903,7 @@ class Orchestrator:
         Lidarr holds. Then file them by title (_import_library_folder_by_tracknumber only
         fills empty tracks). If the album ends up holding fewer files than
         before, the old release is restored and its files filed again.
+        `budget` ([switches left this pass]) is spent only on a switch.
         Returns what was done, for the audit report."""
         from collections import Counter
         from song_harvest import norm_title
@@ -5981,6 +5985,10 @@ class Orchestrator:
         rid, n = int(r["id"]), int(r.get("trackCount") or 0)
         prev_n = next((int(x.get("trackCount") or 0) for x in rels
                        if x.get("id") == prev), 0)
+        if budget is not None:
+            if budget[0] <= 0:
+                return "deferred (per-pass limit)"
+            budget[0] -= 1
         if not self.lidarr.set_album_monitored_release(album_id, rid):
             return "Lidarr refused the switch to release %s" % rid
         self._settled_tracks(album_id, n)
@@ -9667,12 +9675,8 @@ class Orchestrator:
                             aid = int(artist_rec["id"])
                             if (album_rec is not None and reason.startswith(
                                     "album has untracked files")):
-                                if deluxe_budget[0] <= 0:
-                                    action_taken = "deferred (per-pass limit)"
-                                else:
-                                    deluxe_budget[0] -= 1
-                                    action_taken = self._switch_to_fitting_release(
-                                        album_rec, aid, album_dir)
+                                action_taken = self._switch_to_fitting_release(
+                                    album_rec, aid, album_dir, budget=deluxe_budget)
                                 raise _AuditSkip()
                             # Re-check album state LIVE before acting.
                             # The cached index may be stale; if Lidarr now
