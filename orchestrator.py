@@ -8727,6 +8727,18 @@ class Orchestrator:
         )
 
         artist_id = imported_artist_id
+        if not artist_id:
+            # The CUE's performer is not always Lidarr's artist: 'Ray Parker
+            # Jr. And Raydio' for an album Lidarr files under 'Ray Parker
+            # Jr.' -- 8/8 in the library, recorded "imported_unverified". The
+            # folder the files landed in names the artist Lidarr used.
+            try:
+                if not self.lidarr.find_artist(artist_name):
+                    rec = self.lidarr.find_artist(album_dir.parent.name)
+                    if rec and rec.get("id"):
+                        artist_id = int(rec["id"])
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("post-import artist from folder failed: %s", exc)
         last_report = 0.0
         refresh_tried = False
         scan_tried = False
