@@ -1362,6 +1362,12 @@ def main() -> int:
     # UNAVAILABLE -- deferred by the caller, never recorded as a "no".
     ollama_client, label = build_llm(ollama_cfg)
     if ollama_client is not None:
+        try:
+            n = ollama_client.use_answer_file(
+                Path(args.config).parent / "llm_answers.json")
+            logger.info("LLM: %d earlier answer(s) loaded -- not asked again", n)
+        except Exception as _exc:  # noqa: BLE001
+            logger.warning("LLM answer file not usable: %s", _exc)
         if ollama_client.ping():
             logger.info("LLM reachable: %s", label)
         else:

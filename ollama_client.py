@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import time
 from typing import List, Optional
@@ -33,6 +34,51 @@ import requests
 import titlematch
 
 logger = logging.getLogger(__name__)
+
+
+class _AnswerFile(dict):
+    """The model's answers, kept across restarts: every container recreate
+    emptied the in-memory cache, and 324 asks in four days were 132
+    questions. Keyed by question; each entry also names the model that gave
+    it, and an answer from another model or older than `max_age_days` is not
+    loaded. Written whole (temp file + os.replace) on every new answer --
+    a few hundred small entries. UNAVAILABLE is never stored: it is not an
+    answer."""
+
+    def __init__(self, path, model: str, max_age_days: float = 30.0):
+        super().__init__()
+        self.path, self.model = path, model
+        self._stamp: dict = {}
+        cutoff = time.time() - max_age_days * 86400
+        try:
+            with open(path, encoding="utf-8") as fh:
+                rows = json.load(fh)
+        except (OSError, ValueError):
+            rows = []
+        for row in rows if isinstance(rows, list) else []:
+            try:
+                kind, text, titles, answer, model_, ts = row
+            except (TypeError, ValueError):
+                continue
+            if model_ == model and float(ts) >= cutoff:
+                key = (kind, text, frozenset(titles))
+                super().__setitem__(key, answer)
+                self._stamp[key] = float(ts)
+
+    def __setitem__(self, key, answer) -> None:
+        if is_unavailable(answer):
+            return
+        super().__setitem__(key, answer)
+        self._stamp[key] = time.time()
+        rows = [[k[0], k[1], sorted(k[2]), v, self.model, self._stamp.get(k, 0)]
+                for k, v in self.items()]
+        tmp = "%s.tmp" % self.path
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(rows, fh, ensure_ascii=False)
+            os.replace(tmp, self.path)
+        except OSError as exc:
+            logger.debug("LLM answer file %s not written: %s", self.path, exc)
 
 
 class _Unavailable(str):
@@ -203,6 +249,12 @@ class OllamaClient:
         # Cleared only by restart (library growth changes the owned list and so
         # the key, so staleness self-heals).
         self._match_cache: dict = {}
+
+    def use_answer_file(self, path) -> int:
+        """Keep this client's answers in `path` across restarts (see
+        _AnswerFile). Returns how many were loaded."""
+        self._match_cache = _AnswerFile(str(path), self.model)
+        return len(self._match_cache)
 
     # ---------- low-level ------------------------------------------------
 
