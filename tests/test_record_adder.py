@@ -148,6 +148,8 @@ class _Lidarr:
         self.held = None if held is None else list(held)
         self.releases = [{"id": 9, "foreignReleaseId": "r6", "monitored": True}]
         self.bare_until = bare_until     # refreshes before an album has releases
+        self.manual = self.deleted = False
+        self.switches = []
 
     def lookup_albums(self, term):
         if term != "Donny Hathaway In Performance":
@@ -161,18 +163,27 @@ class _Lidarr:
 
     def add_album_unmonitored(self, resource, artist_id):
         self.added.append((resource["foreignAlbumId"], artist_id))
+        self.manual = True
         return {"id": 46993}
 
     def get_album(self, i):
+        if self.deleted:
+            return None
         if self.refreshed < self.bare_until:
             return {"id": i, "title": "In Performance", "releases": []}
         return {"id": i, "title": "In Performance", "releases": self.releases}
 
     def list_tracks_for_album(self, i):
+        if self.deleted:
+            return []
         return [{"id": k, "hasFile": k < self.filled} for k in range(6)]
 
     def refresh_artist(self, aid, force=False):
         self.refreshed += 1
+        # Lidarr's RefreshAlbumService.ShouldDelete: outside the profile,
+        # not manual, no files -- gone.
+        if self.added and not self.manual and not self.filled:
+            self.deleted = True
         if self.links:
             self.filled = 6
         return 5
@@ -180,7 +191,10 @@ class _Lidarr:
     def wait_for_command(self, cmd, timeout_seconds=60):
         return {}
 
-    def set_album_monitored_release(self, a, r):
+    def set_album_monitored_release(self, a, r, keep_manual=False):
+        self.switches.append((self.refreshed, r, keep_manual))
+        if not keep_manual:
+            self.manual = False          # the PUT copies addOptions from its body
         for rel in self.releases:
             rel["monitored"] = rel["id"] == r
         return True
@@ -282,6 +296,27 @@ class GiveLidarrTheRecord(unittest.TestCase):
                                   "(its name)", bare)
             self.assertEqual((lid.refreshed, lid.removed), (bare, []))
 
+    def test_an_added_record_keeps_its_manual_mark_through_the_switch(self):
+        # Lorde / 'Te ao mārama' (live, 13:03 and 13:40): releases came with
+        # the add, the switch's PUT dropped addType manual, and the refresh
+        # deleted the album (outside the profile, no files).
+        lid = _Lidarr(links=False)
+        lid.releases = [{"id": 8, "foreignReleaseId": "r5", "monitored": True},
+                        {"id": 9, "foreignReleaseId": "r6", "monitored": False}]
+        o = _orch(lid)
+
+        def by_title(rec, aid, audios):
+            if [r["foreignReleaseId"] for r in rec["releases"] if r["monitored"]] == ["r6"]:
+                lid.filled = 6
+                return 77
+            return None
+        o._import_library_folder_by_tracknumber = by_title
+        out = o._give_lidarr_the_record(113, ARTIST, self.audios, ["In Performance"])
+        self.assertEqual(out, "record: added 'In Performance' (Album/Live) to "
+                              "Lidarr, unmonitored -- 6 of 6 track(s) filed "
+                              "(its name)")
+        self.assertEqual(lid.switches, [(1, 9, True)])   # after the refresh, mark kept
+
     def test_a_bigger_edition_of_a_listed_record_is_not_called_a_copy(self):
         # Don Davis / '2008 - The Matrix The Deluxe Edition': 30 songs, while
         # Lidarr held 10 on its 10-track release from another folder.
@@ -336,6 +371,20 @@ class AddedBody(unittest.TestCase):
                          ("/api/v1/album", 113, False,
                           {"addType": "manual", "searchForNewAlbum": False}))
         self.assertNotIn("id", body)
+
+    def test_a_switch_on_an_added_album_keeps_it_manual(self):
+        from lidarr import LidarrClient
+        sent = []
+        c = LidarrClient.__new__(LidarrClient)
+        c.get_album = lambda i: {"id": i, "addOptions": None,
+                                 "releases": [{"id": 8, "monitored": True},
+                                              {"id": 9, "monitored": False}]}
+        c._put = lambda path, body: sent.append(body)
+        c.set_album_monitored_release(5, 9, keep_manual=True)
+        c.set_album_monitored_release(5, 9)
+        self.assertEqual(sent[0]["addOptions"],
+                         {"addType": "manual", "searchForNewAlbum": False})
+        self.assertIsNone(sent[1]["addOptions"])
 
 
 if __name__ == "__main__":

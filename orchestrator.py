@@ -5958,12 +5958,10 @@ class Orchestrator:
                     "on its %s-track release; this folder is the %d-track one "
                     "(%s), not switched" % (title, filled, mon.get("trackCount") or "?",
                                             res["tracks"], res["via"]))
-        if not filled and rid and not next(
-                (r.get("monitored") for r in full.get("releases") or []
-                 if r.get("id") == rid), False):
-            self.lidarr.set_album_monitored_release(album_id, int(rid))
         # Lidarr's refresh rescans the artist folder and links files that
-        # fit; what it leaves is filed by title.
+        # fit; what it leaves is filed by title. No release is switched
+        # before it: the switch's PUT cost Lorde's 'Te ao mārama' its
+        # manual mark, and that refresh deleted the album (no files yet).
         cmd = self.lidarr.refresh_artist(artist_id, force=True)
         if cmd:
             self.lidarr.wait_for_command(int(cmd), timeout_seconds=300)
@@ -5990,7 +5988,8 @@ class Orchestrator:
                 # was given the 5-track one titled in Māori alone, and the
                 # files ('Te ara tika + The Path') contradicted it. The
                 # folder is filed on the release it fits.
-                self.lidarr.set_album_monitored_release(album_id, int(rid))
+                self.lidarr.set_album_monitored_release(
+                    album_id, int(rid), keep_manual=not alb.get("id"))
                 self._settled_tracks(album_id, int(next(
                     (r.get("trackCount") for r in rels if r.get("id") == rid), 0)
                     or res["tracks"]))

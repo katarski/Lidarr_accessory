@@ -291,13 +291,19 @@ class LidarrClient:
         return album.get("releases") or []
 
     def set_album_monitored_release(
-        self, album_id: int, release_id: int
+        self, album_id: int, release_id: int, keep_manual: bool = False,
     ) -> bool:
         """
         PUT /api/v1/album/{id} with the given release marked monitored=True
         and all other releases monitored=False. Lidarr's ManualImport maps
         files against the monitored release, so switching it lets us import
         files whose track count differs from the default release.
+
+        `keep_manual`: the album was added by hand (addType manual). The PUT
+        copies addOptions from its body and the GET never shows them, so the
+        mark is lost -- and a refresh deletes an album the metadata profile
+        leaves out that is not manual and holds no files (Lidarr's
+        RefreshAlbumService.ShouldDelete). Lorde's 'Te ao mārama' EP went so.
         """
         album = self.get_album(album_id)
         if not album:
@@ -312,6 +318,8 @@ class LidarrClient:
         for r in releases:
             r["monitored"] = (r.get("id") == release_id)
         album["releases"] = releases
+        if keep_manual:
+            album["addOptions"] = {"addType": "manual", "searchForNewAlbum": False}
         try:
             self._put(f"/api/v1/album/{album_id}", album)
             logger.info(
