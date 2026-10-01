@@ -327,14 +327,15 @@ class MusicBrainzClient:
     def release_groups(
         self, artist_mbid: str, studio_only: bool = True,
         include_eps: bool = False, page_limit: int = 100,
-        max_pages: int = 6,
+        max_pages: int = 6, all_types: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Every release-group (album-level record) MusicBrainz has for an artist.
 
         `studio_only` drops release-groups carrying a non-studio secondary type
         (compilation / live / remix / soundtrack / demo ...), matching the
-        pipeline's "official releases only" rule. `include_eps` also keeps EPs.
+        pipeline's "official releases only" rule. `include_eps` also keeps EPs;
+        `all_types` keeps every primary type (singles too).
 
         Returns [{title, type, secondary_types, first_release_date, mbid}],
         oldest first. Empty on any failure -- callers must treat empty as
@@ -355,7 +356,7 @@ class MusicBrainzClient:
                 primary = str(g.get("primary-type") or "").strip().lower()
                 secondary = [str(s or "").strip().lower()
                              for s in (g.get("secondary-types") or [])]
-                if primary and primary not in wanted_primary:
+                if primary and primary not in wanted_primary and not all_types:
                     continue
                 if studio_only and any(
                         s in NON_STUDIO_SECONDARY for s in secondary):

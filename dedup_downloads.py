@@ -238,6 +238,34 @@ def _records_named(core: list, albums: list, artist_words: set) -> list:
     return out
 
 
+def _musicbrainz_identity(lidarr, arec, album: str, albums: list):
+    """Which of the artist's records MusicBrainz says `album` is:
+    ("album", rec) for one of the artist's Lidarr albums, ("other", title)
+    for a record Lidarr does not list -- which it therefore cannot hold --
+    or None when MusicBrainz cannot tell (no client, no artist id, no answer,
+    no record with this core, or several Lidarr albums)."""
+    mb = getattr(lidarr, "mb", None)
+    mbid = (arec or {}).get("foreignArtistId")
+    core = _core(album)
+    if mb is None or not mbid or not core:
+        return None
+    try:
+        groups = mb.release_groups(mbid, studio_only=False, include_eps=True,
+                                   all_types=True) or []
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("musicbrainz release groups for %s failed: %s", mbid, exc)
+        return None
+    hits = [g for g in groups if _core(g.get("title") or "") == core]
+    if not hits:
+        return None
+    by_fid = {str(a.get("foreignAlbumId") or ""): a for a in albums}
+    listed = [by_fid[str(g.get("mbid"))] for g in hits
+              if str(g.get("mbid")) in by_fid]
+    if listed:
+        return ("album", listed[0]) if len(listed) == 1 else None
+    return ("other", hits[0].get("title"))
+
+
 def _pick_among_same_title(same_title, album: str, folder_hint):
     """
     The album a download names, from the albums that share its title, as
@@ -388,6 +416,18 @@ def album_complete_in_library(
                             best = (len(ow_words), a)
                 if best is not None:
                     alb = best[1]
+        # MusicBrainz knows the records Lidarr's list leaves out (singles,
+        # compilations, other editions): a download it names as one of those
+        # is a record Lidarr cannot hold. VOCES8's 'A Choral Christmas'
+        # (2023) went to the model, which said the owned 'Christmas' (2012).
+        if alb is None:
+            mbid_says = _musicbrainz_identity(lidarr, arec, album, albums)
+            if mbid_says and mbid_says[0] == "album":
+                alb = mbid_says[1]
+            elif mbid_says:
+                logger.info("  %r is %r on MusicBrainz, a record Lidarr does "
+                            "not list -- not owned", album[:60], mbid_says[1])
+                return False, 0, 0
         # AI fallback: only when the deterministic matches missed. Ask the LLM to
         # map the download folder to an album the user ACTUALLY OWNS (has files
         # for). It never sees not-owned albums, so it can't cause us to deselect
