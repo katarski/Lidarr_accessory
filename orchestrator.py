@@ -3542,6 +3542,14 @@ class Orchestrator:
             # one more try under the rules that can (the attempt is counted
             # again, so a second failure gives up for good).
             return None
+        if attempts == cap and float(ts) < self._SPLIT_ONCE_SINCE:
+            # Given up under the old rules, when a refused import kept the
+            # image and each disc of an album was imported alone: one more
+            # try under the rules that split once, delete the image and
+            # .cue, and import a multi-disc album whole (31 Oct; Christina
+            # Aguilera's '1999 - 2003' CD-1 had given up and held its album
+            # back). The attempt is counted, so a second failure gives up.
+            return None
         if attempts >= cap:
             return (f"gave up after {attempts} attempt(s) ({outcome} at "
                     f"{when}{with_album}); it is in the WebUI needs-attention "
@@ -3550,6 +3558,8 @@ class Orchestrator:
 
     # 1 Oct 2026 02:00 CEST: multi-image sheets became splittable.
     _MULTI_IMAGE_SINCE = 1790812800.0
+    # 31 Oct 2026 14:44 CET: a CUE is split once and its image and .cue go.
+    _SPLIT_ONCE_SINCE = 1793454285.0
 
     def _cue_is_multi_image(self, cue_path: Path) -> bool:
         try:
