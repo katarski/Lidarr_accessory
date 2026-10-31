@@ -46,7 +46,8 @@ from dedup_downloads import _EDITION_WORDS as _EDITION_NOISE_WORDS
 from held_store import HeldStore
 from lidarr import LidarrClient, _demojibake, _translit_cyrillic
 from ollama_client import OllamaClient, is_unavailable
-from splitter import SplitResult, probe_duration, repair_leadin, split_cue
+from splitter import (SplitResult, incomplete_splits, probe_duration,
+                      repair_leadin, split_cue)
 from tagger import TagPlan, album_folder_name, tag_splits
 
 logger = logging.getLogger(__name__)
@@ -1487,14 +1488,34 @@ class Orchestrator:
         splits = self._rename_to_plan(splits, plans, cue)
 
         # Extraction + tagging succeeded, and the split files now live in
-        # staging. We deliberately do NOT delete or park the source disc
-        # image + .cue here. Nothing about the source is touched until the
-        # import is verified to have actually landed in the library (see
-        # the post-verification block below). This is the guarantee:
-        # a source is only ever removed once its tracks are confirmed in
-        # the library -- whether the move was done by Lidarr or by our own
-        # manual-move fallback. If the import fails, the originals stay put
-        # so the album can be recovered or retried.
+        # staging. Until 31 Oct the source disc image + .cue stayed until the
+        # import was verified, so a refused import kept them -- and the CUE
+        # was split again on each of its retries (Chambao's 'Caminando' CD1
+        # at 13:19 and 13:51 that day, a Christina Aguilera disc 10 times on
+        # 1 Oct). The owner, 31 Oct: "the original should be deleted after
+        # the split. no point of keeping it", "then the cue should be deleted
+        # too". So once every track is checked whole and as long as the
+        # sheet says, the image(s) and the .cue go now. The tracks are the
+        # album, losslessly; a refused import leaves them as a plain split
+        # folder, which the cueless sweep adopts and retries as one. A
+        # DTS-CD drops its own source below, after moving its tracks.
+        if _dts_decoded is None:
+            bad = incomplete_splits(splits, audio_path,
+                                    ffmpeg_binary=self.cfg.ffmpeg_binary)
+            if len(splits) != len(cue.tracks):
+                bad = bad or ["%d of %d tracks split" % (len(splits),
+                                                          len(cue.tracks))]
+            if bad:
+                logger.warning(
+                    "%s: not every split track checks out (%s) -- the disc "
+                    "image and .cue are kept", cue_path.name,
+                    ", ".join(bad[:5]))
+            else:
+                logger.info(
+                    "%s: all %d split tracks check out -- deleting the disc "
+                    "image and .cue before the import", cue_path.name,
+                    len(splits))
+                self._delete_originals(cue_path, audio_path)
 
         artist_name = (plans[0].albumartist if plans else cue.performer) or ""
         album_name = (plans[0].album if plans else cue.title) or ""

@@ -91,6 +91,13 @@ class SplitReuse(unittest.TestCase):
         _, enc = self.split(reuse=False)
         self.assertEqual(len(enc), 2)
 
+    def test_incomplete_splits_names_only_the_bad_tracks(self):
+        first, _ = self.split()
+        self.assertEqual(splitter.incomplete_splits(first, self.image), [])
+        first[1].output_path.write_bytes(b"")
+        self.assertEqual(splitter.incomplete_splits(first, self.image),
+                         [first[1].output_path.name])
+
 
 if __name__ == "__main__":
     unittest.main()

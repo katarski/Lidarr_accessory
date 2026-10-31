@@ -269,6 +269,30 @@ def split_cue(
     return results
 
 
+def incomplete_splits(
+    splits: List[SplitResult],
+    audio_path: Path,
+    ffmpeg_binary: str = "ffmpeg",
+) -> List[str]:
+    """Names of the tracks in `splits` that are not whole FLACs as long as the
+    sheet says (`_complete_split`); [] when every one is. Asked before the disc
+    image is deleted, so the image only goes when its tracks are all there."""
+    lengths: dict = {}
+    bad: List[str] = []
+    for s in splits:
+        t = s.track
+        if t.end_seconds is not None:
+            want = t.end_seconds - t.start_seconds
+        else:
+            src = Path(getattr(t, "source", None) or audio_path)
+            if src not in lengths:
+                lengths[src] = probe_duration(ffmpeg_binary, src)
+            want = (lengths[src] - t.start_seconds) if lengths[src] else None
+        if want is None or not _complete_split(s.output_path, want):
+            bad.append(s.output_path.name)
+    return bad
+
+
 # A split track's length against the sheet's. ffmpeg cuts at the sample, and
 # the tracks it wrote matched the sheet to the millisecond (Chambao 31 Oct).
 _SPLIT_LENGTH_TOLERANCE = 0.1
