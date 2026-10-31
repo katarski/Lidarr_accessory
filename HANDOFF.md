@@ -30,19 +30,26 @@ PARK only pulls):
 git push origin main
 tar --exclude=.git --exclude=__pycache__ -cf - . | ssh root@192.168.1.200   'rm -rf /tmp/cue_test && mkdir -p /tmp/cue_test && tar -xf - -C /tmp/cue_test'
 # PARK: tests in the image, sync the checkout, deploy
-docker run --rm -v /tmp/cue_test:/src -w /src -e PYTHONIOENCODING=utf-8   --entrypoint python cue_pipeline:pre-gate-20260929 -m unittest discover -s tests -t .
+docker run --rm -v /tmp/cue_test:/src -w /src -e PYTHONIOENCODING=utf-8   --entrypoint python cue_pipeline:base -m unittest discover -s tests -t .
 D=/mnt/cache/appdata/cue_pipeline_src
 git -c safe.directory=$D -C $D fetch -q origin && git -c safe.directory=$D -C $D reset -q --hard origin/main
 sh /tmp/cue_test/tools/deploy.sh guard-<date>-<what>
 ```
 
-`tools/deploy.sh` builds FROM `cue_pipeline:pre-gate-20260929` (the last full
-build) with the repo's `*.py` and `tools/`, checks `OrchestratorConfig` is
+`tools/deploy.sh` builds FROM `cue_pipeline:base` (a full build; until 31 Oct
+`pre-gate-20260929`, which an image prune had removed by then with every other
+image no container used: only `:latest` and `guard-20261001-artistnames` were
+left, and `base` was tagged from those. deploy.sh now refuses to start when the
+base is missing and prints the `docker tag` that recreates it) with the repo's `*.py` and `tools/`, checks `OrchestratorConfig` is
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20261001-artistnames`**
-(10017ac). Earlier tags for rollback: `guard-20261001-artistpath`,
+then is the container replaced. Live now: **`guard-20261031-qwen38`**
+(02fb97b; the LLM model fix and the two commits of 1 Oct below, deployed
+31 Oct by the nv3090 session over SSH). Earlier tags for rollback:
+`guard-20261001-artistnames` (10017ac; the only earlier tag the prune left; the
+ones listed next are gone from PARK, their archives are in
+`/mnt/user/System Backups/docker-images/`), `guard-20261001-artistpath`,
 `guard-20261001-queued`,
 `guard-20261001-manualmark`,
 `guard-20261001-relafter`,
@@ -759,6 +766,18 @@ test of a feature whose purpose is removing files.
 
 ## 6. Open items
 
+0. **31 Oct, started again after 11 days stopped** (Signal 15 on 20 Oct
+   16:46; Lidarr stopped since 28 Oct 11:31, started 31 Oct). Fixed then:
+   the template's `LLM_MODEL` named `huihui_ai/Qwen3.6-abliterated:27b`,
+   which DANIEL's Ollama (0.40.13) does not have (only
+   `huihui_ai/Qwen3.8-abliterated:27b` and `qwen3.8:27b`): changed in
+   `my-cue_pipeline.xml` (backup `.bak-20261031-qwen38`). If HA still asks for
+   the 3.6 name it fails the same way: check HA's model on DANIEL's side.
+   c9e9213 and 02fb97b (1 Oct, committed, never deployed) are live too: 385
+   tests OK in the image. **Pushing from an SSH session on DANIEL fails**
+   (Git Credential Manager cannot reach Windows Credential Manager there):
+   commits made that way wait for the owner's push (GitHub Desktop, Push).
+
 1. **0 audit findings are open: `docs/AUDIT_OPEN.md`**, in fix order, each
    with evidence, root cause and the agreed fix (the verifier's correction
    where there was one). Start at item 1 (none). 91 are fixed;
@@ -816,7 +835,7 @@ test of a feature whose purpose is removing files.
 | Lidarr | `http://park:8686` (`park` resolves inside the container) |
 | Prowlarr | `http://192.168.1.200:9696` |
 | qBittorrent | `http://park:8080`, category **`lidarr`** — never touch others |
-| LLM | `http://daniel:11434`, **HA's own** `huihui_ai/Qwen3.6-abliterated:27b`, `num_ctx 16384`, `think false` — one runner serves both. Asked only when the GPU gate is open (HA sensors via `HA_URL`/`HA_TOKEN`); `keep_alive` 600 never shortens HA's; `warmup_on_start` false |
+| LLM | `http://daniel:11434`, **HA's own** `huihui_ai/Qwen3.8-abliterated:27b` (31 Oct; was `Qwen3.6`, which DANIEL's Ollama no longer has: every ask got "model not found"), `num_ctx 16384`, `think false` — one runner serves both. Asked only when the GPU gate is open (HA sensors via `HA_URL`/`HA_TOKEN`); `keep_alive` 600 never shortens HA's; `warmup_on_start` false |
 | WebUI | `http://192.168.1.200:8830` |
 | Container limits | `--cpuset-cpus 1,3,7,9 --cpus 2.0 --cpu-shares 256 --memory 4g` |
 

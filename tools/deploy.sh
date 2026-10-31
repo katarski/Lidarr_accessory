@@ -1,13 +1,26 @@
 #!/bin/sh
 # Incremental cue_pipeline deploy from /tmp/cue_test (a tar of the repo).
-# Base image: cue_pipeline:pre-gate-20260929 (the last full build). Never
-# Edit->Apply; tpl2run + mkrun.py assertions; recreate only if all pass.
+# Base image: cue_pipeline:base (a full build; every *.py and tools/ are
+# copied over it). Never Edit->Apply; tpl2run + mkrun.py assertions;
+# recreate only if all pass.
+#
+# The base was cue_pipeline:pre-gate-20260929 until 31 Oct, when it was found
+# gone: an image prune between 1 and 31 Oct removed every image no container
+# used, tagged or not, leaving only :latest. A prune can do that again, so a
+# missing base stops the deploy before anything is touched, naming the fix.
 set -e
 TAG=${1:?usage: cue_deploy.sh <guard-tag>}
+BASE=${BASE:-cue_pipeline:base}
+if ! docker image inspect "$BASE" >/dev/null 2>&1; then
+  echo "base image $BASE is missing (pruned?). Recreate it from the live image:" >&2
+  echo "  docker tag cue_pipeline:latest $BASE" >&2
+  echo "or load an archive from /mnt/user/System Backups/docker-images/." >&2
+  exit 1
+fi
 rm -rf /tmp/cuebuild && mkdir /tmp/cuebuild
 cp /tmp/cue_test/*.py /tmp/cuebuild/ && cp -r /tmp/cue_test/tools /tmp/cuebuild/tools
 chmod -R a+rX /tmp/cuebuild
-printf 'FROM cue_pipeline:pre-gate-20260929\nCOPY *.py /app/\nCOPY tools/ /app/tools/\n' > /tmp/cuebuild/Dockerfile
+printf 'FROM %s\nCOPY *.py /app/\nCOPY tools/ /app/tools/\n' "$BASE" > /tmp/cuebuild/Dockerfile
 docker build -q -t cue_pipeline:latest -t "cue_pipeline:$TAG" /tmp/cuebuild >/dev/null
 docker run --rm --user 99:100 --entrypoint python cue_pipeline:latest -c \
   "import main, orchestrator, dataclasses; assert dataclasses.is_dataclass(orchestrator.OrchestratorConfig)"
