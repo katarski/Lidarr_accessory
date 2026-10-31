@@ -44,14 +44,19 @@ base is missing and prints the `docker tag` that recreates it) with the repo's `
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20261031-sacdchain`**
-(8cb2f11, deployed 31 Oct 19:43 by the nv3090 session over SSH once no job
-ran. Watched: 19:43:48 Lara Fabian 9's ISO deleted ("its 11 FLAC carry the
-whole 6-channel area"), 19:44-19:46 hand-off, Lidarr now 11 FLAC at 6 ch in
-place of the AAC stereo copies, 20:34:03 "lifecycle: REMOVED (disc image
-spent, its tracks imported)" and the download folder gone). Earlier tags for
-rollback, newest first: `guard-20261031-twincues` (d403c1e, 18:53; at 19:06
-it deleted '2 Unlimited - II (Enhanced) wav.cue'),
+then is the container replaced. Live now: **`guard-20261031-nopictures`**
+(6a29b04, deployed 31 Oct 23:35 by the nv3090 session over SSH once no job
+ran. Watched: from 23:36 the re-checks deselected the pictures of 20
+torrents in 11 minutes ("PICTURES -> deselect N picture file(s)", each one
+"-> deselected"), no error; torrents with pictures still to download went
+from 36 to 16 by 23:48, the rest waiting for their 30-minute re-check). The
+owner also had Lidarr's own artist and album images turned off (Settings >
+Metadata: Kodi/Emby and Roksbox, 23:34). Earlier tags for rollback, newest
+first: `guard-20261031-sacdchain` (8cb2f11, 19:43; Lara Fabian 9's ISO
+deleted at 19:43:48, 11 FLAC at 6 ch replaced the AAC stereo copies
+19:44-19:46, the torrent and its folder removed at 20:34:03),
+`guard-20261031-twincues` (d403c1e, 18:53; at 19:06 it deleted '2 Unlimited
+- II (Enhanced) wav.cue'),
 `guard-20261031-handadded` (9d94200 with e0c62da,
 c1936aa and 027984f; 16:16), `guard-20261031-wronggrab`
 (ddf89d6), `guard-20261031-recorddl` (6e934df),
