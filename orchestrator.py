@@ -1527,6 +1527,7 @@ class Orchestrator:
                 # no disc of it holds a .cue any more.
                 unit = self._multidisc_cue_unit(cue_path)
                 if unit is not None:
+                    self._tag_disc_number(splits, cue_path.parent, unit[0])
                     moved = self._disc_tracks_into_disc_folder(
                         splits, cue_path.parent, staging_dir)
                     waiting = [c.parent.name for c in unit[1] if c.exists()]
@@ -5537,6 +5538,127 @@ class Orchestrator:
         )
         return True
 
+    def _give_lidarr_the_download(
+        self, key_path: Path, folder: Path, audios: List[Path],
+        artist_name: str, album_name: str, reason: str,
+    ) -> bool:
+        """
+        A download no album Lidarr lists will take: find the record its songs
+        ARE on MusicBrainz (record_adder.identify_record -- the library audit's
+        record step, 1 Oct), give Lidarr that album and import the folder into
+        it by explicit trackId. True if files landed.
+
+        The owner, 31 Oct: "it should force a sync with lidarr and then qbit
+        is out of the picture once sync is correct, given that musicbrainz ...
+        confirms this is the correct music for the missing album/artist".
+        Lidarr's metadata profile leaves out compilations, live albums, EPs
+        and singles, so such a download was "no monitored album" for good;
+        the record step did this for library folders only (open item 13).
+        The album is added unmonitored, as the record step adds it: Lidarr
+        holds it and its files without searching for it. Lidarr rewrites the
+        imported files' tags from MusicBrainz (writeAudioTags=sync), names and
+        ids both. An album added here that nothing lands in is removed again.
+        """
+        if not audios:
+            return False
+        from record_adder import identify_record
+        from song_harvest import norm_title
+        tag_artist = ""
+        for p in audios[:3]:
+            tag_artist = (self._read_audio_tags(p) or ("", ""))[0]
+            if tag_artist:
+                break
+        artist_rec = None
+        for nm in (artist_name, tag_artist):
+            if not nm:
+                continue
+            try:
+                artist_rec = self.lidarr.find_artist(nm)
+            except Exception:  # noqa: BLE001
+                artist_rec = None
+            if artist_rec and artist_rec.get("id"):
+                break
+            artist_rec = None
+        if not artist_rec:
+            logger.info("Record step (download): %s -- artist %r is not in "
+                        "Lidarr", folder.name[:50], artist_name or tag_artist)
+            return False
+        aid = int(artist_rec["id"])
+        songs = [(title, float(self._audio_duration_seconds(p) or 0.0))
+                 for p, title in self._record_song_titles(audios)]
+        gen = self._lidarr_generation()
+        res, why = identify_record(
+            self.lidarr, artist_rec,
+            [self._album_from_tags(audios), album_name, folder.name],
+            songs, len(audios), norm_title,
+            mb=getattr(self.lidarr, "mb", None), web=getattr(self.lidarr, "web", None))
+        if self._lidarr_generation() != gen:
+            return False
+        if res is None:
+            logger.info("Record step (download): %s -- %s", folder.name[:50], why)
+            return False
+        alb, rel = res["album"], res["release"]
+        title = str(alb.get("title") or "")
+        added = False
+        if alb.get("id"):
+            album_id = int(alb["id"])
+        else:
+            new = self.lidarr.add_album_unmonitored(alb, aid)
+            if not new or not new.get("id"):
+                logger.info("Record step (download): %s -- Lidarr refused to "
+                            "add %r", folder.name[:50], title)
+                return False
+            album_id, added = int(new["id"]), True
+            logger.info("Record step (download): added %r to Lidarr, "
+                        "unmonitored -- %s, %d of %d song(s) on release %s",
+                        title, res["via"], res["hit"], len(songs),
+                        rel.get("foreignReleaseId"))
+        full = self.lidarr.get_album(album_id) or {}
+        if not full.get("releases"):
+            # An added album has no releases until a refresh has read it.
+            for _ in range(2):
+                cmd = self.lidarr.refresh_artist(aid, force=True)
+                if cmd:
+                    self.lidarr.wait_for_command(int(cmd), timeout_seconds=300)
+                full = self.lidarr.get_album(album_id) or full
+                if full.get("releases"):
+                    break
+        rels = full.get("releases") or []
+        rid = next((r.get("id") for r in rels
+                    if r.get("foreignReleaseId") == rel.get("foreignReleaseId")), None)
+        if rid and not next((r.get("monitored") for r in rels
+                             if r.get("id") == rid), False):
+            # The folder is filed on the release it fits, not the one Lidarr
+            # picked (record step: Lorde's 'Te ao mārama').
+            self.lidarr.set_album_monitored_release(album_id, int(rid),
+                                                    keep_manual=added)
+            full = self.lidarr.get_album(album_id) or full
+        cmd = self._import_library_folder_by_tracknumber(full, aid, audios)
+        filled = 0
+        if cmd:
+            self.lidarr.wait_for_command(int(cmd), timeout_seconds=600)
+            filled = sum(1 for t in (self.lidarr.list_tracks_for_album(album_id) or [])
+                         if t.get("hasFile"))
+        if not filled:
+            if added:
+                self.lidarr.remove_added_album(album_id)
+            logger.info("Record step (download): %s fits %r (%s), but Lidarr "
+                        "filed none of it%s", folder.name[:50], title, res["via"],
+                        " -- the album was removed again" if added else "")
+            return False
+        logger.info("Record step (download): %s -> %r, %d of %d track(s) filed "
+                    "(%s)", folder.name[:50], title, filled, res["tracks"],
+                    res["via"])
+        self._trigger_artist_refresh(str(artist_rec.get("artistName") or artist_name),
+                                     artist_id=aid)
+        self._record(
+            key_path, outcome="imported_via_manual", pre_split=True,
+            artist=str(artist_rec.get("artistName") or artist_name), album=title,
+            track_count=filled,
+            reason=("record step: %s after: %s" % (res["via"], reason))[:300],
+        )
+        return True
+
     # ---- what a grab was FOR -------------------------------------------
     # When the search grabs a torrent it knows exactly which album it wanted.
     # That fact used to be dropped on the floor: the download landed, and the
@@ -6973,6 +7095,10 @@ class Orchestrator:
                         key_path, folder, audios, artist_name, album_name,
                         reason):
                     return
+                if self._give_lidarr_the_download(
+                        key_path, folder, audios, artist_name, album_name,
+                        reason):
+                    return
                 logger.info(
                     "Pre-split: %s / %s has no monitored album in Lidarr "
                     "(compilation/live/best-of, or not in your metadata "
@@ -7139,6 +7265,9 @@ class Orchestrator:
             # be rescued this way.
             if self._rescue_by_song_titles(key_path, folder, audios,
                                            artist_name, album_name, reason):
+                return
+            if self._give_lidarr_the_download(key_path, folder, audios,
+                                              artist_name, album_name, reason):
                 return
             logger.warning(
                 "Pre-split handoff: no acceptable candidates (floor=%.0f%%) "
@@ -14922,6 +15051,32 @@ class Orchestrator:
                                 c.name)
                 except OSError as exc:
                     logger.warning("Could not delete %s: %s", c, exc)
+
+    def _tag_disc_number(self, splits: List[SplitResult], disc: Path,
+                         root: Path) -> None:
+        """discnumber/disctotal on a disc's split tracks, from its folder
+        ('CD-2' of two disc folders -> 2/2). Each disc's sheet numbers its
+        tracks from 1, so without it CD-1's and CD-2's track 1 are the same
+        (disc, track) to the import."""
+        m = re.search(r"\d{1,2}", disc.name or "")
+        if not m:
+            return
+        try:
+            total = sum(1 for d in root.iterdir() if d.is_dir()
+                        and self._DISC_SUBDIR_RE.match(d.name or ""))
+        except OSError:
+            total = 0
+        from mutagen.flac import FLAC
+        for sp in splits:
+            try:
+                f = FLAC(str(sp.output_path))
+                f["discnumber"] = str(int(m.group(0)))
+                if total:
+                    f["disctotal"] = str(total)
+                    f["totaldiscs"] = str(total)
+                f.save()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("discnumber on %s failed: %s", sp.output_path.name, exc)
 
     def _disc_tracks_into_disc_folder(self, splits: List[SplitResult],
                                       disc: Path, staging_dir: Path) -> int:
