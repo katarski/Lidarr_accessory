@@ -44,10 +44,10 @@ base is missing and prints the `docker tag` that recreates it) with the repo's `
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20261031-qwen38`**
-(02fb97b; the LLM model fix and the two commits of 1 Oct below, deployed
-31 Oct by the nv3090 session over SSH). Earlier tags for rollback:
-`guard-20261001-artistnames` (10017ac; the only earlier tag the prune left; the
+then is the container replaced. Live now: **`guard-20261031-unignorable`**
+(57e9807, deployed 31 Oct 13:44 by the nv3090 session over SSH). Earlier tags
+for rollback: `guard-20261031-qwen38` (02fb97b; the LLM model fix and the two
+commits of 1 Oct), `guard-20261001-artistnames` (10017ac; the only earlier tag the prune left; the
 ones listed next are gone from PARK, their archives are in
 `/mnt/user/System Backups/docker-images/`), `guard-20261001-artistpath`,
 `guard-20261001-queued`,
@@ -777,6 +777,15 @@ test of a feature whose purpose is removing files.
    tests OK in the image. **Pushing from an SSH session on DANIEL fails**
    (Git Credential Manager cannot reach Windows Credential Manager there):
    commits made that way wait for the owner's push (GitHub Desktop, Push).
+   Then a third fix, 57e9807: the queue reaper's DELETE of row 468890554 (no
+   artist/album) got Lidarr 3.1.6's NullReferenceException in
+   `IgnoredDownloadService.IgnoreDownload` (HTTP 500) every 10 minutes, and each
+   one counted against Lidarr. Now it's an answer: the row is remembered and
+   left to Lidarr. Verified live 13:48:27 (one INFO line, 0 errors). The deploy
+   at 13:44 killed Christina Aguilera 1999-2003 CD2's split at track 14/20,
+   which used one of its 3 attempts (item 13; it would have been refused anyway).
+   The three ERROR lines on 31 Oct (Chambao CD1/CD2, Christina CD1) are
+   strict_import_only refusals of compilations Lidarr doesn't carry: item 13.
 
 1. **0 audit findings are open: `docs/AUDIT_OPEN.md`**, in fix order, each
    with evidence, root cause and the agreed fix (the verifier's correction
