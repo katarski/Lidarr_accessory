@@ -654,7 +654,9 @@ layer says `http://daniel:11434`.
   album `have` (don't download) and `owned` (Lidarr holds it complete, matched
   without the LLM). Only `owned` may ground a delete; the lifecycle pass also
   requires `folder_fully_owned` for every on-disk folder, and never asks the
-  LLM. Uncategorised torrents are adopted only if they carry our own tag.
+  LLM. Uncategorised torrents are adopted only with proof they are ours (our
+  tag, `grab_targets.json`, a Lidarr Grabbed event); the rest are the owner's
+  and stay as they are (`handadded.py`, 31 Oct).
 - **A submitted import is not an import**: the harvest purge waits in the
   ledger (`pending`) until every submitted track has a file; unproven audio is
   never deleted; only the torrent whose content IS the folder is removed.
@@ -817,12 +819,57 @@ test of a feature whose purpose is removing files.
      removeFromClient, Lidarr re-searches (autoRedownloadFailed on), and the
      leftovers are deleted. Only when the folder holds every audio file of the
      torrent.
-   - *Hand-added torrents are adopted* (ddf89d6; the owner: "treat them like
-     Lidarr's"). Only when every file is audio or a rip sidecar: no video,
-     programs or archives.
-   Still open: a download whose artist Lidarr doesn't have is left alone, and
-   so is a hand-added download that is no record (no grab reason exists for
-   it).
+   - *A torrent added by hand stays* (e0c62da; replaces ddf89d6's "hand-added torrents
+     are adopted": the owner, 31 Oct 15:1x, "I dont understand the hand added
+     thing. if it hand added - it stays"; "if it found a better torrent than
+     the hand added one - we keep the better one!"). Asked, he chose: a worse
+     hand-added torrent goes with its files once Lidarr holds every song of it
+     in better quality; a better one, or music Lidarr lacks, goes in as a COPY
+     and the torrent and its files stay as they are. In code: an uncategorised
+     torrent is adopted only with proof it is ours (our tag, `grab_targets.json`,
+     or a Lidarr Grabbed event for its hash); every other one is hand-added.
+     `handadded.py` keeps their folders (refreshed each qbt pass, persisted in
+     `handadded.json`, loaded before the startup scan) and the CUE worker, the
+     cueless sweep, reconcile, the purge sweep, the harvest and
+     `_delete_originals` skip them. Only `Orchestrator.handadded_pass` (every
+     30 min) acts on them: it removes one with its files when Lidarr's
+     manual-import preview rejects every file as "not an upgrade" and every
+     library file is in a strictly higher quality group of the artist's profile,
+     and otherwise copies in whole albums Lidarr accepts (missing or upgrade),
+     or gives Lidarr the record (`_give_lidarr_the_download`, copy mode). A
+     hand-added CUE image is not split (a split would change the torrent).
+     The 45 torrents ddf89d6 adopted at 15:07 were all ours by that proof (40
+     Lidarr grab events, 5 in the grab record), so none was Dan's.
+   A download whose artist Lidarr doesn't have is a wrong grab when the
+   pipeline grabbed it (`_reject_wrong_grab` runs after the record step finds
+   no artist; e.g. Klaus Badelt's "Basic" grabbed for Ramin Djawadi's "House of
+   the Dragon: Season 3"), and stays when it was added by hand.
+   - *Lidarr's release protocol* (c1936aa). Lidarr 3.1.6.5079 (Park's image
+     update of 28 Oct, running since 31 Oct 13:09) names a release's protocol
+     "TorrentDownloadProtocol"; three filters kept only "torrent", so every
+     release was dropped: Find missing always answered "your indexers offered
+     no torrent", every interactive search logged "no torrent candidates" and
+     fell back to Prowlarr. `_is_torrent_release` takes both and the enum's 2.
+   - *Find missing answers at once* (027984f; the owner: "when i go to
+     assembly nd I hit find missing, I am not sure anythign happens"). The
+     hunt ran inside the click (Lidarr's artist and album searches, then a
+     grab) behind a 3-second toast, and a refusal was never logged. Now
+     `assembly_find_missing_start` queues it for one background thread
+     (cue-asm-find); the plan's `hunt` keeps state/note/finished, the row
+     shows it and refreshes every 15 s while a search runs; outcomes are
+     logged at INFO.
+   - *An interrupted extraction runs again, its leftovers go* (9d94200; the
+     owner: "I expect if someting is interupted, to be resumed later", "will
+     the leftovers ... be deleted? they should be"). A `.sacd_extract_tmp`
+     found when an SACD extraction starts is deleted and the extraction
+     reruns (before, its files made the folder look extracted; Lara Fabian's
+     '9' after the 31 Oct 15:15 stop). A `.dvda_extract_tmp` older than the
+     process is a leftover, not a running rip. No pass takes the pipeline's
+     temp folders for downloads (`dedup_downloads.in_pipeline_temp`).
+   - *SACD progress bar* (9d94200; the owner: "make a progress bar for teh
+     sacd like when splitting a regular cue"): DSF bytes written against the
+     area's size from `sacd_extract -P`, "track i/n -- name"; DSD->FLAC moves
+     the bar per track.
 
 1. **0 audit findings are open: `docs/AUDIT_OPEN.md`**, in fix order, each
    with evidence, root cause and the agreed fix (the verifier's correction
