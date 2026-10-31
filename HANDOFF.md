@@ -44,12 +44,11 @@ base is missing and prints the `docker tag` that recreates it) with the repo's `
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20261031-handadded`**
-(9d94200 with e0c62da, c1936aa and 027984f; deployed 31 Oct 16:16 by the nv3090
-session over SSH, once no job ran. Watched at the start: the three hand-added
-torrents stay, '2 Unlimited 1998 - II' adopted through its grab record, Lara
-Fabian 9's leftovers deleted and its SACD extraction run again with the bar,
-no errors). Earlier tags for rollback, newest first: `guard-20261031-wronggrab`
+then is the container replaced. Live now: **`guard-20261031-twincues`**
+(d403c1e, deployed 31 Oct 18:53 by the nv3090 session over SSH once no job
+ran; at 19:06 it deleted '2 Unlimited - II (Enhanced) wav.cue'). Earlier tags
+for rollback, newest first: `guard-20261031-handadded` (9d94200 with e0c62da,
+c1936aa and 027984f; 16:16), `guard-20261031-wronggrab`
 (ddf89d6), `guard-20261031-recorddl` (6e934df),
 `guard-20261031-retryonce` (87c540d), `guard-20261031-multidisc` (b6091cf),
 `guard-20261031-deleteaftersplit` (2ff7218), `guard-20261031-splitonce`
@@ -885,6 +884,43 @@ test of a feature whose purpose is removing files.
      dropped, also for one that already gave up. Anything else (still
      downloading, never in the torrent, another app's or no torrent, no
      qBittorrent) keeps the old failure.
+   - *An SACD goes from image to library in one pass, and then everything of
+     it goes* (the owner: "why are there dfs file not converted to flat? why
+     does it still exists there? multichannel takes precedence over 2 Chanel
+     and should have been replaced"; "and once moved - everything associated
+     with the download - had to be deleted"). Lara Fabian's '9' waited a whole
+     sweep pass (over 2.5 h) after its extraction before DSD->FLAC, and its
+     FLAC would have waited another before the import; with
+     `delete_source_folder_on_success` off nothing ever deleted the ISO, and
+     the lifecycle skipped the torrent (`.iso` is no audio extension).
+     Now: the DSF an extraction just placed (`fresh_dsd`) are transcoded in
+     the same pass and the FLAC it wrote (`fresh_flac`) skip the age guard, so
+     the hand-off follows at once. `_sacd_iso_spent` / `_delete_spent_sacd_iso`
+     (under `delete_originals_on_success`): the image goes when the folder's
+     FLAC carry its whole best area (no DSF left, as many FLAC as the area has
+     tracks, each with the area's channels), or when no audio is left and
+     Lidarr holds the album complete in lossless files of at least the disc's
+     channels; never for a folder with two images, a hand-added or claimed
+     folder, or one this process extracts. `torrent_lifecycle_pass`: a pure
+     disc-image torrent (a selected .iso, no selected audio) is removed with
+     its data once no image and no audio is left under it; never while either
+     is, and only the entry when its folder is not visible.
+   - *Multichannel takes precedence over stereo* (same words). Lidarr's quality
+     profile never counts channels: a 6-channel FLAC over the library's stereo
+     FLAC is "Not an upgrade". `multichannel_over_library` (the candidate's
+     `tracks[].trackFileId` -> GET /api/v1/trackfile `mediaInfo.audioChannels`
+     against the file's own count): such a file is not owned in
+     `folder_fully_owned` (pre-split 2b, the purge, the lifecycle), and
+     `_filter_acceptable` accepts its "not an upgrade" (`[MULTICHANNEL]`). The
+     SACD owned check extracts a disc whose album the library holds with fewer
+     channels or in lossy files ("lossless takes precedence"), and calls the
+     image spent when the library is lossless at as many channels. Unknown
+     channels or qualities never count. Lidarr's ManualImport replaces either
+     way: `ManualImportService.Execute` builds its decisions without the
+     specifications and `UpgradeMediaFileService.UpgradeTrackFile` recycles the
+     tracks' existing files with no quality comparison; the import's
+     `UpgradeSpecification` compares quality only, not the cutoff or
+     `upgradeAllowed` (Lidarr develop source, checked 31 Oct 2026).
 
 1. **0 audit findings are open: `docs/AUDIT_OPEN.md`**, in fix order, each
    with evidence, root cause and the agreed fix (the verifier's correction

@@ -1137,6 +1137,23 @@ def _count_audio_on_disk(path: str) -> int:
     return n
 
 
+def _disc_image_or_audio_on_disk(path: str) -> bool:
+    """Is a disc image (.iso) or any audio file still on disk under `path`?
+    True too when the tree cannot be read: for a decision that deletes, what
+    cannot be seen is not "gone". A single-file torrent's content_path IS the
+    file."""
+    if os.path.isfile(path):
+        ext = os.path.splitext(path)[1].lower()
+        return ext == ".iso" or ext in AUDIO_EXTS
+    errors: List[OSError] = []
+    for _dp, _dn, fn in os.walk(path, onerror=errors.append):
+        for x in fn:
+            ext = os.path.splitext(x)[1].lower()
+            if ext == ".iso" or ext in AUDIO_EXTS:
+                return True
+    return bool(errors)
+
+
 def _folder_newest_mtime(path: str) -> float:
     """Newest mtime under `path` (the folder itself if empty). 0.0 on error."""
     newest = 0.0
@@ -1223,6 +1240,16 @@ def torrent_lifecycle_pass(
     Non-music torrents (no selected audio -- TV, movies) are ignored.
     Reads the real download folder, so it never deletes a torrent whose files
     haven't actually been imported. Returns (removed, paused).
+
+    A PURE disc-image torrent (a selected .iso and no selected audio: an SACD
+    rip) has no audio of its own for the rules above to count: the pipeline
+    extracts it in place and deletes the image once it is spent, and the audio
+    it made is imported out of the folder. It is removed with its data (the
+    rip's .md5/.sfv/log/cover) once no image and no audio is left under its
+    folder; while either is, it is left alone (the image is not spent yet, or
+    its tracks wait for the import). Before this the torrent and its extras
+    sat in the client for ever ("once moved - everything associated with the
+    download - had to be deleted", the owner, 31 Oct 2026).
     """
     if now is None:
         now = time.time()
@@ -1269,13 +1296,38 @@ def torrent_lifecycle_pass(
             if f.get("priority", 1) != 0
             and os.path.splitext(f.get("name", ""))[1].lower() in AUDIO_EXTS
         )
-        if sel_audio == 0:
+        sel_disc = sum(
+            1 for f in files
+            if f.get("priority", 1) != 0
+            and os.path.splitext(f.get("name", ""))[1].lower() == ".iso"
+        )
+        if sel_audio == 0 and sel_disc == 0:
             continue  # not a music torrent (or all audio deselected) -> ignore
 
         folder = _map_to_download_root(
             t.get("content_path"), t.get("save_path"), download_root
         )
         folder_exists = os.path.exists(folder)
+        if sel_audio == 0:
+            # A pure disc-image torrent (see the docstring): no on_complete, no
+            # pause, no plan -- only "is there still an image or audio here".
+            iname = t.get("name") or "?"
+            if not folder_exists:
+                # Exactly the torrent-entry-only removal below: data we could
+                # not see is never deleted.
+                if qbt.remove(h, delete_files=False):
+                    removed += 1
+                    emit(
+                        f"lifecycle: removed torrent entry only (content not visible "
+                        f"under {download_root} -- imported+cleaned, or stored "
+                        f"elsewhere; data left untouched) {iname!r}"
+                    )
+            elif not _disc_image_or_audio_on_disk(folder):
+                if qbt.remove(h, delete_files=True):
+                    removed += 1
+                    emit(f"lifecycle: REMOVED (disc image spent, its tracks "
+                         f"imported) {iname!r}")
+            continue
         on_disk = _count_audio_on_disk(folder) if folder_exists else 0
         state = (t.get("state") or "").lower()
         name = t.get("name") or "?"

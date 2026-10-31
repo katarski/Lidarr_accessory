@@ -45,7 +45,9 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from cue_parser import Cue, LLMUnavailableError, parse_cue, read_cue_text
 from dedup_downloads import _EDITION_WORDS as _EDITION_NOISE_WORDS
-from dedup_downloads import in_pipeline_temp
+from dedup_downloads import (AUDIO_EXTS as _DOWNLOAD_AUDIO_EXTS,
+                             NOT_AN_UPGRADE as _NOT_AN_UPGRADE, in_pipeline_temp,
+                             multichannel_over_library)
 from held_store import HeldStore
 from lidarr import LidarrClient, _demojibake, _translit_cyrillic
 from ollama_client import OllamaClient, is_unavailable
@@ -1986,6 +1988,16 @@ class Orchestrator:
         except OSError:
             return False
 
+    @staticmethod
+    def _top_level_files(folder: Path) -> Optional[List[str]]:
+        """Names of the files directly in `folder`, as os.walk lists them
+        (everything that is not a directory); None when it cannot be read."""
+        try:
+            with os.scandir(str(folder)) as it:
+                return [e.name for e in it if not e.is_dir()]
+        except OSError:
+            return None
+
     def _sibling_audio_files(self, folder: Path) -> List[Path]:
         """
         List audio files in a folder. Uses the broad `_ALL_AUDIO_EXTS` set
@@ -3107,6 +3119,186 @@ class Orchestrator:
         return parse_sacd_area((proc.stdout or "") + "\n" + (proc.stderr or ""),
                                area)
 
+    # Lidarr quality names (lower-cased prefixes) that are a lossless copy. A
+    # name that starts with none of them (MP3-320, AAC-VBR, WMA, "Unknown") is
+    # a lossy one; no name at all is unknown, which is neither.
+    _LOSSLESS_QUALITY_PREFIXES = ("flac", "alac", "ape", "wavpack", "wav",
+                                  "aiff", "dsd")
+
+    @classmethod
+    def _disc_vs_library(cls, media, disc_channels: int) -> Tuple[str, int, str]:
+        """How the files the library holds of an album compare with a disc of
+        `disc_channels` channels. `media` is [(channels, quality name)], as
+        LidarrClient.album_trackfile_media gives it. Returns (verdict, the
+        library's most channels, its quality names):
+
+          "better"  the disc should replace them: a file is lossy, or no file
+                    has as many channels as the disc (the owner, 31 Oct 2026:
+                    "multichannel takes precedence over 2 Chanel and should
+                    have been replaced");
+          "enough"  every file is lossless and has at least the disc's
+                    channels: the disc adds nothing and its image is spent;
+          ""        no answer, or one that settles neither (a channel count or
+                    a quality unknown, an album of mixed files): what was done
+                    before stays.
+        """
+        media = list(media or [])
+        if not media or disc_channels <= 0:
+            return "", 0, ""
+        names = "/".join(sorted({q for _c, q in media if q}))
+        lib_max = max(c for c, _q in media)
+        lossy = any(q and not q.lower().startswith(cls._LOSSLESS_QUALITY_PREFIXES)
+                    for _c, q in media)
+        if lossy or (lib_max > 0 and disc_channels > lib_max):
+            return "better", lib_max, names
+        if all(q and c >= disc_channels for c, q in media):
+            return "enough", lib_max, names
+        return "", lib_max, names
+
+    def _disc_against_library(
+        self, iso: Path, owned: Dict[str, Any],
+    ) -> Tuple[str, int, str, int]:
+        """_disc_vs_library for this SACD image against the album Lidarr holds
+        (`owned`, its album record): (verdict, the library's channels, its
+        quality names, the disc's channels). The verdict is "" -- and no
+        sacd_extract is run -- when Lidarr names no files for the album or the
+        image is not a readable SACD."""
+        try:
+            aid = owned.get("id")
+            media = self.lidarr.album_trackfile_media(aid) if aid else []
+            if not media:
+                return "", 0, "", 0
+            area = self._sacd_best_area(iso)
+            if area is None:
+                return "", 0, "", 0
+            info = self._sacd_area_info(iso, area) or {}
+            disc_ch = int(info.get("channels") or 0)
+            verdict, lib_ch, names = self._disc_vs_library(media, disc_ch)
+            return verdict, lib_ch, names, disc_ch
+        except Exception as exc:  # noqa: BLE001
+            # Whatever fails here, the answer is "no verdict": what was done
+            # before (not extracting an owned album) stays.
+            logger.debug("SACD: %s against the library failed: %s", iso.name, exc)
+            return "", 0, "", 0
+
+    @staticmethod
+    def _audio_under(folder: Path) -> bool:
+        """Is there any audio file anywhere under `folder`, an extraction's own
+        working folders left out? True too when the tree cannot be read: what
+        cannot be seen is not "nothing"."""
+        errors: List[OSError] = []
+        for dp, dn, fn in os.walk(str(folder), onerror=errors.append):
+            dn[:] = [d for d in dn if not in_pipeline_temp(d)]
+            if any(os.path.splitext(x)[1].lower() in _DOWNLOAD_AUDIO_EXTS
+                   for x in fn):
+                return True
+        return bool(errors)
+
+    def _sacd_iso_spent(self, folder: Path, iso: Path) -> str:
+        """Why this SACD image is spent -- its audio is where it belongs and
+        nothing needs the image again -- or "" (it stays). Only on proof:
+
+          * the folder's own FLAC carry the WHOLE best area of this disc: no
+            DSF/DFF is left at its top level, it holds at least as many FLAC
+            as the area has tracks, and each has at least the area's channels
+            (the provenance proof: they were made from this image); or
+          * the album was imported before this was known: no audio is left
+            anywhere under the folder and Lidarr holds the album complete in
+            lossless files that have at least the area's channels.
+
+        Nothing else is spent: a folder with several images is never judged
+        (its FLAC cannot be told apart, and only one image of a folder is ever
+        extracted), and an image that is not a readable SACD (a DVD, a data
+        disc) never is.
+
+        Lara Fabian's '9' sat for hours as a 6-channel extraction beside its
+        ISO, and with delete_source_folder_on_success off nothing ever took
+        the 10 GB image away (the owner, 31 Oct 2026: "once moved - everything
+        associated with the download - had to be deleted")."""
+        try:
+            if iso.parent != folder or not iso.is_file():
+                return ""
+            top = [p for p in folder.iterdir() if p.is_file()]
+        except OSError:
+            return ""
+        if sum(1 for p in top if p.suffix.lower() == ".iso") != 1:
+            return ""
+        if any(p.suffix.lower() in (".dsf", ".dff") for p in top):
+            return ""                      # the transcode is not finished
+        flacs = [p for p in top if p.suffix.lower() == ".flac"]
+        if not flacs and self._audio_under(folder):
+            return ""                      # other audio is here: not the case
+        area = self._sacd_best_area(iso)
+        if area is None:
+            return ""
+        info = self._sacd_area_info(iso, area) or {}
+        tracks = int(info.get("tracks") or 0)
+        channels = int(info.get("channels") or 0)
+        if tracks <= 0 or channels <= 0:
+            return ""
+        if flacs:
+            if len(flacs) < tracks:
+                return ""
+            for f in flacs:
+                if self._audio_channels(f) < channels:   # 0: unknown
+                    return ""
+            return ("its %d FLAC carry the whole %d-channel area (%d track(s))"
+                    % (len(flacs), channels, tracks))
+        for who, what in (self._album_folder_identity(Path(iso.stem)),
+                          self._album_folder_identity(folder)):
+            if not (who and what):
+                continue
+            try:
+                owned = self._album_already_in_library(who, what)
+            except Exception:  # noqa: BLE001
+                owned = None
+            if not owned:
+                continue
+            # The first album that is owned decides, as the extraction's own
+            # check does.
+            try:
+                aid = owned.get("id")
+                media = self.lidarr.album_trackfile_media(aid) if aid else []
+            except Exception:  # noqa: BLE001
+                media = []
+            verdict, lib_ch, names = self._disc_vs_library(media, channels)
+            if verdict == "enough":
+                return ("Lidarr holds %s / %s complete in lossless files (%s) "
+                        "of %d channel(s) or more, the disc has %d"
+                        % (who, what, names, lib_ch, channels))
+            return ""
+        return ""
+
+    def _delete_spent_sacd_iso(self, folder: Path, isos) -> bool:
+        """Delete the SACD image(s) in `folder` that _sacd_iso_spent names.
+        Only while delete_originals_on_success is on, for a folder that is not
+        a hand-added torrent's, that no other worker is processing and that
+        this process is not extracting. True when an image was deleted. Never
+        raises: a file that cannot be deleted is a warning, tried again on a
+        later pass."""
+        if not getattr(self.cfg, "delete_originals_on_success", False):
+            return False
+        busy = getattr(self, "_sacd_busy", None) or ()
+        if str(folder) in busy or claims.busy(folder):
+            return False
+        deleted = False
+        for iso in isos or []:
+            try:
+                if handadded.protected(folder) or handadded.protected(iso):
+                    return deleted
+                why = self._sacd_iso_spent(folder, iso)
+                if not why:
+                    continue
+                iso.unlink()
+            except FileNotFoundError:
+                continue
+            except Exception as exc:  # noqa: BLE001 (OSError, or a Lidarr read)
+                logger.warning("SACD: could not delete %s: %s", iso.name, exc)
+                continue
+            logger.info("SACD: deleted %s -- %s", iso.name, why)
+            deleted = True
+        return deleted
+
     def _delete_interrupted_temp(self, tmp: Path, what: str) -> None:
         """What an interrupted extraction left: its temp folder goes, and the
         extraction runs again from the start (the owner, 31 Oct 2026: "I
@@ -3142,11 +3334,15 @@ class Orchestrator:
         """
         Extract a ripped SACD `.iso` in `folder` to per-track DSF *in place*
         (multichannel area preferred over stereo), then remove only the useless
-        sidecar .cue. The .iso is KEPT so the DSD path can transcode the DSF and
-        hand them to Lidarr; the .iso is removed only when the whole source
-        folder is deleted after a verified import. Returns True when the sweep
-        should skip the rest of this pass, or False once the DSF already exist
-        so the DSD path (further down the loop) transcodes and hands them off.
+        sidecar .cue. The .iso is KEPT while the DSD path transcodes the DSF
+        and hands them to Lidarr; it is removed once it is spent (its FLAC
+        carry the whole area, or Lidarr holds the album in lossless at as many
+        channels: _sacd_iso_spent) or when the whole source folder is deleted
+        after a verified import. Returns True when the sweep should skip the
+        rest of this pass -- except after an extraction that just placed the
+        DSF, where the sweep carries on in the same pass -- or False once the
+        DSF already exist so the DSD path (further down the loop) transcodes
+        and hands them off.
 
         Guards: never touches a still-settling .iso; never re-extracts a folder
         that already holds DSF/DFF/FLAC; leaves a non-SACD (video/data) ISO
@@ -3175,7 +3371,8 @@ class Orchestrator:
 
         # Already extracted on a prior pass? Drop the stray .cue and fall
         # through so the DSD path transcodes/hands off the DSF. The .iso stays
-        # until the source folder is removed after a verified import.
+        # until it is spent (its FLAC carry the whole disc) or the source
+        # folder is removed after a verified import.
         # (any(rglob(...)) checks each generator YIELDS a match -- a bare
         # generator object is always truthy, so it must be consumed.)
         already = any(
@@ -3185,6 +3382,9 @@ class Orchestrator:
         )
         if already:
             self._remove_stray_cues(folder)
+            # The FLAC an earlier pass made (or the DSD path will make): the
+            # image goes once they carry the whole disc.
+            self._delete_spent_sacd_iso(folder, isos)
             return False
 
         iso = max(isos, key=lambda p: p.stat().st_size if p.exists() else 0)
@@ -3204,10 +3404,36 @@ class Orchestrator:
                 owned = None
             if owned:
                 st = owned.get("statistics") or {}
+                # Owned by NAME -- but Lidarr counts neither channels nor lossy
+                # against lossless, so what does the library hold? A disc of
+                # more channels, or a lossless disc over lossy files, replaces
+                # it (the owner, 31 Oct 2026: "multichannel takes precedence
+                # over 2 Chanel and should have been replaced": Lara Fabian's
+                # '9' sat as a 6-channel image against 11 AAC stereo files).
+                verdict, lib_ch, names, disc_ch = self._disc_against_library(
+                    iso, owned)
+                if verdict == "better":
+                    if disc_ch > lib_ch:
+                        logger.info(
+                            "SACD: %s is %s / %s, complete in the library at "
+                            "%d channel(s) (%s); the disc has %d -- extracting: "
+                            "multichannel takes precedence", iso.name, who,
+                            what, lib_ch, names or "?", disc_ch)
+                    else:
+                        logger.info(
+                            "SACD: %s is %s / %s, complete in the library but "
+                            "not lossless (%s, %d channel(s)); the disc is "
+                            "lossless with %d -- extracting: lossless takes "
+                            "precedence", iso.name, who, what, names or "?",
+                            lib_ch, disc_ch)
+                    break
                 logger.info(
                     "SACD: %s is %s / %s, already complete in the library "
                     "(%s/%s) -- not extracting.", iso.name, who, what,
                     st.get("trackFileCount"), st.get("totalTrackCount"))
+                if verdict == "enough":
+                    # Lossless at as many channels: nothing here is needed.
+                    self._delete_spent_sacd_iso(folder, isos)
                 self._sweep_ledger_mark(folder, isos, now_ts)
                 self._sweep_ledger_save()
                 return True
@@ -3318,7 +3544,7 @@ class Orchestrator:
         shutil.rmtree(tmp, ignore_errors=True)
         logger.info(
             "SACD: %s -> %d per-track DSF (%s) in %s -- DSD path will transcode "
-            "(ISO kept until verified import)",
+            "(ISO kept until its FLAC carry the whole disc)",
             iso.name, moved, label, folder.name,
         )
         self._remove_stray_cues(folder)
@@ -8810,6 +9036,15 @@ class Orchestrator:
             if folder in self._skip_seen or folder_r in self._skip_seen:
                 continue
 
+            # What THIS pass makes in the folder further down: the per-track DSF
+            # an SACD extraction just placed (`fresh_dsd`) and the FLAC the DSD
+            # transcode just wrote (`fresh_flac`). Both are finished work of
+            # this very pass, so the age guards below (written for a download
+            # still arriving) must not hold them back until the next one --
+            # which, with a pass of two and a half hours, was the next morning.
+            fresh_dsd = False
+            fresh_flac: set = set()
+
             # Misnamed audio (.fla = truncated FLAC): rename first -- these
             # files are otherwise invisible to the sweep, the cue watcher AND
             # Lidarr. Re-scan the folder next sweep under the correct names.
@@ -8850,9 +9085,10 @@ class Orchestrator:
             # SACD ISO: a folder holding a .iso (often with a sidecar SACD .cue
             # the normal splitter can't use) is extracted to per-track DSF in
             # place -- preferring the multichannel area over stereo -- then only
-            # the stray .cue is removed. The .iso is kept so the DSD block below
-            # (this or a later sweep) transcodes the DSF to FLAC and hands them
-            # off; the .iso is deleted with the folder after a verified import.
+            # the stray .cue is removed. The .iso is kept while the DSD block
+            # below transcodes the DSF to FLAC (in this same pass when the DSF
+            # were just placed) and hands them off; it is deleted once spent
+            # (_sacd_iso_spent) or with the folder after a verified import.
             if isos and getattr(self.cfg, "extract_sacd_iso", True):
                 self._activity_start(folder, "SACD", isos[0].name)
                 try:
@@ -8860,8 +9096,26 @@ class Orchestrator:
                 finally:
                     self._activity_end(folder)
                 if did:
-                    # Re-scan on the next sweep as an ordinary DSD folder.
-                    continue
+                    # The extraction just placed per-track DSF? Then carry on
+                    # in THIS pass as a DSD folder: `filenames` was listed
+                    # before they existed, so it is read again, and the DSD
+                    # block treats them as its own finished output. Anything
+                    # else (busy, settling, owned, not an SACD, failed) is
+                    # done with for this pass.
+                    names = self._top_level_files(folder)
+                    seen = set(filenames)
+                    placed = [] if names is None else [
+                        n for n in names
+                        if n.lower().endswith((".dsf", ".dff")) and n not in seen]
+                    busy = getattr(self, "_sacd_busy", None) or ()
+                    if not placed or str(folder) in busy:
+                        continue
+                    filenames = names
+                    fresh_dsd = True
+                    logger.info(
+                        "cueless sweep: %s -- %d DSF just placed by the SACD "
+                        "extraction; transcoding them in this pass",
+                        folder.name[:50], len(placed))
 
             # Archive (.rar/.zip/.7z/.tar...): unpack in place with 7z, then the
             # normal flow imports the extracted audio on the next sweep. Done
@@ -8996,8 +9250,11 @@ class Orchestrator:
             # that Lidarr can't import. Transcode each to 48kHz/16-bit FLAC in
             # place; the pre-split path below then imports the FLACs. Only touch
             # a folder whose DSD files are all stable, so we never start a
-            # multi-minute transcode on a still-downloading rip. Idempotent, so
-            # re-running is cheap. Like the DTS block, the just-written FLACs are
+            # multi-minute transcode on a still-downloading rip -- the DSF this
+            # pass's own SACD extraction just placed (`fresh_dsd`) are complete
+            # and count as stable. Idempotent, so re-running is cheap. The FLAC
+            # this pass writes (`fresh_flac`) are handed off in the same pass;
+            # like the DTS block's, the FLAC of an ordinary DSD folder are
             # usually caught by the stability guard and imported on the next sweep.
             if getattr(self.cfg, "transcode_dsd", True):
                 dsd_files = [
@@ -9006,7 +9263,7 @@ class Orchestrator:
                 ]
                 if dsd_files:
                     dsd_stable = True
-                    for d in dsd_files:
+                    for d in (() if fresh_dsd else dsd_files):
                         try:
                             if now_ts - d.stat().st_mtime < min_stable:
                                 dsd_stable = False
@@ -9028,11 +9285,23 @@ class Orchestrator:
                             "higher-channel sibling %s", folder.name, mch_sib.name)
                         self._skip_seen.add(folder)
                     elif dsd_stable:
+                        # Which FLAC this call makes: any that is not there yet.
+                        # One that was (a torrent that ships both formats) may
+                        # still be arriving and keeps going through the age guard.
+                        before = self._top_level_files(folder)
                         self._activity_start(folder, "DSD→FLAC")
                         try:
-                            self._transcode_dsd_folder(folder)
+                            made = self._transcode_dsd_folder(folder)
                         finally:
                             self._activity_end(folder)
+                        if before is not None:
+                            was = set(before)
+                            fresh_flac = {p for p in (made or [])
+                                          if p.name not in was}
+                        # The DSF are gone and the FLAC carry the disc: the image
+                        # has done its work (nothing else ever deletes it).
+                        if isos and getattr(self.cfg, "extract_sacd_iso", True):
+                            self._delete_spent_sacd_iso(folder, isos)
                     else:
                         logger.debug(
                             "cueless sweep: %s has DSD files still downloading; "
@@ -9049,6 +9318,8 @@ class Orchestrator:
                 continue
             unstable = False
             for a in audios:
+                if a in fresh_flac:
+                    continue    # written a moment ago by this pass, and finished
                 try:
                     age = now_ts - a.stat().st_mtime
                 except OSError:
@@ -11576,6 +11847,23 @@ class Orchestrator:
                 return True
         return False
 
+    def _candidate_multichannel(self, c: dict) -> Optional[Tuple[int, int]]:
+        """dedup_downloads.multichannel_over_library for a ManualImport
+        candidate: (the file's channels, the library's) when the file has more
+        than the library's copy of its track. Lidarr names the path IT sees;
+        lidarr_to_windows maps it back to where we see the file, the way
+        folder_fully_owned maps ours the other way. None when Lidarr is not at
+        hand or nothing is known."""
+        lidarr = getattr(self, "lidarr", None)
+        raw = str(c.get("path") or "")
+        if lidarr is None or not raw:
+            return None
+        try:
+            local = Path(lidarr.lidarr_to_windows(raw))
+        except Exception:  # noqa: BLE001
+            local = Path(raw)
+        return multichannel_over_library(lidarr, local, c)
+
     def _filter_acceptable(self, candidates: list, album_name: str = "",
                            artist_name: str = "") -> list:
         """
@@ -11588,6 +11876,11 @@ class Orchestrator:
             we only override if Lidarr still resolved the album, so an extra- or
             missing-track batch imports its matches instead of being dropped
             wholesale on the 80% rule.
+          - a "not an upgrade" rejection counts as overridable too when the
+            file has MORE CHANNELS than the library's copy of the track
+            (multichannel takes precedence: Lidarr's quality profile never
+            counts channels, so a 6-channel FLAC over a stereo file is "not
+            an upgrade" to it).
         Anything else (missing artist, no album match, permissions, etc.) is a
         hard fail.
 
@@ -11614,10 +11907,21 @@ class Orchestrator:
                 continue
             override = True
             seen_pct = None
+            mc = None                # (channels, library's) once it was asked
+            std_used = False
             for r in rej:
                 reason = (r.get("reason") or "")
                 low = reason.lower()
-                if not any(k in low for k in self._OVERRIDABLE_REJECTIONS):
+                if any(k in low for k in self._OVERRIDABLE_REJECTIONS):
+                    std_used = True
+                elif _NOT_AN_UPGRADE in low:
+                    if mc is None:
+                        mc = self._candidate_multichannel(c) or ()
+                    if not mc:
+                        override = False
+                        break
+                    continue         # no match % in this verdict
+                else:
                     override = False
                     break
                 m = self._MATCH_RE.search(reason)
@@ -11633,19 +11937,24 @@ class Orchestrator:
                 override = False
             if override:
                 path_name = Path(c.get("path") or "").name or "?"
-                # Pull the actual % from the last rejection message so we
-                # log "match 63% passes floor 60%" rather than hiding it.
-                actual_str = "?"
-                for r in rej:
-                    m = self._MATCH_RE.search(r.get("reason") or "")
-                    if m:
-                        actual_str = m.group(1)
-                        break
-                logger.info(
-                    "  [OVERRIDE] %s -- match %s%% passes floor %.0f%%, "
-                    "forcing import despite Lidarr's 80%% rule",
-                    path_name, actual_str, floor,
-                )
+                if mc:
+                    logger.info(
+                        "  [MULTICHANNEL] %s -- %d ch over the library's %d ch: "
+                        "replacing", path_name, mc[0], mc[1])
+                if std_used:
+                    # Pull the actual % from the last rejection message so we
+                    # log "match 63% passes floor 60%" rather than hiding it.
+                    actual_str = "?"
+                    for r in rej:
+                        m = self._MATCH_RE.search(r.get("reason") or "")
+                        if m:
+                            actual_str = m.group(1)
+                            break
+                    logger.info(
+                        "  [OVERRIDE] %s -- match %s%% passes floor %.0f%%, "
+                        "forcing import despite Lidarr's 80%% rule",
+                        path_name, actual_str, floor,
+                    )
                 ok.append(c)
         return ok
 

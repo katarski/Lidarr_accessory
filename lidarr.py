@@ -932,6 +932,63 @@ class LidarrClient:
             return {}
         return out
 
+    @staticmethod
+    def _media_of(row) -> Tuple[int, str]:
+        """(audio channels, quality name) of one track file resource: 0 and ""
+        for what Lidarr does not carry -- unknown, which is never "fewer"."""
+        try:
+            ch = int(float(((row.get("mediaInfo") or {}).get("audioChannels"))
+                           or 0))
+        except (AttributeError, TypeError, ValueError):
+            ch = 0
+        try:
+            name = str((((row.get("quality") or {}).get("quality") or {})
+                        .get("name")) or "")
+        except AttributeError:
+            name = ""
+        return max(ch, 0), name
+
+    def trackfile_media(self, ids) -> Dict[int, Tuple[int, str]]:
+        """{track file id: (audio channels, quality name)} for the library
+        files with these ids. {} when there is nothing to ask or Lidarr could
+        not be asked (a partial answer is never returned), like
+        trackfile_qualities. What multichannel precedence compares: Lara
+        Fabian's '9' arrives from its SACD as 6-channel FLAC while the library
+        holds it as 2-channel AAC, and Lidarr's quality profile alone calls
+        such a file "not an upgrade" (it never counts channels)."""
+        uniq: List[int] = []
+        for i in ids or []:
+            try:
+                n = int(i)
+            except (TypeError, ValueError):
+                continue
+            if n > 0 and n not in uniq:
+                uniq.append(n)
+        if not uniq:
+            return {}
+        out: Dict[int, Tuple[int, str]] = {}
+        try:
+            for k in range(0, len(uniq), 100):
+                rows = self._get("/api/v1/trackfile", trackFileIds=uniq[k:k + 100])
+                for r in rows or []:
+                    if r.get("id") is not None:
+                        out[int(r["id"])] = self._media_of(r)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("trackfile_media failed: %s", exc)
+            return {}
+        return out
+
+    def album_trackfile_media(self, album_id) -> List[Tuple[int, str]]:
+        """[(audio channels, quality name)] of every library file of this
+        album. [] when it has none or Lidarr could not be asked: an empty
+        answer is no evidence, and the caller keeps what it did before."""
+        try:
+            rows = self._get("/api/v1/trackfile", albumId=int(album_id)) or []
+            return [self._media_of(r) for r in rows if isinstance(r, dict)]
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("album_trackfile_media(%s) failed: %s", album_id, exc)
+            return []
+
     def quality_profile_index(self, profile_id) -> Dict[int, int]:
         """{quality id: position} in a quality profile; a higher position is a
         better quality (Lidarr lists a profile's items in ASCENDING order, and

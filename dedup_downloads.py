@@ -25,7 +25,7 @@ import shutil
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional, Tuple
 
 import yaml
 
@@ -605,6 +605,57 @@ NOT_AN_UPGRADE = "not an upgrade"
 _PARTIAL_EXTS = (".part", ".!qb", ".crdownload")
 
 
+def multichannel_over_library(lidarr, local_path, candidate) -> Optional[Tuple[int, int]]:
+    """(the file's channels, the library's channels) when the local file has
+    MORE channels than the library's copy of the track it matches; None for
+    anything else -- equal or fewer channels, no library file for the track,
+    or a count that cannot be read (unknown never counts, either side).
+
+    The owner's rule (31 Oct 2026): "multichannel takes precedence over 2
+    Chanel and should have been replaced". Lidarr never counts channels: a
+    6-channel FLAC over the library's stereo FLAC is rejected "Not an upgrade
+    for existing track file(s)", so the rejection alone would call the
+    download redundant and delete it (Lara Fabian's '9' came from its SACD as
+    6-channel FLAC against a library of 2-channel AAC). `candidate` is a
+    ManualImport candidate: its tracks[].trackFileId are the library's files
+    for the track (> 0 when there is one)."""
+    ids = []
+    for t in (candidate.get("tracks") or []):
+        try:
+            n = int((t or {}).get("trackFileId") or 0)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if n > 0 and n not in ids:
+            ids.append(n)
+    if not ids:
+        return None
+    try:
+        media = lidarr.trackfile_media(ids)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("multichannel check: Lidarr could not be asked: %s", exc)
+        return None
+    if not isinstance(media, dict):
+        return None
+    lib_ch = 0
+    for i in ids:
+        try:
+            lib_ch = max(lib_ch, int(media.get(i, (0, ""))[0] or 0))
+        except (IndexError, TypeError, ValueError):
+            continue
+    if lib_ch <= 0:
+        return None
+    local_ch = 0
+    try:
+        from audio_open import File as MutagenFile  # lazy
+        mf = MutagenFile(str(local_path))
+        local_ch = int(getattr(getattr(mf, "info", None), "channels", 0) or 0)
+    except Exception:  # noqa: BLE001
+        local_ch = 0
+    if local_ch > lib_ch > 0:
+        return local_ch, lib_ch
+    return None
+
+
 def folder_fully_owned(lidarr, folder: Path, audios, artist_id=None):
     """
     Is EVERY audio file in `folder` already in the library at the same or a
@@ -617,6 +668,11 @@ def folder_fully_owned(lidarr, folder: Path, audios, artist_id=None):
     and the imported-downloads purge both ask it, instead of comparing track
     COUNTS -- which deleted a song Lidarr did not know at all, and lossless
     copies of albums the library holds as MP3.
+
+    One more verdict is Lidarr's blind spot: it never counts channels, so a
+    file it calls "not an upgrade" can still have more channels than the
+    library's copy. Multichannel takes precedence (multichannel_over_library):
+    such a file is NOT owned, however the quality profile ranks it.
     """
     folder = Path(folder)
     if not folder.exists():
@@ -649,6 +705,11 @@ def folder_fully_owned(lidarr, folder: Path, audios, artist_id=None):
         if not any(NOT_AN_UPGRADE in r for r in reasons):
             return False, ("%s would be imported (Lidarr: %s)"
                            % (Path(f).name, "; ".join(reasons) or "accepted"))
+        mc = multichannel_over_library(lidarr, f, c)
+        if mc is not None:
+            return False, ("%s has %d channel(s), the library's copy %d -- "
+                           "multichannel takes precedence"
+                           % (Path(f).name, mc[0], mc[1]))
     return True, "all %d file(s) are owned at the same or better quality" % len(audios)
 
 
