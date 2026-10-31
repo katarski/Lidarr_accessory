@@ -1013,7 +1013,12 @@ function asmRun(ids,kind){
         +'recordings — one request per missing track, about a second each, then '
         +'cached. It then searches your indexers for those titles and continues '
         +'on its own each pass until a compilation is found or the list runs out.'
-      : '');
+      : (kind==='find'
+        ? '\n\nThe search runs in the background: Lidarr searches the artist '
+          +'and the album, then a release is grabbed and checked for the songs. '
+          +'Each row shows how it goes, and the hunt goes on each pass until a '
+          +'song turns up or no release is left.'
+        : ''));
   if(!confirm(what+' '+ids.length+' album(s)?'+extra))return;
   toast('working…');
   fetch('/api/assembly/'+kind,{method:'POST',
@@ -1022,8 +1027,10 @@ function asmRun(ids,kind){
    .then(function(r){return r.json();}).then(function(j){
       var res=j.results||[];
       var bad=res.filter(function(r){return !r.ok;});
-      toast('Done: '+(j.done||0)+' ok'+(bad.length?(', '+bad.length+' failed: '
-            +h(bad[0].message||'')):''));
+      toast((kind==='find'
+             ? 'Search started for '+(j.done||0)+' album(s); each row shows how it goes'
+             : 'Done: '+(j.done||0)+' ok')
+            +(bad.length?(', '+bad.length+' failed: '+h(bad[0].message||'')):''));
       ASMSEL.clear();asmLoad();
    }).catch(function(e){toast('failed: '+e);});
 }
@@ -1038,6 +1045,11 @@ function asmLoad(){
       ASM.length+' album(s) partly available · '+don+' fully assembled'
       +(j.sources?(' · '+j.sources+' source song(s) shared across assemblies'):'');
     asmRender();
+    // While a Find missing runs, keep the rows current.
+    clearTimeout(window._asmPoll);
+    if(TAB==='assembly'&&ASM.some(function(a){var u=a.hunt||{};
+        return u.state==='searching'||u.active;}))
+      window._asmPoll=setTimeout(asmLoad,15000);
   }).catch(function(){document.getElementById('asm-list').innerHTML='<p class="muted">assembly unavailable</p>';});
 }
 function asmRender(){
@@ -1060,6 +1072,21 @@ function asmRender(){
     var bar='<div style="background:#30363d;border-radius:4px;height:10px;width:12rem;overflow:hidden">'
       +'<div style="width:'+Math.min(100,pct)+'%;height:100%;background:'+col+'"></div></div>';
     var miss=(a.missing||[]).map(function(m){return '<li>'+h(m.track)+'</li>';}).join('');
+    // Find missing's state, kept on the plan by the background search.
+    var hu=a.hunt||{}, hb='', hl='';
+    if(hu.state==='searching')
+      hb='<span style="color:#58a6ff" title="'+h(hu.note||'')+'">searching…</span> ';
+    else if(hu.active)
+      hb='<span style="color:#d29922" title="'+h(hu.note||'')+'">hunting · '
+        +(hu.tried||[]).length+(hu.candidates?(' of '+hu.candidates):'')
+        +' release(s) tried</span> ';
+    else if(hu.note)
+      hb='<span class="muted" title="'+h(hu.note)+'">last search: '
+        +h(String(hu.note).slice(0,60))+'</span> ';
+    if(hu.note)
+      hl='<div style="flex-basis:100%"><b>Find missing</b>: '+h(hu.note)
+        +(hu.finished?' <span class="muted">('+h(new Date(hu.finished*1000)
+          .toLocaleString())+')</span>':'')+'</div>';
     var got=(a.matched||[]).map(function(m){
       var src=m.source||'';
       return '<li>'+h(m.track)+' <span class="muted">← </span>'
@@ -1074,6 +1101,7 @@ function asmRender(){
       +'<span style="color:'+col+'">'+pct.toFixed(0)+'%</span> '
       +'<span class="muted">'+((a.n_matched||0)+(a.n_present||0))+'/'+(a.total||0)+' songs</span> '
       +((a.n_present||0)?'<span class="muted">('+(a.n_present||0)+' already in library)</span> ':'')
+      +hb
       +bar
       +'<div class="acts" style="margin-left:auto">'
       +'<button class="b-ll" title="Search torrents for the songs this album is '
@@ -1092,6 +1120,7 @@ function asmRender(){
       +'onclick="asmActOne(event,\''+h(String(a.id))+'\',\'remove\')">Remove</button>'
       +'</div>'
       +'</summary><div class="cvbody" style="display:flex;gap:2rem;flex-wrap:wrap">'
+      +hl
       +'<div><b>Assembled ('+(a.n_matched||0)+')</b><ul>'+(got||'<li class="muted">none</li>')+'</ul></div>'
       +'<div><b>Still missing ('+(a.n_missing||0)+')</b><ul>'+(miss||'<li class="muted">none — complete</li>')+'</ul></div>'
       +'</div></details>';
@@ -2615,11 +2644,14 @@ def make_handler(store, actions: HeldActions):
                 ids = body.get("ids") or ([body["id"]] if body.get("id") else [])
                 fn = {
                     "/api/assembly/remove": "assembly_remove",
-                    "/api/assembly/find": "assembly_find_missing",
+                    # Answers at once; the hunt runs in the background.
+                    "/api/assembly/find": "assembly_find_missing_start",
                     "/api/assembly/comp": "assembly_find_compilation",
                     "/api/assembly/add": "assembly_add_to_library",
                 }[path]
                 act = getattr(actions, fn, None)
+                if act is None and fn == "assembly_find_missing_start":
+                    act = getattr(actions, "assembly_find_missing", None)
                 if act is None:
                     self._json(503, {"ok": False, "message": "assembly disabled"})
                     return

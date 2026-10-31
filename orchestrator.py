@@ -27,6 +27,7 @@ import json
 import logging
 import logging.handlers
 import os
+import queue
 import re
 import shutil
 import subprocess
@@ -95,6 +96,11 @@ def _album_track_file_count(album_rec: Dict[str, Any]) -> int:
         if isinstance(v, int):
             return v
     return 0
+
+
+# Lazy creation of an Orchestrator's Find-missing worker state (several WebUI
+# threads can ask at once).
+_ASM_FIND_INIT = threading.Lock()
 
 
 def _is_torrent_release(rel) -> bool:
@@ -12648,6 +12654,115 @@ class Orchestrator:
             return False, "assembly disabled"
         return (True, "removed") if store.remove(album_id) else (False, "not found")
 
+    # ---- Find missing, answered at once ------------------------------------
+    # The owner, 31 Oct 2026: "when i go to assembly nd I hit find missing, I
+    # am not sure anythign happens". The hunt ran inside the click's request:
+    # Lidarr's artist search and album search (up to 120 s each), then a grab
+    # and its check, while the page showed "working..." for 3 s and the answer
+    # minutes later for 3 s more; a refusal before a grab was never logged. Now
+    # the button answers at once, ONE background thread (cue-asm-find) works
+    # the albums in order, and the plan's `hunt` keeps what the tab shows on
+    # the row: state (searching / hunting / stopped), note (the last answer),
+    # finished (when).
+
+    def _asm_find_state(self) -> Dict[str, Any]:
+        st = getattr(self, "_asm_find", None)
+        if st is None:
+            with _ASM_FIND_INIT:
+                st = getattr(self, "_asm_find", None)
+                if st is None:
+                    st = {"lock": threading.Lock(), "pending": set(),
+                          "queue": queue.Queue(), "thread": None}
+                    self._asm_find = st
+        return st
+
+    def assembly_find_missing_start(self, album_id):
+        """Find missing from the Assembly tab: the checks that need no search,
+        then the album is queued for the cue-asm-find thread and the answer
+        comes back at once. (False, why) only when there is nothing to do."""
+        store = getattr(self, "assembly", None)
+        if store is None:
+            return False, "assembly disabled"
+        plan = store.get(album_id)
+        if not plan:
+            return False, "no plan for that album"
+        missing = [m for m in (plan.get("missing") or [])
+                   if str(m.get("track") or "").strip()]
+        if not missing:
+            return False, "nothing missing -- use Add to library"
+        st = self._asm_find_state()
+        key = str(album_id)
+        with st["lock"]:
+            if key in st["pending"]:
+                return True, "already searching"
+            st["pending"].add(key)
+            t = st["thread"]
+            if t is None or not t.is_alive():
+                t = threading.Thread(target=self._asm_find_loop, daemon=True,
+                                     name="cue-asm-find")
+                st["thread"] = t
+                t.start()
+        hunt = dict(plan.get("hunt") or {})
+        hunt.update(state="searching", note="searching your indexers",
+                    queued=time.time())
+        plan["hunt"] = hunt
+        store.upsert(album_id, plan)
+        logger.info("Assembly find missing: queued %s / %s (%d song(s) missing)",
+                    plan.get("artist"), plan.get("album"), len(missing))
+        st["queue"].put(album_id)
+        return True, "search started"
+
+    def _asm_find_loop(self) -> None:
+        st = self._asm_find_state()
+        while True:
+            album_id = st["queue"].get()
+            try:
+                self._assembly_find_job(album_id)
+            except Exception:  # noqa: BLE001
+                logger.exception("Assembly find missing failed for %s", album_id)
+            finally:
+                with st["lock"]:
+                    st["pending"].discard(str(album_id))
+
+    def _asm_hunt_answer(self, album_id, ok: bool, msg: str) -> None:
+        """Keep the hunt's last answer on the plan, for the Assembly tab."""
+        store = getattr(self, "assembly", None)
+        plan = store.get(album_id) if store is not None else None
+        if not plan:
+            return                         # dismissed meanwhile
+        hunt = dict(plan.get("hunt") or {})
+        hunt["note"] = str(msg)[:300]
+        hunt["ok"] = bool(ok)
+        hunt["finished"] = time.time()
+        hunt["state"] = "hunting" if hunt.get("active") else "stopped"
+        plan["hunt"] = hunt
+        store.upsert(album_id, plan)
+
+    def _assembly_find_job(self, album_id) -> Tuple[bool, str]:
+        """One queued Find missing: the hunt (assembly_find_missing), then its
+        answer on the plan and in the log."""
+        store = getattr(self, "assembly", None)
+        if store is None:
+            return False, "assembly disabled"
+        plan = store.get(album_id)
+        if not plan:
+            return False, "no plan for that album"
+        # The hunt stays active only when this search finds releases to try.
+        hunt = dict(plan.get("hunt") or {})
+        hunt["active"] = False
+        plan["hunt"] = hunt
+        store.upsert(album_id, plan)
+        try:
+            ok, msg = self.assembly_find_missing(album_id)
+        except Exception as exc:  # noqa: BLE001
+            ok, msg = False, "failed: %s" % exc
+        self._asm_hunt_answer(album_id, ok, msg)
+        after = (store.get(album_id) or {}).get("hunt") or {}
+        logger.info("Assembly find missing: %s / %s -- %s%s",
+                    plan.get("artist"), plan.get("album"), msg,
+                    " (it goes on each pass)" if after.get("active") else "")
+        return ok, msg
+
     def assembly_find_missing(self, album_id):
         """
         Hunt for the songs this assembly still lacks -- in COLLECTIONS.
@@ -13661,6 +13776,9 @@ class Orchestrator:
                 state = plan.get(key) or {}
                 if not state.get("active"):
                     continue
+                if key == "hunt" and str(plan.get("id")) in \
+                        self._asm_find_state()["pending"]:
+                    continue               # the tab's own search has it now
                 if not (plan.get("missing") or []):
                     state["active"] = False
                     state["note"] = "nothing missing any more"
@@ -13679,6 +13797,8 @@ class Orchestrator:
                     logger.info("assembly %s: %s -- %s",
                                 "compilation hunt" if key == "comp" else "hunt",
                                 "ok" if ok else "no luck", msg)
+                    if key == "hunt":
+                        self._asm_hunt_answer(aid, ok, msg)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("assembly %s failed for %s: %s", key, aid, exc)
                 done += 1
