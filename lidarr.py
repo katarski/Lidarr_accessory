@@ -1257,7 +1257,8 @@ class LidarrClient:
 
         A row Lidarr answers NotFound for is remembered and not asked about
         again: it stays in the queue list, and every pass re-sent the DELETE
-        (and Lidarr logged a Fatal each time)."""
+        (and Lidarr logged a Fatal each time). So is a row Lidarr cannot
+        drop without touching the client (`_is_unignorable_row`)."""
         gone = self.__dict__.setdefault("_queue_gone", set())
         if queue_id in gone:
             return False
@@ -1275,6 +1276,13 @@ class LidarrClient:
                 # -- or listed but not removable by id.
                 logger.debug("queue_remove(%s): not found -- not asked again",
                              queue_id)
+                gone.add(queue_id)
+                return False
+            if (r.status_code >= 500 and not remove_from_client
+                    and not blocklist and self._is_unignorable_row(r)):
+                logger.info("queue_remove(%s): Lidarr cannot drop a row with no "
+                            "artist/album unless it is removed from the client "
+                            "-- left to Lidarr, not asked again", queue_id)
                 gone.add(queue_id)
                 return False
             r.raise_for_status()
@@ -1328,7 +1336,8 @@ class LidarrClient:
             raise
         if (r.status_code >= 500 and not self._is_not_found(r)
                 and not self._is_client_conflict(r)
-                and not self._is_unreadable_search(r)):
+                and not self._is_unreadable_search(r)
+                and not self._is_unignorable_row(r)):
             if self._is_lidarr_error(r):
                 # Lidarr answered, with its own error ("Failed to connect to
                 # qBittorrent", "database is locked"): this call failed, so
@@ -1395,6 +1404,25 @@ class LidarrClient:
             return "Invalid response received from LidarrAPI" in (r.text or "")[:4000]
         except Exception:  # noqa: BLE001
             return False
+
+    @staticmethod
+    def _is_unignorable_row(r) -> bool:
+        """Lidarr's answer to a DELETE of a queue row it matched to no artist
+        or album, without removeFromClient/blocklist: QueueController.Remove
+        asks IgnoredDownloadService.IgnoreDownload, which reads
+        trackedDownload.RemoteAlbum.Artist with RemoteAlbum null and throws a
+        NullReferenceException (Lidarr 3.1.6.5079: HTTP 500). Lidarr is up;
+        the row just cannot be dropped this way. Rows 861852112 and 812171111
+        got it on 1 Oct, 468890554 every 10 minutes from 31 Oct 13:13; each
+        answer counted against Lidarr, so work running meanwhile saw
+        "Lidarr failed meanwhile".
+        The rows-only reaper never removes from the client, so it is an
+        answer about one row."""
+        try:
+            text = (r.text or "")[:8000]
+        except Exception:  # noqa: BLE001
+            return False
+        return "NullReferenceException" in text and "IgnoreDownload" in text
 
     def _went_down(self, why) -> None:
         with self._down_lock:
