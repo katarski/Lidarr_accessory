@@ -44,9 +44,13 @@ base is missing and prints the `docker tag` that recreates it) with the repo's `
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20261031-wronggrab`**
-(ddf89d6, deployed 31 Oct 15:07 by the nv3090 session over SSH). Earlier tags
-for rollback, newest first: `guard-20261031-recorddl` (6e934df),
+then is the container replaced. Live now: **`guard-20261031-handadded`**
+(9d94200 with e0c62da, c1936aa and 027984f; deployed 31 Oct 16:16 by the nv3090
+session over SSH, once no job ran. Watched at the start: the three hand-added
+torrents stay, '2 Unlimited 1998 - II' adopted through its grab record, Lara
+Fabian 9's leftovers deleted and its SACD extraction run again with the bar,
+no errors). Earlier tags for rollback, newest first: `guard-20261031-wronggrab`
+(ddf89d6), `guard-20261031-recorddl` (6e934df),
 `guard-20261031-retryonce` (87c540d), `guard-20261031-multidisc` (b6091cf),
 `guard-20261031-deleteaftersplit` (2ff7218), `guard-20261031-splitonce`
 (cf03910), `guard-20261031-unignorable` (57e9807), `guard-20261031-qwen38` (02fb97b; the LLM model fix and the two
