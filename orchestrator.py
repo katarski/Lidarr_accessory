@@ -97,6 +97,21 @@ def _album_track_file_count(album_rec: Dict[str, Any]) -> int:
     return 0
 
 
+def _is_torrent_release(rel) -> bool:
+    """Is this Lidarr release (GET /api/v1/release) a torrent?
+
+    Lidarr names the protocol differently by version: "torrent" in the one
+    Park ran until its image update of 28 Oct 2026, "TorrentDownloadProtocol"
+    in 3.1.6.5079 (checked live on 31 Oct: every release says so), and the
+    enum's number 2 in older history records. Comparing with "torrent" alone
+    dropped every release from 31 Oct on: the Assembly tab's Find missing
+    always answered "your indexers offered no torrent", and every interactive
+    search logged "no torrent candidates" and fell back to Prowlarr.
+    """
+    p = str((rel or {}).get("protocol") or "").strip().lower()
+    return p in ("torrent", "torrentdownloadprotocol", "2")
+
+
 def _match_key(value: str) -> str:
     """
     Aggressive normalization for fuzzy equality of artist/album names.
@@ -12142,7 +12157,7 @@ class Orchestrator:
         guard_artist = bool(artn) and len(artn_bare) <= 4
         dropped_artist = 0
         for raw in releases or []:
-            if (raw.get("protocol") or "").lower() != "torrent":
+            if not _is_torrent_release(raw):
                 continue
             guid = raw.get("guid")
             if not guid or guid in blocked:
@@ -12692,7 +12707,7 @@ class Orchestrator:
         seen_guid = set()
         skipped_owned = 0
         for r in rels:
-            if str(r.get("protocol") or "").lower() != "torrent":
+            if not _is_torrent_release(r):
                 continue
             g = r.get("guid")
             if not g or g in seen_guid:
@@ -14462,7 +14477,7 @@ class Orchestrator:
         dropped_wrong_artist = 0
         scored: List[Dict[str, Any]] = []
         for raw in releases or []:
-            if (raw.get("protocol") or "").lower() != "torrent":
+            if not _is_torrent_release(raw):
                 continue
             guid = raw.get("guid")
             if not guid or guid in blocked:
