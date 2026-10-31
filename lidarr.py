@@ -887,6 +887,75 @@ class LidarrClient:
         except OSError as exc:
             logger.debug("manualimport cache: could not save: %s", exc)
 
+    def grabbed_download(self, download_id: str) -> Optional[bool]:
+        """Did Lidarr itself grab the download with this id (a torrent's
+        infohash)? Its history holds a Grabbed event (eventType 1) whose
+        downloadId is the hash in UPPER case. True / False; None when Lidarr
+        could not be asked -- which is neither."""
+        try:
+            d = self._get("/api/v1/history", downloadId=str(download_id).upper(),
+                          eventType=1, page=1, pageSize=1)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("grabbed_download(%s) failed: %s", download_id, exc)
+            return None
+        if not isinstance(d, dict):
+            return None
+        try:
+            return int(d.get("totalRecords") or 0) > 0
+        except (TypeError, ValueError):
+            return None
+
+    def trackfile_qualities(self, ids) -> Dict[int, int]:
+        """{track file id: quality id} for the library files with these ids.
+        {} when there is nothing to ask or Lidarr could not be asked (a
+        partial answer is never returned)."""
+        uniq: List[int] = []
+        for i in ids or []:
+            try:
+                n = int(i)
+            except (TypeError, ValueError):
+                continue
+            if n > 0 and n not in uniq:
+                uniq.append(n)
+        if not uniq:
+            return {}
+        out: Dict[int, int] = {}
+        try:
+            for k in range(0, len(uniq), 100):
+                rows = self._get("/api/v1/trackfile", trackFileIds=uniq[k:k + 100])
+                for r in rows or []:
+                    qid = ((r.get("quality") or {}).get("quality") or {}).get("id")
+                    if r.get("id") is not None and qid is not None:
+                        out[int(r["id"])] = int(qid)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("trackfile_qualities failed: %s", exc)
+            return {}
+        return out
+
+    def quality_profile_index(self, profile_id) -> Dict[int, int]:
+        """{quality id: position} in a quality profile; a higher position is a
+        better quality (Lidarr lists a profile's items in ASCENDING order, and
+        every quality of a group shares the group's position). {} when the
+        profile could not be read."""
+        try:
+            pid = int(profile_id)
+            if pid <= 0:
+                return {}
+            d = self._get("/api/v1/qualityprofile/%d" % pid)
+            out: Dict[int, int] = {}
+            for i, item in enumerate((d or {}).get("items") or []):
+                qid = (item.get("quality") or {}).get("id")
+                if qid is not None:
+                    out[int(qid)] = i
+                for sub in item.get("items") or []:
+                    sid = (sub.get("quality") or {}).get("id")
+                    if sid is not None:
+                        out[int(sid)] = i
+            return out
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("quality_profile_index(%s) failed: %s", profile_id, exc)
+            return {}
+
     def manual_import_candidates(
         self, folder_path: str, artist_id: Optional[int] = None,
         force: bool = False,
@@ -1617,6 +1686,7 @@ class LidarrClient:
         import_mode: str = "copy",
         album_track_totals: Optional[Dict[int, int]] = None,
         require_full_album: bool = True,
+        artist_id: Optional[int] = None,
     ) -> Tuple[Optional[int], int, List[str]]:
         """
         Let Lidarr's OWN manual-import matcher decide what in `folder_path`
@@ -1643,9 +1713,11 @@ class LidarrClient:
         the library with a mismatched subset.
 
         `import_mode` is "copy" (default, leaves the download in place) or
-        "move". Returns (command_id, files_imported, [album titles]).
+        "move". `artist_id`, when known, is Lidarr's hint for a folder whose
+        name does not carry the artist (see manual_import_candidates).
+        Returns (command_id, files_imported, [album titles]).
         """
-        cands = self.manual_import_candidates(folder_path)
+        cands = self.manual_import_candidates(folder_path, artist_id=artist_id)
         # Group cleanly-matched files by destination album so we can compare
         # each album's source tracks against its destination track count.
         by_album: Dict[int, Dict[str, Any]] = {}

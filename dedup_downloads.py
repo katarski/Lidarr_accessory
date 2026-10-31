@@ -664,6 +664,7 @@ def purge_imported_downloads(
     where `dupes` is the list of (folder, size, have, total) found regardless
     of `delete`, so a dry run can report exactly what it WOULD remove.
     """
+    import handadded       # inside: a module-level import would be a cycle
     watch_root = Path(watch_root)
     excluded_res = list(excluded_res or [])
     now = _now if _now is not None else time.time()
@@ -677,6 +678,9 @@ def purge_imported_downloads(
         for e in excluded_res:
             if pr == e or e in pr.parents:
                 return True
+        # A torrent added by hand stays as it is (handadded.py).
+        if handadded.protected(pr) is not None:
+            return True
         return "_processed" in p.parts
 
     candidates: list = []

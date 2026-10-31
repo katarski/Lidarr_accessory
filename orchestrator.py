@@ -35,6 +35,7 @@ import time
 import unicodedata
 
 import claims
+import handadded
 import titlematch
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -1006,6 +1007,15 @@ class Orchestrator:
     # ---- Public entry --------------------------------------------------
 
     def process(self, cue_path: Path) -> None:
+        # A torrent the owner added by hand stays as it is (handadded.py): its
+        # CUE is not split, nothing of it is moved or deleted, and no ledger
+        # row is written for it.
+        hit = handadded.protected(cue_path)
+        if hit:
+            logger.info("Skipping %s -- it belongs to a torrent added by hand "
+                        "(%s); it stays as it is", Path(cue_path).name,
+                        Path(hit).name)
+            return
         staging_dir: Optional[Path] = None
         self._repair_temps = set()
         # The CUE's folder is this job's for its whole run: nothing else in the
@@ -5541,6 +5551,7 @@ class Orchestrator:
     def _give_lidarr_the_download(
         self, key_path: Path, folder: Path, audios: List[Path],
         artist_name: str, album_name: str, reason: str,
+        import_mode: str = "move",
     ) -> bool:
         """
         A download no album Lidarr lists will take: find the record its songs
@@ -5633,7 +5644,8 @@ class Orchestrator:
             self.lidarr.set_album_monitored_release(album_id, int(rid),
                                                     keep_manual=added)
             full = self.lidarr.get_album(album_id) or full
-        cmd = self._import_library_folder_by_tracknumber(full, aid, audios)
+        cmd = self._import_library_folder_by_tracknumber(
+            full, aid, audios, import_mode=import_mode)
         filled = 0
         if cmd:
             self.lidarr.wait_for_command(int(cmd), timeout_seconds=600)
@@ -5748,6 +5760,242 @@ class Orchestrator:
         )
         self._skip_seen.add(folder)
         return True
+
+    # ---- torrents the owner added by hand -----------------------------------
+
+    def handadded_pass(self) -> Dict[str, int]:
+        """
+        The torrents the owner added by hand (handadded.torrents(): no
+        category, no proof that the pipeline grabbed them), once they are
+        complete.
+
+        The owner, 31 Oct 2026: "if it hand added - it stays." And: "but
+        listen. if it found a better torrent than the hand added one - we
+        keep the better one!" Asked what that means, he chose:
+
+          * a hand-added torrent that is WORSE, once Lidarr holds every song
+            of it in better quality (file by file: Lidarr's own "not an
+            upgrade" verdict, and the library file strictly higher in the
+            artist's quality profile): "Remove it with its files";
+          * a hand-added torrent that is BETTER, or music Lidarr lacks: "Yes,
+            copy it in" -- Lidarr imports a COPY, and the torrent and its
+            files stay exactly as they are.
+
+        Every pass that splits, moves or deletes in the download folder skips
+        these folders (handadded.protected); this is the only one that acts
+        on them. A torrent with a CUE sheet is left as it is: a copy needs a
+        split, which a hand-added torrent does not get. One torrent never
+        stops the pass. Returns {"removed", "copied", "left"}.
+        """
+        stats = {"removed": 0, "copied": 0, "left": 0}
+        q = self._get_qbt()
+        if q is None:
+            return stats
+        from dedup_downloads import AUDIO_EXTS, NOT_AN_UPGRADE
+        from lidarr import UnmappedPath
+        if getattr(self, "_ha_tried", None) is None:
+            self._ha_tried = {}            # hash -> last try to copy it in
+        if getattr(self, "_ha_said", None) is None:
+            self._ha_said = {}             # hash -> last "left as it is" log
+        if getattr(self, "_ha_checked", None) is None:
+            self._ha_checked = {}          # hash -> last "is it worse" check
+        tried, said, checked = self._ha_tried, self._ha_said, self._ha_checked
+        not_ready = {"missingFiles", "error", "checkingUP", "checkingDL",
+                     "checkingResumeData", "moving"}
+
+        def _left(h: str, name: str, why: str) -> None:
+            stats["left"] += 1
+            now = time.time()
+            if now - said.get(h, 0.0) < 86400:
+                return
+            said[h] = now
+            logger.info("Hand-added: %r stays as it is -- %s", name, why)
+
+        def _one(h: str, info: Dict[str, Any]) -> None:
+            name = str(info.get("name") or h[:12])
+            answered, t = q.lookup(h)
+            if not answered or not t:
+                return
+            if (t.get("category") or "").strip():
+                return
+            if float(t.get("progress") or 0) < 1.0:
+                return
+            if str(t.get("state") or "") in not_ready:
+                return
+            if claims.busy_torrent(str(t.get("content_path") or "")):
+                return
+            roots = [Path(r) for r in (info.get("roots") or [])
+                     if Path(r).exists()]
+            audios: List[Path] = []
+            for r in roots:
+                if r.is_dir():
+                    audios.extend(p for p in r.rglob("*")
+                                  if p.is_file()
+                                  and p.suffix.lower() in AUDIO_EXTS)
+                elif r.suffix.lower() in AUDIO_EXTS:
+                    audios.append(r)
+            audios = sorted(set(audios))
+            if not roots or not audios:
+                return
+            # The artist: from the files' tags, else from the folder's name.
+            rec = None
+            for p in audios[:5]:
+                a = (self._read_audio_tags(p) or ("", ""))[0]
+                if a:
+                    found = self.lidarr.find_artist(a)
+                    if found and found.get("id"):
+                        rec = found
+                        break
+            if rec is None:
+                first = roots[0].name.split(" - ")[0].strip()
+                found = self.lidarr.find_artist(first) if first else None
+                if found and found.get("id"):
+                    rec = found
+            if rec is None:
+                _left(h, name, "its artist is not in Lidarr")
+                return
+            aid = int(rec["id"])
+
+            # A worse copy goes: every song of it is in the library in a
+            # strictly better quality. Only for a torrent with one folder, so
+            # what was verified is all of what is removed.
+            # At most every 6 h per torrent: each check is a fresh import
+            # probe in Lidarr (force=True, ~20 s for an album).
+            if len(roots) == 1 and time.time() - checked.get(h, 0.0) >= 21600:
+                checked[h] = time.time()
+                try:
+                    lf = self.lidarr.windows_to_lidarr(roots[0])
+                except UnmappedPath:
+                    _left(h, name, "Lidarr cannot see it")
+                    return
+                gen = self._lidarr_generation()
+                cands = self.lidarr.manual_import_candidates(
+                    lf, artist_id=aid, force=True) or []
+                if self._lidarr_generation() != gen:
+                    return                 # Lidarr failed: no verdict this pass
+                paths = [self.lidarr.windows_to_lidarr(p) for p in audios]
+                ids: List[int] = []
+                for c in cands:
+                    for tr in (c.get("tracks") or []):
+                        try:
+                            tfid = int(tr.get("trackFileId") or 0)
+                        except (TypeError, ValueError):
+                            tfid = 0
+                        if tfid > 0:
+                            ids.append(tfid)
+                tq = self.lidarr.trackfile_qualities(ids)
+                pid = rec.get("qualityProfileId") or 0
+                pidx = self.lidarr.quality_profile_index(pid) if pid else {}
+                ok, why = handadded.library_strictly_better(
+                    cands, paths, tq, pidx, not_an_upgrade=NOT_AN_UPGRADE)
+                if ok:
+                    # Asked again right before the delete: still ours to
+                    # leave alone (no category), still protected -- and what
+                    # was checked is ALL of the torrent (its own file list:
+                    # only music and sidecars, every audio file verified).
+                    answered, t2 = q.lookup(h)
+                    if (answered and t2
+                            and not (t2.get("category") or "").strip()
+                            and handadded.protected(str(roots[0]))):
+                        try:
+                            tfiles = q.files(h)
+                        except Exception:  # noqa: BLE001
+                            tfiles = []
+                        whole, why2 = handadded.torrent_fully_checked(
+                            tfiles, t2.get("save_path"), t2.get("content_path"),
+                            str(self.cfg.watch_root or "/downloads"),
+                            [str(p) for p in audios], AUDIO_EXTS)
+                        if not whole:
+                            _left(h, name, "Lidarr holds it better, but %s"
+                                  % why2)
+                            return
+                        if q.remove(h, delete_files=True):
+                            logger.info(
+                                "Hand-added: removed %r with its files -- %s "
+                                "(the owner: the better copy is kept)",
+                                name, why)
+                            handadded.forget(h)
+                            stats["removed"] += 1
+                    return
+
+            # A better copy, or music Lidarr lacks, goes in as a COPY.
+            for r in roots:
+                has_cue = (r.suffix.lower() == ".cue" if not r.is_dir() else
+                           any(p.suffix.lower() == ".cue"
+                               for p in r.rglob("*") if p.is_file()))
+                if has_cue:
+                    _left(h, name, "it holds a CUE sheet; a copy needs a "
+                                   "split, which a hand-added torrent does "
+                                   "not get")
+                    return
+            if time.time() - tried.get(h, 0.0) < 86400:
+                return
+            tried[h] = time.time()
+            for root in roots:
+                try:
+                    lf = self.lidarr.windows_to_lidarr(root)
+                except UnmappedPath:
+                    continue
+                gen = self._lidarr_generation()
+                cands = self.lidarr.manual_import_candidates(
+                    lf, artist_id=aid) or []
+                if self._lidarr_generation() != gen:
+                    tried.pop(h, None)     # Lidarr failed: try again next pass
+                    return
+                album_ids: List[int] = []
+                for c in cands:
+                    if c.get("rejections"):
+                        continue
+                    alb = (c.get("album") or {}).get("id")
+                    if alb and int(alb) not in album_ids:
+                        album_ids.append(int(alb))
+                if album_ids:
+                    totals: Dict[int, int] = {}
+                    for alb in album_ids:
+                        n_tracks = int(((self.lidarr.get_album(alb) or {})
+                                        .get("statistics") or {})
+                                       .get("totalTrackCount") or 0)
+                        if n_tracks > 0:
+                            totals[alb] = n_tracks
+                    if not totals:
+                        continue           # no album's size is known: no copy
+                    # Only albums whose track count is known: the full-album
+                    # check needs it.
+                    cmd, n, titles = self.lidarr.manual_import_folder(
+                        lf, allowed_album_ids=set(totals), import_mode="copy",
+                        album_track_totals=totals, require_full_album=True,
+                        artist_id=aid)
+                    if n and cmd:
+                        self._wait_for_manual_import(
+                            cmd, root, timeout=int(getattr(
+                                self.cfg, "manual_import_timeout_seconds",
+                                300)), require_cleared=False)
+                        logger.info(
+                            "Hand-added: copied %d file(s) of %r into Lidarr "
+                            "(%s) -- the torrent stays as it is",
+                            n, name, ", ".join(titles))
+                        stats["copied"] += n
+                elif not any((c.get("album") or {}).get("id") for c in cands):
+                    # Lidarr lists no album for these songs: the record step.
+                    root_audios = [p for p in audios
+                                   if p == root or root in p.parents]
+                    if self._give_lidarr_the_download(
+                            root, root, root_audios,
+                            str(rec.get("artistName") or ""), "",
+                            "hand-added copy", import_mode="copy"):
+                        stats["copied"] += 1
+
+        for h, info in list(handadded.torrents().items()):
+            try:
+                _one(h, info)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("hand-added pass: %s: %s",
+                               str(info.get("name") or h[:12]), exc)
+        if stats["removed"] or stats["copied"] or stats["left"]:
+            logger.info("Hand-added pass: %d removed, %d copied in, "
+                        "%d left as they are", stats["removed"],
+                        stats["copied"], stats["left"])
+        return stats
 
     # ---- what a grab was FOR -------------------------------------------
     # When the search grabs a torrent it knows exactly which album it wanted.
@@ -6506,10 +6754,13 @@ class Orchestrator:
 
     def _import_library_folder_by_tracknumber(
         self, album_rec: Dict[str, Any], artist_id: int, audios: List[Path],
+        import_mode: str = "move",
     ) -> Optional[int]:
         """
         Import a LIBRARY folder by pairing each file to its track. Returns the
-        ManualImport command id, or None.
+        ManualImport command id, or None. `import_mode` is "move" for the
+        pipeline's own folders and "copy" for a hand-added torrent's, whose
+        files stay where they are.
 
         A file is paired by its SONG TITLE (tag title, then the titles its
         filename carries). Its disc/track number only breaks a tie between
@@ -6641,7 +6892,7 @@ class Orchestrator:
             "empty tracks%s", str(album_rec.get("title"))[:50], len(items),
             len(audios),
             " (%d not imported)" % unmapped if unmapped else "")
-        return self.lidarr.manual_import_apply_files(items, import_mode="move")
+        return self.lidarr.manual_import_apply_files(items, import_mode=import_mode)
 
     # A title that says nothing: "Track 01", "Audio Track 3", "Piste 4", "07".
     # Four digits stay a title ("1979").
@@ -8076,6 +8327,9 @@ class Orchestrator:
             for ex in excluded_resolved:
                 if folder_r == ex or ex in folder_r.parents:
                     return True
+            # A torrent added by hand stays as it is (handadded.py).
+            if handadded.protected(folder_r) is not None:
+                return True
             return False
 
         min_stable = max(0, int(self.cfg.sweep_min_stable_seconds))
@@ -8301,6 +8555,9 @@ class Orchestrator:
             for ex in excluded_resolved:
                 if folder_r == ex or ex in folder_r.parents:
                     return True
+            # A torrent added by hand stays as it is (handadded.py).
+            if handadded.protected(folder_r) is not None:
+                return True
             return False
 
         min_stable = max(0, int(self.cfg.sweep_min_stable_seconds))
@@ -15205,6 +15462,10 @@ class Orchestrator:
         successful import. Only called after we're sure the split files
         are either in the library or accepted by Lidarr.
         """
+        if handadded.protected(cue_path) or handadded.protected(audio_path):
+            logger.info("not deleting %s: it belongs to a torrent added by hand",
+                        Path(cue_path or audio_path).name)
+            return
         # A lead-in-repaired copy was split, not the download's own file: the
         # original is what must go. Deleting only the copy left the 342 MB
         # 'Joe Nichols - Man With a Memory ... .iso.wv' behind, the cueless

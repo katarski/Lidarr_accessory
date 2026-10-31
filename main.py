@@ -27,6 +27,7 @@ from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 from watchdog.observers.polling import PollingObserver
 
+import handadded
 from lidarr import LidarrClient, LidarrConfig
 from llm_gate import build_llm
 from orchestrator import Orchestrator, OrchestratorConfig
@@ -544,7 +545,9 @@ def _is_excluded(path: Path, excluded: list) -> bool:
                 return True
         except OSError:
             continue
-    return False
+    # A torrent added by hand stays as it is: no CUE in its folder is split,
+    # moved or deleted (handadded.py).
+    return handadded.protected(resolved) is not None
 
 
 class CueEventHandler(FileSystemEventHandler):
@@ -890,6 +893,8 @@ def qbt_auto_deselect_loop(
     download_root: str = "", llm=None, q: "Optional[queue.Queue[Path]]" = None,
     assembly_keep_provider=None, deselect_ledger_path: Optional[Path] = None,
     cue_seen: "Optional[set]" = None,
+    handadded_path: Optional[Path] = None,
+    grab_targets_path: Optional[Path] = None,
 ) -> None:
     """
     Poll qBittorrent on a schedule. Two jobs per pass:
@@ -1008,6 +1013,11 @@ def qbt_auto_deselect_loop(
             return None
         return assembly_keep_provider()
 
+    # Proof that the pipeline grabbed a torrent (handadded.make_proof): the
+    # adoption takes only proven uncategorised torrents, and the rest are
+    # the owner's -- they stay as they are.
+    proof = handadded.make_proof(lidarr, grab_targets_path)
+
     delay = min(cadence, 10)  # first pass right after startup
     while not stop.wait(delay):
         delay = cadence
@@ -1022,9 +1032,20 @@ def qbt_auto_deselect_loop(
             # every pass below skips them and they download in full.
             if adopt_uncategorised_on and category:
                 try:
-                    adopt_uncategorised(qbt, category, emit=logger.info)
+                    adopt_uncategorised(qbt, category, emit=logger.info,
+                                        proof=proof)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("adopt uncategorised: %s", exc)
+            # The torrents still without a category and without proof are the
+            # owner's: their folders are kept out of every pass that splits,
+            # moves or deletes (handadded.protected). Every pass, adoption on
+            # or off.
+            if category:
+                try:
+                    handadded.refresh(qbt, proof, download_root,
+                                      path=handadded_path, emit=logger.info)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("hand-added refresh: %s", exc)
             if do_deselect:
                 # Songs an album assembly needs must stay selected even when
                 # their compilation looks fully "owned"/unwanted (requirement e).
@@ -1103,6 +1124,23 @@ def qbt_auto_deselect_loop(
                     logger.warning("stalled reaper: %s", exc)
         except Exception as exc:  # noqa: BLE001
             logger.exception("qbt loop thread: %s", exc)
+
+
+def handadded_loop(orch, stop: threading.Event, interval: int = 1800) -> None:
+    """
+    The torrents the owner added by hand: a worse one goes once Lidarr holds
+    every song of it in better quality, a better one (or music Lidarr lacks)
+    goes into Lidarr as a COPY and stays (Orchestrator.handadded_pass).
+    """
+    if stop.wait(300):                 # not onto the startup work
+        return
+    while True:
+        try:
+            orch.handadded_pass()
+        except Exception:  # noqa: BLE001
+            logger.exception("hand-added pass failed")
+        if stop.wait(max(600, interval)):
+            return
 
 
 def purge_imported_loop(
@@ -1979,6 +2017,32 @@ def main() -> int:
         )
         heartbeat_thread.start()
 
+    # The torrents added by hand, before any CUE is queued: the saved set first
+    # (so their folders are protected at once), then qBittorrent's own answer.
+    _ha_path = Path(args.config).parent / "handadded.json"
+    _grab_path = (Path(orch_cfg.sweep_ledger_file).with_name("grab_targets.json")
+                  if getattr(orch_cfg, "sweep_ledger_file", None) else None)
+    try:
+        _n_ha = handadded.load(_ha_path)
+        if _n_ha:
+            logger.info("hand-added torrents: %d loaded", _n_ha)
+        _qb = cfg.get("qbittorrent") or {}
+        if _qb.get("base_url"):
+            import qbittorrent_client
+            _qc = qbittorrent_client.shared(
+                _qb["base_url"], _qb.get("username", ""), _qb.get("password", ""))
+            if _qc.login():
+                # No Lidarr call here (a hung Lidarr must not hold up the
+                # start): an unproven torrent stays protected until the
+                # qBittorrent loop's first pass asks Lidarr and adopts it.
+                handadded.refresh(_qc, handadded.make_proof(None, _grab_path),
+                                  str(watch_root), path=_ha_path)
+            else:
+                logger.warning("hand-added torrents: qBittorrent login failed; "
+                               "the saved set stays")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("hand-added torrents at startup: %s", exc)
+
     pre_existing = scan_existing(watch_root, excluded_dirs, q, seen=cue_seen)
     if pre_existing:
         logger.info("Queued %d pre-existing .cue files at startup", pre_existing)
@@ -2064,6 +2128,8 @@ def main() -> int:
                         return
                     srcs = [i.get("source_path") for i in orch.held.list()
                             if i.get("source_path")]
+                    # A hand-added torrent's folder is not ours to harvest.
+                    srcs = [s for s in srcs if handadded.protected(s) is None]
                     SH.harvest_pass(
                         lidarr, srcs, ledger=led,
                         tolerance_seconds=orch_cfg.harvest_duration_tolerance,
@@ -2207,7 +2273,11 @@ def main() -> int:
                       # re-plans (and re-LLMs) every torrent from scratch.
                       (isearch_state_path.parent / "deselect_planned.json"
                        if isearch_state_path else None)),
-                kwargs={"cue_seen": cue_seen},
+                kwargs={
+                    "cue_seen": cue_seen,
+                    "handadded_path": _ha_path,
+                    "grab_targets_path": _grab_path,
+                },
                 daemon=True,
                 name="cue-qbt",
             )
@@ -2219,6 +2289,14 @@ def main() -> int:
                 _as_bool(qbt_cfg.get("pause_during_scan", True)),
                 qbt_cfg["base_url"], qbt_cfg.get("category", ""),
             )
+            threading.Thread(
+                target=handadded_loop, args=(orch, stop, 1800),
+                daemon=True, name="cue-handadded",
+            ).start()
+            logger.info(
+                "Hand-added pass: enabled (every 1800s) -- torrents added by "
+                "hand stay; a better copy goes in, a worse one goes when "
+                "Lidarr holds it better")
 
     # --- Purge-imported sweep (opt-in) ---------------------------------
     # Continuously delete download folders whose album Lidarr already has

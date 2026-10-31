@@ -66,7 +66,7 @@ def _orch(lidarr):
     o._album_from_tags = lambda a: "Comp"
     o._record_song_titles = lambda a: [(p, "Song %d" % i) for i, p in enumerate(a)]
     o._audio_duration_seconds = lambda p: 200.0
-    o._import_library_folder_by_tracknumber = lambda alb, aid, a: 5
+    o._import_library_folder_by_tracknumber = lambda alb, aid, a, **k: 5
     o._trigger_artist_refresh = lambda *a, **k: None
     o._record = lambda *a, **k: o.recorded.append(k.get("outcome"))
     return o

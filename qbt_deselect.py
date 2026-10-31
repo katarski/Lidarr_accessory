@@ -929,38 +929,33 @@ def dead_grab_reaper_pass(
     return removed
 
 
-# What a music rip carries beside its audio: sheets, rip logs and checksums,
-# artwork and scans, notes, playlists. Anything else (video, programs,
-# archives) and a hand-added torrent is not adopted.
-_MUSIC_ONLY_EXTS = frozenset({
-    ".cue", ".log", ".txt", ".nfo", ".m3u", ".m3u8", ".pls", ".accurip",
-    ".sfv", ".md5", ".ffp", ".st5", ".toc", ".sha1", ".sha256",
-    ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tif", ".tiff", ".webp", ".pdf",
-})
-
-
 def adopt_uncategorised(
     qbt: QbtClient, category: str,
     emit: Callable[[str], None] = logger.info, max_adopt: int = 50,
+    proof: Optional[Callable[[dict], Optional[bool]]] = None,
 ) -> int:
     """
     Give the managed category to music torrents that have NO category.
 
     Everything in this module filters by `category` (Lidarr sets it on its own
-    grabs), so a torrent added by hand -- or by anything that forgets the
-    category -- is invisible to the pipeline: no deselect, no lifecycle, no
-    reaping. It just downloads in full. A real case: "Beck - Odelay (2016)
-    [FLAC 24-88]" sitting at 27% with an empty category while 263 other torrents
-    were managed.
+    grabs), so a torrent the pipeline itself grabbed or added but whose
+    category went missing is invisible to the pipeline: no deselect, no
+    lifecycle, no reaping. It just downloads in full. A real case: "Beck -
+    Odelay (2016) [FLAC 24-88]" sitting at 27% with an empty category while
+    263 other torrents were managed.
 
-    A torrent the pipeline itself added (it carries SELF_ADDED_TAG) is
-    adopted when most of it is audio. A torrent added by hand is adopted too
-    (the owner, 31 Oct 2026: treat hand-added torrents like Lidarr's, so
-    once their music is imported or owned they are removed), but only when
-    EVERY file is music or what a rip carries beside it (_MUSIC_ONLY_EXTS)
-    and it holds audio. The client is shared, and a cleanup once took six
-    'How Its Made' episodes from another app: one video, program or archive
-    file keeps a torrent out. Returns the number adopted.
+    A torrent that carries SELF_ADDED_TAG (the pipeline added it itself) is
+    adopted when most of it is audio. Any other uncategorised torrent is
+    adopted only when `proof(t)` is True -- proof that the pipeline grabbed it
+    (handadded.make_proof: its grab record, or a Lidarr Grabbed event for its
+    hash) -- and it holds audio. A torrent without that proof was added by
+    hand and is never adopted: the owner, 31 Oct 2026: "if it hand added - it
+    stays" (Orchestrator.handadded_pass keeps its rules). The 15:07 adoption
+    of 31 Oct took 45 uncategorised torrents under the earlier rule (every
+    file music or a rip's sidecar), and all 45 turned out to have proof: 40
+    Lidarr grab events and 5 in the grab record. The client is shared, so a
+    torrent whose proof could not be asked for (None) is not adopted either.
+    Returns the number adopted.
     """
     if not category:
         return 0
@@ -975,6 +970,13 @@ def adopt_uncategorised(
         h = t.get("hash")
         if not h:
             continue
+        if not self_added:
+            try:
+                proven = proof is not None and proof(t) is True
+            except Exception:  # noqa: BLE001
+                proven = False
+            if not proven:
+                continue                          # hand-added: it stays
         try:
             files = qbt.files(h)
         except Exception:  # noqa: BLE001
@@ -986,12 +988,8 @@ def adopt_uncategorised(
                     in AUDIO_EXTS)
         if audio == 0:
             continue                              # not a music download
-        if self_added:
-            if audio * 2 < len(files):
-                continue                          # not a music download
-        elif any(os.path.splitext(str(f.get("name") or ""))[1].lower()
-                 not in AUDIO_EXTS | _MUSIC_ONLY_EXTS for f in files):
-            continue                              # hand-added, not only music
+        if self_added and audio * 2 < len(files):
+            continue                              # not a music download
         if qbt.set_category(h, category):
             adopted += 1
             emit(f"adopted uncategorised music torrent into '{category}': "

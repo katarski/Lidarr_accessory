@@ -115,22 +115,27 @@ class _QbtFiles(_Qbt):
 
 
 class Adopt(unittest.TestCase):
-    def test_our_own_and_hand_added_music_are_adopted(self):
-        # The owner, 31 Oct 2026: hand-added torrents are treated like
-        # Lidarr's. Only when every file is music or a rip's sidecar: the
-        # client is shared, and one video file keeps a torrent out.
+    def test_our_own_and_proven_music_are_adopted_hand_added_stays(self):
+        # The owner, 31 Oct 2026: "if it hand added - it stays." A torrent is
+        # adopted when it carries the pipeline's own tag, or when there is
+        # proof the pipeline grabbed it (its grab record, a Lidarr grab
+        # event). One without proof was added by hand, however musical it
+        # looks: the client is shared, and the owner's torrents stay as they
+        # are.
         ts = [{"hash": "mine", "category": "", "tags": QbtClient.SELF_ADDED_TAG},
+              {"hash": "proven", "category": "", "tags": ""},
               {"hash": "hand", "category": "", "tags": ""},
-              {"hash": "video", "category": "", "tags": ""},
               {"hash": "other", "category": "tv", "tags": ""}]
         q = _QbtFiles(ts, {
             "mine": [{"name": "x.flac"}, {"name": "x.mkv"}],
+            "proven": [{"name": "CD-1/x.flac"}, {"name": "CD-1/x.cue"},
+                       {"name": "CD-1/x.log"}, {"name": "cover/01.jpg"}],
             "hand": [{"name": "CD-1/x.flac"}, {"name": "CD-1/x.cue"},
                      {"name": "CD-1/x.log"}, {"name": "cover/01.jpg"}],
-            "video": [{"name": "a.flac"}, {"name": "b.flac"}, {"name": "c.mkv"}],
             "other": [{"name": "y.flac"}]})
-        QD.adopt_uncategorised(q, "lidarr", emit=lambda s: None)
-        self.assertEqual(q.categorised, ["mine", "hand"])
+        QD.adopt_uncategorised(q, "lidarr", emit=lambda s: None,
+                               proof=lambda t: t["hash"] == "proven")
+        self.assertEqual(q.categorised, ["mine", "proven"])
 
 
 class _Lidarr:
