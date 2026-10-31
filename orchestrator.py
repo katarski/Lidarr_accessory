@@ -45,6 +45,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from cue_parser import Cue, LLMUnavailableError, parse_cue, read_cue_text
 from dedup_downloads import _EDITION_WORDS as _EDITION_NOISE_WORDS
+from dedup_downloads import in_pipeline_temp
 from held_store import HeldStore
 from lidarr import LidarrClient, _demojibake, _translit_cyrillic
 from ollama_client import OllamaClient, is_unavailable
@@ -96,6 +97,65 @@ def _album_track_file_count(album_rec: Dict[str, Any]) -> int:
         if isinstance(v, int):
             return v
     return 0
+
+
+# When this process started. An extraction's temp folder older than that was
+# left by an interrupted run (a restart, a crash): nothing in this process owns
+# it, so it is deleted and the extraction runs again (the owner, 31 Oct 2026: "I
+# expect if someting is interupted, to be resumed later"; "will the leftovers
+# from the interupted extraction be deleted? they should be").
+_PROCESS_START = time.time()
+
+# DSD64, the only SACD rate: 2,822,400 bits a second per channel.
+_DSD64_BYTES_PER_SEC_PER_CH = 352800.0
+
+
+def parse_sacd_area(text: str, area: str) -> Optional[Dict[str, Any]]:
+    """The area `area` ('m': the multichannel one with the most channels, '2':
+    the stereo one) of a `sacd_extract -P` listing: {channels, tracks,
+    seconds}. Play time is mins:secs:frames, 75 frames a second. None when
+    the listing has no such area."""
+    areas: List[Dict[str, Any]] = []
+    for block in re.split(r"Area Information \[\d+\]:", text or "")[1:]:
+        ch = re.search(r"Speaker config:\s*(\d+)\s*Channel", block)
+        if not ch:
+            continue
+        tc = re.search(r"Track Count:\s*(\d+)", block)
+        tt = re.search(r"Total play time:\s*(\d+):(\d+):(\d+)", block)
+        secs = ((int(tt.group(1)) * 60 + int(tt.group(2))
+                 + int(tt.group(3)) / 75.0) if tt else 0.0)
+        areas.append({"channels": int(ch.group(1)),
+                      "tracks": int(tc.group(1)) if tc else 0,
+                      "seconds": secs})
+    if area == "m":
+        multi = [a for a in areas if a["channels"] > 2]
+        return max(multi, key=lambda a: a["channels"]) if multi else None
+    return next((a for a in areas if a["channels"] == 2), None)
+
+
+def sacd_progress(tmp: Path, expect_bytes: float,
+                  n_tracks: int) -> Tuple[Optional[float], int, str]:
+    """How far an SACD extraction has come: (percent or None, tracks begun,
+    the name of the one being written). sacd_extract writes the tracks one
+    after another as DSF, so the bytes on disk against the area's size (play
+    time x channels x 352,800 bytes a second) are the progress; held below 100
+    until the extraction ends."""
+    try:
+        files = sorted(list(tmp.rglob("*.dsf")) + list(tmp.rglob("*.dff")))
+    except OSError:
+        files = []
+    done = 0
+    for f in files:
+        try:
+            done += f.stat().st_size
+        except OSError:
+            pass
+    pct: Optional[float] = None
+    if expect_bytes > 0:
+        pct = min(99.0, 100.0 * done / expect_bytes)
+    elif n_tracks > 0 and files:
+        pct = min(99.0, 100.0 * (len(files) - 1) / n_tracks)
+    return pct, len(files), (files[-1].stem if files else "")
 
 
 # Lazy creation of an Orchestrator's Find-missing worker state (several WebUI
@@ -3018,6 +3078,35 @@ class Orchestrator:
             return "2"
         return None
 
+    def _sacd_area_info(self, iso_path: Path, area: str) -> Optional[Dict[str, Any]]:
+        """{channels, tracks, seconds} of the area that will be extracted, from
+        `sacd_extract -P`: what the progress bar measures against. None when it
+        cannot be read (the bar then counts tracks, or shows none)."""
+        try:
+            proc = subprocess.run(
+                ["sacd_extract", "-P", "-i", str(iso_path)],
+                capture_output=True, text=True, timeout=600,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("SACD: listing failed for %s: %s", iso_path.name, exc)
+            return None
+        return parse_sacd_area((proc.stdout or "") + "\n" + (proc.stderr or ""),
+                               area)
+
+    def _delete_interrupted_temp(self, tmp: Path, what: str) -> None:
+        """What an interrupted extraction left: its temp folder goes, and the
+        extraction runs again from the start (the owner, 31 Oct 2026: "I
+        expect if someting is interupted, to be resumed later"; "will the
+        leftovers from the interupted extraction be deleted? they should
+        be")."""
+        try:
+            n = sum(1 for p in tmp.rglob("*") if p.is_file())
+        except OSError:
+            n = 0
+        shutil.rmtree(tmp, ignore_errors=True)
+        logger.info("%s: deleted what an interrupted extraction left in %s "
+                    "(%d file(s)) -- it runs again", what, tmp.parent.name, n)
+
     def _remove_stray_cues(self, folder: Path) -> None:
         """
         Remove sidecar .cue file(s) so the sweep won't treat an ISO folder as
@@ -3047,8 +3136,19 @@ class Orchestrator:
 
         Guards: never touches a still-settling .iso; never re-extracts a folder
         that already holds DSF/DFF/FLAC; leaves a non-SACD (video/data) ISO
-        completely alone.
+        completely alone. A temp folder found on the way in is what an
+        interrupted extraction left: it is deleted first, whatever happens next,
+        so the extraction runs again (the sweep is one thread, and an extraction
+        of this process is in `_sacd_busy`).
         """
+        busy = getattr(self, "_sacd_busy", None)
+        if busy is None:
+            busy = self._sacd_busy = set()
+        if str(folder) in busy:
+            return True            # this process is extracting it right now
+        stale = folder / ".sacd_extract_tmp"
+        if stale.exists():
+            self._delete_interrupted_temp(stale, "SACD")
         # Don't grab a still-downloading ISO (SACD rips are multi-GB).
         settle = max(min_stable, 60)
         for iso in isos:
@@ -3065,7 +3165,8 @@ class Orchestrator:
         # (any(rglob(...)) checks each generator YIELDS a match -- a bare
         # generator object is always truthy, so it must be consumed.)
         already = any(
-            any(True for _ in folder.rglob(f"*{ext}"))
+            any(True for p in folder.rglob(f"*{ext}")
+                if not in_pipeline_temp(p.relative_to(folder)))
             for ext in (".dsf", ".dff", ".flac")
         )
         if already:
@@ -3114,24 +3215,75 @@ class Orchestrator:
             return True
 
         label = "multichannel" if area == "m" else "2-channel"
-        logger.info("SACD: extracting %s area from %s ...", label, iso.name)
+        # The bar on the WebUI, like a CUE split's: the bytes written against
+        # the area's size, and which track is being written (the owner, 31 Oct
+        # 2026: "make a progress bar for teh sacd like when splitting a
+        # regular cue").
+        info = self._sacd_area_info(iso, area) or {}
+        n_tracks = int(info.get("tracks") or 0)
+        expect = (float(info.get("seconds") or 0.0) * int(info.get("channels") or 0)
+                  * _DSD64_BYTES_PER_SEC_PER_CH)
+        logger.info("SACD: extracting %s area from %s (%s track(s)) ...", label,
+                    iso.name, n_tracks or "?")
         cmd = ["sacd_extract", "-m" if area == "m" else "-2",
                "-s", "-c", "-y", str(tmp), "-i", str(iso)]
+        tail: List[str] = []
+        busy.add(str(folder))
         try:
-            proc = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=7200,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("SACD: extraction failed for %s: %s", iso.name, exc)
-            shutil.rmtree(tmp, ignore_errors=True)
-            self._skip_seen.add(folder)
-            return True
+            try:
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, errors="replace")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("SACD: extraction failed for %s: %s", iso.name, exc)
+                shutil.rmtree(tmp, ignore_errors=True)
+                self._skip_seen.add(folder)
+                return True
+
+            def _drain() -> None:
+                try:
+                    for line in proc.stdout:
+                        tail.append(line)
+                        if len(tail) > 400:
+                            del tail[:200]
+                except Exception:  # noqa: BLE001
+                    pass
+            reader = threading.Thread(target=_drain, daemon=True,
+                                      name="sacd-extract-out")
+            reader.start()
+            t0 = time.time()
+            while True:
+                try:
+                    proc.wait(timeout=5)
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+                if time.time() - t0 > 7200:
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=30)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    logger.warning("SACD: extraction of %s ran over 2 h -- "
+                                   "stopped", iso.name)
+                    shutil.rmtree(tmp, ignore_errors=True)
+                    self._skip_seen.add(folder)
+                    return True
+                pct, began, name = sacd_progress(tmp, expect, n_tracks)
+                detail = ("%s, track %d/%d — %s" % (label, began, n_tracks, name)
+                          if n_tracks and began else
+                          "%s area of %s" % (label, iso.name))
+                self._activity_start(folder, "SACD", detail, pct=pct)
+            reader.join(timeout=5)
+        finally:
+            busy.discard(str(folder))
+        out = "".join(tail)
 
         dsfs = sorted(tmp.rglob("*.dsf")) + sorted(tmp.rglob("*.dff"))
         if not dsfs:
             logger.warning(
                 "SACD: extraction produced no DSF for %s -- %s",
-                iso.name, (proc.stderr or proc.stdout or "")[-200:],
+                iso.name, out[-200:],
             )
             shutil.rmtree(tmp, ignore_errors=True)
             self._skip_seen.add(folder)
@@ -3663,6 +3815,10 @@ class Orchestrator:
         for dest in candidates:
             tmp = dest / ".dvda_extract_tmp"
             try:
+                if tmp.is_dir() and tmp.stat().st_mtime < _PROCESS_START:
+                    # Left by an interrupted run, not a rip of this process.
+                    self._delete_interrupted_temp(tmp, "DVD-Audio")
+                    continue
                 if tmp.is_dir() and (now_ts - tmp.stat().st_mtime) < 7200:
                     return True
             except OSError:
@@ -3860,7 +4016,10 @@ class Orchestrator:
         # The staging dir doubles as the lock: if it's present and recently
         # touched, another pass owns this rip -- defer.
         try:
-            if tmp.is_dir() and (now_ts - tmp.stat().st_mtime) < 7200:
+            if tmp.is_dir() and tmp.stat().st_mtime < _PROCESS_START:
+                # Left by an interrupted run: it goes, the rip starts again.
+                self._delete_interrupted_temp(tmp, "DVD-Audio")
+            elif tmp.is_dir() and (now_ts - tmp.stat().st_mtime) < 7200:
                 logger.info(
                     "DVD-Audio: %s is already being extracted (staging dir "
                     "present) -- leaving it to the pass that owns it", iso.name)
@@ -4297,7 +4456,11 @@ class Orchestrator:
                 sources = kept
         made: List[Path] = []
         self._clear_partials(folder)
-        for p in sources:
+        for i, p in enumerate(sources, 1):
+            # The bar on the WebUI, track by track like a CUE split's.
+            self._activity_start(folder, "DSD→FLAC",
+                                 "track %d/%d — %s" % (i, len(sources), p.stem),
+                                 pct=100.0 * (i - 1) / max(1, len(sources)))
             out = p.with_suffix(".flac")
             if out.exists() and out.resolve() != p.resolve():
                 made.append(out)
@@ -8351,6 +8514,9 @@ class Orchestrator:
             # A torrent added by hand stays as it is (handadded.py).
             if handadded.protected(folder_r) is not None:
                 return True
+            # An extraction's own working folder is never a download.
+            if in_pipeline_temp(folder_r):
+                return True
             return False
 
         min_stable = max(0, int(self.cfg.sweep_min_stable_seconds))
@@ -8578,6 +8744,9 @@ class Orchestrator:
                     return True
             # A torrent added by hand stays as it is (handadded.py).
             if handadded.protected(folder_r) is not None:
+                return True
+            # An extraction's own working folder is never a download.
+            if in_pipeline_temp(folder_r):
                 return True
             return False
 

@@ -28,6 +28,7 @@ from watchdog.observers import Observer
 from watchdog.observers.polling import PollingObserver
 
 import handadded
+from dedup_downloads import in_pipeline_temp
 from lidarr import LidarrClient, LidarrConfig
 from llm_gate import build_llm
 from orchestrator import Orchestrator, OrchestratorConfig
@@ -545,6 +546,9 @@ def _is_excluded(path: Path, excluded: list) -> bool:
                 return True
         except OSError:
             continue
+    # An extraction's own working folder is never a download.
+    if in_pipeline_temp(resolved):
+        return True
     # A torrent added by hand stays as it is: no CUE in its folder is split,
     # moved or deleted (handadded.py).
     return handadded.protected(resolved) is not None

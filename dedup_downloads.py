@@ -143,6 +143,23 @@ from lidarr import LidarrClient, LidarrConfig, UnmappedPath
 
 logger = logging.getLogger("dedup")
 
+# Folders the pipeline itself works in while it extracts a disc image
+# (Orchestrator._extract_sacd_folder / _extract_dvda_folder). No pass may take
+# one for a download: after the 31 Oct 2026 15:24 restart the cueless sweep took
+# the leftover `.sacd_extract_tmp/9/6ch` of Lara Fabian's killed SACD
+# extraction for a DSD album and transcoded its half-written track ("02 - UN
+# AVE MARIA.flac encoded but is unreadable"), and reconcile probed it.
+PIPELINE_TEMP_DIRS = frozenset({".sacd_extract_tmp", ".dvda_extract_tmp"})
+
+
+def in_pipeline_temp(path) -> bool:
+    """Is `path` inside one of the pipeline's own extraction folders?"""
+    try:
+        return any(part in PIPELINE_TEMP_DIRS for part in Path(path).parts)
+    except (TypeError, ValueError):
+        return False
+
+
 AUDIO_EXTS = {
     ".flac", ".ape", ".wv", ".wav", ".aiff", ".aif",
     ".m4a", ".m4b", ".alac",
@@ -681,6 +698,8 @@ def purge_imported_downloads(
         # A torrent added by hand stays as it is (handadded.py).
         if handadded.protected(pr) is not None:
             return True
+        if in_pipeline_temp(p):
+            return True            # an extraction's own working folder
         return "_processed" in p.parts
 
     candidates: list = []
