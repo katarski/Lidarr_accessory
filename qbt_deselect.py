@@ -158,6 +158,39 @@ _VIDEO_DIR = re.compile(r"(?i)(?:^|/)(?:video_ts|bdmv)(?:/|$)")
 # A DVD-Audio zone -- this is AUDIO, never deselected as "video".
 _AUDIO_TS_DIR = re.compile(r"(?i)(?:^|/)audio_ts(?:/|$)")
 
+# --- No pictures (the owner, 31 Oct 2026) -----------------------------------
+# "lidarr keeps images to be downlaoded. At one pont i requested no pictures
+# and I am still seeing them." A music grab's covers, scans and artwork are not
+# downloaded, like its video. Nothing in the pipeline reads a picture file (no
+# tag embeds art from one).
+_PICTURE_EXTS = frozenset({
+    ".jpg", ".jpeg", ".jpe", ".jfif", ".png", ".gif", ".bmp", ".tif", ".tiff",
+    ".webp", ".heic",
+})
+
+
+def _picture_file_indices(files: List[Dict[str, Any]]) -> List[int]:
+    """qBit file indices of the pictures still to download: a picture
+    extension, still selected (priority not 0) and not finished. A finished
+    picture is left alone (deselecting it deletes nothing and saves nothing),
+    and one already deselected is not listed, so a re-check stays quiet."""
+    out: List[int] = []
+    for f in files:
+        if "index" not in f:
+            continue
+        ext = os.path.splitext(str(f.get("name", "")))[1].lower()
+        if ext not in _PICTURE_EXTS:
+            continue
+        try:
+            if int(f.get("priority", 1)) == 0:
+                continue
+            if float(f.get("progress") or 0) >= 1.0:
+                continue
+            out.append(int(f["index"]))
+        except (TypeError, ValueError):
+            continue
+    return out
+
 
 def _blocklist_torrent(lidarr: LidarrClient, thash: str) -> None:
     """Blocklist the Lidarr queue row for this torrent (so Lidarr won't grab the
@@ -537,10 +570,12 @@ def process_torrent(
     files: Optional[List[Dict[str, Any]]] = None,
     llm=None, deselect_video: bool = True, reap_useless: bool = False,
     assembly_keep: Optional[set] = None, out: Optional[dict] = None,
+    deselect_images: bool = True,
 ) -> tuple:
     """Plan + (optionally) deselect one torrent. Returns (deselected, kept).
     `out`, when given, receives "deferred": how many albums wait for the LLM
-    (kept downloading for now; the torrent must be planned again)."""
+    (kept downloading for now; the torrent must be planned again).
+    `deselect_images`: the pictures still to download are deselected too."""
     thash = torrent.get("hash")
     tname = torrent.get("name") or "?"
     if files is None:
@@ -548,10 +583,12 @@ def process_torrent(
     # Video exclusion (#4) is independent of the album plan: even a torrent with
     # no owned albums (or no audio-album grouping) should drop its video files.
     video_idx = _video_file_indices(files) if deselect_video else []
+    # No pictures (the owner): independent of the album plan, like video.
+    picture_idx = _picture_file_indices(files) if deselect_images else []
     plan = plan_torrent(lidarr, tname, files, forced_artist, llm=llm)
     if out is not None:
         out["deferred"] = sum(1 for a in plan if a.get("deferred"))
-    if not plan and not video_idx:
+    if not plan and not video_idx and not picture_idx:
         return 0, 0
     emit(f"Torrent: {tname}")
     to_deselect: List[int] = []
@@ -584,6 +621,14 @@ def process_torrent(
             to_deselect.extend(fresh)
             emit(f"  VIDEO -> deselect {len(fresh)} video file(s) "
                  f"(VIDEO_TS/BDMV/containers; AUDIO_TS + .iso kept)")
+    # Pictures (covers, scans, artwork): the owner wants none downloaded.
+    if picture_idx:
+        already = set(to_deselect)
+        fresh = [i for i in picture_idx if i not in already]
+        if fresh:
+            to_deselect.extend(fresh)
+            emit(f"  PICTURES -> deselect {len(fresh)} picture file(s) "
+                 f"(covers, scans, artwork)")
     # Idempotent apply: only touch files NOT already deselected, so a periodic
     # re-check (see auto_deselect_pass recheck) is quiet and issues no needless
     # priority churn on a torrent it already handled. `cur` is every file's
@@ -683,6 +728,7 @@ def auto_deselect_pass(
     on_progress: Optional[Callable[[], None]] = None,
     progress_every: int = 10,
     start_added_stopped: bool = True,
+    deselect_images: bool = True,
 ) -> int:
     """
     One scheduled pass for the pipeline: for each INCOMPLETE music torrent,
@@ -776,6 +822,7 @@ def auto_deselect_pass(
                 qbt, lidarr, t, apply=True, emit=emit, files=files, llm=llm,
                 deselect_video=deselect_video, reap_useless=reap_useless,
                 assembly_keep=assembly_keep, out=info,
+                deselect_images=deselect_images,
             )
             seen.add(h)
             if planned is not None:

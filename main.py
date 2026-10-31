@@ -225,6 +225,7 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     put("qbittorrent", "pause_during_scan", "QBIT_PAUSE_SCAN", _as_bool)
     put("qbittorrent", "start_added_stopped", "QBIT_START_ADDED_STOPPED", _as_bool)
     put("qbittorrent", "deselect_video", "QBIT_DESELECT_VIDEO", _as_bool)
+    put("qbittorrent", "deselect_images", "QBIT_DESELECT_IMAGES", _as_bool)
     put("qbittorrent", "redeselect_recheck_seconds", "QBIT_REDESELECT_RECHECK", int)
     put("qbittorrent", "adopt_uncategorised", "QBIT_ADOPT_UNCATEGORISED", _as_bool)
     put("qbittorrent", "stalled_reaper", "QBIT_STALLED_REAPER", _as_bool)
@@ -932,6 +933,9 @@ def qbt_auto_deselect_loop(
     do_deselect = _as_bool(qcfg.get("auto_deselect", False))
     manage_completed = _as_bool(qcfg.get("manage_completed", True))
     deselect_video = _as_bool(qcfg.get("deselect_video", True))  # #4
+    # No pictures (the owner, 31 Oct 2026): covers, scans and artwork in a
+    # lidarr-category torrent are deselected like its video.
+    deselect_images = _as_bool(qcfg.get("deselect_images", True))
     reap_useless = _as_bool(qcfg.get("reap_useless_torrents", True))
     # Dead-grab reaper: remove lidarr-category torrents stuck at ~0% past a
     # grace window (default 2 days) + blocklist so Lidarr re-searches a live
@@ -1068,6 +1072,7 @@ def qbt_auto_deselect_loop(
                                                          pause_during_scan=pause_scan,
                                                          llm=match_llm,
                                                          deselect_video=deselect_video,
+                                                         deselect_images=deselect_images,
                                                          reap_useless=reap_useless,
                                                          planned=planned_deselect,
                                                          recheck_seconds=redeselect_recheck,

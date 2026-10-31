@@ -229,6 +229,12 @@ qbittorrent:
   # containers) are deselected. A DVD-Audio AUDIO_TS zone and a whole-disc .iso
   # are AUDIO and kept. Set false to disable.
   deselect_video: true
+  # No pictures (the owner, 31 Oct 2026): pictures in lidarr-category torrents
+  # (covers, scans, artwork: .jpg .jpeg .png .gif .bmp .tif .tiff .webp ...)
+  # still to download are deselected, at first sight and at every re-check.
+  # Finished pictures and hand-added torrents are left alone. Set false to
+  # download them again.
+  deselect_images: true
   # Dead-grab reaper: remove lidarr-category torrents stuck at ~0% in a dead/
   # stalled/metadata state longer than dead_grab_grace_minutes (from add time),
   # and blocklist them so Lidarr re-searches a live (lossless-preferred)

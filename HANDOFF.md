@@ -926,6 +926,19 @@ test of a feature whose purpose is removing files.
      tracks' existing files with no quality comparison; the import's
      `UpgradeSpecification` compares quality only, not the cutoff or
      `upgradeAllowed` (Lidarr develop source, checked 31 Oct 2026).
+   - *No pictures* (the owner: "lidarr keeps images to be downlaoded. At one
+     pont i requested no pictures and I am still seeing them"). No rule for
+     them existed: the deselect pass dropped video, owned albums and noise
+     folders, never pictures. Read on 31 Oct 2026 at 23:20: 1,590 selected
+     pictures in 176 of qBittorrent's torrents, 566 of them still to download
+     in 36. `_picture_file_indices` (.jpg .jpeg .jpe .jfif .png .gif .bmp
+     .tif .tiff .webp .heic; still selected and not finished) joins
+     `process_torrent` beside the video, whatever the album plan says, so a
+     torrent's first sight and every re-check (`redeselect_recheck_seconds`,
+     1800 live) drop them; a finished picture and a hand-added torrent (no
+     category) are left alone. `qbittorrent.deselect_images` (default true).
+     Lidarr's own metadata writers (Kodi/Emby and Roksbox, artist and album
+     images on) are Lidarr settings, not the pipeline's.
 
 1. **0 audit findings are open: `docs/AUDIT_OPEN.md`**, in fix order, each
    with evidence, root cause and the agreed fix (the verifier's correction
