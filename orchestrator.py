@@ -1515,7 +1515,30 @@ class Orchestrator:
                     "%s: all %d split tracks check out -- deleting the disc "
                     "image and .cue before the import", cue_path.name,
                     len(splits))
+                gone = [audio_path, getattr(self, "_repair_origin", {}).get(audio_path)]
                 self._delete_originals(cue_path, audio_path)
+                self._delete_twin_cues(cue_path.parent, gone)
+                # A disc of a multi-disc album is never imported on its own:
+                # half an album fits no release, so every disc was refused
+                # (Christina Aguilera's '1999 - 2003', CD-1 and CD-2, each
+                # "Couldn't find similar album" on 31 Oct). Its tracks go into
+                # the disc folder, the layout the cueless sweep imports as ONE
+                # album (_unify_multidisc_eligible), and the sweep does so once
+                # no disc of it holds a .cue any more.
+                unit = self._multidisc_cue_unit(cue_path)
+                if unit is not None:
+                    moved = self._disc_tracks_into_disc_folder(
+                        splits, cue_path.parent, staging_dir)
+                    waiting = [c.parent.name for c in unit[1] if c.exists()]
+                    logger.info(
+                        "%s: disc %r of album %r split (%d track(s) in the disc "
+                        "folder) -- the album is imported whole by the sweep%s",
+                        cue_path.name, cue_path.parent.name, unit[0].name, moved,
+                        " once %s %s split" % (", ".join(sorted(set(waiting))),
+                                              "is" if len(set(waiting)) == 1 else "are")
+                        if waiting else "")
+                    self._skip_seen.add(cue_path)
+                    return None
 
         artist_name = (plans[0].albumartist if plans else cue.performer) or ""
         album_name = (plans[0].album if plans else cue.title) or ""
@@ -4849,6 +4872,20 @@ class Orchestrator:
                 singles.append((folder, audios))
         result: List[Tuple[Path, List[Path]]] = list(singles)
         for parent in parents:
+            # A disc still holding its .cue is not split yet: the album waits
+            # for it, or the discs split so far would go to Lidarr as the
+            # whole album (see _process: a disc's tracks land in its folder).
+            try:
+                pending = [d.name for d in parent.iterdir() if d.is_dir()
+                           and self._DISC_SUBDIR_RE.match(d.name or "")
+                           and any(f.suffix.lower() == ".cue" for f in d.iterdir())]
+            except OSError:
+                pending = ["?"]
+            if pending:
+                logger.debug(
+                    "cueless sweep: multi-disc album %r waits for %s to be split",
+                    parent.name, ", ".join(sorted(pending)))
+                continue
             discs = self._present_disc_subfolders(parent)
             allaudio: List[Path] = []
             for d in discs:
@@ -14844,6 +14881,63 @@ class Orchestrator:
                 "album %s / %s Lidarr holds complete (%d/%d)", a.name, stem,
                 outcome, artist, album, have, want)
         return dropped
+
+    _CUE_FILE_RE = re.compile(r'(?im)^\s*FILE\s+"([^"]+)"')
+
+    def _delete_twin_cues(self, folder: Path, images: List[Optional[Path]]) -> None:
+        """Delete the other .cue files in `folder` whose every FILE names one
+        of the deleted `images` (by stem: a sheet may say .wav for the .flac).
+        EAC rips often carry two sheets for one image -- Christina Aguilera's
+        '1999 - 2003.cue' and 'Christina Aguilera - 1999 - 2003.cue' -- and
+        the one left behind would be "No companion audio" for good."""
+        stems = {p.stem.casefold() for p in images if p}
+        if not stems:
+            return
+        try:
+            cues = [p for p in folder.iterdir()
+                    if p.suffix.lower() == ".cue" and p.is_file()]
+        except OSError:
+            return
+        for c in cues:
+            try:
+                text = c.read_bytes().decode("utf-8", errors="replace")
+            except OSError:
+                continue
+            refs = [Path(r.replace("\\", "/")).stem.casefold()
+                    for r in self._CUE_FILE_RE.findall(text)]
+            if refs and all(r in stems for r in refs):
+                try:
+                    c.unlink()
+                    logger.info("Deleted twin cue %s (its image is split and gone)",
+                                c.name)
+                except OSError as exc:
+                    logger.warning("Could not delete %s: %s", c, exc)
+
+    def _disc_tracks_into_disc_folder(self, splits: List[SplitResult],
+                                      disc: Path, staging_dir: Path) -> int:
+        """Move a disc's split tracks from its staging folder up into the disc
+        folder itself; a name already there keeps its file where it is.
+        Returns how many moved. The staging folder goes when it is empty."""
+        moved = 0
+        for sp in splits:
+            src = sp.output_path
+            dst = disc / src.name
+            if src.parent == disc or dst.exists() or not src.exists():
+                continue
+            try:
+                shutil.move(str(src), str(dst))
+                sp.output_path = dst
+                moved += 1
+            except OSError as exc:
+                logger.warning("Could not move %s into %s: %s", src.name,
+                               disc.name, exc)
+        try:
+            if staging_dir != disc and staging_dir.is_dir() and \
+                    not any(staging_dir.iterdir()):
+                staging_dir.rmdir()
+        except OSError:
+            pass
+        return moved
 
     def _delete_originals(self, cue_path: Path, audio_path: Path) -> None:
         """
