@@ -105,13 +105,32 @@ class Reap(unittest.TestCase):
             self.assertEqual(q.removed, want)
 
 
+class _QbtFiles(_Qbt):
+    def __init__(self, torrents, files_by_hash):
+        super().__init__(torrents)
+        self._fh = files_by_hash
+
+    def files(self, h):
+        return self._fh.get(h, [])
+
+
 class Adopt(unittest.TestCase):
-    def test_only_our_own_torrents_are_adopted(self):
-        mine = {"hash": "a", "category": "", "tags": QbtClient.SELF_ADDED_TAG}
-        theirs = {"hash": "b", "category": "", "tags": ""}
-        q = _Qbt([mine, theirs], [{"name": "x.flac"}])
+    def test_our_own_and_hand_added_music_are_adopted(self):
+        # The owner, 31 Oct 2026: hand-added torrents are treated like
+        # Lidarr's. Only when every file is music or a rip's sidecar: the
+        # client is shared, and one video file keeps a torrent out.
+        ts = [{"hash": "mine", "category": "", "tags": QbtClient.SELF_ADDED_TAG},
+              {"hash": "hand", "category": "", "tags": ""},
+              {"hash": "video", "category": "", "tags": ""},
+              {"hash": "other", "category": "tv", "tags": ""}]
+        q = _QbtFiles(ts, {
+            "mine": [{"name": "x.flac"}, {"name": "x.mkv"}],
+            "hand": [{"name": "CD-1/x.flac"}, {"name": "CD-1/x.cue"},
+                     {"name": "CD-1/x.log"}, {"name": "cover/01.jpg"}],
+            "video": [{"name": "a.flac"}, {"name": "b.flac"}, {"name": "c.mkv"}],
+            "other": [{"name": "y.flac"}]})
         QD.adopt_uncategorised(q, "lidarr", emit=lambda s: None)
-        self.assertEqual(q.categorised, ["a"])
+        self.assertEqual(q.categorised, ["mine", "hand"])
 
 
 class _Lidarr:

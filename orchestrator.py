@@ -5659,6 +5659,96 @@ class Orchestrator:
         )
         return True
 
+    def _reject_wrong_grab(self, key_path: Path, folder: Path,
+                           audios: List[Path], reason: str) -> bool:
+        """
+        The torrent was grabbed for album X (our grab record, else Lidarr's
+        queue), its songs are not X, and no record Lidarr could take is them
+        either (the record step ran first): the release was wrong. The
+        owner, 31 Oct: "if it is not correct - then something needs to be
+        done behind reasoning of why it was downloaded", and for this case
+        "Blocklist, delete, re-search". Lidarr is told the download failed --
+        blocklisted, removed from qBittorrent with its files -- and, with
+        autoRedownloadFailed on, searches X again. What the torrent left
+        behind (the split tracks, covers) is deleted with its folder.
+
+        Only when this hand-off holds EVERY audio file of the torrent: a
+        discography grabbed for one album holds others, which are not that
+        album and not wrong. True when the release was rejected.
+        """
+        tgt = self._grab_target_for_folder(folder)
+        if not tgt or not tgt.get("hash") or not tgt.get("root"):
+            return False
+        try:
+            album_id = int(tgt.get("album_id") or 0)
+        except (TypeError, ValueError):
+            return False
+        if not album_id:
+            return False
+        try:
+            files = [{"name": p.name} for p in audios]
+            cov, matched, total = self._best_release_title_coverage(files, album_id)
+        except Exception:  # noqa: BLE001
+            return False
+        floor = float(getattr(self.cfg, "verify_track_titles_accept", 0.60))
+        fcov = matched / float(len(audios)) if audios else 0.0
+        if not total or cov >= floor or fcov >= 0.85:
+            return False           # its songs agree, or could not be read
+        root = Path(tgt["root"])
+        wr = Path(self.cfg.watch_root or "/downloads")
+        try:
+            inside = (root.resolve(strict=False) != wr.resolve(strict=False)
+                      and wr.resolve(strict=False) in root.resolve(strict=False).parents)
+        except OSError:
+            inside = False
+        if not inside:
+            return False
+        mine = {str(p) for p in audios}
+        exts = set(self.cfg.audio_extensions)
+        try:
+            everything = [p for p in (root.rglob("*") if root.is_dir() else [root])
+                          if p.is_file() and p.suffix.lower() in exts]
+        except OSError:
+            return False
+        if not everything or any(str(p) not in mine for p in everything):
+            logger.info("Grab target: %s is not %r, but the torrent holds more "
+                        "than this folder -- not rejected", folder.name[:44],
+                        str(tgt.get("title"))[:40])
+            return False
+        thash = str(tgt["hash"])
+        row = next((r for r in (self.lidarr.queue_list() or [])
+                    if str(r.get("downloadId") or "").lower() == thash), None)
+        how = ""
+        if row is not None and row.get("id") is not None:
+            if self.lidarr.queue_remove(int(row["id"]), remove_from_client=True,
+                                        blocklist=True):
+                how = "blocklisted in Lidarr and removed from qBittorrent"
+        if not how:
+            q = self._get_qbt()
+            if q is not None and self._qbt_ours_by_hash(q, thash) and \
+                    q.remove(thash, delete_files=True):
+                how = "removed from qBittorrent (not in Lidarr's queue to blocklist)"
+        if not how:
+            return False
+        try:
+            if root.is_dir():
+                shutil.rmtree(root)
+            elif root.exists():
+                root.unlink()
+        except OSError as exc:
+            logger.warning("Grab target: could not delete %s: %s", root, exc)
+        logger.info(
+            "Grab target: %s was grabbed for %r but its songs are not that album "
+            "(%d/%d titles) and MusicBrainz names no record for them -- %s, "
+            "its files deleted; Lidarr searches for the album again",
+            root.name[:50], str(tgt.get("title"))[:50], matched, total, how)
+        self._record(
+            key_path, outcome="failed", pre_split=True,
+            reason=("wrong music for its grab (%s): %s" % (tgt.get("title"), how))[:300],
+        )
+        self._skip_seen.add(folder)
+        return True
+
     # ---- what a grab was FOR -------------------------------------------
     # When the search grabs a torrent it knows exactly which album it wanted.
     # That fact used to be dropped on the floor: the download landed, and the
@@ -5737,9 +5827,10 @@ class Orchestrator:
                 if (cp == fr or mapped == fr or fr.startswith(cp + "/")
                         or (mapped and fr.startswith(mapped + "/"))):
                     thash = str(t.get("hash") or "").lower()
+                    root = cp if (cp == fr or fr.startswith(cp + "/")) else mapped
                     rec = d.get(thash)
                     if rec:
-                        return dict(rec, source="recorded")
+                        return dict(rec, source="recorded", hash=thash, root=root)
                     # Not one of ours -- but Lidarr's QUEUE still says which
                     # album it grabbed this download for, which beats parsing
                     # an artist out of a folder name ("Lowell Fulsom",
@@ -5748,7 +5839,7 @@ class Orchestrator:
                     # is sitting in the queue against five cupcakKe albums).
                     qrec = self._queue_target_for_hash(thash)
                     if qrec:
-                        return qrec
+                        return dict(qrec, hash=thash, root=root)
         except Exception as exc:  # noqa: BLE001
             logger.debug("grab target lookup failed for %s: %s", folder, exc)
         return None
@@ -7099,6 +7190,8 @@ class Orchestrator:
                         key_path, folder, audios, artist_name, album_name,
                         reason):
                     return
+                if self._reject_wrong_grab(key_path, folder, audios, reason):
+                    return
                 logger.info(
                     "Pre-split: %s / %s has no monitored album in Lidarr "
                     "(compilation/live/best-of, or not in your metadata "
@@ -7268,6 +7361,8 @@ class Orchestrator:
                 return
             if self._give_lidarr_the_download(key_path, folder, audios,
                                               artist_name, album_name, reason):
+                return
+            if self._reject_wrong_grab(key_path, folder, audios, reason):
                 return
             logger.warning(
                 "Pre-split handoff: no acceptable candidates (floor=%.0f%%) "
