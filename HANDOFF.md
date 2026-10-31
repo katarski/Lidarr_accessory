@@ -874,6 +874,17 @@ test of a feature whose purpose is removing files.
      sacd like when splitting a regular cue"): DSF bytes written against the
      area's size from `sacd_extract -P`, "track i/n -- name"; DSD->FLAC moves
      the bar per track.
+   - *A twin sheet an earlier split left goes* (the owner: "make it delete
+     twin ques after that"). '2 Unlimited - II (Enhanced) wav.cue' named the
+     APE image its twin '... ape.cue' split at 14:41, minutes before b6091cf
+     deleted twins with their image, so it failed as "No companion audio"
+     toward needs-attention. `_spent_twin_cue`: every FILE of a sheet with no
+     companion names (by stem) an audio file of OUR torrent (category) in the
+     sheet's own folder that qBittorrent downloaded whole (progress 1) and
+     that is gone from disk -> the sheet is deleted and its ledger row
+     dropped, also for one that already gave up. Anything else (still
+     downloading, never in the torrent, another app's or no torrent, no
+     qBittorrent) keeps the old failure.
 
 1. **0 audit findings are open: `docs/AUDIT_OPEN.md`**, in fix order, each
    with evidence, root cause and the agreed fix (the verifier's correction

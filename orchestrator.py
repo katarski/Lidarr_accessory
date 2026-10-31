@@ -1147,6 +1147,14 @@ class Orchestrator:
         # one stat() instead of a full re-split. See _cue_ledger_verdict.
         verdict = self._cue_ledger_verdict(cue_path)
         if verdict:
+            # A twin sheet an earlier split left behind gave up as "No
+            # companion audio"; it is deleted now instead of waiting in the
+            # needs-attention list (_spent_twin_cue).
+            if (verdict.startswith("gave up")
+                    and not self._find_companion_candidates(cue_path)):
+                spent = self._spent_twin_cue(cue_path)
+                if spent and self._drop_spent_twin_cue(cue_path, spent):
+                    return None
             logger.info("Skipping %s -- %s", cue_path.name, verdict)
             self._skip_seen.add(cue_path)
             return None
@@ -1282,6 +1290,12 @@ class Orchestrator:
                                % cue_path.parent.name,
                     )
                     return None
+            # A twin of a sheet whose image was split and deleted names that
+            # image; it can never be split again, so it goes instead of
+            # failing (2 Unlimited - II (Enhanced) wav.cue, 31 Oct).
+            spent = self._spent_twin_cue(cue_path)
+            if spent and self._drop_spent_twin_cue(cue_path, spent):
+                return None
             logger.error("No companion audio next to %s", cue_path)
             self._record(cue_path, outcome="failed", pre_split=False,
                          reason="no companion audio")
@@ -15707,6 +15721,102 @@ class Orchestrator:
                                 c.name)
                 except OSError as exc:
                     logger.warning("Could not delete %s: %s", c, exc)
+
+    def _spent_twin_cue(self, cue_path: Path) -> str:
+        """Why `cue_path` is the twin of a sheet whose image was split, or "".
+
+        A rip often carries two sheets for one image: '2 Unlimited - II
+        (Enhanced) ape.cue' and '... wav.cue' both name '2 Unlimited - II
+        (Enhanced)'. The split deletes the image with its sheet, and since
+        b6091cf the twins too (_delete_twin_cues). A twin an earlier split
+        left names an image that is gone for good, so it failed as "No
+        companion audio" until it gave up in the needs-attention list
+        (31 Oct). The split's own sheet leaves no ledger row (a .cue gone
+        from disk is not remembered), so the proof is qBittorrent's.
+
+        Spent: every FILE of the sheet names, by stem, an audio file of a
+        torrent of ours (_qbt_ours) in the sheet's own folder that
+        qBittorrent downloaded whole (progress 1) and that is no longer on
+        disk. An image still downloading or never in the torrent, a folder
+        no torrent of ours holds, or no qBittorrent keeps the sheet."""
+        try:
+            text = cue_path.read_bytes().decode("utf-8", errors="replace")
+        except OSError:
+            return ""
+        refs = {Path(r.replace("\\", "/")).stem.casefold()
+                for r in self._CUE_FILE_RE.findall(text)}
+        refs.discard("")
+        if not refs:
+            return ""
+        folder = cue_path.parent
+        try:
+            if any(p.suffix.lower() in _ALL_AUDIO_EXTS
+                   and p.stem.casefold() in refs and p.is_file()
+                   for p in folder.iterdir()):
+                return ""
+        except OSError:
+            return ""
+        q = self._get_qbt()
+        if q is None:
+            return ""
+        try:
+            fr = str(folder.resolve(strict=False)).replace("\\", "/").rstrip("/")
+            wr = str((self.cfg.watch_root or Path("/")).resolve(
+                strict=False)).replace("\\", "/").rstrip("/")
+            best: Optional[Dict[str, Any]] = None
+            base, best_len = "", -1
+            for t in q.torrents():
+                if not self._qbt_ours(t):
+                    continue
+                cp = str(t.get("content_path") or "").replace("\\", "/").rstrip("/")
+                sp = str(t.get("save_path") or "").replace("\\", "/").rstrip("/")
+                if not cp or cp == sp:    # the whole root (_torrent_name_for_folder)
+                    continue
+                name = os.path.basename(cp)
+                # The torrent's root as qBittorrent names it, and as this
+                # container sees it (the watch root holds every download).
+                for root, parent in ((cp, os.path.dirname(cp)),
+                                     ((f"{wr}/{name}" if name else ""), wr)):
+                    if (root and (fr == root or fr.startswith(root + "/"))
+                            and len(root) > best_len):
+                        best, base, best_len = t, parent, len(root)
+            if best is None:
+                return ""
+            rel = fr[len(base):].strip("/")
+            found: Dict[str, str] = {}
+            for f in q.files(str(best.get("hash") or "")) or []:
+                d, _, leaf = str(f.get("name") or "").replace(
+                    "\\", "/").rpartition("/")
+                stem, ext = os.path.splitext(leaf)
+                if (d.strip("/") != rel or ext.lower() not in _ALL_AUDIO_EXTS
+                        or stem.casefold() not in refs
+                        or float(f.get("progress") or 0) < 1.0
+                        or (folder / leaf).exists()):
+                    continue
+                found.setdefault(stem.casefold(), leaf)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("twin-cue check failed for %s: %s", cue_path, exc)
+            return ""
+        if set(found) != refs:
+            return ""
+        return ("its image %s was downloaded whole in torrent %r and is gone "
+                "-- split before, with its twin sheet"
+                % (", ".join(sorted(found.values())), best.get("name")))
+
+    def _drop_spent_twin_cue(self, cue_path: Path, why: str) -> bool:
+        """Delete a spent twin sheet and forget its ledger row (a failure
+        that was never one). True when it is gone."""
+        try:
+            cue_path.unlink()
+        except OSError as exc:
+            logger.warning("Could not delete twin cue %s: %s", cue_path, exc)
+            return False
+        logger.info("Deleted twin cue %s -- %s", cue_path.name, why)
+        led = self._cue_ledger()
+        if led.pop(str(cue_path), None) is not None:
+            self._cue_ledger_save()
+        self._skip_seen.add(cue_path)
+        return True
 
     def _tag_disc_number(self, splits: List[SplitResult], disc: Path,
                          root: Path) -> None:
