@@ -44,9 +44,12 @@ base is missing and prints the `docker tag` that recreates it) with the repo's `
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20261031-unignorable`**
-(57e9807, deployed 31 Oct 13:44 by the nv3090 session over SSH). Earlier tags
-for rollback: `guard-20261031-qwen38` (02fb97b; the LLM model fix and the two
+then is the container replaced. Live now: **`guard-20261031-wronggrab`**
+(ddf89d6, deployed 31 Oct 15:07 by the nv3090 session over SSH). Earlier tags
+for rollback, newest first: `guard-20261031-recorddl` (6e934df),
+`guard-20261031-retryonce` (87c540d), `guard-20261031-multidisc` (b6091cf),
+`guard-20261031-deleteaftersplit` (2ff7218), `guard-20261031-splitonce`
+(cf03910), `guard-20261031-unignorable` (57e9807), `guard-20261031-qwen38` (02fb97b; the LLM model fix and the two
 commits of 1 Oct), `guard-20261001-artistnames` (10017ac; the only earlier tag the prune left; the
 ones listed next are gone from PARK, their archives are in
 `/mnt/user/System Backups/docker-images/`), `guard-20261001-artistpath`,
@@ -787,6 +790,40 @@ test of a feature whose purpose is removing files.
    The three ERROR lines on 31 Oct (Chambao CD1/CD2, Christina CD1) are
    strict_import_only refusals of compilations Lidarr doesn't carry: item 13.
 
+   **The owner's rules of 31 Oct, all live (one commit each, tests in the
+   image):**
+   - *Split once* (cf03910). A retry keeps every track that is already whole
+     and as long as the sheet says. It used to re-split the whole image on
+     each of up to 3 retries: 58 splits in the logs, one disc 10 times.
+   - *The image and .cue go right after the split* (2ff7218): "the original
+     should be deleted after the split", "then the cue should be deleted too".
+     Only when every track checks out. A refused import leaves a plain split
+     folder for the cueless sweep. **This reverses the old "source stays until
+     a verified import" guarantee**; the owner decided it.
+   - *Multi-disc CUE albums are imported whole* (b6091cf). A disc's tracks go
+     into its CD folder, get discnumber tags and are never imported alone. The
+     sweep imports the album once no disc holds a .cue. Twin .cue files of a
+     deleted image are deleted.
+   - *Given-up CUEs get one more try* under these rules (87c540d; 312 in the
+     ledger before 14:44).
+   - *Record step for downloads* (6e934df; was item 13). After the grab-target
+     import and the song-title rescue, `_give_lidarr_the_download` asks
+     MusicBrainz (`identify_record`). If the songs are a record, Lidarr gets it
+     (added unmonitored), and the folder is imported by trackId. Lidarr then
+     writes names and MBIDs into the tags, and the lifecycle removes the
+     torrent.
+   - *Wrong music for its grab* (ddf89d6). The owner chose "Blocklist, delete,
+     re-search": Lidarr's queue row is removed with blocklist and
+     removeFromClient, Lidarr re-searches (autoRedownloadFailed on), and the
+     leftovers are deleted. Only when the folder holds every audio file of the
+     torrent.
+   - *Hand-added torrents are adopted* (ddf89d6; the owner: "treat them like
+     Lidarr's"). Only when every file is audio or a rip sidecar: no video,
+     programs or archives.
+   Still open: a download whose artist Lidarr doesn't have is left alone, and
+   so is a hand-added download that is no record (no grab reason exists for
+   it).
+
 1. **0 audit findings are open: `docs/AUDIT_OPEN.md`**, in fix order, each
    with evidence, root cause and the agreed fix (the verifier's correction
    where there was one). Start at item 1 (none). 91 are fixed;
@@ -824,7 +861,8 @@ test of a feature whose purpose is removing files.
     the old number-only pairing). Nothing detects a file owned by an album
     whose track it is not; the record step trusts Lidarr's ownership and
     reports that folder as owned. Needs a mis-filed-file check.
-13. **Christina Aguilera / Greatest Hits CD1+CD2** (/downloads/Christina
+13. (31 Oct: the record step now runs for downloads too, item 0.)
+    **Christina Aguilera / Greatest Hits CD1+CD2** (/downloads/Christina
     Aguilera_Greatest_Hits): Lidarr matches 'Christina Aguilera' (1999)
     and the import is rightly refused (strict_import_only). The CUE
     ledger (/config/cue_seen.json) caps it at 3 attempts; 7 splits on
