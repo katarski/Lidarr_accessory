@@ -146,17 +146,29 @@ def split_cue(
     extra_args: Optional[List[str]] = None,
     filename_template: Optional[str] = None,
     progress=None,
+    reuse_existing: bool = False,
 ) -> List[SplitResult]:
     """
     Split `audio_path` into per-track FLAC files using the timings in `cue`.
     Files are written into `staging_dir` which will be created if missing.
     `progress(i, n, name)`, when given, is called before each track encode
     (feeds the WebUI's live split-progress display).
+
+    `reuse_existing`: a track whose FLAC is already in `staging_dir`, whole
+    and as long as the sheet says (`_complete_split`), is kept instead of
+    encoded again. A CUE whose import failed is retried, and every retry
+    split the whole image again although its tracks sat there from the last
+    attempt: on 31 Oct Chambao's 'Caminando' CD1 was split at 13:19 and again
+    at 13:51, ~7 minutes of ffmpeg each, and on 1 Oct a Christina Aguilera
+    disc was split 10 times. A track cut short by a killed run fails the
+    check and is encoded again.
     """
     extra_args = extra_args or []
     staging_dir.mkdir(parents=True, exist_ok=True)
 
     results: List[SplitResult] = []
+    reused = 0
+    image_lengths: dict = {}
 
     n_tracks = len(cue.tracks)
     for t_idx, track in enumerate(cue.tracks, 1):
@@ -179,6 +191,20 @@ def split_cue(
                 f"points to already-split audio -- this should have been "
                 f"caught by is_disc_image()."
             )
+
+        if reuse_existing and out_path.exists():
+            src = Path(getattr(track, "source", None) or audio_path)
+            if track.end_seconds is not None:
+                want = track.end_seconds - track.start_seconds
+            else:
+                if src not in image_lengths:
+                    image_lengths[src] = probe_duration(ffmpeg_binary, src)
+                total = image_lengths[src]
+                want = (total - track.start_seconds) if total else None
+            if want is not None and _complete_split(out_path, want):
+                reused += 1
+                results.append(SplitResult(track=track, output_path=out_path))
+                continue
 
         cmd: List[str] = [
             ffmpeg_binary,
@@ -235,7 +261,32 @@ def split_cue(
 
         results.append(SplitResult(track=track, output_path=out_path))
 
+    if reused:
+        logger.info(
+            "Split: kept %d of %d track(s) already split in %s; encoded %d",
+            reused, n_tracks, staging_dir.name, n_tracks - reused,
+        )
     return results
+
+
+# A split track's length against the sheet's. ffmpeg cuts at the sample, and
+# the tracks it wrote matched the sheet to the millisecond (Chambao 31 Oct).
+_SPLIT_LENGTH_TOLERANCE = 0.1
+
+
+def _complete_split(path: Path, want_seconds: float) -> bool:
+    """Is `path` a whole FLAC of `want_seconds`? ffmpeg writes the sample count
+    into STREAMINFO when it finishes, so a file it was killed in the middle of
+    reads 0 samples (or fails to read) and does not count."""
+    try:
+        from mutagen.flac import FLAC
+        info = FLAC(str(path)).info
+        if not info.total_samples or not info.sample_rate:
+            return False
+        got = info.total_samples / float(info.sample_rate)
+    except Exception:  # noqa: BLE001 (unreadable, truncated, not FLAC)
+        return False
+    return abs(got - want_seconds) <= _SPLIT_LENGTH_TOLERANCE
 
 
 def _wait_for_write(

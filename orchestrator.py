@@ -1410,6 +1410,7 @@ class Orchestrator:
                         flac_compression_level=self.cfg.flac_compression_level,
                         extra_args=self.cfg.ffmpeg_extra_args,
                         filename_template=self.cfg.filename_template,
+                        reuse_existing=True,
                         progress=lambda i, n, name: self._activity_start(
                             cue_path.parent, "Splitting cue",
                             f"track {i}/{n} — {name}", pct=100.0 * (i - 1) / n),
