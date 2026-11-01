@@ -28,6 +28,27 @@ class _Lidarr:
         self._albums = albums or {}
         self.failure_generation = 0
         self.fail_albums = False
+        self.pidx = {}                     # quality id -> place in the profile
+        self.tracks = {}                   # album id -> [track dicts]
+        self.tfq = {}                      # track file id -> quality id
+        self.preview = []                  # manual-import candidates
+        self.previews = 0
+
+    def quality_profile_index(self, pid):
+        return dict(self.pidx)
+
+    def list_tracks_for_album(self, album_id):
+        return list(self.tracks.get(album_id, []))
+
+    def trackfile_qualities(self, ids):
+        return {i: self.tfq[i] for i in ids if i in self.tfq}
+
+    def manual_import_candidates(self, folder, artist_id=None, force=False):
+        self.previews += 1
+        return list(self.preview)
+
+    def windows_to_lidarr(self, p):
+        return "L:" + str(p)
 
     def artists(self, force=False):
         return list(self._artists)
@@ -56,7 +77,7 @@ def _album(title, have, total, monitored=True):
             "statistics": {"trackFileCount": have, "totalTrackCount": total}}
 
 
-class AutoDiscard(unittest.TestCase):
+class _Held(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -119,6 +140,8 @@ class AutoDiscard(unittest.TestCase):
     def left(self):
         return sorted(Path(i["source_path"]).name for i in self.store.list())
 
+
+class AutoDiscard(_Held):
     def test_nothing_wants_it_is_discarded_and_its_row_dropped(self):
         self.row("Moby - Alice CDS")                         # album unknown to Lidarr
         self.row("Fats", artist="Fats Dominoo", album="Classics [Disc 2]")
@@ -222,7 +245,8 @@ class AutoDiscard(unittest.TestCase):
     def test_the_curator_runs_it_only_when_switched_on(self):
         self.row("A")
         calls = []
-        self.o._auto_discard_held_unwanted = lambda budget: calls.append(budget) or 0
+        self.o._auto_discard_held_unwanted = \
+            lambda budget, library_budget=0: calls.append(budget) or 0
         self.o._drop_redundant_nested_held = lambda: 0
         self.o._auto_resolve_held_gaps = lambda budget=6: 0
         self.o.expand_box_set = lambda it: None
@@ -237,6 +261,103 @@ class AutoDiscard(unittest.TestCase):
         cfg.held_auto_discard_unwanted = True
         self.o.curate_held_pass()
         self.assertEqual(calls, [20])
+
+
+FLAC, MP3 = 6, 2                           # Lidarr quality ids
+
+
+class LibraryCopies(_Held):
+    """Rows whose summary says the library has the album (owner, 1 Nov 2026:
+    "if library has better - then why are these downloaded"; "if the download
+    is better than the library - then it should overwrite it")."""
+
+    def setUp(self):
+        super().setUp()
+        lid = self.lidarr
+        lid._artists[0]["qualityProfileId"] = 1
+        lid._albums[1] = [dict(_album("Play", 18, 18), id=11)]
+        lid.pidx = {MP3: 5, FLAC: 10}
+        lid.tracks = {11: [{"title": "Porcelain", "duration": 241000, "trackFileId": 101}]}
+        lid.tfq = {101: FLAC}
+        self.songs = [SH.SourceFile(path="", title="Porcelain", duration_ms=240000)]
+        p = mock.patch.object(SH, "scan_folder", self._scan)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _scan(self, root):
+        return [SH.SourceFile(path=os.path.join(root, "01.flac"), title=s.title,
+                              duration_ms=s.duration_ms) for s in self.songs]
+
+    def copy_row(self, name, quality=FLAC, details=None):
+        d = self.row(name, album="Play", existing={
+            "_ts": time.time(), "in_library": True, "n_audio": 18,
+            "_artist": "Moby", "_album": "Play"})
+        self.lidarr.preview = [{"path": "L:" + str(d / "01.flac"),
+                                "quality": {"quality": {"id": quality}}}]
+        if details:
+            it = next(i for i in self.store.list() if i["source_path"] == str(d))
+            self.store.update(it["id"], details=details)
+        return d
+
+    def run_lib(self, library_budget=3):
+        self.ledger_file.write_text(json.dumps(
+            {"checked": self.checked, "pending": self.pending}))
+        return self.o._auto_discard_held_unwanted(
+            budget=20, library_budget=library_budget)
+
+    def test_same_quality_as_the_library_is_deleted(self):
+        self.copy_row("Moby - Play [FLAC]")
+        self.assertEqual(self.run_lib(), 1)
+        self.assertEqual(self.left(), [])
+
+    def test_worse_than_the_library_is_deleted(self):
+        self.copy_row("Moby - Play [MP3]", quality=MP3)
+        self.assertEqual(self.run_lib(), 1)
+
+    def test_a_better_file_keeps_the_row_and_is_not_asked_again_soon(self):
+        self.lidarr.tfq = {101: MP3}
+        self.copy_row("Moby - Play [FLAC]")
+        self.assertEqual(self.run_lib(), 0)
+        self.assertEqual(self.left(), ["Moby - Play [FLAC]"])
+        n = self.lidarr.previews
+        self.assertEqual(self.run_lib(), 0)
+        self.assertEqual(self.lidarr.previews, n)          # 6 h memo
+
+    def test_a_live_take_is_not_the_studio_song(self):
+        self.lidarr.tfq = {101: MP3}
+        self.songs = [SH.SourceFile(path="", title="Porcelain (Live)", duration_ms=240000)]
+        self.copy_row("Moby - Play Live")
+        self.assertEqual(self.run_lib(), 1)                # no upgrade of the studio song
+
+    def test_another_length_is_not_the_same_recording(self):
+        self.lidarr.tfq = {101: MP3}
+        self.songs = [SH.SourceFile(path="", title="Porcelain", duration_ms=300000)]
+        self.copy_row("Moby - Play Edit")
+        self.assertEqual(self.run_lib(), 1)
+
+    def test_anything_unknown_keeps_the_row(self):
+        d = self.copy_row("Unparsed")
+        self.lidarr.preview = []                           # no quality for the file
+        self.assertEqual(self.run_lib(), 0)
+        self.o._held_copy_checked = {}
+        self.songs = [SH.SourceFile(path="", title="", duration_ms=240000)]
+        self.lidarr.preview = [{"path": "L:" + str(d / "01.flac"),
+                                "quality": {"quality": {"id": FLAC}}}]
+        self.assertEqual(self.run_lib(), 0)                # untagged file
+        self.o._held_copy_checked = {}
+        self.songs = [SH.SourceFile(path="", title="Porcelain", duration_ms=240000)]
+        self.lidarr.pidx = {}
+        self.assertEqual(self.run_lib(), 0)                # profile not read
+        self.assertEqual(self.left(), ["Unparsed"])
+
+    def test_a_multichannel_download_stays(self):
+        self.copy_row("Moby - Play 5.1", details={"max_channels": 6, "multichannel": True})
+        self.assertEqual(self.run_lib(), 0)
+
+    def test_off_or_no_budget_leaves_library_copies(self):
+        self.copy_row("Moby - Play [FLAC]")
+        self.assertEqual(self.run_lib(library_budget=0), 0)
+        self.assertEqual(self.run_pass(), 0)               # the old call: no library budget
 
 
 class Ledger(unittest.TestCase):

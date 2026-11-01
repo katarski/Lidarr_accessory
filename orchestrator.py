@@ -545,6 +545,10 @@ class OrchestratorConfig:
     # delete un-imported audio, which is why it is a switch of its own.
     held_auto_discard_unwanted: bool = True
     held_auto_discard_max_per_pass: int = 20
+    # Of those, rows whose library summary says the library has the album: each
+    # is checked file by file against the library (a Lidarr import preview,
+    # ~5-20 s), so fewer per pass.
+    held_auto_discard_library_max_per_pass: int = 3
     # The song harvest's ledger (main.py sets it): a held folder is deleted only
     # once the harvest has judged it as it is now and has nothing pending there.
     harvest_ledger_file: Optional[Path] = None
@@ -16575,7 +16579,8 @@ class Orchestrator:
                             artist, album)
         return done
 
-    def _auto_discard_held_unwanted(self, budget: int = 20) -> int:
+    def _auto_discard_held_unwanted(self, budget: int = 20,
+                                    library_budget: int = 0) -> int:
         """
         AUTO-RESOLVE THAT DELETES (owner, 1 Nov 2026, of the held downloads
         with no album in the library: "delete them"). A needs-attention row
@@ -16599,6 +16604,16 @@ class Orchestrator:
             writing into it (_held_download_finished);
           * not hand-added, not the harvest's keep folder (songs wanted later
             wait there), not a root.
+        A row whose summary says the library HAS the album (owner, 1 Nov 2026:
+        "if library has better - then why are these downloaded", "if it is
+        the same quality as the library why was it downloaded", "if the
+        download is better than the library - then it should overwrite it")
+        goes under the same rules plus one: no file of it is better than the
+        library's own file of that song (_held_no_better_file). A row with a
+        better file stays: it is an upgrade to import, not a delete. At most
+        `library_budget` such rows per pass (each one is a Lidarr import
+        preview); a kept one is checked again after 6 h or when its folder
+        changes.
         At most `budget` rows per pass, oldest first. Returns the number of
         rows discarded.
         """
@@ -16623,7 +16638,10 @@ class Orchestrator:
         roots = {norm(r) for r in (getattr(cfg, "watch_root", None),
                                    getattr(cfg, "staging_root", None),
                                    getattr(cfg, "library_root_windows", None)) if r}
-        done = 0
+        done, lib_left = 0, max(0, int(library_budget or 0))
+        if getattr(self, "_held_copy_checked", None) is None:
+            self._held_copy_checked = {}   # folder -> (signature, last check)
+        checked = self._held_copy_checked
         for it in sorted(store.list(), key=lambda i: float(i.get("created") or 0)):
             if done >= budget:
                 break
@@ -16636,9 +16654,13 @@ class Orchestrator:
             if handadded.protected(sp) is not None:
                 continue
             ex = it.get("existing")
-            if not (isinstance(ex, dict) and ex.get("_ts")
-                    and ex.get("in_library") is False
-                    and not int(ex.get("n_audio") or 0)):
+            if not (isinstance(ex, dict) and ex.get("_ts")):
+                continue
+            copy = ex.get("in_library") is True and int(ex.get("n_audio") or 0) > 0
+            if not copy and not (ex.get("in_library") is False
+                                 and not int(ex.get("n_audio") or 0)):
+                continue
+            if copy and lib_left <= 0:
                 continue
             if any(p == src or p.startswith(src + "/") for p in pending):
                 continue
@@ -16646,7 +16668,8 @@ class Orchestrator:
             if not folder.is_dir():
                 continue                      # prune_missing drops the row
             try:
-                if not ledger.judged(sp, SH.folder_signature(sp)):
+                sig = SH.folder_signature(sp)
+                if not ledger.judged(sp, sig):
                     continue
             except Exception:  # noqa: BLE001
                 continue
@@ -16655,6 +16678,16 @@ class Orchestrator:
             why = self._held_nothing_wanted(it)
             if not why:
                 continue
+            if copy:
+                seen = checked.get(src)
+                if seen and seen[0] == sig and time.time() - seen[1] < 21600:
+                    continue
+                lib_left -= 1
+                same = self._held_no_better_file(it, folder)
+                if not same:
+                    checked[src] = (sig, time.time())
+                    continue
+                why = "%s, %s" % (why, same)
             ok, msg = self.discard(it)
             if not ok:
                 logger.info("held auto-discard: %s kept for now -- %s",
@@ -16669,14 +16702,100 @@ class Orchestrator:
             extra = extra[len(pre):] if extra.startswith(pre) else ""
             extra = extra.split("; kept monitored", 1)[0]
             logger.info(
-                "held auto-discard: deleted %s (%s - %s): not in the library, "
+                "held auto-discard: deleted %s (%s - %s): %s, "
                 "%s, the harvest found nothing wanted in it%s",
                 folder.name, it.get("artist") or "?", it.get("album") or "?",
+                "the library has it" if copy else "not in the library",
                 why, extra)
         if done:
             logger.info("held auto-discard: %d held download(s) nothing wants "
                         "deleted this pass", done)
         return done
+
+    def _held_no_better_file(self, it: Dict[str, Any],
+                             folder: Path) -> Optional[str]:
+        """Why no file of this held download is better than the library's
+        own file of the same song (a short reason), or None when one is --
+        or when that cannot be known now. A song is the same when the titles
+        agree (song_harvest._same_song_title), the variant words agree (live,
+        remix, demo, edit ...: never a live take for a studio one, the owner:
+        "I dont het some live perfomrnaces when I am expecitn g a sutio
+        recording") and the lengths are within 3 s; any album of the artist
+        with files counts. Better is a strictly higher place in the artist's
+        quality profile: Lidarr's own parse of each file (its import preview,
+        a GET) against the library file's quality. None for: no artist in
+        Lidarr, the profile or the library files' qualities not read, a file
+        without a title or length, a file the preview does not parse, a
+        multichannel download (channels are not in the profile:
+        multichannel_over_library's rule), Lidarr failing during the reads,
+        or one better file."""
+        import song_harvest as SH
+        details = it.get("details") or {}
+        if int(details.get("max_channels") or 2) > 2 or details.get("multichannel"):
+            return None
+        ex = it.get("existing") or {}
+        artist = str(it.get("artist") or ex.get("_artist") or "").strip()
+        if not artist:
+            return None
+        gen = self._lidarr_generation()
+        try:
+            rec = self.lidarr.find_artist(artist)
+            if not rec or not rec.get("id"):
+                return None
+            aid = int(rec["id"])
+            pidx = self.lidarr.quality_profile_index(
+                rec.get("qualityProfileId") or 0)
+            if not pidx:
+                return None
+            files = SH.scan_folder(str(folder))
+            if not files or any(not f.title or not f.duration_ms for f in files):
+                return None
+            lib: List[Tuple[str, int, int]] = []
+            for al in self.lidarr.list_albums_for_artist(aid) or []:
+                if not int((al.get("statistics") or {}).get("trackFileCount") or 0):
+                    continue
+                for tr in self.lidarr.list_tracks_for_album(int(al["id"])) or []:
+                    tf = int(tr.get("trackFileId") or 0)
+                    if tf > 0:
+                        lib.append((str(tr.get("title") or ""),
+                                    int(tr.get("duration") or 0), tf))
+            tq = self.lidarr.trackfile_qualities([x[2] for x in lib]) if lib else {}
+            cands = self.lidarr.manual_import_candidates(
+                self.lidarr.windows_to_lidarr(folder), artist_id=aid,
+                force=True) or []
+            lpaths = {f.path: str(self.lidarr.windows_to_lidarr(Path(f.path)))
+                      for f in files}
+        except Exception:  # noqa: BLE001  (UnmappedPath, Lidarr down ...)
+            return None
+        if self._lidarr_generation() != gen:
+            return None
+        if lib and not tq:
+            return None
+        parsed: Dict[str, int] = {}
+        for c in cands:
+            q = ((c.get("quality") or {}).get("quality") or {}).get("id")
+            if c.get("path") and q is not None:
+                parsed[str(c["path"])] = int(q)
+        held = 0
+        for f in files:
+            mine = pidx.get(parsed.get(lpaths.get(f.path, "")))
+            if mine is None:
+                return None
+            hit = False
+            for title, dur, tf in lib:
+                if not (SH._same_song_title(f.title, title)
+                        and SH.variant_markers(f.title) == SH.variant_markers(title)
+                        and dur and abs(f.duration_ms - dur) <= 3000):
+                    continue
+                theirs = pidx.get(tq.get(tf))
+                if theirs is None:
+                    return None
+                if mine > theirs:
+                    return None           # an upgrade: never deleted
+                hit = True
+            held += hit
+        return ("none of its %d file(s) is better than the library's "
+                "(%d are songs the library holds)" % (len(files), held))
 
     def _held_nothing_wanted(self, it: Dict[str, Any]) -> Optional[str]:
         """Why Lidarr wants no album of this held row (a short reason), or
@@ -16824,7 +16943,9 @@ class Orchestrator:
             try:
                 self._auto_discard_held_unwanted(
                     budget=max(0, int(getattr(
-                        self.cfg, "held_auto_discard_max_per_pass", 20))))
+                        self.cfg, "held_auto_discard_max_per_pass", 20))),
+                    library_budget=max(0, int(getattr(
+                        self.cfg, "held_auto_discard_library_max_per_pass", 3))))
             except Exception as exc:  # noqa: BLE001
                 logger.warning("held curator: unwanted-download discard "
                                "failed: %s", exc)
@@ -17787,6 +17908,8 @@ class Orchestrator:
          "Delete a held download nothing wants: no such album in the library, no monitored Lidarr album missing it, and the song harvest judged it and found nothing wanted (owner, 1 Nov 2026: 'delete them'). The only auto-resolve that deletes un-imported audio."),
         ("lidarr.held_auto_discard_max_per_pass", "lidarr", "held_auto_discard_max_per_pass", "Delete unwanted: max / pass", "int", 20,
          "How many unwanted held downloads may be deleted per curator pass, oldest first."),
+        ("lidarr.held_auto_discard_library_max_per_pass", "lidarr", "held_auto_discard_library_max_per_pass", "Delete library copies: max / pass", "int", 3,
+         "Of those, held downloads of an album the library has: deleted only when no file is better than the library's file of that song (same title and variant, length within 3 s; Lidarr's quality profile); one with a better file stays as an upgrade (owner, 1 Nov 2026). Each is a Lidarr import preview, so few per pass; 0 turns this part off."),
         ("lidarr.assembly_interval_seconds", "lidarr", "assembly_interval_seconds", "Assembly: interval (s)", "int", 1800,
          "Seconds between assembly planning passes."),
         ("lidarr.assembly_hunt_per_pass", "lidarr", "assembly_hunt_per_pass", "Assembly: hunts / pass", "int", 2,
@@ -18025,6 +18148,7 @@ class Orchestrator:
             "lidarr.held_auto_resolve_max_per_pass",
             "lidarr.held_auto_discard_unwanted",
             "lidarr.held_auto_discard_max_per_pass",
+            "lidarr.held_auto_discard_library_max_per_pass",
             "lidarr.assembly_interval_seconds",
             "lidarr.assembly_max_albums_per_pass",
             "lidarr.assembly_hunt_per_pass",
