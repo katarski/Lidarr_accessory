@@ -58,9 +58,13 @@ fully imported (all of them missingFiles at
 torrents whose songs Lidarr does not hold ("NOT removing ... keeping data")
 and the 2 deselected torrents with finished songs on disk. qBittorrent
 then held 162 torrents (192 at 10:48), 8 lidarr missingFiles, all with
-songs. `cue_pipeline:base` was gone again on 1 Nov (pruned with every
-rollback tag but the live one between 31 Oct 23:35 and 1 Nov 11:20) and was
-re-tagged from `:latest`. Earlier tags for rollback, newest first:
+songs. `cue_pipeline:base` was gone again on 1 Nov: on 1 Nov 03:21-03:24
+it and every `guard-20261031-*` tag were archived to
+`/mnt/user/System Backups/docker-images/` (`cue_pipeline_base.tar.zst`,
+`cue_pipeline_<tag>.tar.zst`) and removed from Docker, all but the image
+the container ran (no scheduled job does this: a one-off, like the 4 Oct
+02:0x batch). It was re-tagged from `:latest`; `zstd -dc FILE | docker
+load` brings an archived one back. Earlier tags for rollback, newest first:
 `guard-20261031-nopictures`
 (6a29b04, deployed 31 Oct 23:35 by the nv3090 session over SSH once no job
 ran; the only earlier image still on PARK on 1 Nov. Watched: from 23:36 the re-checks deselected the pictures of 20
@@ -68,8 +72,8 @@ torrents in 11 minutes ("PICTURES -> deselect N picture file(s)", each one
 "-> deselected"), no error; torrents with pictures still to download went
 from 36 to 16 by 23:48, the rest waiting for their 30-minute re-check). The
 owner also had Lidarr's own artist and album images turned off (Settings >
-Metadata: Kodi/Emby and Roksbox, 23:34). Then (gone from
-PARK on 1 Nov): `guard-20261031-sacdchain` (8cb2f11, 19:43; Lara Fabian 9's ISO
+Metadata: Kodi/Emby and Roksbox, 23:34). Then (archived and
+removed from PARK on 1 Nov): `guard-20261031-sacdchain` (8cb2f11, 19:43; Lara Fabian 9's ISO
 deleted at 19:43:48, 11 FLAC at 6 ch replaced the AAC stereo copies
 19:44-19:46, the torrent and its folder removed at 20:34:03),
 `guard-20261031-twincues` (d403c1e, 18:53; at 19:06 it deleted '2 Unlimited
