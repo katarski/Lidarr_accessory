@@ -192,17 +192,21 @@ def _picture_file_indices(files: List[Dict[str, Any]]) -> List[int]:
     return out
 
 
-def _blocklist_torrent(lidarr: LidarrClient, thash: str) -> None:
+def _blocklist_torrent(lidarr: LidarrClient, thash: str) -> int:
     """Blocklist the Lidarr queue row for this torrent (so Lidarr won't grab the
-    same release again) -- used to BAN a video-only torrent. Best-effort."""
+    same release again) -- used to BAN a video-only torrent. Best-effort.
+    Returns how many queue rows were blocklisted."""
     if not (lidarr and thash):
-        return
+        return 0
+    n = 0
     try:
         for r in lidarr.queue_list():
             if str(r.get("downloadId") or "").lower() == thash.lower() and r.get("id") is not None:
                 lidarr.queue_remove(r["id"], remove_from_client=False, blocklist=True)
+                n += 1
     except Exception as exc:  # noqa: BLE001
         logger.debug("blocklist_torrent(%s) failed: %s", thash[:12], exc)
+    return n
 
 
 def _video_file_indices(files: List[Dict[str, Any]]) -> List[int]:
@@ -948,6 +952,8 @@ def dead_grab_reaper_pass(
         added = float(t.get("added_on") or 0)
         if prog >= 0.01:
             continue                       # making real progress -> leave alone
+        if _lifecycle_owns(t):
+            continue                       # completed once -> the lifecycle's
         if state not in _DEAD_STATES:
             # A force-started grab with an empty swarm looks "downloading"
             # forever. Both seeder figures must be zero: `num_seeds` is what we
@@ -1086,6 +1092,8 @@ def stalled_grab_reaper_pass(
             continue                       # deliberate: leave it alone
         if prog < 0.01:
             continue                       # 0% -> dead_grab_reaper's job
+        if _lifecycle_owns(t):
+            continue                       # completed once -> the lifecycle's
         last = float(t.get("last_activity") or 0)
         if not last or (now - last) < grace_seconds:
             continue
@@ -1168,6 +1176,107 @@ def _map_to_download_root(content_path: str, save_path: str, download_root: str)
     else:
         rel = os.path.basename(cp)
     return os.path.join(download_root, rel) if rel else download_root
+
+
+# qBittorrent states of a torrent it counts as finished: seeding, queued or
+# stopped after completing. checkingUP is left out: a recheck is reading it.
+_FINISHED_STATES = frozenset({
+    "uploading", "stalledup", "forcedup", "queuedup", "pausedup", "stoppedup",
+})
+
+
+def _lifecycle_owns(t: Dict[str, Any]) -> bool:
+    """Is this torrent finished, so that the lifecycle pass decides its fate?
+
+    Progress 1.0, or a torrent that COMPLETED ONCE (qBittorrent's
+    `completion_on`) and now reads 0 % for one of two reasons:
+
+      * missingFiles: the pipeline moved or deleted files of it (an import, a
+        split, a spent image) and qBittorrent noticed. It cannot seed any more,
+        and its progress drops to 0 when it is checked again;
+      * nothing selected (`size` 0, a finished state): the deselect pass
+        dropped every file. qBittorrent counts such a torrent finished at
+        once and shows it "seeding" at 0 % (its progress is the wanted part
+        done, and nothing is wanted).
+
+    Until 1 Nov 2026 the lifecycle skipped both (progress < 1.0 read as "still
+    downloading"), and the dead-grab reaper took them for grabs that never
+    started: 24 h after the ADD it deleted them with their data, unread (a
+    missingFiles torrent can still hold songs not imported yet), and
+    blocklisted the release. Measured on 1 Nov: 18 torrents with nothing
+    selected and 32 missingFiles, 31 of them with their folder still there.
+    The owner: "I see torrents with 0 perceent taht are also seeding. why are
+    they not removed?"
+    """
+    if float(t.get("progress") or 0) >= 1.0:
+        return True
+    if not float(t.get("completion_on") or 0) > 0:
+        return False
+    state = str(t.get("state") or "").lower()
+    if state == "missingfiles":
+        return True
+    size = t.get("size")
+    return (size is not None and int(size) == 0
+            and state in _FINISHED_STATES)
+
+
+def _every_file_deselected_music(files: List[Dict[str, Any]]) -> bool:
+    """Every file of the torrent at priority 0, and music among them (audio
+    or a disc image): the deselect pass found nothing in it to download."""
+    if not files or any(f.get("priority", 1) != 0 for f in files):
+        return False
+    return any(os.path.splitext(str(f.get("name") or ""))[1].lower()
+               in AUDIO_EXTS or
+               os.path.splitext(str(f.get("name") or ""))[1].lower() == ".iso"
+               for f in files)
+
+
+def _remove_deselected_torrent(
+    qbt: QbtClient, lidarr: Optional[LidarrClient], t: Dict[str, Any],
+    download_root: str, now: float, min_stable_seconds: int,
+    emit: Callable[[str], None],
+) -> int:
+    """A finished torrent whose every file is deselected (see _lifecycle_owns)
+    leaves the client, its Lidarr queue row blocklisted as the dead-grab
+    reaper did before (nothing in the release was wanted, so Lidarr should
+    not grab it again). What is on disk decides how:
+
+      * its folder holds a finished song or a disc image (downloaded before
+        the deselect) -> it stays, for the WebUI: deselected is not owned;
+      * its folder holds nothing else -> removed with its data. That is
+        qBittorrent's partial files (`.!qB`: songs cut off by the deselect,
+        unusable) and extras;
+      * no folder, but its part file (`.<hash>.parts`, the pieces it shares
+        with deselected files) under the download root -> removed with its
+        data: the part file proves the torrent is stored there, and nothing
+        else of it exists;
+      * neither -> the torrent entry only (data we cannot see is never
+        deleted).
+
+    Returns 1 when the torrent was removed."""
+    h = str(t.get("hash") or "")
+    name = t.get("name") or "?"
+    done_at = float(t.get("completion_on") or 0)
+    if done_at > 0 and now - done_at < max(0, min_stable_seconds):
+        return 0                    # just deselected: next pass
+    folder = _map_to_download_root(
+        t.get("content_path"), t.get("save_path"), download_root)
+    if os.path.exists(folder):
+        if _disc_image_or_audio_on_disk(folder):
+            return 0
+        delete, what = True, ("REMOVED (every file deselected; its partial "
+                              "files and extras deleted")
+    elif os.path.isfile(os.path.join(download_root, "." + h.lower() + ".parts")):
+        delete, what = True, "REMOVED (every file deselected; its part file deleted"
+    else:
+        delete, what = False, ("removed torrent entry only (every file "
+                               f"deselected; nothing of it under {download_root}")
+    blocked = _blocklist_torrent(lidarr, h)
+    if not qbt.remove(h, delete_files=delete):
+        return 0
+    emit(f"lifecycle: {what}{'; blocklisted in Lidarr' if blocked else ''}) "
+         f"{name!r}")
+    return 1
 
 
 def _count_audio_on_disk(path: str) -> int:
@@ -1288,6 +1397,12 @@ def torrent_lifecycle_pass(
     Reads the real download folder, so it never deletes a torrent whose files
     haven't actually been imported. Returns (removed, paused).
 
+    "Completed" includes the torrents qBittorrent shows at 0 % although they
+    completed once (_lifecycle_owns): a missingFiles torrent follows the rules
+    above (it is never paused: it seeds nothing), and one whose every file was
+    deselected leaves the client by what is on disk
+    (_remove_deselected_torrent).
+
     A PURE disc-image torrent (a selected .iso and no selected audio: an SACD
     rip) has no audio of its own for the rules above to count: the pipeline
     extracts it in place and deletes the image once it is spent, and the audio
@@ -1324,7 +1439,7 @@ def torrent_lifecycle_pass(
     removed = paused = 0
     walked = 0
     for t in qbt.torrents(category=category):
-        if float(t.get("progress") or 0) < 1.0:
+        if not _lifecycle_owns(t):
             continue  # still downloading -> the deselect pass owns it
         h = t.get("hash")
         if not h:
@@ -1349,7 +1464,11 @@ def torrent_lifecycle_pass(
             and os.path.splitext(f.get("name", ""))[1].lower() == ".iso"
         )
         if sel_audio == 0 and sel_disc == 0:
-            continue  # not a music torrent (or all audio deselected) -> ignore
+            if _every_file_deselected_music(files):
+                removed += _remove_deselected_torrent(
+                    qbt, lidarr, t, download_root, now, min_stable_seconds,
+                    emit)
+            continue  # not a music torrent (or only its music deselected) -> ignore
 
         folder = _map_to_download_root(
             t.get("content_path"), t.get("save_path"), download_root
@@ -1474,9 +1593,11 @@ def torrent_lifecycle_pass(
                         reaped = True
                         emit(f"lifecycle: REMOVED ({why}) {name!r}")
             if (not reaped and on_disk < sel_audio
-                    and "paused" not in state and "stopped" not in state):
+                    and "paused" not in state and "stopped" not in state
+                    and state != "missingfiles"):
                 # Partially moved, still has wanted content -> pause seeding
-                # while the pipeline finishes the rest.
+                # while the pipeline finishes the rest. (A missingFiles
+                # torrent seeds nothing; a pause would only change its state.)
                 qbt.pause(h)
                 paused += 1
                 emit(
