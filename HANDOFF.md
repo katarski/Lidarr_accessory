@@ -44,7 +44,12 @@ base is missing and prints the `docker tag` that recreates it) with the repo's `
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20261101-unwanted`**
+then is the container replaced. Live now: **`guard-20261101-librarycopies`**
+(dcae106, deployed 1 Nov 17:42:47 the same way, idle at 17:42:09. Watched:
+the 17:43 and 17:49 passes deleted 3 held library copies with nothing better
+in them -- More Abba Gold, Frida's The Sun Will Shine Again CD1 and CD2 --
+and 13 more no-album rows; no failed discard). Earlier tags for rollback,
+newest first: `guard-20261101-unwanted`
 (0b24018, deployed 1 Nov 15:40:46 by the nv3090 session over SSH with its
 idle wait, `/tmp/cue-quiet-deploy.sh` on PARK, then `tools/deploy.sh`).
 Watched: from 15:41 every curator pass deleted 20 held downloads nothing
@@ -1051,6 +1056,25 @@ test of a feature whose purpose is removing files.
     track (title and duration within 3 s, no live or remix difference),
     and one the same or worse with nothing new should go on Lidarr's
     per-file verdict.
+16. (1 Nov) **Held library copies with nothing better in them are deleted
+    too** (dcae106, `_held_no_better_file`; the owner: "if library has
+    better - then why are these downloaded", "if it is the same quality as
+    the library why was it dowlnloaded", "if the download is better than
+    the library - then it should overwrite it"). Read first through
+    Lidarr's import preview (GETs only, 1 Nov 17:3x): none of the 43 rows
+    whose summary said "in the library" was a better copy of a library
+    album -- other albums or editions, partial copies, folders without
+    audio; the summary's folder match is loose (Aretha's Gold [MFSL] was
+    compared with "Aretha (1986)"). Such a row now goes under item 15's
+    rules plus one: no file is better than the library's own file of the
+    same song (titles agree, variant words agree, lengths within 3 s, any
+    album of the artist with files; better = strictly higher in the
+    artist's quality profile, Lidarr's parse against the library file's
+    quality). A better file keeps the row; anything unknown keeps it; a
+    multichannel download is kept (channels are not in the profile). At
+    most 3 a pass (`held_auto_discard_library_max_per_pass`), a kept row
+    checked again after 6 h or when its folder changes. Left open: the
+    import of a kept better file over the library's (none seen yet).
 
 ---
 
