@@ -44,7 +44,13 @@ base is missing and prints the `docker tag` that recreates it) with the repo's `
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20261101-zeropercent`**
+then is the container replaced. Live now: **`guard-20261101-unwanted`**
+(0b24018, deployed 1 Nov 15:40:46 by the nv3090 session over SSH with its
+idle wait, `/tmp/cue-quiet-deploy.sh` on PARK, then `tools/deploy.sh`).
+Watched: from 15:41 every curator pass deleted 20 held downloads nothing
+wants (180 in 9 passes by 16:34; 71 held rows left), one of them by
+deselecting only its album in a bigger torrent; no failed discard. Earlier
+tags for rollback, newest first: `guard-20261101-zeropercent`
 (e6face8, deployed 1 Nov 11:27 by the nv3090 session over SSH once the
 pipeline was idle: no `/api/activity` item, no converter process -- read
 with `docker top cue_pipeline -o pid,args`, as `-o args` alone fails on
@@ -64,7 +70,7 @@ it and every `guard-20261031-*` tag were archived to
 `cue_pipeline_<tag>.tar.zst`) and removed from Docker, all but the image
 the container ran (no scheduled job does this: a one-off, like the 4 Oct
 02:0x batch). It was re-tagged from `:latest`; `zstd -dc FILE | docker
-load` brings an archived one back. Earlier tags for rollback, newest first:
+load` brings an archived one back. Then:
 `guard-20261031-nopictures`
 (6a29b04, deployed 31 Oct 23:35 by the nv3090 session over SSH once no job
 ran; the only earlier image still on PARK on 1 Nov. Watched: from 23:36 the re-checks deselected the pictures of 20
@@ -1025,6 +1031,26 @@ test of a feature whose purpose is removing files.
     Art of the Piano, Zwan), and 65 torrents at 100 % kept because Lidarr
     does not hold their albums complete (some since August): a rule for
     them is the owner's (keep for the WebUI, or remove after some days).
+15. (1 Nov) **Held downloads nothing wants are deleted by the pipeline**
+    (0b24018, `_auto_discard_held_unwanted` in the held curator; owner,
+    asked about the 221 held downloads with no album in the library:
+    "delete them"). A row goes the way the WebUI's Discard does (torrent
+    removed, or only this album deselected in a bigger one; folder deleted;
+    row dropped), 20 a pass, oldest first, only when: its library summary
+    says not in the library; Lidarr, asked then, has no monitored album of
+    it still missing tracks (a Lidarr failure keeps the row); the song
+    harvest judged the folder as it is now (`HarvestLedger.judged`, the
+    folder signature) and has nothing pending there (harvest off or dry
+    run: no deletes); no torrent of any category still writing into it;
+    not hand-added, not `_harvest_pending`, not a root. Its own switch,
+    `held_auto_discard_unwanted` (Settings tab, on). Why they were held:
+    downloads of albums the library does not have and Lidarr does not
+    monitor (box sets, compilations, other editions grabbed for a song the
+    harvest wanted), kept after the harvest took its songs. Left open: a
+    download better than the library's copy should replace it track for
+    track (title and duration within 3 s, no live or remix difference),
+    and one the same or worse with nothing new should go on Lidarr's
+    per-file verdict.
 
 ---
 
