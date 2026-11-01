@@ -44,15 +44,32 @@ base is missing and prints the `docker tag` that recreates it) with the repo's `
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20261031-nopictures`**
+then is the container replaced. Live now: **`guard-20261101-zeropercent`**
+(e6face8, deployed 1 Nov 11:27 by the nv3090 session over SSH once the
+pipeline was idle: no `/api/activity` item, no converter process -- read
+with `docker top cue_pipeline -o pid,args`, as `-o args` alone fails on
+PARK ("Couldn't find PID field") and so always counted 0 -- and no import,
+hand-off, grab or staging line in 60 s. Watched: the first lifecycle pass,
+11:45-11:54, removed 40 and paused 1: 17 torrents with every file
+deselected left with their partial `.!qB` files and extras (15 blocklisted
+in Lidarr, 2 had no queue row), 2 with nothing on disk as entries only, 21
+fully imported (all of them missingFiles at
+10:48); it kept 7 missingFiles
+torrents whose songs Lidarr does not hold ("NOT removing ... keeping data")
+and the 2 deselected torrents with finished songs on disk. qBittorrent
+then held 162 torrents (192 at 10:48), 8 lidarr missingFiles, all with
+songs. `cue_pipeline:base` was gone again on 1 Nov (pruned with every
+rollback tag but the live one between 31 Oct 23:35 and 1 Nov 11:20) and was
+re-tagged from `:latest`. Earlier tags for rollback, newest first:
+`guard-20261031-nopictures`
 (6a29b04, deployed 31 Oct 23:35 by the nv3090 session over SSH once no job
-ran. Watched: from 23:36 the re-checks deselected the pictures of 20
+ran; the only earlier image still on PARK on 1 Nov. Watched: from 23:36 the re-checks deselected the pictures of 20
 torrents in 11 minutes ("PICTURES -> deselect N picture file(s)", each one
 "-> deselected"), no error; torrents with pictures still to download went
 from 36 to 16 by 23:48, the rest waiting for their 30-minute re-check). The
 owner also had Lidarr's own artist and album images turned off (Settings >
-Metadata: Kodi/Emby and Roksbox, 23:34). Earlier tags for rollback, newest
-first: `guard-20261031-sacdchain` (8cb2f11, 19:43; Lara Fabian 9's ISO
+Metadata: Kodi/Emby and Roksbox, 23:34). Then (gone from
+PARK on 1 Nov): `guard-20261031-sacdchain` (8cb2f11, 19:43; Lara Fabian 9's ISO
 deleted at 19:43:48, 11 FLAC at 6 ch replaced the AAC stereo copies
 19:44-19:46, the torrent and its folder removed at 20:34:03),
 `guard-20261031-twincues` (d403c1e, 18:53; at 19:06 it deleted '2 Unlimited
@@ -992,6 +1009,18 @@ test of a feature whose purpose is removing files.
     though nothing changed. The compilation is not in Lidarr: the record
     step's add-then-import would place it, but runs for library folders
     only -- worth extending to downloads.
+14. (1 Nov) **Finished torrents that read 0 % are the lifecycle's**
+    (e6face8, `_lifecycle_owns`): every file deselected (qBittorrent counts
+    such a torrent finished and "seeds" it at 0 %) or missingFiles (the
+    pipeline moved or deleted its files). Before, the lifecycle walked
+    only progress 1.0 and the dead-grab reaper deleted both kinds 24 h
+    after the add with their data, unread (8 missingFiles held songs not
+    imported). Both reapers now leave a torrent that completed once. Left
+    for the owner: the deselected or missingFiles torrents whose songs
+    Lidarr does not hold (kept, 10 on 1 Nov, e.g. Safri Duo, Chambao, The
+    Art of the Piano, Zwan), and 65 torrents at 100 % kept because Lidarr
+    does not hold their albums complete (some since August): a rule for
+    them is the owner's (keep for the WebUI, or remove after some days).
 
 ---
 
