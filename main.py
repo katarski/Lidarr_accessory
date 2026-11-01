@@ -135,6 +135,8 @@ def apply_env_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
     put("lidarr", "webui_held_refresh_seconds", "WEBUI_HELD_REFRESH", int)
     put("lidarr", "held_auto_resolve", "HELD_AUTO_RESOLVE", _as_bool)
     put("lidarr", "held_auto_resolve_max_per_pass", "HELD_AUTO_RESOLVE_MAX", int)
+    put("lidarr", "held_auto_discard_unwanted", "HELD_AUTO_DISCARD_UNWANTED", _as_bool)
+    put("lidarr", "held_auto_discard_max_per_pass", "HELD_AUTO_DISCARD_MAX", int)
     put("lidarr", "tag_identify_pre_split", "TAG_IDENTIFY_PRE_SPLIT", _as_bool)
     put("lidarr", "prefer_multichannel", "PREFER_MULTICHANNEL", _as_bool)
     put("lidarr", "transcode_lossless_to_flac", "TRANSCODE_LOSSLESS_TO_FLAC", _as_bool)
@@ -1640,6 +1642,11 @@ def main() -> int:
         held_auto_resolve=bool(lidarr_cfg.get("held_auto_resolve", True)),
         held_auto_resolve_max_per_pass=int(
             lidarr_cfg.get("held_auto_resolve_max_per_pass", 6)),
+        held_auto_discard_unwanted=bool(
+            lidarr_cfg.get("held_auto_discard_unwanted", True)),
+        held_auto_discard_max_per_pass=int(
+            lidarr_cfg.get("held_auto_discard_max_per_pass", 20)),
+        harvest_ledger_file=Path(args.config).parent / "harvest_ledger.json",
         qbt_url=str((cfg.get("qbittorrent") or {}).get("base_url", "") or ""),
         qbt_user=str((cfg.get("qbittorrent") or {}).get("username", "") or ""),
         qbt_pass=str((cfg.get("qbittorrent") or {}).get("password", "") or ""),

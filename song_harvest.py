@@ -760,6 +760,13 @@ class HarvestLedger:
             return False
         return rec.get("wanted") == wanted_signature(index, rec.get("titles") or [])
 
+    def judged(self, source: str, folder_sig: str) -> bool:
+        """The harvest has judged `source` with the folder as it is now (its
+        recorded signature is `folder_sig`). What it took from the folder is
+        imported or in `pending`; what is left matched no wanted track."""
+        rec = self._seen.get(source)
+        return isinstance(rec, dict) and rec.get("folder") == folder_sig
+
     def mark(self, source: str, folder_sig: str, titles: Iterable[str],
              index: Dict[str, List[WantedTrack]]) -> None:
         keys = sorted({t for t in titles if t})

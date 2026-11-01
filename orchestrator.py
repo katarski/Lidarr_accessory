@@ -537,6 +537,17 @@ class OrchestratorConfig:
     held_auto_resolve: bool = True
     # Cap auto-imports per curator pass (each one talks to Lidarr repeatedly).
     held_auto_resolve_max_per_pass: int = 6
+    # Owner, 1 Nov 2026, of the held downloads with no album in the library
+    # that nothing wants: "delete them". The curator DISCARDS such a row the way
+    # the WebUI's Discard does (torrent removed or this album deselected in a
+    # bigger one, folder deleted, row dropped); every gate is in
+    # _auto_discard_held_unwanted. Unlike the auto-resolve above this DOES
+    # delete un-imported audio, which is why it is a switch of its own.
+    held_auto_discard_unwanted: bool = True
+    held_auto_discard_max_per_pass: int = 20
+    # The song harvest's ledger (main.py sets it): a held folder is deleted only
+    # once the harvest has judged it as it is now and has nothing pending there.
+    harvest_ledger_file: Optional[Path] = None
     held_items_file: Optional[Path] = None
     # When the user resolves a held item in the WebUI (keep-existing or
     # move-held), unmonitor the matching Lidarr album so neither Lidarr nor the
@@ -16564,6 +16575,180 @@ class Orchestrator:
                             artist, album)
         return done
 
+    def _auto_discard_held_unwanted(self, budget: int = 20) -> int:
+        """
+        AUTO-RESOLVE THAT DELETES (owner, 1 Nov 2026, of the held downloads
+        with no album in the library: "delete them"). A needs-attention row
+        whose download nothing wants is discarded the way the WebUI's Discard
+        does it (_discard: the torrent removed, or only this album deselected
+        in a bigger one; the folder deleted) and the row is dropped.
+
+        "Nothing wants it" is proven, never assumed; any doubt keeps the row
+        for a later pass. ALL of these must hold:
+          * the library has no such album: the row's library summary was
+            answered and says not in the library, no audio;
+          * Lidarr wants no album of it, asked now (_held_nothing_wanted): the
+            artist is not in Lidarr, or no album of it matching the title is
+            monitored and still missing tracks. A matching album Lidarr wants
+            is a gap -- _auto_resolve_held_gaps or the user imports it;
+          * the song harvest judged the folder AS IT IS NOW (its ledger holds
+            the folder's current signature) and has nothing pending there: its
+            per-song match is what finds a wanted track inside a compilation,
+            so a folder it has not judged is not ours to delete;
+          * the download is finished: no torrent of any category still
+            writing into it (_held_download_finished);
+          * not hand-added, not the harvest's keep folder (songs wanted later
+            wait there), not a root.
+        At most `budget` rows per pass, oldest first. Returns the number of
+        rows discarded.
+        """
+        store, cfg = self.held, self.cfg
+        if store is None or budget <= 0:
+            return 0
+        if not (getattr(cfg, "harvest_enabled", False)
+                and not getattr(cfg, "harvest_dry_run", True)):
+            return 0      # no live harvest: nobody proved "no song wanted"
+        lpath = getattr(cfg, "harvest_ledger_file", None)
+        if not lpath or not Path(lpath).is_file():
+            return 0
+        import song_harvest as SH
+        ledger = SH.HarvestLedger(str(lpath))
+        norm = lambda p: os.path.normpath(str(p)).replace("\\", "/")  # noqa: E731
+        pending = set()
+        for src, rec in (ledger.pending or {}).items():
+            pending.add(norm(src))
+            for p in ((rec or {}).get("paths") or []) if isinstance(rec, dict) else []:
+                pending.add(norm(p))
+        keep = norm(cfg.harvest_keep_dir) if getattr(cfg, "harvest_keep_dir", "") else ""
+        roots = {norm(r) for r in (getattr(cfg, "watch_root", None),
+                                   getattr(cfg, "staging_root", None),
+                                   getattr(cfg, "library_root_windows", None)) if r}
+        done = 0
+        for it in sorted(store.list(), key=lambda i: float(i.get("created") or 0)):
+            if done >= budget:
+                break
+            sp = str(it.get("source_path") or "")
+            src = norm(sp) if sp else ""
+            if not src or src in roots:
+                continue
+            if keep and (src == keep or src.startswith(keep + "/")):
+                continue
+            if handadded.protected(sp) is not None:
+                continue
+            ex = it.get("existing")
+            if not (isinstance(ex, dict) and ex.get("_ts")
+                    and ex.get("in_library") is False
+                    and not int(ex.get("n_audio") or 0)):
+                continue
+            if any(p == src or p.startswith(src + "/") for p in pending):
+                continue
+            folder = Path(sp)
+            if not folder.is_dir():
+                continue                      # prune_missing drops the row
+            try:
+                if not ledger.judged(sp, SH.folder_signature(sp)):
+                    continue
+            except Exception:  # noqa: BLE001
+                continue
+            if not self._held_download_finished(folder):
+                continue
+            why = self._held_nothing_wanted(it)
+            if not why:
+                continue
+            ok, msg = self.discard(it)
+            if not ok:
+                logger.info("held auto-discard: %s kept for now -- %s",
+                            folder.name, msg)
+                continue
+            store.remove(it["id"])
+            done += 1
+            # _discard's message: "Discarded (NAME)<torrent part>; kept
+            # monitored ..." -- only the torrent part says something here.
+            extra = str(msg or "")
+            pre = "Discarded (%s)" % folder.name
+            extra = extra[len(pre):] if extra.startswith(pre) else ""
+            extra = extra.split("; kept monitored", 1)[0]
+            logger.info(
+                "held auto-discard: deleted %s (%s - %s): not in the library, "
+                "%s, the harvest found nothing wanted in it%s",
+                folder.name, it.get("artist") or "?", it.get("album") or "?",
+                why, extra)
+        if done:
+            logger.info("held auto-discard: %d held download(s) nothing wants "
+                        "deleted this pass", done)
+        return done
+
+    def _held_nothing_wanted(self, it: Dict[str, Any]) -> Optional[str]:
+        """Why Lidarr wants no album of this held row (a short reason), or
+        None when it wants one -- or cannot say right now (Lidarr failing
+        during the lookup, an empty artist list, no identity)."""
+        ex = it.get("existing") or {}
+        artist = str(it.get("artist") or ex.get("_artist") or "").strip()
+        album = str(it.get("album") or ex.get("_album") or "").strip()
+        album = self._strip_disc_marker(album) or album
+        if not (artist and album):
+            return None
+        gen = self._lidarr_generation()
+        try:
+            if not self.lidarr.artists():
+                return None
+            art = self.lidarr.find_artist(artist)
+            albums = (self.lidarr.list_albums_for_artist(int(art["id"]))
+                      if art else [])
+        except Exception:  # noqa: BLE001
+            return None
+        if self._lidarr_generation() != gen:
+            return None
+        if not art:
+            return "the artist is not in Lidarr"
+        want = titlematch.key(album)
+        same = [a for a in albums or []
+                if want and titlematch.key(a.get("title") or "")
+                and (titlematch.key(a.get("title") or "") in want
+                     or want in titlematch.key(a.get("title") or ""))]
+        for a in same:
+            st = a.get("statistics") or {}
+            have = int(st.get("trackFileCount") or 0)
+            total = int(st.get("totalTrackCount") or 0)
+            if a.get("monitored") and (total == 0 or have < total):
+                return None               # a gap Lidarr wants: never a discard
+        if not same:
+            return "Lidarr has no such album of %s" % artist
+        return "Lidarr's album is %s" % (
+            "complete" if all(int((a.get("statistics") or {}).get(
+                "trackFileCount") or 0) >= int((a.get("statistics") or {}).get(
+                    "totalTrackCount") or 0) for a in same) else "unmonitored")
+
+    def _held_download_finished(self, folder: Path) -> bool:
+        """No torrent, of any category, still downloading into `folder`: each
+        torrent covering it (or inside it) is complete or completed once (a
+        finished torrent with every file deselected reads 0 %). False when
+        qBittorrent cannot be asked."""
+        q = self._get_qbt()
+        if q is None:
+            return False
+        try:
+            torrents = q.torrents()
+        except Exception:  # noqa: BLE001
+            return False
+        fr = str(folder.resolve(strict=False)).replace("\\", "/").rstrip("/")
+        wr = str((self.cfg.watch_root or Path("/")).resolve(strict=False)).replace("\\", "/").rstrip("/")
+        for t in torrents or []:
+            cp = str(t.get("content_path") or "").replace("\\", "/").rstrip("/")
+            if not cp:
+                continue
+            mapped = f"{wr}/{os.path.basename(cp)}"
+            touches = any(x == fr or fr.startswith(x + "/") or x.startswith(fr + "/")
+                          for x in (cp, mapped))
+            if not touches:
+                continue
+            if float(t.get("progress") or 0) >= 1.0:
+                continue
+            if int(t.get("completion_on") or 0) > 0:
+                continue
+            return False
+        return True
+
     _DISC_MARKER_ANY = re.compile(
         r"(?i)[\s\-_,\(\[]*\b(?:cd|disc|disk)\s*[.\-_]?\s*\d{1,2}\b[\s\-_,\)\]]*")
 
@@ -16635,6 +16820,14 @@ class Orchestrator:
                         self.cfg, "held_auto_resolve_max_per_pass", 6))))
             except Exception as exc:  # noqa: BLE001
                 logger.debug("held curator: gap auto-resolve failed: %s", exc)
+        if getattr(self.cfg, "held_auto_discard_unwanted", False):
+            try:
+                self._auto_discard_held_unwanted(
+                    budget=max(0, int(getattr(
+                        self.cfg, "held_auto_discard_max_per_pass", 20))))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("held curator: unwanted-download discard "
+                               "failed: %s", exc)
         refreshed = 0
         now = time.time()
         # How long a "not in the library" answer stands. It used to equal the
@@ -17590,6 +17783,10 @@ class Orchestrator:
          "Blocklist the release so Lidarr searches for a different one instead of re-grabbing it."),
         ("lidarr.held_auto_resolve_max_per_pass", "lidarr", "held_auto_resolve_max_per_pass", "Auto-resolve: max / pass", "int", 6,
          "How many needs-attention rows may be settled automatically per pass."),
+        ("lidarr.held_auto_discard_unwanted", "lidarr", "held_auto_discard_unwanted", "Needs-attention: delete unwanted downloads", "bool", True,
+         "Delete a held download nothing wants: no such album in the library, no monitored Lidarr album missing it, and the song harvest judged it and found nothing wanted (owner, 1 Nov 2026: 'delete them'). The only auto-resolve that deletes un-imported audio."),
+        ("lidarr.held_auto_discard_max_per_pass", "lidarr", "held_auto_discard_max_per_pass", "Delete unwanted: max / pass", "int", 20,
+         "How many unwanted held downloads may be deleted per curator pass, oldest first."),
         ("lidarr.assembly_interval_seconds", "lidarr", "assembly_interval_seconds", "Assembly: interval (s)", "int", 1800,
          "Seconds between assembly planning passes."),
         ("lidarr.assembly_hunt_per_pass", "lidarr", "assembly_hunt_per_pass", "Assembly: hunts / pass", "int", 2,
@@ -17826,6 +18023,8 @@ class Orchestrator:
             "lidarr.webui_unmonitor_on_resolve",
             "lidarr.webui_held_refresh_seconds",
             "lidarr.held_auto_resolve_max_per_pass",
+            "lidarr.held_auto_discard_unwanted",
+            "lidarr.held_auto_discard_max_per_pass",
             "lidarr.assembly_interval_seconds",
             "lidarr.assembly_max_albums_per_pass",
             "lidarr.assembly_hunt_per_pass",
