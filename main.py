@@ -867,6 +867,12 @@ def reconcile_loop(
     cadence = max(300, interval)
     delay = cadence
     while not stop.wait(delay):
+        # An album with two monitored releases makes Lidarr's album and queue
+        # reads fail (HTTP 500); repair it before this pass reads them.
+        try:
+            orch.lidarr.heal_multi_release_albums()
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("multi-release heal: %s", exc)
         try:
             orch.reconcile_monitored_gaps(watch_root, excluded)
         except Exception as exc:  # noqa: BLE001

@@ -151,6 +151,16 @@ class LidarrClient:
     # Long enough to collapse a burst of find_artist calls, short enough that
     # an artist added in Lidarr shows up on the next pass.
     _ARTISTS_TTL = 60.0
+    # Lidarr's HTTP 500 for every read that maps an album holding more than one
+    # monitored release (its mapper takes the monitored release with
+    # SingleOrDefault): /queue, /album, /wanted/missing all fail on it.
+    _MULTI_RELEASE_MARK = "Sequence contains more than one matching element"
+    # Locating that album scans every artist's albums (~0.44 s per artist), so
+    # the locate-and-repair runs at most once per this many seconds.
+    _HEAL_INTERVAL = 1800.0
+    # A release switch landing while a refresh of that artist or album runs can
+    # leave two releases monitored; a switch waits this long for the refresh.
+    _REFRESH_IDLE_WAIT = 120.0
 
     def __init__(self, cfg: LidarrConfig, session: Optional[requests.Session] = None):
         self.cfg = cfg
@@ -189,6 +199,12 @@ class LidarrClient:
         # find_artist fetched it EVERY call from 15 call sites.
         self._artists_at = 0.0
         self._artists: List[Dict[str, Any]] = []
+        # time.time() of the last 500 carrying _MULTI_RELEASE_MARK (0.0: none
+        # yet; set by _send), and of the moment the last
+        # heal_multi_release_albums FINISHED: a heal runs only for a 500 seen
+        # after the previous one ended.
+        self._multi_release_seen_at = 0.0
+        self._heal_last_at = 0.0
         self._load_mi_cache()
 
     # ---- Path translation ------------------------------------------------
@@ -315,6 +331,30 @@ class LidarrClient:
                 release_id, album_id,
             )
             return False
+        if self._refresh_running(album.get("artistId"), album_id):
+            if not self._wait_refresh_idle(album.get("artistId"), album_id):
+                logger.warning(
+                    "set_album_monitored_release: a refresh of artist %s / "
+                    "album %s is still running after %.0fs; not switching "
+                    "album %s to release %s now (a switch during a refresh "
+                    "can leave two releases monitored)",
+                    album.get("artistId"), album_id, self._REFRESH_IDLE_WAIT,
+                    album_id, release_id,
+                )
+                return False
+            # The refresh may have rewritten the releases: switch from what
+            # Lidarr holds now, never from the copy read before it (the PUT
+            # writes every release of the body back).
+            album = self.get_album(album_id)
+            if not album:
+                return False
+            releases = album.get("releases") or []
+            if not any(r.get("id") == release_id for r in releases):
+                logger.warning(
+                    "set_album_monitored_release: release %s no longer in "
+                    "album %s after the refresh", release_id, album_id,
+                )
+                return False
         for r in releases:
             r["monitored"] = (r.get("id") == release_id)
         album["releases"] = releases
@@ -330,6 +370,148 @@ class LidarrClient:
         except Exception as exc:
             logger.error("set_album_monitored_release failed: %s", exc)
             return False
+
+    def heal_multi_release_albums(self) -> List[int]:
+        """Repair every album that has more than one monitored release; returns
+        the ids repaired.
+
+        Why: Lidarr answers HTTP 500 "Sequence contains more than one matching
+        element" to every read that maps such an album (its mapper takes the
+        monitored release with SingleOrDefault): /queue, /album,
+        /album?artistId=, /album/{id}, /wanted/missing. The pipeline goes blind
+        (no queue, no wanted list) until the album is back to one monitored
+        release. Lidarr's own RefreshAlbum command keeps the release holding
+        the most files, so the repair is that command and nothing else.
+
+        It runs at most every _HEAL_INTERVAL (the scan of the artists costs
+        ~0.44 s each) and only when such a 500 was seen after the last heal
+        finished (_send records it in _multi_release_seen_at). Runs in the
+        reconcile thread."""
+        seen = getattr(self, "_multi_release_seen_at", 0.0)
+        last = getattr(self, "_heal_last_at", 0.0)
+        if not seen or seen <= last:
+            return []
+        if last and time.time() - last < self._HEAL_INTERVAL:
+            return []
+        healed: List[int] = []
+        try:
+            # The probe: the unfiltered album list is what the failing reads
+            # include, so it says whether anything is left to repair.
+            try:
+                r = self.session.get(self._url("/api/v1/album"), timeout=300)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("multi-release: album list probe failed: %s", exc)
+                return healed
+            if r.status_code < 400:
+                logger.info("multi-release: Lidarr's album list reads again; "
+                            "nothing to repair")
+                return healed
+            if not self._is_multi_release(r):
+                return healed
+            # Candidates: the artists refreshed most recently first (a switch
+            # landing in a refresh is what leaves two releases monitored),
+            # then the rest in Lidarr's order.
+            ids: List[int] = []
+            for a in self.artists():
+                try:
+                    ids.append(int(a["id"]))
+                except (KeyError, TypeError, ValueError, OverflowError):
+                    continue
+            refreshed = dict(getattr(self, "_refresh_seen", None) or {})
+            recent = sorted((i for i in ids if i in refreshed),
+                            key=lambda i: refreshed[i][0], reverse=True)
+            order: List[int] = []
+            placed = set()
+            for aid in recent + ids:
+                if aid not in placed:
+                    placed.add(aid)
+                    order.append(aid)
+            logger.info(
+                "multi-release: Lidarr answered %r; looking for the album with "
+                "more than one monitored release among %d artists",
+                self._MULTI_RELEASE_MARK, len(order))
+            for aid in order:
+                try:
+                    r = self.session.get(self._url("/api/v1/album"),
+                                         params={"artistId": aid}, timeout=60)
+                except Exception:  # noqa: BLE001
+                    continue
+                if r.status_code < 400 or not self._is_multi_release(r):
+                    continue
+                # This artist has the album. Its tracks name its albums.
+                try:
+                    tracks = self._get("/api/v1/track", artistId=aid)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("multi-release: tracks of artist %s "
+                                   "unreadable: %s", aid, exc)
+                    continue
+                album_ids = set()
+                for t in (tracks if isinstance(tracks, list) else []):
+                    try:
+                        album_ids.add(int(t["albumId"]))
+                    except (KeyError, TypeError, ValueError, OverflowError):
+                        continue
+                found = False
+                for album_id in sorted(album_ids):
+                    try:
+                        ra = self.session.get(
+                            self._url("/api/v1/album/%d" % album_id),
+                            timeout=30)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if ra.status_code >= 400 and self._is_multi_release(ra):
+                        found = True
+                        if self._repair_multi_release(album_id, aid):
+                            healed.append(album_id)
+                if not found:
+                    continue
+                try:
+                    rp = self.session.get(self._url("/api/v1/album"),
+                                          timeout=300)
+                    reads = rp.status_code < 400
+                except Exception:  # noqa: BLE001
+                    reads = False
+                if reads:
+                    logger.info("multi-release: the album list reads again "
+                                "after %d repair(s)", len(healed))
+                    break
+        finally:
+            self._heal_last_at = time.time()
+        return healed
+
+    def _repair_multi_release(self, album_id: int, artist_id: int) -> bool:
+        """Ask Lidarr to RefreshAlbum one album that has more than one
+        monitored release, wait for the command, and say whether the album
+        reads again. The one write of heal_multi_release_albums."""
+        try:
+            resp = self._post("/api/v1/command",
+                              {"name": "RefreshAlbum", "albumId": int(album_id)})
+        except Exception as exc:  # noqa: BLE001
+            logger.error("multi-release: RefreshAlbum for album %s failed: %s",
+                         album_id, exc)
+            return False
+        cmd_id = resp.get("id") if isinstance(resp, dict) else None
+        rec = (self.wait_for_command(cmd_id, timeout_seconds=300,
+                                     poll_interval=3.0) if cmd_id else {})
+        try:
+            ra = self.session.get(
+                self._url("/api/v1/album/%d" % int(album_id)), timeout=30)
+            ok = ra.status_code < 400
+        except Exception:  # noqa: BLE001
+            ok = False
+        if ok:
+            logger.info(
+                "multi-release: album %s (artist %s) had more than one "
+                "monitored release; Lidarr's RefreshAlbum (command %s) left "
+                "one", album_id, artist_id, cmd_id)
+        else:
+            logger.error(
+                "multi-release: album %s (artist %s) still has more than one "
+                "monitored release after RefreshAlbum (command %s, status %s); "
+                "every Lidarr read that includes it fails; next try in %.0f min",
+                album_id, artist_id, cmd_id, (rec or {}).get("status"),
+                self._HEAL_INTERVAL / 60)
+        return ok
 
     def lookup_albums(self, term: str) -> List[Dict[str, Any]]:
         """Lidarr's album search (its metadata server, not the library):
@@ -1470,6 +1652,8 @@ class LidarrClient:
                 # it is counted, but Lidarr is up and the rest may go on.
                 with self._down_lock:
                     self.failure_generation += 1
+                if self._is_multi_release(r):
+                    self._multi_release_seen_at = time.time()
                 self._answered()
             else:
                 self._went_down("HTTP %d" % r.status_code)
@@ -1488,6 +1672,19 @@ class LidarrClient:
         except Exception:  # noqa: BLE001
             return False
         return isinstance(body, dict) and "message" in body
+
+    @staticmethod
+    def _is_multi_release(r) -> bool:
+        """Lidarr's error body for an album with more than one monitored
+        release ({"message": "Sequence contains more than one matching
+        element"}, HTTP 500): every read that maps such an album fails with
+        it. Lidarr is up; heal_multi_release_albums repairs the album."""
+        try:
+            body = r.json()
+            return (isinstance(body, dict) and LidarrClient._MULTI_RELEASE_MARK
+                    in str(body.get("message") or ""))
+        except Exception:  # noqa: BLE001
+            return False
 
     @staticmethod
     def _is_not_found(r) -> bool:
@@ -2013,6 +2210,63 @@ class LidarrClient:
             return (r.json() or {}).get("status") in ("queued", "started")
         except Exception:  # noqa: BLE001
             return False
+
+    def _refresh_running(self, artist_id: Optional[int],
+                         album_id: Optional[int]) -> bool:
+        """True while Lidarr has a queued or started refresh that covers this
+        artist (a RefreshArtist naming it, or naming no artist: that refreshes
+        every one) or this album (a RefreshAlbum naming it). A switch of the
+        monitored release landing in such a refresh can leave two releases
+        monitored. False when Lidarr cannot say: a switch is never held up on
+        a guess."""
+        def as_int(v):
+            try:
+                return int(v)
+            except (TypeError, ValueError, OverflowError):
+                return None
+
+        try:
+            commands = self._get("/api/v1/command")
+        except Exception:  # noqa: BLE001
+            return False
+        want_artist, want_album = as_int(artist_id), as_int(album_id)
+        for c in (commands if isinstance(commands, list) else []):
+            if not isinstance(c, dict):
+                continue
+            if str(c.get("status") or "").lower() not in ("queued", "started"):
+                continue
+            body = c.get("body")
+            body = body if isinstance(body, dict) else {}
+            name = c.get("name") or body.get("name")
+            if name == "RefreshArtist":
+                raw = body.get("artistIds")
+                vals = list(raw) if isinstance(raw, (list, tuple, set)) else []
+                if body.get("artistId") is not None:
+                    vals.append(body["artistId"])
+                ids = {i for i in map(as_int, vals) if i is not None}
+                # No artist named: Lidarr refreshes every one of them.
+                if not ids or (want_artist is not None and want_artist in ids):
+                    return True
+            elif name == "RefreshAlbum":
+                got = as_int(body.get("albumId"))
+                if got is not None and got == want_album:
+                    return True
+        return False
+
+    def _wait_refresh_idle(self, artist_id: Optional[int],
+                           album_id: Optional[int],
+                           timeout: Optional[float] = None) -> bool:
+        """Wait until no refresh covers this artist or album (_refresh_running),
+        for up to `timeout` seconds (_REFRESH_IDLE_WAIT by default). True when
+        none runs, False when one still does at the end of the wait."""
+        deadline = time.monotonic() + (
+            self._REFRESH_IDLE_WAIT if timeout is None else timeout)
+        while True:
+            if not self._refresh_running(artist_id, album_id):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(3.0)
 
     def refresh_artist(self, artist_id: int, force: bool = False) -> Optional[int]:
         """Ask Lidarr to reconcile an artist against disk.
