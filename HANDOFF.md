@@ -44,12 +44,24 @@ base is missing and prints the `docker tag` that recreates it) with the repo's `
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20261101-librarycopies`**
+then is the container replaced. Live now: **`guard-20261104-multirelease`**
+(3fbfe7c, deployed 4 Nov 12:27:11 the same way, idle at 12:26:54; image
+f3f208d09bd0. Lidarr had answered HTTP 500 "Sequence contains more than one
+matching element" since 2 Nov 16:55 UTC to every read mapping album 1310,
+Macy Gray 'Big', whose releases 12345 and 12346 were both monitored (a
+refresh saving releases one at a time while an import switched them): no
+queue, album list or wanted list for the pipeline. Watched: the first
+reconcile pass, 12:32:34, scanned the 790 artists, found album 1310 and
+Lidarr's RefreshAlbum (command 555871) left 12345, the release with its 13
+files, monitored at 12:36:24; "the album list reads again after 1
+repair(s)" at 12:36:59; no 500 since. Owner, on the error: "find out what
+is wrong and fix it"). Earlier tags for rollback, newest first:
+`guard-20261101-librarycopies`
 (dcae106, deployed 1 Nov 17:42:47 the same way, idle at 17:42:09. Watched:
 the 17:43 and 17:49 passes deleted 3 held library copies with nothing better
 in them -- More Abba Gold, Frida's The Sun Will Shine Again CD1 and CD2 --
-and 13 more no-album rows; no failed discard). Earlier tags for rollback,
-newest first: `guard-20261101-unwanted`
+and 13 more no-album rows; no failed discard), then
+`guard-20261101-unwanted`
 (0b24018, deployed 1 Nov 15:40:46 by the nv3090 session over SSH with its
 idle wait, `/tmp/cue-quiet-deploy.sh` on PARK, then `tools/deploy.sh`).
 Watched: from 15:41 every curator pass deleted 20 held downloads nothing
