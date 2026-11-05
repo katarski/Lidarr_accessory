@@ -1654,7 +1654,7 @@ def main() -> int:
         held_auto_discard_max_per_pass=int(
             lidarr_cfg.get("held_auto_discard_max_per_pass", 20)),
         held_auto_discard_library_max_per_pass=int(
-            lidarr_cfg.get("held_auto_discard_library_max_per_pass", 3)),
+            lidarr_cfg.get("held_auto_discard_library_max_per_pass", 10)),
         harvest_ledger_file=Path(args.config).parent / "harvest_ledger.json",
         qbt_url=str((cfg.get("qbittorrent") or {}).get("base_url", "") or ""),
         qbt_user=str((cfg.get("qbittorrent") or {}).get("username", "") or ""),

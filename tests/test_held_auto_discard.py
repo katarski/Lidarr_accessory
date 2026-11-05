@@ -288,10 +288,10 @@ class LibraryCopies(_Held):
         return [SH.SourceFile(path=os.path.join(root, "01.flac"), title=s.title,
                               duration_ms=s.duration_ms) for s in self.songs]
 
-    def copy_row(self, name, quality=FLAC, details=None):
-        d = self.row(name, album="Play", existing={
+    def copy_row(self, name, quality=FLAC, details=None, lib=None, album="Play"):
+        d = self.row(name, album=album, existing=dict({
             "_ts": time.time(), "in_library": True, "n_audio": 18,
-            "_artist": "Moby", "_album": "Play"})
+            "_artist": "Moby", "_album": album}, **(lib or {})))
         self.lidarr.preview = [{"path": "L:" + str(d / "01.flac"),
                                 "quality": {"quality": {"id": quality}}}]
         if details:
@@ -358,6 +358,184 @@ class LibraryCopies(_Held):
         self.copy_row("Moby - Play [FLAC]")
         self.assertEqual(self.run_lib(library_budget=0), 0)
         self.assertEqual(self.run_pass(), 0)               # the old call: no library budget
+
+    def test_a_compilation_the_library_has_goes_without_a_preview(self):
+        self.lidarr._albums[1].append(dict(_album("Gold: Greatest Hits", 18, 18), id=12))
+        self.lidarr.tfq = {101: MP3}                      # would be an upgrade
+        self.copy_row("Moby - Gold Greatest Hits", album="Gold: Greatest Hits")
+        n = self.lidarr.previews
+        self.assertEqual(self.run_lib(), 1)
+        self.assertEqual(self.lidarr.previews, n)
+
+    def test_lidarr_s_own_compilation_type_counts(self):
+        self.lidarr._albums[1].append(dict(_album("Cross Road", 14, 14), id=13,
+                                           secondaryTypes=[{"name": "Compilation"}]))
+        self.lidarr.tfq = {101: MP3}                      # would be an upgrade
+        self.copy_row("Moby - Cross Road (14 classic grooves)",
+                      album="Cross Road (14 classic grooves)")
+        self.assertEqual(self.run_lib(), 1)
+
+    def test_why_a_row_stays_is_said(self):
+        self.lidarr.tfq = {101: MP3}
+        d = self.copy_row("Moby - Play [FLAC]")
+        self.assertEqual(self.run_lib(), 0)
+        self.assertIn("upgrade", self.o._held_stay_reasons[str(d).replace("\\", "/")])
+
+    LIB_FLAC = {"n_audio": 18, "formats": {".flac": 18}, "lossless": True,
+                "has_lossy": False, "max_channels": 2, "bits": 16,
+                "sample_rate": 44100, "total_bytes": 18 * 30000000,
+                "quality": "FLAC"}
+    HELD_MP3 = {"n_audio": 1, "formats": {".mp3": 1}, "lossless": False,
+                "has_lossy": True, "max_channels": 2, "bits": 0,
+                "sample_rate": 44100, "total_bytes": 9000000, "quality": "MP3"}
+
+    def test_when_the_songs_cannot_be_judged_the_folders_decide(self):
+        self.copy_row("Moby - Play [MP3]", details=self.HELD_MP3, lib=self.LIB_FLAC)
+        self.lidarr.preview = []                           # Lidarr parses nothing
+        self.assertEqual(self.run_lib(), 1)                # MP3 over a FLAC library
+
+    def test_a_better_folder_stays_when_the_songs_cannot_be_judged(self):
+        held = dict(self.LIB_FLAC, n_audio=1, bits=24, sample_rate=96000,
+                    quality="FLAC 24/96")
+        self.copy_row("Moby - Play [24-96]", details=held, lib=self.LIB_FLAC)
+        self.lidarr.preview = []
+        self.assertEqual(self.run_lib(), 0)
+        lossy_lib = dict(self.HELD_MP3, n_audio=18, total_bytes=18 * 9000000)
+        self.o._held_copy_checked = {}
+        self.copy_row("Moby - Play [FLAC]", details=dict(self.LIB_FLAC, n_audio=1),
+                      lib=lossy_lib)
+        self.lidarr.preview = []
+        self.assertEqual(self.run_lib(), 0)                # FLAC over an MP3 library
+        self.assertEqual(len(self.left()), 2)
+
+    def test_an_artist_lidarr_lacks_is_judged_by_the_folders(self):
+        self.copy_row("Moby - Play [MP3]", details=self.HELD_MP3, lib=self.LIB_FLAC)
+        self.lidarr._artists = [a for a in self.lidarr._artists
+                                if a["artistName"] != "Moby"]
+        self.assertEqual(self.run_lib(), 1)
+
+    def test_a_gap_every_song_of_which_the_library_holds_goes(self):
+        self.lidarr._albums[1] = [dict(_album("Play", 10, 18), id=11)]
+        self.copy_row("Moby - Play [FLAC]")
+        self.assertEqual(self.run_lib(), 1)
+
+    def test_a_gap_with_a_song_the_library_lacks_stays(self):
+        self.lidarr._albums[1] = [dict(_album("Play", 10, 18), id=11)]
+        self.songs.append(SH.SourceFile(path="", title="Natural Blues",
+                                        duration_ms=250000))
+        self.copy_row("Moby - Play [FLAC]")
+        self.assertEqual(self.run_lib(), 0)
+        self.assertEqual(self.left(), ["Moby - Play [FLAC]"])
+
+
+class NoMusicNoIdentity(_Held):
+    """5 Nov 2026: 20 of 68 rows held no music at all, 7 had no artist."""
+
+    def bare(self, name, files):
+        d = self.watch / name
+        d.mkdir(parents=True, exist_ok=True)
+        for f in files:
+            (d / f).parent.mkdir(parents=True, exist_ok=True)
+            (d / f).write_bytes(b"x" * 10)
+        self.store.add(str(d), artist="", album=name, tracks=0,
+                       outcome="skipped_unmonitored")
+        return d
+
+    def test_a_folder_with_no_audio_goes_without_a_summary_or_a_judgement(self):
+        self.bare("Montell Jordan - More", ["01.flac.!qb", "02.mp3.!qb"])
+        self.bare("C'est si bon", ["album.cue", "album.log", "cover.jpg"])
+        self.bare("Abba Gold", [])
+        self.assertEqual(self.run_pass(), 3)
+        self.assertEqual(self.left(), [])
+
+    def test_an_itunes_lp_s_interface_sounds_are_not_music(self):
+        self.bare("sounds", ["Revelator.itlp/TuneKit/sounds/Exit.aif"])
+        self.assertEqual(self.run_pass(), 1)
+
+    def test_no_audio_still_downloading_stays(self):
+        self.bare("Coming", ["01.flac.!qb"])
+        wr = str(self.watch).replace("\\", "/")
+        self.qbt.t = [{"content_path": wr + "/Coming", "progress": 0.3,
+                       "completion_on": -1}]
+        self.assertEqual(self.run_pass(), 0)
+
+    def test_a_folder_an_assembly_plans_to_use_stays(self):
+        d = self.row("Moby - Alice CDS")
+        e = self.bare("Empty", [])
+        self.o.assembly = SimpleNamespace(needed_files=lambda: {
+            str(d / "01.flac"): ["Moby - Play"], str(e / "x.flac"): ["Moby - 18"]})
+        self.assertEqual(self.run_pass(), 0)
+        self.assertEqual(self.left(), ["Empty", "Moby - Alice CDS"])
+
+    def test_no_identity_anywhere_goes_once_the_harvest_judged_it(self):
+        d = self.row("Muddy (1990)", artist="", album="Muddy (1990)",
+                     existing={"_ts": time.time()})
+        self.assertEqual(self.run_pass(), 1)
+        self.assertEqual(self.discarded, [d.name])
+
+    def test_an_identity_found_since_keeps_the_row_for_the_summary(self):
+        self.row("Barry Manilow – Even Now - (1978)", artist="",
+                 album="x", existing={"_ts": time.time()})
+        self.row("Unjudged", artist="", album="", judged=False,
+                 existing={"_ts": time.time()})
+        self.assertEqual(self.run_pass(), 0)
+
+
+class OtherRecordOfThatName(_Held):
+    """Lidarr misses tracks of Miles Davis's 'Blue Moods' (4 songs); the held
+    'Blue Moods' is eleven other songs of his (5 Nov 2026)."""
+
+    def setUp(self):
+        super().setUp()
+        self.lidarr._albums[2] = [dict(_album("Blue Moods", 0, 4), id=21)]
+        self.lidarr.tracks = {21: [{"title": t} for t in (
+            "Nature Boy", "Alone Together", "There's No You", "Easy Living")]}
+        self.songs = ["Time After Time", "Summertime"]
+        p = mock.patch.object(SH, "scan_folder", lambda root: [
+            SH.SourceFile(path=os.path.join(root, "%02d.flac" % i), title=t,
+                          duration_ms=200000) for i, t in enumerate(self.songs)])
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_none_of_its_songs_on_the_wanted_album_goes(self):
+        self.row("Blue Moods", artist="Miles Davis", album="Blue Moods")
+        self.assertEqual(self.run_pass(), 1)
+
+    def test_one_song_of_the_wanted_album_keeps_it(self):
+        self.songs.append("Easy Living")
+        self.row("Blue Moods", artist="Miles Davis", album="Blue Moods")
+        self.assertEqual(self.run_pass(), 0)
+
+    def test_an_untitled_file_keeps_it(self):
+        self.songs.append("")
+        self.row("Blue Moods", artist="Miles Davis", album="Blue Moods")
+        self.assertEqual(self.run_pass(), 0)
+
+
+class Names(unittest.TestCase):
+    def setUp(self):
+        self.o = Orchestrator.__new__(Orchestrator)
+        self.o.lidarr = _Lidarr()
+
+    def test_compilations_and_best_ofs(self):
+        r = self.o._compilation_reason
+        for t in ("Gold", "The Best Of Etta James", "Cross Road: The Best Of",
+                  "Greatest Hits", "The Collection", "Die großen Erfolge",
+                  "Etta James Collected", "Smooth Jazz Tribute"):
+            self.assertTrue(r(t), t)
+        for t in ("Golden Hour", "Hard Candy", "Jagged Little Pill",
+                  "The Collection (6 Complete Albums)", "Outland"):
+            self.assertIsNone(r(t), t)
+        self.assertTrue(r("Hits", secondary_types=["Compilation"]))
+        self.assertTrue(r("Now 12", artist="Various Artists"))
+        self.assertTrue(r("Lounge", secondary_types=["Compilation", "Live"]))
+
+    def test_dash_and_year_folder_names(self):
+        f = self.o._album_folder_identity
+        self.assertEqual(f(Path("/d/Barry Manilow – Even Now - (1978)")),
+                         ("Barry Manilow", "Even Now"))
+        self.assertEqual(f(Path("/d/2005 - Armin van Buuren - Shivers   Serenity")),
+                         ("Armin van Buuren", "Shivers Serenity"))
 
 
 class Ledger(unittest.TestCase):

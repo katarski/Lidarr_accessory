@@ -2055,6 +2055,9 @@ class Orchestrator:
         if self._DISC_SUBDIR_RE.match(p.name or ""):
             p = p.parent
         name = re.sub(r"[\(\[\{][^)\]\}]*[)\]\}]", " ", p.name or "")
+        # An en/em dash is the same separator: 'Barry Manilow – Even Now -
+        # (1978)' stayed a row with no artist (5 Nov 2026).
+        name = re.sub(r"\s+[–—]\s+", " - ", name)
         name = re.sub(r"\s{2,}", " ", name).strip(" -_.")
         if " - " not in name:
             return "", ""
@@ -2074,6 +2077,10 @@ class Orchestrator:
                     cand = re.sub(r"[\(\[\{][^)\]\}]*[)\]\}]", " ", up.name)
                     cand = re.sub(r"\s{2,}", " ", cand).strip(" -_.")
                     pa = cand if cand and self._is_lidarr_artist(cand) else ""
+            if not pa and " - " in album:
+                # 'YEAR - Artist - Album' straight in the downloads folder:
+                # '2005 - Armin van Buuren - Shivers   Serenity' had no artist.
+                pa, album = (x.strip(" -_.") for x in album.split(" - ", 1))
             return pa, album
         return artist, album
 
@@ -2271,6 +2278,32 @@ class Orchestrator:
             logger.debug("tag-identify: find_artist(%r) failed: %s", container, exc)
         cache[container] = name
         return name
+
+    def _identity_from_tags(self, folder: Path, limit: int = 8) -> Tuple[str, str]:
+        """(artist, album) as most of a folder's first `limit` audio files
+        tag them: the album artist before the track artist. ('', '') for no
+        folder, no audio or no tags."""
+        from collections import Counter
+        try:
+            if not folder or not str(folder) or not folder.is_dir():
+                return "", ""
+            audios = self._held_audio_files(folder)[:max(1, limit)]
+        except OSError:
+            return "", ""
+        arts: Counter = Counter()
+        albs: Counter = Counter()
+        for a in audios:
+            try:
+                t = self._read_track_tags(a) or {}
+            except Exception:  # noqa: BLE001
+                continue
+            who = str(t.get("albumartist") or t.get("artist") or "").strip()
+            if who:
+                arts[who] += 1
+            if str(t.get("album") or "").strip():
+                albs[str(t["album"]).strip()] += 1
+        return (arts.most_common(1)[0][0] if arts else "",
+                albs.most_common(1)[0][0] if albs else "")
 
     def _album_from_tags(self, audios: List[Path]) -> str:
         """Most common non-empty ALBUM tag across the files (the reliable album
@@ -6051,6 +6084,17 @@ class Orchestrator:
         alb, rel = res["album"], res["release"]
         title = str(alb.get("title") or "")
         added = False
+        if not alb.get("id"):
+            comp = self._compilation_reason(
+                title, artist_name, alb.get("secondaryTypes") or ())
+            if comp:
+                # The owner, 5 Nov 2026: "I do not want compilations or best
+                # of". A record Lidarr already lists was the owner's choice;
+                # one this step would add is not added.
+                logger.info("Record step (download): %s -- %r is %s: not "
+                            "added (no compilations or best-ofs)",
+                            folder.name[:50], title, comp)
+                return False
         if alb.get("id"):
             album_id = int(alb["id"])
         else:
@@ -16699,41 +16743,160 @@ class Orchestrator:
                             artist, album)
         return done
 
+    # What a compilation / best-of calls itself (the owner, 5 Nov 2026: "I do
+    # not want compilations or best of"). Whole words only: 'Golden' is not
+    # 'Gold', and a box of complete albums is not a best-of.
+    _COMPILATION_TITLE_RE = re.compile(
+        r"(?i)\b(?:best\s+of|the\s+very\s+best|the\s+best|greatest|"
+        r"(?:smash|golden|super|number\s+one|no\.?\s*1)\s+hits|hits|gold|platinum|"
+        r"collection|collected|anthology|essentials?|definitive|retrospective|"
+        r"tribute|the\s+singles|die\s+gro(?:ss|ß)en\s+erfolge|"
+        r"gr[ao]ndes\s+[eé]xitos|le\s+meilleur|el\s+mejor|i\s+successi)\b")
+    _COMPILATION_NOT_RE = re.compile(r"(?i)\bcomplete\s+albums?\b|\bbox(?:ed)?\s*set\b")
+    _VARIOUS_ARTISTS_RE = re.compile(r"(?i)^\s*(?:various(?:\s+artists)?|v\.?\s?a\.?)\s*$")
+
+    def _compilation_reason(self, album: str, artist: str = "",
+                            secondary_types: Any = ()) -> Optional[str]:
+        """Why a record is a compilation or a best-of (a short reason), or
+        None. MusicBrainz's own 'Compilation' type, a Various Artists credit,
+        or what the title calls itself."""
+        if any(str(s.get("name") if isinstance(s, dict) else s).lower() == "compilation"
+               for s in secondary_types or ()):
+            return "a compilation (MusicBrainz)"
+        if artist and self._VARIOUS_ARTISTS_RE.match(artist):
+            return "a Various Artists compilation"
+        album = str(album or "")
+        m = self._COMPILATION_TITLE_RE.search(album)
+        if m and not self._COMPILATION_NOT_RE.search(album):
+            return "a compilation / best-of (%r)" % m.group(0)
+        return None
+
+    # What a download may hold that becomes music: audio, and the disc images
+    # and multichannel streams the extractors turn into audio.
+    _HELD_MEDIA_EXTS = frozenset(_ALL_AUDIO_EXTS | {
+        ".iso", ".img", ".bin", ".nrg", ".mdf", ".mka", ".mkv", ".m2ts",
+        ".vob", ".dts", ".ac3", ".mlp", ".thd", ".dtshd", ".w64", ".rf64"})
+
+    def _held_not_music(self, folder: Path) -> Optional[str]:
+        """Why a held folder holds no music at all (a short reason), or None.
+        5 Nov 2026: 20 of 68 rows were folders with only a cue, a log and
+        art, or only qBittorrent's '.!qb' parts of files deselected from the
+        torrent, or an iTunes LP's four interface sounds ('TuneKit/sounds')."""
+        media: List[Path] = []
+        other = 0
+        try:
+            for p in folder.rglob("*"):
+                try:
+                    if not p.is_file():
+                        continue
+                except OSError:
+                    continue
+                if p.suffix.lower() in self._HELD_MEDIA_EXTS:
+                    media.append(p)
+                else:
+                    other += 1
+        except OSError:
+            return None
+        if not media:
+            return ("it holds no audio (%d other file(s): cue / log / art / "
+                    "parts of deselected files)" % other)
+        if all(any(seg.lower().endswith(".itlp") for seg in p.parts) for p in media):
+            return "its only audio is %d iTunes LP interface sound(s)" % len(media)
+        return None
+
+    @staticmethod
+    def _held_album_not_better(it: Dict[str, Any]) -> Optional[str]:
+        """Why the held download, as a whole, is no better than the library's
+        copy (a short reason) -- from the two folder summaries alone (format,
+        channels, bit depth, sample rate; for two lossy copies the size per
+        file) -- or None when it is better or either summary is missing.
+        The fallback when the per-song check cannot judge: an artist Lidarr
+        does not hold, a file without a title, a file Lidarr does not parse."""
+        det = it.get("details") or {}
+        ex = it.get("existing") or {}
+        hn, ln = int(det.get("n_audio") or 0), int(ex.get("n_audio") or 0)
+        if not (hn and ln and det.get("formats") and ex.get("formats")):
+            return None
+        hch = int(det.get("max_channels") or 2)
+        lch = int(ex.get("max_channels") or 2)
+        if (hch > 2 or det.get("multichannel")) and hch > lch:
+            return None                          # more channels: an upgrade
+        if det.get("lossless") and ex.get("has_lossy"):
+            return None                          # lossless over lossy
+        if det.get("lossless") and ex.get("lossless"):
+            if (int(det.get("bits") or 0) > int(ex.get("bits") or 0)
+                    or int(det.get("sample_rate") or 0) > int(ex.get("sample_rate") or 0)):
+                return None                      # a hi-res master
+        elif not det.get("lossless") and not ex.get("lossless"):
+            # Two lossy copies: the bigger file per song is the higher bitrate.
+            if (int(det.get("total_bytes") or 0) / hn
+                    > 1.05 * int(ex.get("total_bytes") or 0) / ln):
+                return None
+        return ("the library's copy is as good or better (this: %s; the "
+                "library: %s)" % (det.get("quality") or "?", ex.get("quality") or "?"))
+
+    def _held_assembly_sources(self) -> set:
+        """Folders holding a file some album assembly plans to use (the
+        Assembly tab): those wait for that plan, whatever else holds."""
+        store = getattr(self, "assembly", None)
+        out: set = set()
+        if store is None:
+            return out
+        try:
+            needed = store.needed_files() or {}
+        except Exception:  # noqa: BLE001
+            return out
+        for p in needed:
+            d = os.path.normpath(os.path.dirname(str(p))).replace("\\", "/")
+            while d and d not in out and d not in ("/", "."):
+                out.add(d)
+                nd = os.path.dirname(d)
+                if nd == d:
+                    break
+                d = nd
+        return out
+
     def _auto_discard_held_unwanted(self, budget: int = 20,
                                     library_budget: int = 0) -> int:
         """
-        AUTO-RESOLVE THAT DELETES (owner, 1 Nov 2026, of the held downloads
-        with no album in the library: "delete them"). A needs-attention row
-        whose download nothing wants is discarded the way the WebUI's Discard
-        does it (_discard: the torrent removed, or only this album deselected
-        in a bigger one; the folder deleted) and the row is dropped.
+        AUTO-RESOLVE THAT DELETES. The owner, 1 Nov 2026, of the held
+        downloads with no album in the library: "delete them"; 5 Nov 2026: "I
+        do not need anything to stay there that the library has better, or
+        same. And if its new - there needs to be a decision if it should be
+        imported. I do not want compilations or best of". A row is discarded
+        the way the WebUI's Discard does it (_discard: the torrent removed,
+        or only this album deselected in a bigger one; the folder deleted)
+        and dropped.
 
-        "Nothing wants it" is proven, never assumed; any doubt keeps the row
-        for a later pass. ALL of these must hold:
-          * the library has no such album: the row's library summary was
-            answered and says not in the library, no audio;
-          * Lidarr wants no album of it, asked now (_held_nothing_wanted): the
-            artist is not in Lidarr, or no album of it matching the title is
-            monitored and still missing tracks. A matching album Lidarr wants
-            is a gap -- _auto_resolve_held_gaps or the user imports it;
-          * the song harvest judged the folder AS IT IS NOW (its ledger holds
-            the folder's current signature) and has nothing pending there: its
-            per-song match is what finds a wanted track inside a compilation,
-            so a folder it has not judged is not ours to delete;
-          * the download is finished: no torrent of any category still
-            writing into it (_held_download_finished);
-          * not hand-added, not the harvest's keep folder (songs wanted later
-            wait there), not a root.
-        A row whose summary says the library HAS the album (owner, 1 Nov 2026:
-        "if library has better - then why are these downloaded", "if it is
-        the same quality as the library why was it downloaded", "if the
-        download is better than the library - then it should overwrite it")
-        goes under the same rules plus one: no file of it is better than the
-        library's own file of that song (_held_no_better_file). A row with a
-        better file stays: it is an upgrade to import, not a delete. At most
-        `library_budget` such rows per pass (each one is a Lidarr import
-        preview); a kept one is checked again after 6 h or when its folder
-        changes.
+        Never touched: a root, the harvest's keep folder (songs wanted later
+        wait there), a hand-added folder, a folder the harvest still has an
+        import pending in, a folder holding a file an album assembly plans
+        to use, a download still running (_held_download_finished).
+
+        Then, per row:
+          * NO MUSIC (_held_not_music: empty, only cue / log / art / '.!qb'
+            parts, an iTunes LP's interface sounds): nothing can come of it.
+          * Otherwise the song harvest must have judged the folder AS IT IS
+            NOW (its ledger holds the current signature): its per-song match
+            is what takes a wanted track out of a compilation first.
+          * NO IDENTITY (the summary was answered, but neither the row, the
+            folder name nor the tags say what album it is): nothing can
+            import it, and the harvest matched none of its songs.
+          * NOT IN THE LIBRARY: Lidarr wants no album of it, asked now
+            (_held_nothing_wanted). A matching album Lidarr monitors and
+            misses is a gap -- _auto_resolve_held_gaps imports it. New
+            albums Lidarr can take were already given it by the record step
+            (_give_lidarr_the_download, which adds no compilation).
+          * THE LIBRARY HAS IT: deleted unless it is better. A compilation /
+            best-of goes without asking (_compilation_reason). Otherwise no
+            file of it may be better than the library's own file of that
+            song (_held_file_verdict); when that cannot be judged, the two
+            folder summaries decide (_held_album_not_better). A gap Lidarr
+            still misses keeps its row unless every song of it is already in
+            the library as good or better. A better download stays: an
+            upgrade, not a delete. At most `library_budget` such rows per
+            pass (each a Lidarr import preview); a kept one is asked again
+            after 6 h or when its folder changes.
         At most `budget` rows per pass, oldest first. Returns the number of
         rows discarded.
         """
@@ -16758,118 +16921,319 @@ class Orchestrator:
         roots = {norm(r) for r in (getattr(cfg, "watch_root", None),
                                    getattr(cfg, "staging_root", None),
                                    getattr(cfg, "library_root_windows", None)) if r}
+        planned = self._held_assembly_sources()
         done, lib_left = 0, max(0, int(library_budget or 0))
         if getattr(self, "_held_copy_checked", None) is None:
             self._held_copy_checked = {}   # folder -> (signature, last check)
         checked = self._held_copy_checked
+        # Why each row stays (folder -> reason), for the log and the probe:
+        # a row nothing decides about is the thing to look at.
+        stays: Dict[str, str] = {}
+        self._held_stay_reasons = stays
         for it in sorted(store.list(), key=lambda i: float(i.get("created") or 0)):
             if done >= budget:
                 break
             sp = str(it.get("source_path") or "")
             src = norm(sp) if sp else ""
+
+            def stay(reason: str, _k: str = src or str(it.get("id"))) -> None:
+                stays[_k] = reason
+
             if not src or src in roots:
+                stay("a root or no folder")
                 continue
             if keep and (src == keep or src.startswith(keep + "/")):
+                stay("the harvest's keep folder")
                 continue
             if handadded.protected(sp) is not None:
-                continue
-            ex = it.get("existing")
-            if not (isinstance(ex, dict) and ex.get("_ts")):
-                continue
-            copy = ex.get("in_library") is True and int(ex.get("n_audio") or 0) > 0
-            if not copy and not (ex.get("in_library") is False
-                                 and not int(ex.get("n_audio") or 0)):
-                continue
-            if copy and lib_left <= 0:
+                stay("hand-added")
                 continue
             if any(p == src or p.startswith(src + "/") for p in pending):
+                stay("the harvest has an import pending in it")
+                continue
+            if src in planned:
+                stay("an album assembly plans to use a file of it")
                 continue
             folder = Path(sp)
             if not folder.is_dir():
-                continue                      # prune_missing drops the row
+                stay("the folder is gone")       # prune_missing drops the row
+                continue
+            nomusic = self._held_not_music(folder)
+            if nomusic:
+                if not self._held_download_finished(folder):
+                    stay("still downloading (or qBittorrent did not answer)")
+                    continue
+                ok = self._held_discard_row(it, folder, "%s -- nothing to import" % nomusic)
+                done += bool(ok)
+                continue
+            ex = it.get("existing")
+            if not (isinstance(ex, dict) and ex.get("_ts")):
+                stay("no library summary yet")
+                continue
+            copy = ex.get("in_library") is True and int(ex.get("n_audio") or 0) > 0
+            unknown = set(ex) <= {"_ts"}      # answered: no identity
+            new = (ex.get("in_library") in (True, False)
+                   and not int(ex.get("n_audio") or 0))
+            if not (copy or unknown or new):
+                stay("the library summary is unclear (%s, %s audio)"
+                     % (ex.get("in_library"), ex.get("n_audio")))
+                continue
+            if copy and lib_left <= 0:
+                stay("library copies: this pass's budget is spent")
+                continue
             try:
                 sig = SH.folder_signature(sp)
                 if not ledger.judged(sp, sig):
+                    stay("the harvest has not judged the folder as it is now")
                     continue
             except Exception:  # noqa: BLE001
+                stay("the folder could not be read")
                 continue
             if not self._held_download_finished(folder):
+                stay("still downloading (or qBittorrent did not answer)")
+                continue
+            if unknown:
+                # Asked again now: an identity found since (the row, the
+                # folder name, the tags) means the summary is behind -- the
+                # next refresh answers it.
+                a = str(it.get("artist") or "").strip()
+                b = str(it.get("album") or "").strip()
+                if not (a and b):
+                    try:
+                        fa, fb = self._identity_for_folder(folder)
+                    except Exception:  # noqa: BLE001
+                        fa, fb = "", ""
+                    ta, tb = self._identity_from_tags(folder)
+                    a = a or (fa if fa and not self._looks_like_year(fa) else "") or ta
+                    b = b or fb or tb
+                if a and b:
+                    stay("identity found since the summary -- the next refresh")
+                    continue
+                ok = self._held_discard_row(
+                    it, folder, "neither its tags nor its folder name say what "
+                    "album it is, so nothing can import it, and the harvest "
+                    "matched none of its songs to anything Lidarr wants")
+                done += bool(ok)
                 continue
             why = self._held_nothing_wanted(it)
+            album = str(it.get("album") or ex.get("_album") or "")
+            artist = str(it.get("artist") or ex.get("_artist") or "")
+            if not copy:
+                if not why:
+                    other = self._held_gap_not_this(it, folder)
+                    if other:
+                        ok = self._held_discard_row(
+                            it, folder, "not in the library, %s, the harvest "
+                            "found nothing wanted in it" % other)
+                        done += bool(ok)
+                        continue
+                    stay("Lidarr monitors this album and misses tracks (a gap), "
+                         "or could not say")
+                    continue
+                ok = self._held_discard_row(
+                    it, folder, "not in the library, %s, the harvest found "
+                    "nothing wanted in it" % why)
+                done += bool(ok)
+                continue
+            seen = checked.get(src)
+            if seen and seen[0] == sig and time.time() - seen[1] < 21600:
+                stay("library copy: %s (asked again after 6 h)" % seen[2]
+                     if len(seen) > 2 else "library copy: checked < 6 h ago")
+                continue
+            comp = None
+            if why:
+                comp = self._compilation_reason(
+                    album, artist, self._held_lidarr_types(artist, album))
+            if comp:
+                ok = self._held_discard_row(
+                    it, folder, "the library has it, %s, %s, the harvest found "
+                    "nothing wanted in it" % (why, comp))
+                done += bool(ok)
+                continue
+            lib_left -= 1
+            verdict, same, nfiles, covered = self._held_file_verdict(it, folder)
             if not why:
-                continue
-            if copy:
-                seen = checked.get(src)
-                if seen and seen[0] == sig and time.time() - seen[1] < 21600:
+                # A gap Lidarr still misses: only a download every song of
+                # which the library already holds as good or better goes.
+                if verdict == "same" and nfiles and covered >= nfiles:
+                    ok = self._held_discard_row(
+                        it, folder, "the library already holds every one of "
+                        "its %d song(s) as good or better" % nfiles)
+                    done += bool(ok)
                     continue
-                lib_left -= 1
-                same = self._held_no_better_file(it, folder)
-                if not same:
-                    checked[src] = (sig, time.time())
+                other = self._held_gap_not_this(it, folder)
+                if other and verdict != "better":
+                    ok = self._held_discard_row(
+                        it, folder, "the library has it, %s, the harvest found "
+                        "nothing wanted in it" % other)
+                    done += bool(ok)
                     continue
-                why = "%s, %s" % (why, same)
-            ok, msg = self.discard(it)
-            if not ok:
-                logger.info("held auto-discard: %s kept for now -- %s",
-                            folder.name, msg)
+                if verdict == "better":
+                    r = "a gap Lidarr misses; a file of it is better than the library's"
+                elif verdict == "same":
+                    r = ("a gap Lidarr misses; %d of its %d song(s) are not in "
+                         "the library" % (nfiles - covered, nfiles))
+                else:
+                    r = "a gap Lidarr misses; its songs could not be compared"
+                checked[src] = (sig, time.time(), r)
+                stay(r)
                 continue
-            store.remove(it["id"])
-            done += 1
-            # _discard's message: "Discarded (NAME)<torrent part>; kept
-            # monitored ..." -- only the torrent part says something here.
-            extra = str(msg or "")
-            pre = "Discarded (%s)" % folder.name
-            extra = extra[len(pre):] if extra.startswith(pre) else ""
-            extra = extra.split("; kept monitored", 1)[0]
-            logger.info(
-                "held auto-discard: deleted %s (%s - %s): %s, "
-                "%s, the harvest found nothing wanted in it%s",
-                folder.name, it.get("artist") or "?", it.get("album") or "?",
-                "the library has it" if copy else "not in the library",
-                why, extra)
+            if verdict == "unknown":
+                same = self._held_album_not_better(it)
+                verdict = "same" if same else "unknown"
+            if verdict != "same":
+                r = ("an upgrade: a file of it is better than the library's"
+                     if verdict == "better" else
+                     "an upgrade by format, or its songs could not be compared")
+                checked[src] = (sig, time.time(), r)
+                stay(r)
+                logger.info("held auto-discard: %s kept -- %s", folder.name, r)
+                continue
+            ok = self._held_discard_row(
+                it, folder, "the library has it, %s, %s, the harvest found "
+                "nothing wanted in it" % (why, same))
+            done += bool(ok)
         if done:
             logger.info("held auto-discard: %d held download(s) nothing wants "
                         "deleted this pass", done)
         return done
 
+    def _held_lidarr_types(self, artist: str, album: str) -> List[str]:
+        """The secondary types (Compilation, Live ...) Lidarr gives the
+        artist's albums of this title: 'Cross Road (14 classic grooves)'
+        says nothing, Lidarr's 'Cross Road' is a Compilation. [] when the
+        artist or the album is not in Lidarr, or Lidarr does not answer."""
+        album = self._strip_disc_marker(album) or album
+        want = titlematch.key(album)
+        if not (artist and want):
+            return []
+        try:
+            art = self.lidarr.find_artist(artist)
+            albums = (self.lidarr.list_albums_for_artist(int(art["id"]))
+                      if art and art.get("id") else [])
+        except Exception:  # noqa: BLE001
+            return []
+        out: List[str] = []
+        for a in albums or []:
+            k = titlematch.key(a.get("title") or "")
+            if k and (k in want or want in k):
+                for st in a.get("secondaryTypes") or []:
+                    out.append(str(st.get("name") if isinstance(st, dict) else st))
+        return out
+
+    def _held_gap_not_this(self, it: Dict[str, Any], folder: Path) -> Optional[str]:
+        """Why this held download is NOT the album Lidarr misses under its
+        title (a short reason), or None. Proof: every file has a title, and
+        none of them is a song of any monitored, incomplete album of the
+        artist that the title matches -- 'Blue Moods', eleven Miles Davis
+        songs, is not Lidarr's four-song 'Blue Moods' (5 Nov 2026). None for
+        no identity, no such gap, a file without a title, or Lidarr failing."""
+        import song_harvest as SH
+        ex = it.get("existing") or {}
+        artist = str(it.get("artist") or ex.get("_artist") or "").strip()
+        album = str(it.get("album") or ex.get("_album") or "").strip()
+        album = self._strip_disc_marker(album) or album
+        want = titlematch.key(album)
+        if not (artist and want):
+            return None
+        gen = self._lidarr_generation()
+        try:
+            art = self.lidarr.find_artist(artist)
+            if not art or not art.get("id"):
+                return None
+            gaps = []
+            for a in self.lidarr.list_albums_for_artist(int(art["id"])) or []:
+                k = titlematch.key(a.get("title") or "")
+                st = a.get("statistics") or {}
+                have = int(st.get("trackFileCount") or 0)
+                total = int(st.get("totalTrackCount") or 0)
+                if (k and (k in want or want in k) and a.get("monitored")
+                        and a.get("id") and (total == 0 or have < total)):
+                    gaps.append(a)
+            if not gaps:
+                return None
+            titles = [str(t.get("title") or "") for a in gaps
+                      for t in (self.lidarr.list_tracks_for_album(int(a["id"])) or [])]
+            files = SH.scan_folder(str(folder))
+        except Exception:  # noqa: BLE001
+            return None
+        if self._lidarr_generation() != gen:
+            return None
+        titles = [t for t in titles if t]
+        if not titles or not files or any(not f.title for f in files):
+            return None
+        for f in files:
+            if any(SH._same_song_title(f.title, t) for t in titles):
+                return None
+        return ("Lidarr misses tracks of its %r, but none of the %d song(s) "
+                "here is on it -- another record of that name"
+                % (gaps[0].get("title"), len(files)))
+
+    def _held_discard_row(self, it: Dict[str, Any], folder: Path, why: str) -> bool:
+        """Discard one held row (self.discard) and drop it; log why."""
+        ok, msg = self.discard(it)
+        if not ok:
+            logger.info("held auto-discard: %s kept for now -- %s",
+                        folder.name, msg)
+            return False
+        self.held.remove(it["id"])
+        # _discard's message: "Discarded (NAME)<torrent part>; kept
+        # monitored ..." -- only the torrent part says something here.
+        extra = str(msg or "")
+        pre = "Discarded (%s)" % folder.name
+        extra = extra[len(pre):] if extra.startswith(pre) else ""
+        extra = extra.split("; kept monitored", 1)[0]
+        logger.info("held auto-discard: deleted %s (%s - %s): %s%s",
+                    folder.name, it.get("artist") or "?", it.get("album") or "?",
+                    why, extra)
+        return True
+
     def _held_no_better_file(self, it: Dict[str, Any],
                              folder: Path) -> Optional[str]:
-        """Why no file of this held download is better than the library's
-        own file of the same song (a short reason), or None when one is --
-        or when that cannot be known now. A song is the same when the titles
-        agree (song_harvest._same_song_title), the variant words agree (live,
-        remix, demo, edit ...: never a live take for a studio one, the owner:
-        "I dont het some live perfomrnaces when I am expecitn g a sutio
-        recording") and the lengths are within 3 s; any album of the artist
-        with files counts. Better is a strictly higher place in the artist's
-        quality profile: Lidarr's own parse of each file (its import preview,
-        a GET) against the library file's quality. None for: no artist in
-        Lidarr, the profile or the library files' qualities not read, a file
-        without a title or length, a file the preview does not parse, a
-        multichannel download (channels are not in the profile:
-        multichannel_over_library's rule), Lidarr failing during the reads,
-        or one better file."""
+        """_held_file_verdict's reason when no file is better, else None."""
+        verdict, why, _n, _c = self._held_file_verdict(it, folder)
+        return why if verdict == "same" else None
+
+    def _held_file_verdict(self, it: Dict[str, Any],
+                           folder: Path) -> Tuple[str, str, int, int]:
+        """Whether any file of this held download is better than the
+        library's own file of the same song: ("same", reason, files,
+        songs the library holds) when none is, ("better", "", ...) when one
+        is, ("unknown", "", ...) when that cannot be known now. A song is the
+        same when the titles agree (song_harvest._same_song_title), the
+        variant words agree (live, remix, demo, edit ...: never a live take
+        for a studio one, the owner: "I dont het some live perfomrnaces when
+        I am expecitn g a sutio recording") and the lengths are within 3 s;
+        any album of the artist with files counts. Better is a strictly
+        higher place in the artist's quality profile: Lidarr's own parse of
+        each file (its import preview, a GET) against the library file's
+        quality. Unknown for: no artist in Lidarr, the profile or the
+        library files' qualities not read, a file without a title or length,
+        a file the preview does not parse, a multichannel download (channels
+        are not in the profile: multichannel_over_library's rule), Lidarr
+        failing during the reads."""
         import song_harvest as SH
+        unknown = ("unknown", "", 0, 0)
         details = it.get("details") or {}
         if int(details.get("max_channels") or 2) > 2 or details.get("multichannel"):
-            return None
+            return unknown
         ex = it.get("existing") or {}
         artist = str(it.get("artist") or ex.get("_artist") or "").strip()
         if not artist:
-            return None
+            return unknown
         gen = self._lidarr_generation()
         try:
             rec = self.lidarr.find_artist(artist)
             if not rec or not rec.get("id"):
-                return None
+                return unknown
             aid = int(rec["id"])
             pidx = self.lidarr.quality_profile_index(
                 rec.get("qualityProfileId") or 0)
             if not pidx:
-                return None
+                return unknown
             files = SH.scan_folder(str(folder))
             if not files or any(not f.title or not f.duration_ms for f in files):
-                return None
+                return unknown
             lib: List[Tuple[str, int, int]] = []
             for al in self.lidarr.list_albums_for_artist(aid) or []:
                 if not int((al.get("statistics") or {}).get("trackFileCount") or 0):
@@ -16886,11 +17250,11 @@ class Orchestrator:
             lpaths = {f.path: str(self.lidarr.windows_to_lidarr(Path(f.path)))
                       for f in files}
         except Exception:  # noqa: BLE001  (UnmappedPath, Lidarr down ...)
-            return None
+            return unknown
         if self._lidarr_generation() != gen:
-            return None
+            return unknown
         if lib and not tq:
-            return None
+            return unknown
         parsed: Dict[str, int] = {}
         for c in cands:
             q = ((c.get("quality") or {}).get("quality") or {}).get("id")
@@ -16900,7 +17264,7 @@ class Orchestrator:
         for f in files:
             mine = pidx.get(parsed.get(lpaths.get(f.path, "")))
             if mine is None:
-                return None
+                return unknown
             hit = False
             for title, dur, tf in lib:
                 if not (SH._same_song_title(f.title, title)
@@ -16909,13 +17273,14 @@ class Orchestrator:
                     continue
                 theirs = pidx.get(tq.get(tf))
                 if theirs is None:
-                    return None
+                    return unknown
                 if mine > theirs:
-                    return None           # an upgrade: never deleted
+                    return ("better", "", len(files), held)   # an upgrade: never deleted
                 hit = True
             held += hit
-        return ("none of its %d file(s) is better than the library's "
-                "(%d are songs the library holds)" % (len(files), held))
+        return ("same", "none of its %d file(s) is better than the library's "
+                "(%d are songs the library holds)" % (len(files), held),
+                len(files), held)
 
     def _held_nothing_wanted(self, it: Dict[str, Any]) -> Optional[str]:
         """Why Lidarr wants no album of this held row (a short reason), or
@@ -17065,7 +17430,7 @@ class Orchestrator:
                     budget=max(0, int(getattr(
                         self.cfg, "held_auto_discard_max_per_pass", 20))),
                     library_budget=max(0, int(getattr(
-                        self.cfg, "held_auto_discard_library_max_per_pass", 3))))
+                        self.cfg, "held_auto_discard_library_max_per_pass", 10))))
             except Exception as exc:  # noqa: BLE001
                 logger.warning("held curator: unwanted-download discard "
                                "failed: %s", exc)
@@ -17517,6 +17882,15 @@ class Orchestrator:
                 album = album or b
             except Exception:  # noqa: BLE001
                 pass
+        if not artist or not album:
+            # Neither the row nor the folder name says it: the files' own tags
+            # may ('Blue Moods' is Miles Davis's, 'Tough Town (2026) [ALAC]
+            # {Bad Records}' Bryan Adams's -- rows with no artist, 5 Nov 2026).
+            ta, tb = self._identity_from_tags(Path(entry.get("source_path", "")))
+            if not artist and ta:
+                artist = ta
+            if not album and tb:
+                album = tb
         if not (artist and album):
             return {}
         try:
@@ -18028,8 +18402,8 @@ class Orchestrator:
          "Delete a held download nothing wants: no such album in the library, no monitored Lidarr album missing it, and the song harvest judged it and found nothing wanted (owner, 1 Nov 2026: 'delete them'). The only auto-resolve that deletes un-imported audio."),
         ("lidarr.held_auto_discard_max_per_pass", "lidarr", "held_auto_discard_max_per_pass", "Delete unwanted: max / pass", "int", 20,
          "How many unwanted held downloads may be deleted per curator pass, oldest first."),
-        ("lidarr.held_auto_discard_library_max_per_pass", "lidarr", "held_auto_discard_library_max_per_pass", "Delete library copies: max / pass", "int", 3,
-         "Of those, held downloads of an album the library has: deleted only when no file is better than the library's file of that song (same title and variant, length within 3 s; Lidarr's quality profile); one with a better file stays as an upgrade (owner, 1 Nov 2026). Each is a Lidarr import preview, so few per pass; 0 turns this part off."),
+        ("lidarr.held_auto_discard_library_max_per_pass", "lidarr", "held_auto_discard_library_max_per_pass", "Delete library copies: max / pass", "int", 10,
+         "Of those, held downloads of an album the library has: deleted when no file is better than the library's file of that song (same title and variant, length within 3 s; Lidarr's quality profile), and when that cannot be judged, when the folder as a whole is no better (format, channels, bit depth, sample rate); compilations and best-ofs go without that check. One with a better file stays as an upgrade (owner, 1 and 5 Nov 2026). Each is a Lidarr import preview; 0 turns this part off."),
         ("lidarr.assembly_interval_seconds", "lidarr", "assembly_interval_seconds", "Assembly: interval (s)", "int", 1800,
          "Seconds between assembly planning passes."),
         ("lidarr.assembly_hunt_per_pass", "lidarr", "assembly_hunt_per_pass", "Assembly: hunts / pass", "int", 2,

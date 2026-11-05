@@ -171,6 +171,10 @@ class LidarrClient:
         # transport failure or 5xx, and a caller that read it before its work
         # knows whether what it saw can be trusted.
         self.failure_generation = 0
+        # The same count per thread (thread_failures): a long read on
+        # one thread is spoilt by ITS failures, not by another thread's
+        # ManualImport timing out meanwhile.
+        self._thread_fail = threading.local()
         self._down_until = 0.0
         self._down_backoff = 0.0
         self._down_lock = threading.Lock()
@@ -1684,6 +1688,7 @@ class LidarrClient:
             down = now < self._down_until
             if down:
                 self.failure_generation += 1
+                self._count_thread_failure()
         if down:
             raise LidarrUnavailable("Lidarr is not answering (breaker open)")
         try:
@@ -1691,6 +1696,7 @@ class LidarrClient:
         except requests.exceptions.ReadTimeout:
             with self._down_lock:
                 self.failure_generation += 1
+                self._count_thread_failure()
             raise
         except (requests.ConnectionError, requests.Timeout) as exc:
             self._went_down(exc)
@@ -1705,6 +1711,7 @@ class LidarrClient:
                 # it is counted, but Lidarr is up and the rest may go on.
                 with self._down_lock:
                     self.failure_generation += 1
+                    self._count_thread_failure()
                 if self._is_multi_release(r):
                     self._multi_release_seen_at = time.time()
                 self._answered()
@@ -1800,9 +1807,21 @@ class LidarrClient:
             return False
         return "NullReferenceException" in text and "IgnoreDownload" in text
 
+    def thread_failures(self) -> int:
+        """Lidarr failures counted on the calling thread alone (what
+        failure_generation counts for every thread together)."""
+        tl = getattr(self, "_thread_fail", None)
+        return int(getattr(tl, "n", 0) or 0) if tl is not None else 0
+
+    def _count_thread_failure(self) -> None:
+        tl = getattr(self, "_thread_fail", None)
+        if tl is not None:
+            tl.n = int(getattr(tl, "n", 0) or 0) + 1
+
     def _went_down(self, why) -> None:
         with self._down_lock:
             self.failure_generation += 1
+            self._count_thread_failure()
             first = self._down_backoff == 0.0
             self._down_backoff = (self._BACKOFF_FIRST if first
                                   else min(self._BACKOFF_MAX, self._down_backoff * 2))

@@ -802,6 +802,24 @@ class HarvestLedger:
 
 # ---------------------------------------------------------------- the pass
 
+def _failures(lidarr) -> int:
+    """Lidarr failures that spoil this thread's reads: the client's count for
+    this thread when it keeps one, else its count for all threads. With the
+    shared count, any ManualImport timing out on another thread during the
+    minutes the wanted index takes threw the whole pass's verdicts away: on
+    5 Nov 2026 seventeen needs-attention folders were scanned pass after pass
+    and never recorded as judged, so nothing could decide about them."""
+    f = getattr(lidarr, "thread_failures", None)
+    if callable(f):
+        try:
+            n = f()
+        except Exception:  # noqa: BLE001
+            n = None
+        if isinstance(n, int):
+            return n
+    return int(getattr(lidarr, "failure_generation", 0) or 0)
+
+
 def harvest_pass(
     lidarr,
     sources: Iterable[str],
@@ -827,13 +845,13 @@ def harvest_pass(
     import_mode is COPY on purpose: these sources are usually SEEDING torrents,
     and moving files out from under qBittorrent breaks the seed.
     """
-    gen = getattr(lidarr, "failure_generation", 0)
+    gen = _failures(lidarr)
     index = build_wanted_index(lidarr)
     # A Lidarr failure while the index was built makes "not wanted" unknown,
     # and the purge deletes on "not wanted". No purge this pass, and no
     # source is recorded as judged: its "nothing wanted here" could be a
     # failed call (list_tracks_for_album answers [] on failure).
-    index_ok = getattr(lidarr, "failure_generation", 0) == gen
+    index_ok = _failures(lidarr) == gen
     if ledger is not None and index_ok and purge_leftovers_enabled:
         settle_pending_purges(
             lidarr, ledger, index, tolerance_seconds=tolerance_seconds,
