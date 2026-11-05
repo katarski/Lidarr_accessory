@@ -17104,8 +17104,12 @@ class Orchestrator:
         says nothing, Lidarr's 'Cross Road' is a Compilation. [] when the
         artist or the album is not in Lidarr, or Lidarr does not answer."""
         album = self._strip_disc_marker(album) or album
-        want = titlematch.key(album)
-        if not (artist and want):
+        # The same title, or the same title before an edition / subtitle
+        # tail ('Cross Road (14 classic grooves)', 'Tough Town (2026)
+        # {Bad Records}'). Not a substring: 'Gold' is not 'Golden Greats'.
+        base = re.split(r"\s*(?:[\(\[\{]|\s-\s|:)", album, maxsplit=1)[0]
+        wants = {titlematch.key(album), titlematch.key(base)} - {""}
+        if not (artist and wants):
             return []
         try:
             art = self.lidarr.find_artist(artist)
@@ -17116,7 +17120,7 @@ class Orchestrator:
         out: List[str] = []
         for a in albums or []:
             k = titlematch.key(a.get("title") or "")
-            if k and (k in want or want in k):
+            if k and k in wants:
                 for st in a.get("secondaryTypes") or []:
                     out.append(str(st.get("name") if isinstance(st, dict) else st))
         return out

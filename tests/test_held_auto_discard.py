@@ -375,6 +375,13 @@ class LibraryCopies(_Held):
                       album="Cross Road (14 classic grooves)")
         self.assertEqual(self.run_lib(), 1)
 
+    def test_another_title_s_compilation_type_does_not_count(self):
+        self.lidarr._albums[1].append(dict(_album("Pla", 14, 14), id=14,
+                                           secondaryTypes=["Compilation"]))
+        self.assertEqual(self.o._held_lidarr_types("Moby", "Play"), [])
+        self.assertEqual(self.o._held_lidarr_types("Moby", "Pla (2026) {X}"),
+                         ["Compilation"])
+
     def test_why_a_row_stays_is_said(self):
         self.lidarr.tfq = {101: MP3}
         d = self.copy_row("Moby - Play [FLAC]")
