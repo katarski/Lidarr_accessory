@@ -175,7 +175,7 @@ class PositionalNeedsAnExactRelease(unittest.TestCase):
             return [t for r in self.releases if r.get("monitored")
                     for t in self.rows.get(r["id"], [])]
 
-        def set_album_monitored_release(self, album_id, rid):
+        def set_album_monitored_release(self, album_id, rid, **kw):
             self.writes.append(("release", rid))
             return True
 

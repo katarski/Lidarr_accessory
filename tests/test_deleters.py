@@ -316,8 +316,10 @@ class AssemblyAdd(unittest.TestCase):
         return ok, sent, src.exists()
 
     def test_a_track_filled_since_the_plan_is_not_imported_onto(self):
+        # Nothing is sent and the source stays; the song IS in the library,
+        # so the Add reports that instead of a failure.
         ok, sent, kept = self.run_add(filled_before=True, files_it=True)
-        self.assertEqual((ok, sent, kept), (False, [], True))
+        self.assertEqual((ok, sent, kept), (True, [], True))
 
     def test_a_completed_command_that_filed_nothing_keeps_the_source(self):
         ok, sent, kept = self.run_add(filled_before=False, files_it=False)

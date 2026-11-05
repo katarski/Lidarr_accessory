@@ -149,11 +149,20 @@ logger = logging.getLogger("dedup")
 # the leftover `.sacd_extract_tmp/9/6ch` of Lara Fabian's killed SACD
 # extraction for a DSD album and transcoded its half-written track ("02 - UN
 # AVE MARIA.flac encoded but is unreadable"), and reconcile probed it.
-PIPELINE_TEMP_DIRS = frozenset({".sacd_extract_tmp", ".dvda_extract_tmp"})
+#
+# The Assembly tab's staging is one too (Orchestrator.assembly_add_to_library).
+# It sat at `/downloads/assembly-<id>`, so when an Add left it behind the sweep
+# took it for a download: on 5 Nov `assembly-37` was "Record step"-imported,
+# which switched Jagged Little Pill's release and cost the album the 29 files
+# the audit had just filed. No dot: Lidarr's scan skips dot folders, and the
+# staged files are read through its ManualImport.
+ASSEMBLY_STAGING_DIR = "_cue_assembly_staging"
+PIPELINE_TEMP_DIRS = frozenset({".sacd_extract_tmp", ".dvda_extract_tmp",
+                                ASSEMBLY_STAGING_DIR})
 
 
 def in_pipeline_temp(path) -> bool:
-    """Is `path` inside one of the pipeline's own extraction folders?"""
+    """Is `path` inside one of the pipeline's own working folders?"""
     try:
         return any(part in PIPELINE_TEMP_DIRS for part in Path(path).parts)
     except (TypeError, ValueError):

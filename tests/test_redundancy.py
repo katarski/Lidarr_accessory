@@ -196,7 +196,7 @@ class ReleaseSwitch(unittest.TestCase):
         calls = []
         lid = SimpleNamespace(
             list_tracks_for_album=lambda aid: held,
-            set_album_monitored_release=lambda aid, rid: calls.append(rid) or True)
+            set_album_monitored_release=lambda aid, rid, **kw: calls.append(rid) or True)
         s = SimpleNamespace(lidarr=lid)
         s._release_switch_safe = Orchestrator._release_switch_safe.__get__(s)
         s._force_abort = Orchestrator._force_abort.__get__(s)

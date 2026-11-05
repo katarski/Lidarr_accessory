@@ -49,7 +49,7 @@ class _Lidarr:
     def list_tracks_for_release(self, i, rid):
         return [{"id": k, "title": t} for k, t in enumerate(self.dlx_titles, 10)]
 
-    def set_album_monitored_release(self, i, rid):
+    def set_album_monitored_release(self, i, rid, **kw):
         self.switches.append(rid)
         self.old, self.monitored = self.monitored, rid
         self.pending = self.lag

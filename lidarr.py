@@ -308,6 +308,7 @@ class LidarrClient:
 
     def set_album_monitored_release(
         self, album_id: int, release_id: int, keep_manual: bool = False,
+        allow_orphaning: bool = False,
     ) -> bool:
         """
         PUT /api/v1/album/{id} with the given release marked monitored=True
@@ -320,6 +321,11 @@ class LidarrClient:
         mark is lost -- and a refresh deletes an album the metadata profile
         leaves out that is not manual and holds no files (Lidarr's
         RefreshAlbumService.ShouldDelete). Lorde's 'Te ao mārama' EP went so.
+
+        Refused when the switch would orphan files the album holds NOW (read
+        live, never from a caller's snapshot) -- see _switch_orphans. Only a
+        caller that re-files the folder itself straight after passes
+        `allow_orphaning`.
         """
         album = self.get_album(album_id)
         if not album:
@@ -355,6 +361,17 @@ class LidarrClient:
                     "album %s after the refresh", release_id, album_id,
                 )
                 return False
+        if not allow_orphaning:
+            lost = self._switch_orphans(album, release_id)
+            if lost:
+                logger.warning(
+                    "set_album_monitored_release: NOT switching album %r (%s) "
+                    "to release %s -- %s",
+                    album.get("title"), album_id, release_id,
+                    "Lidarr could not be read" if lost < 0 else
+                    "%d file(s) it holds now are not on that release and "
+                    "would lose their Lidarr record" % lost)
+                return False
         for r in releases:
             r["monitored"] = (r.get("id") == release_id)
         album["releases"] = releases
@@ -370,6 +387,42 @@ class LidarrClient:
         except Exception as exc:
             logger.error("set_album_monitored_release failed: %s", exc)
             return False
+
+    def _switch_orphans(self, album: Dict[str, Any], release_id: int) -> int:
+        """How many of the files the album holds right now would lose their
+        Lidarr record if `release_id` became its monitored release; -1 when
+        Lidarr could not be read (an outage is not an answer).
+
+        Tracks are per release: a file-holding track whose recording is not
+        on the new release keeps its file on disk and loses the record -- the
+        file is then neither filed nor unmapped, and every later import onto
+        its path fails on DestinationAlreadyExists. On 5 Nov the library audit
+        filed Jagged Little Pill's 29 files on its 29-track release at 14:30;
+        five minutes later the record step for an Assembly staging folder read
+        the album from a snapshot ("no files"), switched it to the 12-track
+        release, and all 29 were gone from Lidarr while still in the folder."""
+        album_id = int(album.get("id") or 0)
+        cur = next((r.get("id") for r in (album.get("releases") or [])
+                    if r.get("monitored")), None)
+        if not album_id or cur == release_id:
+            return 0
+        st = album.get("statistics")
+        if isinstance(st, dict) and "trackFileCount" in st \
+                and not int(st.get("trackFileCount") or 0):
+            return 0                    # read just now: it holds nothing
+        gen = getattr(self, "failure_generation", 0)
+        held = [t for t in (self.list_tracks_for_album(album_id) or [])
+                if t.get("hasFile")]
+        if getattr(self, "failure_generation", 0) != gen:
+            return -1
+        if not held:
+            return 0
+        want = {t.get("foreignRecordingId") for t in
+                (self.list_tracks_for_release(album_id, release_id) or [])
+                if t.get("foreignRecordingId")}
+        if getattr(self, "failure_generation", 0) != gen or not want:
+            return -1
+        return sum(1 for t in held if t.get("foreignRecordingId") not in want)
 
     def heal_multi_release_albums(self) -> List[int]:
         """Repair every album that has more than one monitored release; returns

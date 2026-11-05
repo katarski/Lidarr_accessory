@@ -193,7 +193,7 @@ class _Lidarr:
     def wait_for_command(self, cmd, timeout_seconds=60):
         return {"status": self.cmd_status}
 
-    def set_album_monitored_release(self, a, r, keep_manual=False):
+    def set_album_monitored_release(self, a, r, keep_manual=False, **kw):
         self.switches.append((self.refreshed, r, keep_manual))
         if not keep_manual:
             self.manual = False          # the PUT copies addOptions from its body

@@ -39,7 +39,7 @@ class FakeLidarr:
             {"id": 1, "foreignReleaseId": "other", "monitored": True},
             {"id": 2, "foreignReleaseId": "rel1", "monitored": False}]}
 
-    def set_album_monitored_release(self, album_id, rid, keep_manual=False):
+    def set_album_monitored_release(self, album_id, rid, keep_manual=False, **kw):
         self.monitored.append((album_id, rid, keep_manual))
         return True
 

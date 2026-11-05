@@ -47,7 +47,7 @@ from cue_parser import Cue, LLMUnavailableError, parse_cue, read_cue_text
 from dedup_downloads import _EDITION_WORDS as _EDITION_NOISE_WORDS
 from dedup_downloads import (AUDIO_EXTS as _DOWNLOAD_AUDIO_EXTS,
                              NOT_AN_UPGRADE as _NOT_AN_UPGRADE, in_pipeline_temp,
-                             multichannel_over_library)
+                             ASSEMBLY_STAGING_DIR, multichannel_over_library)
 from held_store import HeldStore
 from lidarr import LidarrClient, _demojibake, _translit_cyrillic
 from ollama_client import OllamaClient, is_unavailable
@@ -2744,7 +2744,8 @@ class Orchestrator:
         """Undo a release flip on an import that did not happen. Always False."""
         if flipped and prev_rid:
             try:
-                if self.lidarr.set_album_monitored_release(album_id, prev_rid):
+                if self.lidarr.set_album_monitored_release(
+                        album_id, prev_rid, allow_orphaning=True):
                     logger.info("Force-import: restored the monitored release "
                                 "of album %s to %s", album_id, prev_rid)
             except Exception as exc:  # noqa: BLE001
@@ -7158,7 +7159,10 @@ class Orchestrator:
             if budget[0] <= 0:
                 return "deferred (per-pass limit)"
             budget[0] -= 1
-        if not self.lidarr.set_album_monitored_release(album_id, rid):
+        # Populated on purpose: the folder is re-filed straight after, and the
+        # old release restored below if that leaves fewer files.
+        if not self.lidarr.set_album_monitored_release(album_id, rid,
+                                                       allow_orphaning=True):
             return "Lidarr refused the switch to release %s" % rid
         self._settled_tracks(album_id, n)
         rec = self.lidarr.get_album(album_id) or full
@@ -7168,7 +7172,8 @@ class Orchestrator:
         after = sum(1 for t in self._settled_tracks(album_id, n)
                     if t.get("hasFile"))
         if after < before:
-            if prev and self.lidarr.set_album_monitored_release(album_id, int(prev)):
+            if prev and self.lidarr.set_album_monitored_release(
+                    album_id, int(prev), allow_orphaning=True):
                 self._settled_tracks(album_id, prev_n)
                 rec = self.lidarr.get_album(album_id) or full
                 # The files Lidarr held before -- never the folder's others.
@@ -7543,7 +7548,9 @@ class Orchestrator:
                 "%d-track release so the import can match",
                 artist_name, album_name,
                 (cur or {}).get("trackCount", "?"), want, tc)
-            return bool(self.lidarr.set_album_monitored_release(album_id, target))
+            # allow_when_populated: the caller re-files this folder at once.
+            return bool(self.lidarr.set_album_monitored_release(
+                album_id, target, allow_orphaning=allow_when_populated))
         except Exception as exc:  # noqa: BLE001
             logger.debug("release align failed for %s / %s: %s",
                          artist_name, album_name, exc)
@@ -12996,6 +13003,7 @@ class Orchestrator:
         except Exception as exc:  # noqa: BLE001
             logger.warning("assembly: module unavailable (%s)", exc)
             return 0
+        self._drop_legacy_assembly_staging()
         # ---- 1) the songs we could draw from: the held (needs-attention)
         # folders, which is exactly the "these compilations may be of use" pool.
         folders: List[Path] = []
@@ -14109,8 +14117,28 @@ class Orchestrator:
         if self._lidarr_generation() != gen or not before:
             return False, ("could not read the album's tracks from Lidarr -- "
                            "nothing done")
+        # The album's own folder first: songs sitting there untracked (a release
+        # switch orphaned them) are filed in place, and any copy staged onto
+        # their path would only fail on "destination already exists".
+        try:
+            adopted = self._assembly_adopt_library_files(
+                int(album_id), full, artist_id, artist, album, before)
+        except Exception as exc:  # noqa: BLE001 -- best effort; the Add goes on
+            logger.warning("assembly: could not check %s / %s's own folder: %s",
+                           artist, album, exc)
+            adopted = 0
+        if adopted:
+            gen = self._lidarr_generation()
+            before = {int(t["id"]): int(t.get("trackFileId") or 0)
+                      for t in (self.lidarr.list_tracks_for_album(int(album_id))
+                                or []) if t.get("id")}
+            if self._lidarr_generation() != gen or not before:
+                return False, ("filed %d song(s) already in the album folder, "
+                               "then could not re-read the album from Lidarr"
+                               % adopted)
 
-        staging = Path(self.cfg.staging_root) / ("assembly-%s" % album_id)
+        staging = (Path(self.cfg.staging_root) / ASSEMBLY_STAGING_DIR
+                   / ("assembly-%s" % album_id))
         try:
             shutil.rmtree(staging, ignore_errors=True)
             staging.mkdir(parents=True, exist_ok=True)
@@ -14155,6 +14183,14 @@ class Orchestrator:
             })
         if not items:
             shutil.rmtree(staging, ignore_errors=True)
+            if n_filled and not (n_gone or n_nocopy or n_notid):
+                store.remove(album_id)
+                return True, (
+                    "%s / %s: all %d matched song(s) are in the library now%s "
+                    "-- nothing needed copying"
+                    % (artist, album, n_filled,
+                       " (%d were sitting in the album folder untracked and "
+                       "are filed now)" % adopted if adopted else ""))
             # Say WHICH of the three reasons it was. "copy failed or no track
             # id" sent diagnosis at the copy when the real answer was that every
             # source file had already been moved into the library by the harvest.
@@ -14200,9 +14236,14 @@ class Orchestrator:
         self._trigger_artist_refresh(artist, artist_id=artist_id)
         filed = self._assembly_filed(album_id, before, staging)
         done = [t for t in sources if t in filed]
+        state = str((rec or {}).get("status") or "").lower()
         if len(done) == len(items):
             shutil.rmtree(staging, ignore_errors=True)
             store.remove(album_id)
+        elif state in ("completed", "failed", "aborted"):
+            # Lidarr is finished with it: what it did not file are copies whose
+            # sources are kept, and the next Add stages afresh.
+            shutil.rmtree(staging, ignore_errors=True)
         # SHARED-FILE GUARD: only a source whose song Lidarr has filed, and
         # that no other assembly needs.
         still_needed = set(store.needed_files(exclude=album_id).keys())
@@ -14228,14 +14269,93 @@ class Orchestrator:
         if busy_kept:
             tail += ("; %d kept because their folder is being processed"
                      % busy_kept)
+        if adopted:
+            tail += ("; %d song(s) already in the album folder were filed in "
+                     "place" % adopted)
         if len(done) < len(items):
-            state = str((rec or {}).get("status") or "no answer")
+            gone = state in ("completed", "failed", "aborted")
             return False, ("Lidarr filed %d of %d song(s) (import %s: %s); the "
-                           "other %d stay staged in %s and their sources are "
-                           "kept%s" % (len(done), len(items), cmd, state,
-                                       len(items) - len(done), staging, tail))
+                           "other %d %s and their sources are kept%s"
+                           % (len(done), len(items), cmd, state or "no answer",
+                              len(items) - len(done),
+                              "were not filed (Lidarr's log says why)" if gone
+                              else "stay staged in %s while it works" % staging,
+                              tail))
         return True, ("assembled %d song(s) into %s / %s%s"
                       % (len(items), artist, album, tail))
+
+    def _assembly_adopt_library_files(self, album_id: int, full: Dict[str, Any],
+                                      artist_id: int, artist: str, album: str,
+                                      before: Dict[int, int]) -> int:
+        """File, in place, the songs the album's own library folder already
+        holds untracked. Returns how many tracks became filled.
+
+        Lidarr names an assembled copy exactly as it named the file it filed
+        for that track before, so when a release switch has orphaned that
+        file (still on disk, no Lidarr record) every assembled copy fails on
+        DestinationAlreadyExists and the Add does nothing at all -- Counting
+        Crows / Hard Candy, 15 files in `Hard Candy (2002)` and the album at
+        0/15. Only the folder whose name IS the album is used, and the files
+        are paired to EMPTY tracks by song title, so nothing filled is
+        touched and another edition's folder is never read."""
+        if not any(not fid for fid in before.values()):
+            return 0
+        album_dir, _ = self._find_album_on_disk(artist, album)
+        if album_dir is None or _match_key(album_dir.name) != _match_key(album):
+            return 0
+        audios = self._album_audio_everywhere(album_dir)
+        if not audios:
+            return 0
+        cmd = self._import_library_folder_by_tracknumber(full, artist_id, audios)
+        if not cmd:
+            return 0
+        self.lidarr.wait_for_command(int(cmd), timeout_seconds=600)
+        after = {int(t["id"]): int(t.get("trackFileId") or 0)
+                 for t in (self.lidarr.list_tracks_for_album(album_id) or [])
+                 if t.get("id")}
+        n = sum(1 for t, fid in after.items() if fid and not before.get(t))
+        if n:
+            logger.info("assembly: %s / %s -- %d song(s) already in %s were "
+                        "untracked; filed them in place", artist, album, n,
+                        album_dir)
+        return n
+
+    _LEGACY_ASSEMBLY_DIR_RE = re.compile(r"^assembly-\d+$")
+    _STAGED_NAME_RE = re.compile(r"^\d{2,} - .+\.[A-Za-z0-9]+$")
+
+    def _drop_legacy_assembly_staging(self) -> int:
+        """Remove Add's staging folders from the old place, the top of the
+        downloads folder, where the sweep took them for downloads. They hold
+        only copies the Add made (named `NN - title.ext`, no sub-folders); a
+        source is never deleted unless Lidarr filed its song."""
+        root = getattr(self.cfg, "staging_root", None)
+        if not root:
+            return 0
+        root = Path(root)
+        try:
+            kids = [d for d in root.iterdir()
+                    if self._LEGACY_ASSEMBLY_DIR_RE.match(d.name) and d.is_dir()]
+        except OSError:
+            return 0
+        n = 0
+        for d in kids:
+            try:
+                entries = list(d.iterdir())
+            except OSError:
+                continue
+            if any(e.is_dir() or not self._STAGED_NAME_RE.match(e.name)
+                   for e in entries):
+                continue               # not what an Add stages: leave it
+            with claims.held(d) as ok:
+                if not ok:
+                    continue
+                shutil.rmtree(d, ignore_errors=True)
+            if not d.exists():
+                n += 1
+                logger.info("assembly: removed the old staging folder %s "
+                            "(%d staged copies; their sources are kept)",
+                            d, len(entries))
+        return n
 
     def _assembly_filed(self, album_id, before, staging) -> set:
         """Track ids of this album that now hold a NEW trackfile (not the one

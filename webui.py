@@ -103,8 +103,8 @@ _PAGE = r"""<!doctype html>
   button:disabled{opacity:.5;cursor:default}
   .empty{padding:3rem;text-align:center;color:var(--mut)}
   .muted{color:var(--mut)}
-  .toast{position:fixed;bottom:1rem;left:50%;transform:translateX(-50%);background:#111;color:#fff;padding:.55rem 1rem;border-radius:10px;opacity:0;transition:opacity .2s;border:1px solid #333;max-width:92vw;z-index:20}
-  .toast.show{opacity:1}
+  .toast{position:fixed;bottom:1rem;left:50%;transform:translateX(-50%);background:#111;color:#fff;padding:.55rem 1rem;border-radius:10px;opacity:0;transition:opacity .2s;border:1px solid #333;max-width:92vw;z-index:20;pointer-events:none;cursor:pointer;white-space:pre-line}
+  .toast.show{opacity:1;pointer-events:auto}
   #ctx{position:fixed;display:none;background:var(--card);border:1px solid var(--bd);border-radius:9px;padding:.25rem;z-index:30;min-width:170px;box-shadow:0 6px 24px rgba(0,0,0,.4)}
   #ctx.on{display:block}
   #ctx .mi{padding:.4rem .6rem;border-radius:6px;cursor:pointer;white-space:nowrap;font-size:.82rem}
@@ -460,7 +460,7 @@ _PAGE = r"""<!doctype html>
     <details id="pl-specs"><summary>Specs</summary><div id="pl-specbody" class="muted">—</div></details>
   </div>
 </div>
-<div id="toast" class="toast"></div>
+<div id="toast" class="toast" title="Click to close" onclick="this.classList.remove('show')"></div>
 <div id="ctx"></div>
 
 <script>
@@ -508,7 +508,13 @@ function score(d){d=d||{};return (d.lossless?2:0)+(d.multichannel?2:0)+(d.max_ch
 function h(s){return (s==null?'':''+s).replace(/[&<>"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
 function human(b){b=b||0;var u=['B','KB','MB','GB','TB'],i=0;while(b>=1024&&i<u.length-1){b/=1024;i++;}return b.toFixed(b<10&&i>0?1:0)+u[i];}
 function ago(t){if(!t)return'';var s=Math.max(0,Date.now()/1000-t);if(s<90)return Math.round(s)+'s';if(s<5400)return Math.round(s/60)+'m';if(s<172800)return Math.round(s/3600)+'h';return Math.round(s/86400)+'d';}
-function toast(m){var t=document.getElementById('toast');t.textContent=m;t.classList.add('show');setTimeout(function(){t.classList.remove('show');},3200);}
+// ms: how long it stays (default 3.2 s); 0 = until replaced or clicked. An
+// Add to library runs for minutes, and a 3-second "working…" followed by a
+// result nobody saw read as "nothing happens".
+var TOASTT=null;
+function toast(m,ms){var t=document.getElementById('toast');t.textContent=m;t.classList.add('show');
+  if(TOASTT)clearTimeout(TOASTT);TOASTT=null;
+  if(ms!==0)TOASTT=setTimeout(function(){t.classList.remove('show');},ms||3200);}
 // ---- Web player -----------------------------------------------------------
 // One shared <audio> + popup for every tab. Playback starts IMMEDIATELY on click
 // (the stream endpoint supports Range, so the browser buffers as it goes); the
@@ -1020,19 +1026,23 @@ function asmRun(ids,kind){
           +'song turns up or no release is left.'
         : ''));
   if(!confirm(what+' '+ids.length+' album(s)?'+extra))return;
-  toast('working…');
+  toast('Working on '+ids.length+' album(s)'+(kind==='add'
+        ?' -- Lidarr files them one by one, this can take a few minutes…':'…'),0);
   fetch('/api/assembly/'+kind,{method:'POST',
         headers:{'Content-Type':'application/json'},
         body:JSON.stringify({ids:ids})})
    .then(function(r){return r.json();}).then(function(j){
       var res=j.results||[];
       var bad=res.filter(function(r){return !r.ok;});
+      // Say what the server said: one album -> its own answer, several -> the
+      // count plus the first failure's reason.
+      var say=res.length===1?(res[0].message||''):(bad.length?(bad[0].message||''):'');
       toast((kind==='find'
              ? 'Search started for '+(j.done||0)+' album(s); each row shows how it goes'
              : 'Done: '+(j.done||0)+' ok')
-            +(bad.length?(', '+bad.length+' failed: '+h(bad[0].message||'')):''));
+            +(bad.length?(', '+bad.length+' failed'):'')+(say?'\n'+say:''),20000);
       ASMSEL.clear();asmLoad();
-   }).catch(function(e){toast('failed: '+e);});
+   }).catch(function(e){toast('failed: '+e,20000);});
 }
 function asmLoad(){
   fetch('/api/assembly').then(function(r){return r.json();}).then(function(j){
@@ -1363,13 +1373,17 @@ function bulkAct(kind){
   if(!ids.length){toast('Select one or more rows first (checkboxes on the left)');return;}
   var verb=kind==='discard'?'DISCARD (delete torrent + folder, keep library)':kind==='move'?'OVERWRITE library files with the held tracks':'ADD the held tracks to the library (keeping existing)';
   if(!confirm('This will '+verb+' for '+ids.length+' selected item(s). Continue?'))return;
-  toast('Working on '+ids.length+'…');
-  var ok=0,fail=0;
+  toast('Working on '+ids.length+'… (an Add copies and waits for Lidarr, a few minutes each)',0);
+  var ok=0,fail=0,last='',why='';
   (function next(i){
-    if(i>=ids.length){toast('Done: '+ok+' ok'+(fail?', '+fail+' failed':''));SEL.clear();refresh();return;}
+    if(i>=ids.length){toast('Done: '+ok+' ok'+(fail?', '+fail+' failed':'')
+        +(why?'\n'+why:(ids.length===1&&last?'\n'+last:'')),20000);SEL.clear();refresh();return;}
+    toast('Working on '+(i+1)+' of '+ids.length+'…',0);
     fetch('/api/held/'+kind,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:ids[i]})})
-     .then(function(r){return r.json();}).then(function(j){if(j.ok){ok++;HELD=HELD.filter(function(x){return x.id!==ids[i];});}else fail++;})
-     .catch(function(){fail++;}).finally(function(){next(i+1);});
+     .then(function(r){return r.json();}).then(function(j){last=j.message||'';
+       if(j.ok){ok++;HELD=HELD.filter(function(x){return x.id!==ids[i];});}
+       else{fail++;if(!why)why=last;}})
+     .catch(function(e){fail++;if(!why)why=String(e);}).finally(function(){next(i+1);});
   })(0);
 }
 function treeHtml(node){
@@ -1424,8 +1438,9 @@ function act(id,kind){
     :'ADD TO LIBRARY: copy the held tracks into the library (keeping existing files, adding the rest), rescan Lidarr, then delete the source torrent + folder. Continue?';
   if(!confirm(msg))return;
   document.querySelectorAll('[data-id="'+id+'"] button').forEach(function(b){b.disabled=true;});
+  toast(kind==='discard'?'Discarding…':'Working… copying and waiting for Lidarr, this can take a few minutes',0);
   fetch('/api/held/'+kind,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id})})
-   .then(function(r){return r.json();}).then(function(j){toast(j.message||(j.ok?'Done':'Failed'));
+   .then(function(r){return r.json();}).then(function(j){toast(j.message||(j.ok?'Done':'Failed'),20000);
      if(j.ok){HELD=HELD.filter(function(x){return x.id!==id;});render();}
      else document.querySelectorAll('[data-id="'+id+'"] button').forEach(function(b){b.disabled=false;});})
    .catch(function(e){toast('Error: '+e);document.querySelectorAll('[data-id="'+id+'"] button').forEach(function(b){b.disabled=false;});});
@@ -2660,7 +2675,10 @@ def make_handler(store, actions: HeldActions):
                     try:
                         ok, msg = act(aid)
                     except Exception as exc:  # noqa: BLE001
+                        logger.exception("webui: %s %s failed", fn, aid)
                         ok, msg = False, str(exc)[:200]
+                    logger.info("webui: %s %s -> %s: %s", fn, aid,
+                                "ok" if ok else "FAILED", msg)
                     results.append({"id": aid, "ok": bool(ok), "message": msg})
                 good = sum(1 for r in results if r["ok"])
                 self._json(200, {"ok": good > 0, "done": good,
@@ -2805,6 +2823,11 @@ def make_handler(store, actions: HeldActions):
                 logger.exception("webui: action failed for %s", eid)
                 self._json(500, {"ok": False, "message": f"error: {exc}"})
                 return
+            # Logged: the answer used to exist only in a toast, so a failed
+            # Add left nothing to read afterwards.
+            logger.info("webui: %s %s (%s) -> %s: %s", path.rsplit("/", 1)[-1],
+                        eid, Path(str(entry.get("source_path") or "")).name,
+                        "ok" if ok else "FAILED", msg)
             if ok:
                 store.remove(eid)
             self._json(200 if ok else 409, {"ok": ok, "message": msg})

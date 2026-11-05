@@ -319,7 +319,7 @@ class RefreshRunning(unittest.TestCase):
         self.assertTrue(c._wait_refresh_idle(4, 17))     # fails fast, no wait
 
 
-ALBUM = {"id": 17, "artistId": 4,
+ALBUM = {"id": 17, "artistId": 4, "statistics": {"trackFileCount": 0},
          "releases": [{"id": 180, "monitored": True},
                       {"id": 191, "monitored": False}]}
 STARTED = [{"name": "RefreshArtist", "status": "started",
@@ -377,7 +377,7 @@ class SwitchWaitsForRefresh(NoSleep):
         monitored flag onto it; the PUT must carry that state, not the copy
         read before the wait (a PUT writes every release of its body)."""
         polls, reads, puts = [], [], []
-        after = {"id": 17, "artistId": 4,
+        after = {"id": 17, "artistId": 4, "statistics": {"trackFileCount": 0},
                  "releases": [{"id": 180, "monitored": False},
                               {"id": 191, "monitored": False},
                               {"id": 200, "monitored": True}]}
