@@ -44,7 +44,40 @@ base is missing and prints the `docker tag` that recreates it) with the repo's `
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20261105-asmorphans`**
+then is the container replaced. Live now: **`guard-20261105-heldcleanup2`**
+(0cc0bc2, deployed 5 Nov 16:47:15 the same way, idle at 16:46:40; image
+0f622948373e. Owner: "I do not need anything to stay there that the library
+has better, or same. And if its new - there needs to be a decision if it
+should be imported. I do not want compilations or best of". 53f7a9a
+(`guard-20261105-heldcleanup`, 16:27:31, image 0f39f6ba5928) made the
+held curator decide instead of keeping every row one check could not
+answer: no-music folders (empty, only cue/log/art or `.!qb` parts, iTunes
+LP interface sounds) go once the torrent is done; a row nothing identifies
+goes once the harvest judged it (identity now also from tags and from
+'YEAR - Artist - Album' / en-dash folder names); a library copy that is a
+compilation / best-of (title, Various Artists, Lidarr's own Compilation
+type -- same title only, 0cc0bc2) goes without the preview; when the
+per-song check cannot judge, the two folder summaries decide; a gap row
+goes when the library holds every song of it as good or better, or none
+of its songs is on the album Lidarr misses ('Blue Moods'); the record
+step adds no compilation to Lidarr; library copies per pass 3 -> 10;
+`_held_stay_reasons` says why each row stays. And the harvest had judged
+its pass by Lidarr failures on ANY thread, so any ManualImport timeout
+elsewhere during its index build voided every verdict: 17 rows were
+scanned pass after pass, never marked. lidarr.py now also counts failures
+per thread (`thread_failures`); song_harvest uses its own. Watched:
+16:27:49-16:28:09 20 deleted (the per-pass cap), 16:32:23 the harvest
+judged 31 sources, 16:33:27 20 more, 16:38:48 16 more (the 17 included);
+76 rows -> 14. A read-only dry run of 0cc0bc2 at 16:45 deletes none of the
+14, each with its reason: 5 gaps Lidarr misses that the download partly
+fills (This Desert Life, Peggy Lee The Collection, JLP MFSL SACD, Outland,
+Mauro Picotto CD2 -- a better file), 3 assembly sources (Mauro Picotto CD1,
+Refined Sugar, Die grossen Erfolge), 3 "upgrade by format" rows nothing
+imports (Barry Manilow Even Now vinyl sides, Ray Parker Jr. 'wv', Kirk
+Franklin Christmas), 2 harvest imports pending, the keep folder. Open: an
+auto-import of real upgrades (owner 1 Nov: "if the download is better than
+the library - then it should overwrite it") and a gap fill for partial
+downloads the harvest rejects. Before that: **`guard-20261105-asmorphans`**
 (c11e5c2, deployed 5 Nov 14:59:13 the same way, idle at 14:58:35; image
 5908df7ef2b8. Owner: "when I click add to library from the assembly tab or
 use the add to library from the drop down - nothing happens". Hard Candy
