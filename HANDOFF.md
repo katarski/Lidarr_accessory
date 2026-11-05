@@ -44,7 +44,26 @@ base is missing and prints the `docker tag` that recreates it) with the repo's `
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20261104-multirelease`**
+then is the container replaced. Live now: **`guard-20261105-asmorphans`**
+(c11e5c2, deployed 5 Nov 14:59:13 the same way, idle at 14:58:35; image
+5908df7ef2b8. Owner: "when I click add to library from the assembly tab or
+use the add to library from the drop down - nothing happens". Hard Candy
+(0/15) and Jagged Little Pill (0/12) had their files in their own folders
+with no Lidarr record, so every assembled copy failed on
+DestinationAlreadyExists; the leftover `/downloads/assembly-37` was then
+record-stepped by the sweep, which switched the release from a stale
+snapshot and orphaned the 29 files the audit had filed at 14:30. Now
+`set_album_monitored_release` refuses, read live, any switch that orphans a
+held file (opt-in `allow_orphaning` only for callers that re-file at once),
+Add files the album folder's untracked songs in place first, staging lives
+in `/downloads/_cue_assembly_staging/` (pipeline temp: no pass takes it),
+and toasts/log carry every action's answer. Watched: 14:59:12 and 14:59:31
+the guard refused switches of 'Dream Street' and 'Blues Cross Country' (1
+and 2 held files); 14:59:48 the planner removed the old `assembly-37` and
+`assembly-6598`; a read-only probe paired 15/15 Hard Candy and 12/12 Jagged
+Little Pill library files to the empty tracks. The 6 commits from 1-4 Nov
+had never reached origin; pushed with this one). Earlier tags for rollback,
+newest first: `guard-20261104-multirelease`
 (3fbfe7c, deployed 4 Nov 12:27:11 the same way, idle at 12:26:54; image
 f3f208d09bd0. Lidarr had answered HTTP 500 "Sequence contains more than one
 matching element" since 2 Nov 16:55 UTC to every read mapping album 1310,
@@ -55,7 +74,7 @@ reconcile pass, 12:32:34, scanned the 790 artists, found album 1310 and
 Lidarr's RefreshAlbum (command 555871) left 12345, the release with its 13
 files, monitored at 12:36:24; "the album list reads again after 1
 repair(s)" at 12:36:59; no 500 since. Owner, on the error: "find out what
-is wrong and fix it"). Earlier tags for rollback, newest first:
+is wrong and fix it"), then
 `guard-20261101-librarycopies`
 (dcae106, deployed 1 Nov 17:42:47 the same way, idle at 17:42:09. Watched:
 the 17:43 and 17:49 passes deleted 3 held library copies with nothing better
