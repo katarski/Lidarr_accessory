@@ -1533,5 +1533,76 @@ class UntrackedDownloadsAreDecided(unittest.TestCase):
             self.assertEqual(added, [])
 
 
+
+class DoneTorrentsNothingImportedLeave(unittest.TestCase):
+    """Owner, 8 Nov 2026, of torrents done 40 days: "Whatever is going on -
+    should have been done by now either by lidarr itself or the pipeline".
+    "Keeping data for a later pass" had no end."""
+
+    def _pass(self, on_leftovers, done_days, grace_days=3):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = tmp.name
+        tdir = Path(root) / "Ramin Djawadi - 3 Body Problem"
+        tdir.mkdir()
+        song = tdir / "01 theme.flac"
+        song.write_bytes(b"x")
+        old = time.time() - 40 * 86400
+        for p in (song, tdir):
+            os.utime(p, (old, old))
+        part = Path(root) / ".abc.parts"
+        part.write_bytes(b"p")
+        files = [{"name": "Ramin Djawadi - 3 Body Problem/01 theme.flac",
+                  "priority": 1, "progress": 1}]
+        q = _Qbt([{"hash": "abc", "name": tdir.name, "category": "lidarr",
+                   "state": "stalledUP", "progress": 1.0,
+                   "completion_on": time.time() - done_days * 86400,
+                   "content_path": "/data/" + tdir.name, "save_path": "/data"}],
+                 files)
+        checked = {}
+        with mock.patch.object(QD, "_lifecycle_owns", lambda t: True):
+            removed, _ = QD.torrent_lifecycle_pass(
+                q, root, category="lidarr", emit=lambda m: None, lidarr=None,
+                on_leftovers=on_leftovers, checked=checked,
+                hand_over_after_seconds=int(grace_days * 86400))
+        return q, removed, tdir, part, song
+
+    def test_done_past_the_grace_leaves_with_its_files_kept(self):
+        held = []
+        q, removed, tdir, part, song = self._pass(
+            lambda f, why="": held.append((f, why)), done_days=40)
+        self.assertEqual((removed, q.removed), (1, [("abc", False)]))
+        self.assertEqual(held, [(str(tdir), "done 40 day(s) ago, 1 song(s) never imported")])
+        self.assertTrue(song.exists())                 # the curator decides
+        self.assertFalse(part.exists())
+
+    def test_within_the_grace_or_without_a_curator_it_stays(self):
+        held = []
+        q, removed, *_ = self._pass(lambda f, why="": held.append(f), done_days=1)
+        self.assertEqual((removed, q.removed, held), (0, [], []))
+        q, removed, *_ = self._pass(None, done_days=40)
+        self.assertEqual((removed, q.removed), (0, []))
+        q, removed, *_ = self._pass(lambda f, why="": held.append(f), done_days=40,
+                                    grace_days=0)       # 0 = never
+        self.assertEqual((removed, q.removed, held), (0, [], []))
+
+    def test_the_held_row_says_why(self):
+        from orchestrator import Orchestrator
+        rows = []
+        o = Orchestrator.__new__(Orchestrator)
+        o.held = object()
+        o._add_held_one = lambda d, outcome, reason: rows.append((d.name, outcome, reason))
+        o._hold_leftovers(Path("/downloads/X"), "done 40 day(s) ago, 1 song(s) never imported")
+        o._hold_leftovers(Path("/downloads/Y"))
+        self.assertEqual([r[:2] for r in rows], [("X", "done_unimported"), ("Y", "leftover")])
+        self.assertIn("done 40 day(s) ago", rows[0][2])
+        import inspect
+        import main
+        src = inspect.getsource(main)
+        self.assertIn('lambda folder, why="": orch._hold_leftovers(\n'
+                      '                        Path(folder), why)', src)
+        self.assertIn("hand_over_after_seconds=hand_over_after", src)
+
+
 if __name__ == "__main__":
     unittest.main()

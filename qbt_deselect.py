@@ -1333,8 +1333,8 @@ def _deselected_audio_on_disk(files: List[Dict[str, Any]], folder: str) -> List[
 
 def _release_to_held(qbt: QbtClient, t: Dict[str, Any], folder: str,
                      download_root: str, leftovers: List[str],
-                     on_leftovers: Optional[Callable[[str], None]],
-                     emit: Callable[[str], None]) -> int:
+                     on_leftovers: Optional[Callable[..., None]],
+                     emit: Callable[[str], None], why: str = "") -> int:
     """Everything this torrent is still needed for is done, but finished
     songs of albums deselected in it are on disk. Those are decided like any
     held download -- deleted unless better than the library (owner, 8 Nov
@@ -1343,13 +1343,19 @@ def _release_to_held(qbt: QbtClient, t: Dict[str, Any], folder: str,
     well") -- so the folder goes to the held curator, the torrent leaves the
     client with its data left for that decision, and its part file (pieces
     of deselected files only, useless without the torrent) is deleted.
-    Without a curator nothing changes. Returns 1 when the torrent left."""
+    Without a curator nothing changes. Returns 1 when the torrent left.
+
+    `why` set: the torrent leaves for that reason (a done torrent nothing
+    imported, see torrent_lifecycle_pass), and the curator is told it."""
     name = t.get("name") or "?"
     h = str(t.get("hash") or "")
     if on_leftovers is None or not h:
         return 0
     try:
-        on_leftovers(folder)
+        if why:
+            on_leftovers(folder, why)
+        else:
+            on_leftovers(folder)
     except Exception as exc:  # noqa: BLE001
         emit(f"lifecycle: could not hand {name!r} to the held curator: {exc}")
         return 0
@@ -1361,9 +1367,13 @@ def _release_to_held(qbt: QbtClient, t: Dict[str, Any], folder: str,
             os.remove(part)
     except OSError:
         pass
-    emit(f"lifecycle: REMOVED torrent entry ({len(leftovers)} finished song(s) "
-         f"of deselected albums left on disk; the held curator decides them) "
-         f"{name!r}")
+    if why:
+        emit(f"lifecycle: REMOVED torrent entry ({why}; its files are left on "
+             f"disk and the held curator decides them) {name!r}")
+    else:
+        emit(f"lifecycle: REMOVED torrent entry ({len(leftovers)} finished "
+             f"song(s) of deselected albums left on disk; the held curator "
+             f"decides them) {name!r}")
     return 1
 
 
@@ -1436,7 +1446,8 @@ def torrent_lifecycle_pass(
     checked: Optional[dict] = None,
     recheck_seconds: int = 21600,
     on_progress: Optional[Callable[[], None]] = None,
-    on_leftovers: Optional[Callable[[str], None]] = None,
+    on_leftovers: Optional[Callable[..., None]] = None,
+    hand_over_after_seconds: int = 0,
 ) -> tuple:
     """
     Manage COMPLETED music torrents by how much of their content the pipeline
@@ -1455,6 +1466,17 @@ def torrent_lifecycle_pass(
     album_complete_in_library); if so, REMOVE torrent + data (backlog #5). A
     stability guard (`min_stable_seconds`) avoids racing an in-progress import.
     Otherwise the torrent is left running.
+
+    A done torrent whose audio is still on disk `hand_over_after_seconds`
+    after it completed leaves the client (its files kept) and its folder goes
+    to the held curator (`on_leftovers(folder, why)`), which imports, deletes
+    or shows it. The owner, 8 Nov 2026, of torrents done 40 days: "Whatever
+    is going on - should have been done by now either by lidarr itself or
+    the pipeline". "Keeping data for a later pass" had no end: 87 done
+    lidarr torrents, 71 of them "not an album the library holds complete"
+    (soundtracks of artists Lidarr lacks, discographies, a record Lidarr's
+    search could not read). The sweep goes on judging the folder; only the
+    client lets go.
 
     Non-music torrents (no selected audio -- TV, movies) are ignored.
     Reads the real download folder, so it never deletes a torrent whose files
@@ -1619,6 +1641,21 @@ def torrent_lifecycle_pass(
             # this decision deletes. Anything unproven stays on disk for the
             # WebUI to resolve.
             reaped = False
+            done_at = float(t.get("completion_on") or 0)
+            if (hand_over_after_seconds > 0 and on_leftovers is not None
+                    and done_at > 0
+                    and now - done_at >= hand_over_after_seconds
+                    and now - _folder_newest_mtime(folder)
+                    >= max(0, min_stable_seconds)):
+                n_rel = _release_to_held(
+                    qbt, t, folder, download_root, leftovers, on_leftovers,
+                    emit, why="done %d day(s) ago, %d song(s) never imported"
+                    % (int((now - done_at) // 86400), on_disk))
+                if n_rel:
+                    removed += n_rel
+                    if checked is not None:
+                        checked.pop(h, None)
+                    continue
             # Re-check throttle: a completed torrent whose DISK STATE hasn't
             # changed since the last library check is not re-planned until
             # `recheck_seconds` pass. Without this, every pass re-ran the

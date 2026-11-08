@@ -1007,6 +1007,13 @@ def qbt_auto_deselect_loop(
         logger.info("qbt lifecycle: resumed the re-check state -- %d completed "
                     "torrent(s) already checked", len(lifecycle_checked))
     lifecycle_recheck = int(qcfg.get("lifecycle_recheck_seconds", 21600) or 21600)
+    # A done torrent nothing imported leaves the client after this many days,
+    # its folder to the held curator (torrent_lifecycle_pass). 0 = never.
+    try:
+        hand_over_days = float(qcfg.get("lifecycle_hand_over_days", 3))
+    except (TypeError, ValueError):
+        hand_over_days = 3.0
+    hand_over_after = int(max(0.0, hand_over_days) * 86400)
 
     def _enqueue_folder_cues(folder: str) -> None:
         """#8a: a music torrent just completed -> enqueue any .cue in its
@@ -1115,6 +1122,7 @@ def qbt_auto_deselect_loop(
                         lifecycle_state_path, lifecycle_checked,
                         completed_seen),
                     on_leftovers=held_adder,
+                    hand_over_after_seconds=hand_over_after,
                 )
                 _save_lifecycle_state(lifecycle_state_path, lifecycle_checked,
                                       completed_seen)
@@ -2306,8 +2314,8 @@ def main() -> int:
                     "grab_targets_path": _grab_path,
                     # A done torrent's finished songs of deselected albums
                     # go to the held curator (deleted unless better).
-                    "held_adder": ((lambda folder: orch._hold_leftovers(
-                        Path(folder))) if orch.held is not None else None),
+                    "held_adder": ((lambda folder, why="": orch._hold_leftovers(
+                        Path(folder), why)) if orch.held is not None else None),
                 },
                 daemon=True,
                 name="cue-qbt",

@@ -16717,12 +16717,18 @@ class Orchestrator:
             reason=reason, outcome=outcome, details=details,
         )
 
-    def _hold_leftovers(self, folder: Path) -> None:
+    def _hold_leftovers(self, folder: Path, why: str = "") -> None:
         """A done torrent leaves the client with finished songs of albums
         deselected in it still on disk: they become a held row, which the
-        curator deletes unless they are better than the library."""
+        curator deletes unless they are better than the library. `why`: the
+        torrent left because nothing imported it in time (outcome
+        "done_unimported"); the sweep still judges the folder."""
         if self.held is None:
             raise RuntimeError("no held store")
+        if why:
+            self._add_held_one(Path(folder), outcome="done_unimported",
+                               reason="the torrent left qBittorrent: %s" % why)
+            return
         self._add_held_one(Path(folder), outcome="leftover",
                            reason="finished songs of albums deselected in a "
                                   "torrent that is done")
