@@ -330,6 +330,7 @@ class SearchDuringAnOutageIsNotAnAttempt(unittest.TestCase):
         s._save_isearch_state = saved.append
         s._lidarr_generation = Orchestrator._lidarr_generation.__get__(s)
         s._isearch_one_album = lambda alb, st, q: tried.append(alb["id"])
+        s._not_an_album_reason = lambda *a, **k: None
         s._try_artist_fill = lambda *a: tried.append("artist")
         return Orchestrator.interactive_search_pass(s), saved, tried
 
@@ -546,6 +547,7 @@ class SearchStateIsCheckpointed(unittest.TestCase):
                 stop.set()                         # SIGTERM during album 2
             return False
         s._isearch_one_album = one
+        s._not_an_album_reason = lambda *a, **k: None
         Orchestrator.interactive_search_pass(s, None, stop=stop)
         self.assertEqual(tried, [1, 2])
         self.assertIn("last_attempt", saved[0]["1"])   # written after album 1

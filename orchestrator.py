@@ -12828,6 +12828,9 @@ class Orchestrator:
         refuse_unofficial = bool(getattr(
             self.cfg, "interactive_search_refuse_unofficial", True))
         allows_unofficial = self._album_allows_unofficial(album_rec, album)
+        # A torrent named a compilation / mix is never grabbed for an album
+        # that is not one itself ('Journey - The Ultimate Collection Time3').
+        own_not_album = bool(self._not_an_album_reason(album))
         dropped_junk: List[str] = []
         dropped_video: List[str] = []
         dropped_dead = 0
@@ -12854,6 +12857,11 @@ class Orchestrator:
             if vid:
                 dropped_video.append(f"{title} [{vid}]")
                 continue
+            if not own_not_album:
+                na = self._not_an_album_reason(title)
+                if na:
+                    logger.debug("interactive search: %r dropped: %s", title, na)
+                    continue
             # WHOSE RECORD IS THIS? Same test the artist-scope ranker uses.
             # This ranker only ever guarded artists collapsing to <= 4 chars,
             # so "Bellini" and "David Bowie" were unguarded and the album
@@ -15420,6 +15428,12 @@ class Orchestrator:
             if vid:
                 dropped_video_a += 1
                 continue
+            na = self._not_an_album_reason(title)
+            if na:
+                # 'Journey - The Ultimate Collection Time3' was "grabbing
+                # discography" (fills~1); 'Svarga Loka Collection' twice.
+                logger.debug("interactive search: %r dropped: %s", title, na)
+                continue
             tnorm = self._norm_title(title)
             # Artist-name guard. A short/numeric artist name ("112", "4") is too
             # weak as a loose substring (it matched "Now That's What I Call Music
@@ -15878,6 +15892,20 @@ class Orchestrator:
             if aid is None:
                 continue
             aid = int(aid)
+            na = self._not_an_album_reason(
+                alb.get("title", "") or "",
+                str((alb.get("artist") or {}).get("artistName") or ""),
+                alb.get("secondaryTypes") or (), alb.get("albumType") or "")
+            if na:
+                # Owner, 8 Nov 2026: "i dont need compilations, mixes,
+                # remixes and other non album bulshit". Unmonitored, Lidarr
+                # stops wanting it too, and the auto-deselect drops its files.
+                if self.lidarr.set_album_monitored(aid, False):
+                    logger.info("interactive search: %s - %s is %s -- "
+                                "unmonitored, never searched",
+                                (alb.get("artist") or {}).get("artistName"),
+                                alb.get("title"), na)
+                continue
             missing_ids.add(aid)
             art_all = alb.get("artistId") or (alb.get("artist") or {}).get("id")
             if art_all is not None:
@@ -17029,7 +17057,10 @@ class Orchestrator:
     # not want compilations or best of"). Whole words only: 'Golden' is not
     # 'Gold', and a box of complete albums is not a best-of.
     _COMPILATION_TITLE_RE = re.compile(
-        r"(?i)\b(?:best\s+of|the\s+very\s+best|the\s+best|greatest|"
+        # "We're the Best of Friends" (Natalie Cole & Peabo Bryson) is a
+        # studio album: a best-of in a sentence is not a best-of.
+        r"(?i)\b(?:(?<!re\sthe\s)(?<!is\sthe\s)best\s+of|the\s+very\s+best|"
+        r"(?<!re\s)(?<!is\s)the\s+best|greatest|"
         r"(?:smash|golden|super|number\s+one|no\.?\s*1)\s+hits|hits|gold|platinum|"
         r"collection|collected|anthology|essentials?|definitive|retrospective|"
         r"tribute|the\s+singles|die\s+gro(?:ss|ß)en\s+erfolge|"
@@ -17051,6 +17082,42 @@ class Orchestrator:
         m = self._COMPILATION_TITLE_RE.search(album)
         if m and not self._COMPILATION_NOT_RE.search(album):
             return "a compilation / best-of (%r)" % m.group(0)
+        return None
+
+    # What a mix, a remix, a live set or a radio show calls itself (the owner,
+    # 8 Nov 2026: "i dont need compilations, mixes, remixes and other non
+    # album bulshit. I kept seeing it"). The interactive search had grabbed
+    # 'Armin van Buuren - A State Of Trance 996' for the wanted 'A State Of
+    # Trance Radio Top 15 - April 2009' (typed a plain Album on MusicBrainz).
+    _NON_ALBUM_TITLE_RE = re.compile(
+        r"(?i)\b(?:re-?mix(?:es|ed)?|mixe[sd]|megamix|dj[\s-]?(?:mix|set)|"
+        r"mixtape|in\s+the\s+mix|club\s+mix(?:es)?|radio\s+(?:top|show|edits?)|"
+        r"a\s+state\s+of\s+trance|live\s+(?:at|in|from|on)|b-sides|"
+        r"bootlegs?|karaoke|instrumentals)\b|\blive\s*@|[(\[]\s*live\s*[)\]]")
+    # Lidarr / MusicBrainz types the owner's metadata profile leaves out
+    # (it keeps Album, Studio and Soundtrack).
+    _NON_ALBUM_SECONDARY = frozenset({
+        "compilation", "live", "remix", "dj-mix", "mixtape/street", "demo",
+        "interview", "spokenword", "audio drama", "audiobook"})
+
+    def _not_an_album_reason(self, title: str, artist: str = "",
+                             secondary_types: Any = (),
+                             album_type: str = "") -> Optional[str]:
+        """Why a record (or a torrent named for one) is not an album the
+        owner wants -- a compilation, best-of, mix, remix, live set, radio
+        show, single or EP -- or None."""
+        comp = self._compilation_reason(title, artist, secondary_types)
+        if comp:
+            return comp
+        for s in secondary_types or ():
+            name = str(s.get("name") if isinstance(s, dict) else s).strip().lower()
+            if name in self._NON_ALBUM_SECONDARY:
+                return "a %s record (MusicBrainz)" % name
+        if album_type and str(album_type).strip().lower() not in ("album", ""):
+            return "a %s, not an album (MusicBrainz)" % str(album_type).strip().lower()
+        m = self._NON_ALBUM_TITLE_RE.search(str(title or ""))
+        if m:
+            return "a mix / remix / live set (%r)" % m.group(0).strip()
         return None
 
     # What a download may hold that becomes music: audio, and the disc images
@@ -17300,6 +17367,22 @@ class Orchestrator:
             why = self._held_nothing_wanted(it)
             album = str(it.get("album") or ex.get("_album") or "")
             artist = str(it.get("artist") or ex.get("_artist") or "")
+            # Not an album at all -- a live set, a mix, a remix record, a
+            # compilation -- goes, wanted by Lidarr or not, copy or not: the
+            # harvest has judged it already (above) and took any wanted song
+            # out first. The owner, 8 Nov 2026, of 'Hank Williams Jr. -- Hank
+            # Live' kept as "a gap Lidarr misses" beside a 16-of-17 library
+            # copy: "I dont want live! And why does it need attention if its
+            # the same!"
+            na = self._not_an_album_reason(
+                album, artist, self._held_lidarr_types(artist, album))
+            if na:
+                ok = self._held_discard_row(
+                    it, folder, "%s -- not an album (no compilations, mixes, "
+                    "remixes or live); the harvest found nothing wanted in it"
+                    % na)
+                done += bool(ok)
+                continue
             if not copy:
                 if not why:
                     other = self._held_gap_not_this(it, folder)
