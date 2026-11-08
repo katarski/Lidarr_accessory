@@ -1418,5 +1418,120 @@ class LongNamesStillFile(unittest.TestCase):
             self.assertIn("self._file_under_short_name(", src)
 
 
+class DoneTorrentsLeaveWithTheirLeftovers(unittest.TestCase):
+    """Owner, 8 Nov 2026: "when audio is processed or rejected ... the audio
+    downloads (partial, complete) and torrents from qbittorrent must be
+    discarded as well". Fiona Apple Discography V0 kept its torrent with all
+    12 selected songs imported: finished songs of deselected albums on disk
+    blocked it ("CD2 is not an album the library holds complete")."""
+
+    def _pass(self, on_leftovers, keep_selected=False):
+        import qbt_deselect as QD
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = tmp.name
+        tdir = Path(root) / "Disco V0"
+        (tdir / "CD2").mkdir(parents=True)
+        (tdir / "CD2" / "01 old.mp3").write_bytes(b"x")       # deselected, finished
+        if keep_selected:
+            (tdir / "Pawn").mkdir()
+            (tdir / "Pawn" / "01 a.mp3").write_bytes(b"x")
+        part = Path(root) / ".abc.parts"
+        part.write_bytes(b"p")
+        files = [{"name": "Disco V0/Pawn/01 a.mp3", "priority": 1, "progress": 1},
+                 {"name": "Disco V0/CD2/01 old.mp3", "priority": 0, "progress": 1}]
+        q = _Qbt([{"hash": "abc", "name": "Disco V0", "category": "lidarr",
+                   "state": "stoppedUP", "progress": 1.0,
+                   "content_path": "/data/Disco V0", "save_path": "/data"}], files)
+        with mock.patch.object(QD, "_lifecycle_owns", lambda t: True):
+            removed, _ = QD.torrent_lifecycle_pass(
+                q, root, category="lidarr", emit=lambda m: None,
+                lidarr=None, on_leftovers=on_leftovers)
+        return q, removed, str(tdir), part
+
+    def test_leftovers_go_to_the_curator_and_the_torrent_leaves(self):
+        held = []
+        q, removed, folder, part = self._pass(held.append)
+        self.assertEqual((removed, q.removed, held), (1, [("abc", False)], [folder]))
+        self.assertTrue(Path(folder, "CD2", "01 old.mp3").exists())   # curator decides
+        self.assertFalse(part.exists())
+
+    def test_without_a_curator_nothing_changes(self):
+        q, removed, folder, part = self._pass(None)
+        self.assertEqual((removed, q.removed), (0, []))
+        self.assertTrue(part.exists())
+
+    def test_a_selected_song_still_on_disk_keeps_the_torrent(self):
+        held = []
+        q, removed, folder, part = self._pass(held.append, keep_selected=True)
+        self.assertEqual((removed, q.removed, held), (0, [], []))
+
+    def test_leftovers_are_left_out_of_the_ownership_question(self):
+        import qbt_deselect as QD
+        with tempfile.TemporaryDirectory() as root:
+            d = Path(root) / "T" / "CD2"
+            d.mkdir(parents=True)
+            f = d / "01.mp3"
+            f.write_bytes(b"x")
+            ok, why = QD._songs_on_disk_owned(None, [], str(Path(root) / "T"),
+                                             root, skip=[str(f)])
+            self.assertTrue(ok, why)
+            ok, _ = QD._songs_on_disk_owned(None, [], str(Path(root) / "T"), root)
+            self.assertFalse(ok)
+
+
+class UntrackedDownloadsAreDecided(unittest.TestCase):
+    """Owner, 8 Nov 2026: "a lot of stuff in my internet downloads folder
+    that I don't know if its used or just latent from failed logic"."""
+
+    def test_the_sweep(self):
+        from types import SimpleNamespace
+        from orchestrator import Orchestrator
+        with tempfile.TemporaryDirectory() as root:
+            R = Path(root)
+            old = time.time() - 3 * 86400
+
+            def mk(name, files=()):
+                d = R / name
+                d.mkdir()
+                for f in files:
+                    (d / f).write_bytes(b"x")
+                for p in [d] + [d / f for f in files]:
+                    os.utime(p, (old, old))
+                return d
+            mk("Seeding", ["01.flac"])                 # a torrent's folder
+            mk("Held One", ["01.flac"])                # a held row
+            mk("_harvest_pending", ["01.flac"])        # the pipeline's own
+            orphan = mk("Lana Del Rey", ["01.mp3"])
+            shell = mk("Frida - Shine", [])            # emptied by the pipeline
+            mine = mk("Movies", [])                    # the owner's own
+            notes = mk("Misc", ["todo.txt"])
+            cues = mk("Old Rip", ["a.cue", "a.log"])
+            fresh = R / "Today"
+            fresh.mkdir()
+            (fresh / "01.flac").write_bytes(b"x")      # being written now
+            ledger = R / "ledger.csv"
+            ledger.write_text("t,/downloads/Frida - Shine/x.cue,A,B\n", encoding="utf-8")
+            os.utime(ledger, (old, old))
+            added = []
+            o = Orchestrator.__new__(Orchestrator)
+            o.cfg = SimpleNamespace(watch_root=R, ledger_file=str(ledger))
+            o.held = SimpleNamespace(list=lambda: [{"source_path": str(R / "Held One")}])
+            o.assembly = None
+            o._add_held_one = lambda d, outcome, reason: added.append(d.name)
+            o._get_qbt = lambda: SimpleNamespace(torrents=lambda: [
+                {"content_path": "/data/Seeding", "save_path": "/data",
+                 "download_path": "/data/torrents"}])
+            self.assertEqual(o._adopt_untracked_downloads(), 3)
+            self.assertEqual(sorted(added), ["Lana Del Rey", "Old Rip"])
+            self.assertFalse(shell.exists())
+            self.assertTrue(mine.exists() and notes.exists() and fresh.exists())
+            # an unread qBittorrent is not "no torrents"
+            o._get_qbt = lambda: SimpleNamespace(torrents=lambda: [])
+            added.clear()
+            self.assertEqual(o._adopt_untracked_downloads(), 0)
+            self.assertEqual(added, [])
+
+
 if __name__ == "__main__":
     unittest.main()

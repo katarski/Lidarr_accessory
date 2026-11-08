@@ -16675,6 +16675,144 @@ class Orchestrator:
             reason=reason, outcome=outcome, details=details,
         )
 
+    def _hold_leftovers(self, folder: Path) -> None:
+        """A done torrent leaves the client with finished songs of albums
+        deselected in it still on disk: they become a held row, which the
+        curator deletes unless they are better than the library."""
+        if self.held is None:
+            raise RuntimeError("no held store")
+        self._add_held_one(Path(folder), outcome="leftover",
+                           reason="finished songs of albums deselected in a "
+                                  "torrent that is done")
+
+    # A folder holding these and no audio is what a download leaves behind.
+    _DOWNLOAD_MARKERS = frozenset({".cue", ".log", ".m3u", ".m3u8", ".accurip",
+                                   ".ffp", ".sfv", ".md5", ".!qb"})
+
+    def _ledger_tops(self) -> set:
+        """Top-level download folder names the pipeline's ledger has ever
+        recorded an outcome for (cached until the ledger changes)."""
+        path = getattr(self.cfg, "ledger_file", None)
+        try:
+            st = os.stat(path) if path else None
+        except OSError:
+            st = None
+        if st is None:
+            return set()
+        key = (st.st_mtime, st.st_size)
+        cached = getattr(self, "_ledger_tops_cache", None)
+        if cached and cached[0] == key:
+            return cached[1]
+        tops = set()
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    parts = line.split(",", 2)
+                    if len(parts) > 1 and parts[1].startswith("/downloads/"):
+                        tops.add(parts[1][len("/downloads/"):].split("/")[0].lower())
+        except OSError:
+            return set()
+        self._ledger_tops_cache = (key, tops)
+        return tops
+
+    def _adopt_untracked_downloads(self, budget: int = 10,
+                                   min_age: float = 86400.0) -> int:
+        """The downloads folder kept music nothing tracked any more: no
+        torrent, no held row (the owner, 8 Nov 2026: "a lot of stuff in my
+        internet downloads folder that I don't know if its used or just
+        latent from failed logic"). A top-level folder with no torrent of ANY
+        category, no held row, no assembly source, not the pipeline's own
+        (a '.' or '_' name), not being processed, unchanged for `min_age`:
+
+          * music in it (or only what a download leaves: cue, log, playlist,
+            checksums, qBittorrent parts) -> a held row, so the curator
+            decides it like any held download (no music, or the library has
+            it as good or better -> deleted; wanted -> imported; better ->
+            kept);
+          * no file at all, and the pipeline's ledger names it -> removed
+            (a shell an import or discard emptied);
+          * anything else is never touched: this is also the owner's own
+            downloads folder (Movies, Misc, ...).
+
+        An unread qBittorrent is not "no torrents": nothing is done. Returns
+        the number of folders adopted or removed."""
+        root = getattr(self.cfg, "watch_root", None) or getattr(
+            self.cfg, "staging_root", None)
+        if self.held is None or not root or budget <= 0:
+            return 0
+        root = Path(root)
+        try:
+            q = self._get_qbt()
+            torrents = q.torrents() if q is not None else []
+        except Exception:  # noqa: BLE001
+            torrents = []
+        if not torrents:
+            return 0
+        from qbt_deselect import _map_to_download_root
+
+        def top(p) -> str:
+            rel = os.path.relpath(str(p), str(root)).replace("\\", "/")
+            return "" if rel.startswith("..") else rel.split("/")[0].lower()
+        busy = set()
+        for t in torrents:
+            for cp in (t.get("content_path"), t.get("download_path")):
+                if cp:
+                    busy.add(top(_map_to_download_root(
+                        cp, t.get("save_path"), str(root))))
+        for it in self.held.list():
+            busy.add(top(it.get("source_path") or ""))
+        try:
+            for src in (self.assembly.needed_files() if self.assembly else {}):
+                busy.add(top(src))
+        except Exception:  # noqa: BLE001 -- unknown keep-set: touch nothing
+            return 0
+        busy.discard("")
+        now, done = time.time(), 0
+        try:
+            entries = sorted(root.iterdir(), key=lambda p: p.name.lower())
+        except OSError:
+            return 0
+        for d in entries:
+            if done >= budget:
+                break
+            name = d.name
+            if (name[:1] in "._" or name.lower() in busy or not d.is_dir()
+                    or claims.busy(d)):
+                continue
+            newest, n_files, music, marker = d.stat().st_mtime, 0, 0, 0
+            for dp, dn, fn in os.walk(d):
+                for x in fn:
+                    n_files += 1
+                    fp = os.path.join(dp, x)
+                    try:
+                        newest = max(newest, os.path.getmtime(fp))
+                    except OSError:
+                        pass
+                    ext = os.path.splitext(x)[1].lower()
+                    if ext in _ALL_AUDIO_EXTS or ext == ".iso":
+                        music += 1
+                    elif ext in self._DOWNLOAD_MARKERS:
+                        marker += 1
+            if now - newest < min_age:
+                continue
+            if music or marker:
+                self._add_held_one(d, outcome="untracked",
+                                   reason="in the downloads folder with no "
+                                          "torrent and nothing tracking it")
+                logger.info("untracked downloads: %r (%d music file(s)) has no "
+                            "torrent and no held row -- held for the curator",
+                            name, music)
+                done += 1
+            elif n_files == 0 and name.lower() in self._ledger_tops():
+                with claims.held(d) as ok:
+                    if ok:
+                        shutil.rmtree(d, ignore_errors=True)
+                if not d.exists():
+                    logger.info("untracked downloads: removed the empty "
+                                "folder %r the pipeline left", name)
+                    done += 1
+        return done
+
     def expand_box_set(self, entry: Dict[str, Any]) -> bool:
         """
         WebUI helper: if an EXISTING held entry is a multi-album container,
@@ -17504,6 +17642,12 @@ class Orchestrator:
                 getattr(cfg, "library_root_windows", None)])
         except Exception as exc:  # noqa: BLE001
             logger.debug("held curator: prune failed: %s", exc)
+        try:
+            self._adopt_untracked_downloads(budget=max(0, int(getattr(
+                cfg, "untracked_adopt_max_per_pass", 10))))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("held curator: untracked-download sweep failed: %s",
+                           exc)
         for it in store.list():
             try:
                 self.expand_box_set(it)

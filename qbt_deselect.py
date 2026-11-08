@@ -1310,6 +1310,63 @@ def _disc_image_or_audio_on_disk(path: str) -> bool:
     return bool(errors)
 
 
+def _deselected_audio_on_disk(files: List[Dict[str, Any]], folder: str) -> List[str]:
+    """The torrent's DESELECTED audio files that are on disk anyway (finished
+    before the deselect). `folder` is its mapped content path; a file name is
+    relative to that folder's parent (or to the folder itself, for a torrent
+    without a root folder)."""
+    root = str(folder).rstrip("/")
+    top, base = os.path.basename(root), os.path.dirname(root)
+    out: List[str] = []
+    for f in files or []:
+        name = str(f.get("name") or "").replace("\\", "/")
+        if (f.get("priority", 1) != 0
+                or os.path.splitext(name)[1].lower() not in AUDIO_EXTS):
+            continue
+        p = (os.path.join(base, name)
+             if name == top or name.startswith(top + "/")
+             else os.path.join(root, name))
+        if os.path.isfile(p):
+            out.append(os.path.normpath(p))
+    return out
+
+
+def _release_to_held(qbt: QbtClient, t: Dict[str, Any], folder: str,
+                     download_root: str, leftovers: List[str],
+                     on_leftovers: Optional[Callable[[str], None]],
+                     emit: Callable[[str], None]) -> int:
+    """Everything this torrent is still needed for is done, but finished
+    songs of albums deselected in it are on disk. Those are decided like any
+    held download -- deleted unless better than the library (owner, 8 Nov
+    2026: "when audio is processed or rejected ... the audio downloads
+    (partial, complete) and torrents from qbittorrent must be discarded as
+    well") -- so the folder goes to the held curator, the torrent leaves the
+    client with its data left for that decision, and its part file (pieces
+    of deselected files only, useless without the torrent) is deleted.
+    Without a curator nothing changes. Returns 1 when the torrent left."""
+    name = t.get("name") or "?"
+    h = str(t.get("hash") or "")
+    if on_leftovers is None or not h:
+        return 0
+    try:
+        on_leftovers(folder)
+    except Exception as exc:  # noqa: BLE001
+        emit(f"lifecycle: could not hand {name!r} to the held curator: {exc}")
+        return 0
+    if not qbt.remove(h, delete_files=False):
+        return 0
+    part = os.path.join(download_root, "." + h.lower() + ".parts")
+    try:
+        if os.path.isfile(part):
+            os.remove(part)
+    except OSError:
+        pass
+    emit(f"lifecycle: REMOVED torrent entry ({len(leftovers)} finished song(s) "
+         f"of deselected albums left on disk; the held curator decides them) "
+         f"{name!r}")
+    return 1
+
+
 def _folder_newest_mtime(path: str) -> float:
     """Newest mtime under `path` (the folder itself if empty). 0.0 on error."""
     newest = 0.0
@@ -1326,13 +1383,17 @@ def _folder_newest_mtime(path: str) -> float:
     return newest
 
 
-def _songs_on_disk_owned(lidarr, plan, folder: str, download_root: str) -> tuple:
+def _songs_on_disk_owned(lidarr, plan, folder: str, download_root: str,
+                         skip: Iterable[str] = ()) -> tuple:
     """(True, why) only when every audio file still on disk under `folder`
     sits in a directory whose files Lidarr owns one by one (folder_fully_owned)
     for the artist the plan matched there. A directory no plan album maps to
     (split output of an unknown album, a folder Lidarr has no artist for)
-    answers False: nothing unproven is deleted."""
+    answers False: nothing unproven is deleted. `skip` are files left out
+    of the question (finished songs of deselected albums: the held curator
+    decides those)."""
     from dedup_downloads import folder_fully_owned
+    skip = {os.path.normpath(str(p)) for p in skip}
     artist_of: Dict[Path, Any] = {}
     for a in plan:
         for f in a.get("files") or []:
@@ -1346,7 +1407,8 @@ def _songs_on_disk_owned(lidarr, plan, folder: str, download_root: str) -> tuple
         on_disk = {}
         for dp, _dn, fn in os.walk(root):
             for x in fn:
-                if os.path.splitext(x)[1].lower() in AUDIO_EXTS:
+                if (os.path.splitext(x)[1].lower() in AUDIO_EXTS
+                        and os.path.normpath(os.path.join(dp, x)) not in skip):
                     on_disk.setdefault(Path(dp), []).append(Path(dp) / x)
     for d, audios in sorted(on_disk.items()):
         aid = artist_of.get(d)
@@ -1374,6 +1436,7 @@ def torrent_lifecycle_pass(
     checked: Optional[dict] = None,
     recheck_seconds: int = 21600,
     on_progress: Optional[Callable[[], None]] = None,
+    on_leftovers: Optional[Callable[[str], None]] = None,
 ) -> tuple:
     """
     Manage COMPLETED music torrents by how much of their content the pipeline
@@ -1495,6 +1558,14 @@ def torrent_lifecycle_pass(
                          f"imported) {iname!r}")
             continue
         on_disk = _count_audio_on_disk(folder) if folder_exists else 0
+        # Finished songs of DESELECTED albums (downloaded before the deselect)
+        # are not what the torrent is still needed for: they never keep it in
+        # the client, and _release_to_held hands them to the held curator.
+        # Counting them kept 6 done torrents for ever, their imported songs
+        # missing ("CD2 is not an album the library holds complete").
+        leftovers = (_deselected_audio_on_disk(files, folder)
+                     if folder_exists else [])
+        on_disk = max(0, on_disk - len(leftovers))
         state = (t.get("state") or "").lower()
         name = t.get("name") or "?"
 
@@ -1509,7 +1580,10 @@ def torrent_lifecycle_pass(
             except Exception as exc:  # noqa: BLE001
                 emit(f"lifecycle: on_complete failed for {name!r}: {exc}")
 
-        if folder_exists and on_disk == 0:
+        if folder_exists and on_disk == 0 and leftovers:
+            removed += _release_to_held(qbt, t, folder, download_root,
+                                        leftovers, on_leftovers, emit)
+        elif folder_exists and on_disk == 0:
             # We can SEE this torrent's folder and its audio is gone -> the
             # pipeline moved every track into the library. Safe to remove the
             # torrent plus any leftover data (extras / the now-empty folder),
@@ -1584,10 +1658,16 @@ def torrent_lifecycle_pass(
                     plan = None
                 if plan:
                     ok, why = _songs_on_disk_owned(lidarr, plan, folder,
-                                                   download_root)
+                                                   download_root,
+                                                   skip=leftovers)
                     if not ok:
                         emit(f"lifecycle: NOT removing {name!r} -- {why}; "
                              f"keeping data for a later pass")
+                    elif leftovers:
+                        n_rel = _release_to_held(qbt, t, folder, download_root,
+                                                 leftovers, on_leftovers, emit)
+                        removed += n_rel
+                        reaped = bool(n_rel)
                     elif qbt.remove(h, delete_files=True):
                         removed += 1
                         reaped = True

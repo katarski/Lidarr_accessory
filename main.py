@@ -909,6 +909,7 @@ def qbt_auto_deselect_loop(
     cue_seen: "Optional[set]" = None,
     handadded_path: Optional[Path] = None,
     grab_targets_path: Optional[Path] = None,
+    held_adder=None,
 ) -> None:
     """
     Poll qBittorrent on a schedule. Two jobs per pass:
@@ -1113,6 +1114,7 @@ def qbt_auto_deselect_loop(
                     on_progress=lambda: _save_lifecycle_state(
                         lifecycle_state_path, lifecycle_checked,
                         completed_seen),
+                    on_leftovers=held_adder,
                 )
                 _save_lifecycle_state(lifecycle_state_path, lifecycle_checked,
                                       completed_seen)
@@ -2302,6 +2304,10 @@ def main() -> int:
                     "cue_seen": cue_seen,
                     "handadded_path": _ha_path,
                     "grab_targets_path": _grab_path,
+                    # A done torrent's finished songs of deselected albums
+                    # go to the held curator (deleted unless better).
+                    "held_adder": ((lambda folder: orch._hold_leftovers(
+                        Path(folder))) if orch.held is not None else None),
                 },
                 daemon=True,
                 name="cue-qbt",

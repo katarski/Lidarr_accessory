@@ -61,7 +61,7 @@ class LifecycleStateSurvivesARestart(unittest.TestCase):
             with mock.patch.object(QD, "plan_torrent", plan), \
                  mock.patch.object(QD, "plan_is_deferred", lambda p: False), \
                  mock.patch.object(QD, "_songs_on_disk_owned",
-                                   lambda *a: (False, "kept")):
+                                   lambda *a, **k: (False, "kept")):
                 QD.torrent_lifecycle_pass(
                     qbt, str(root), lidarr=object(), min_stable_seconds=0,
                     completed_seen=seen, checked=checked,
