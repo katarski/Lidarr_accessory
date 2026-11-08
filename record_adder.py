@@ -93,6 +93,10 @@ def _web_names(titles: Iterable[str], artist: str) -> List[str]:
     return out
 
 
+def _act_words(name: Any) -> List[str]:
+    return re.findall(r"\w+", str(name or "").lower())
+
+
 def identify_record(
     lidarr: Any, artist: Dict[str, Any], names: Sequence[str],
     songs: Sequence[Tuple[str, float]], n_files: int,
@@ -118,6 +122,23 @@ def identify_record(
     unchecked = [0]
     unread = [0]
     own_names = {k for k in (norm(n) for n in names if n) if k}
+    mine = _act_words(artist_name)
+
+    def same_act(c: Dict[str, Any]) -> bool:
+        a = c.get("artist") or {}
+        if str(a.get("foreignArtistId") or "") == artist_id:
+            return True
+        # An ensemble of the artist under its own MusicBrainz name: VOCES8's
+        # 'A Choral Christmas' is credited to 'VOCES8 Foundation Choir' and
+        # was skipped as "another artist's record" until 8 Nov 2026. Its name
+        # must open with the artist's whole name and the folder must carry
+        # the record's name: songs alone never take another artist's record
+        # (a VA soundtrack shares songs).
+        theirs = _act_words(a.get("artistName"))
+        if not mine or len(theirs) <= len(mine) or theirs[:len(mine)] != mine:
+            return False
+        title = str(c.get("title") or "")
+        return bool({norm(title), norm(title.split(":")[0])} & own_names)
 
     def whole_or_named(c: Dict[str, Any], hit: int, n_rel: int) -> bool:
         # A record Lidarr does not list is added whole, so the folder must be
@@ -136,7 +157,7 @@ def identify_record(
             fid = str(c.get("foreignAlbumId") or "")
             if not fid or fid in tried or len(tried) >= limit:
                 continue
-            if str((c.get("artist") or {}).get("foreignArtistId") or "") != artist_id:
+            if not same_act(c):
                 continue                 # another artist's record (a VA soundtrack)
             tried.add(fid)
             rels = sorted((r for r in (c.get("releases") or [])

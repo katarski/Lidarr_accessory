@@ -17417,6 +17417,23 @@ class Orchestrator:
                 continue
             lib_left -= 1
             verdict, same, nfiles, covered = self._held_file_verdict(it, folder)
+            # The summary's "the library has it" is a NAME match. When the
+            # folder's songs are mostly not the library's, the name was
+            # wrong: 'Voces8 - A Choral Christmas' (VOCES8 Foundation Choir,
+            # 15 songs, none in the library) was matched to VOCES8's
+            # 'Christmas' and deleted on 8 Nov 2026 as "none of its 15
+            # file(s) is better than the library's (0 are songs the library
+            # holds)" -- the owner had asked why it was not in the library.
+            # None better is no proof when none is there. Unproven is never
+            # deleted: the record step decides it.
+            if verdict == "same" and nfiles and covered * 2 < nfiles:
+                r = ("its songs are not the library's (%d of %d are) -- not "
+                     "proven the library's album; the record step decides it"
+                     % (covered, nfiles))
+                checked[src] = (sig, time.time(), r)
+                stay(r)
+                logger.info("held auto-discard: %s kept -- %s", folder.name, r)
+                continue
             if not why:
                 # A gap Lidarr still misses: only a download every song of
                 # which the library already holds as good or better goes.

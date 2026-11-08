@@ -349,14 +349,38 @@ class LibraryCopies(_Held):
     def test_a_live_take_is_not_the_studio_song(self):
         self.lidarr.tfq = {101: MP3}
         self.songs = [SH.SourceFile(path="", title="Porcelain (Live)", duration_ms=240000)]
-        self.copy_row("Moby - Play Live")
-        self.assertEqual(self.run_lib(), 1)                # no upgrade of the studio song
+        d = self.copy_row("Moby - Play Live")
+        verdict = self.o._held_file_verdict(
+            next(i for i in self.store.list() if i["source_path"] == str(d)), d)
+        self.assertEqual(verdict[0], "same")               # no upgrade of the studio song
+        self.assertEqual(verdict[3], 0)                    # nor the library's song
 
     def test_another_length_is_not_the_same_recording(self):
         self.lidarr.tfq = {101: MP3}
         self.songs = [SH.SourceFile(path="", title="Porcelain", duration_ms=300000)]
-        self.copy_row("Moby - Play Edit")
-        self.assertEqual(self.run_lib(), 1)
+        d = self.copy_row("Moby - Play Edit")
+        verdict = self.o._held_file_verdict(
+            next(i for i in self.store.list() if i["source_path"] == str(d)), d)
+        self.assertEqual(verdict[0::3], ("same", 0))
+
+    def test_songs_that_are_not_the_library_s_never_make_a_copy(self):
+        # 8 Nov 2026: 'Voces8 - A Choral Christmas' (15 songs, none the
+        # library's) was deleted as a copy of VOCES8's 'Christmas'.
+        self.songs = [SH.SourceFile(path="", title="Gabriel's Message",
+                                    duration_ms=200000),
+                      SH.SourceFile(path="", title="Silent Night",
+                                    duration_ms=210000)]
+        d = self.copy_row("Voces8 - A Choral Christmas", album="Christmas")
+        self.assertEqual(self.run_lib(), 0)
+        self.assertEqual(self.left(), ["Voces8 - A Choral Christmas"])
+        self.assertIn("not the library's (0 of 2 are)",
+                      self.o._held_stay_reasons[str(d).replace("\\", "/")])
+
+    def test_half_or_more_of_the_library_s_songs_is_a_copy(self):
+        self.songs.append(SH.SourceFile(path="", title="Bonus Remix",
+                                        duration_ms=250000))
+        self.copy_row("Moby - Play [FLAC] +1")
+        self.assertEqual(self.run_lib(), 1)                # 1 of 2: a copy plus a bonus
 
     def test_anything_unknown_keeps_the_row(self):
         d = self.copy_row("Unparsed")

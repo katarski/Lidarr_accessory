@@ -82,6 +82,20 @@ class Identify(unittest.TestCase):
         res, why = ident(_Lookup({"Donny Hathaway In Performance": [va]}), _MB({"r6": SONGS}))
         self.assertIsNone(res)
 
+    def test_an_ensemble_of_the_artist_is_taken_by_the_folder_s_name(self):
+        # VOCES8 / 'A Choral Christmas' is 'VOCES8 Foundation Choir' on
+        # MusicBrainz: skipped as another artist's until 8 Nov 2026.
+        ens = album("ens", "In Performance", [("r6", 6)], artist="dhf")
+        ens["artist"]["artistName"] = "Donny Hathaway Foundation Choir"
+        res, why = ident(_Lookup({"Donny Hathaway In Performance": [ens]}), _MB({"r6": SONGS}))
+        self.assertEqual(res["album"]["artist"]["foreignArtistId"], "dhf")
+        other = dict(ens, artist={"foreignArtistId": "x", "artistName": "Donny"})
+        res, why = ident(_Lookup({"Donny Hathaway In Performance": [other]}), _MB({"r6": SONGS}))
+        self.assertIsNone(res)                    # not the artist's whole name
+        res, why = ident(_Lookup({"Donny Hathaway Tape": [ens]}), _MB({"r6": SONGS}),
+                         names=("Tape",))
+        self.assertIsNone(res)                    # songs alone never take it
+
     def test_an_unlisted_record_must_be_nearly_all_here_or_carry_its_name(self):
         # The Beatles / 'Magical Mystery Tour (1967)': Lidarr's lookup offered
         # only 'The Beatles Collection, Volume 7' (17 tracks), 11 of them its.
