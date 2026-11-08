@@ -933,6 +933,19 @@ test of a feature whose purpose is removing files.
    Damian Marley VOB; RuTracker, 5 Nov 00:55 / 16:29) have NO category, so
    they are not the pipeline's: every grab stamps `qbt_category` (lidarr)
    since August. Added by hand or by another app; handadded.py leaves them.
+   (d) Owner, 13:20: "remove any leftovers from the pipeline or lidarr".
+   Deleted after re-checking each one (no torrent; only .!qB, or no file):
+   5 folders of .!qB partials (Diana Krall 1.1 GB, Cream, Nat King Cole St.
+   Louis Blues, Blue Stahli, Roberta Flack), 11 empty album shells, and the
+   pipeline's old logs/CSVs at the downloads root (pipeline.log*, ledger.csv,
+   library_audit*.csv; the live ones are in /config). The curator had
+   already deleted 311 Archive FLAC, 1962 Peggy Lee and Chic by itself at
+   13:19. Lidarr queue: 266 rows, none without its torrent. Kept on purpose:
+   the root `.cue_pipeline_archives` marker (in use), `_cue_assembly_staging`,
+   `_harvest_pending`, the held rows in Needs attention, the owner's files,
+   and `cleanup_level2_small_dirs.ps1` (206 d, origin unknown). Music
+   folders with no torrent are adopted 10 per curator pass; the curator
+   decides them.
 
 0. **31 Oct, started again after 11 days stopped** (Signal 15 on 20 Oct
    16:46; Lidarr stopped since 28 Oct 11:31, started 31 Oct). Fixed then:
