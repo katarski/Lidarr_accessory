@@ -17722,6 +17722,10 @@ class Orchestrator:
                                "failed: %s", exc)
         refreshed = 0
         now = time.time()
+        discard_live = bool(
+            getattr(self.cfg, "held_auto_discard_unwanted", False)
+            and getattr(self.cfg, "harvest_enabled", False)
+            and not getattr(self.cfg, "harvest_dry_run", True))
         # How long a "not in the library" answer stands. It used to equal the
         # curator's own cadence (300 s), so EVERY entry was re-summarised on
         # EVERY pass. A success clears its entry the moment it happens
@@ -17779,9 +17783,30 @@ class Orchestrator:
                     and int(ex.get("n_audio", 0)) >= held_n):
                 upgrade = (det.get("multichannel") and not ex.get("multichannel")) \
                     or (det.get("lossless") and ex.get("has_lossy"))
-                if not upgrade:
+                if not upgrade and not self._held_row_is_download(it, discard_live):
                     store.remove(it["id"])
         return refreshed
+
+    def _held_row_is_download(self, it: Dict[str, Any], discard_live: bool) -> bool:
+        """A row of a download (a folder under the watch root) that the
+        library already holds stays a row while the auto-discard is live: the
+        auto-discard deletes it (same or worse) or keeps it (better), but only
+        once the song harvest has judged the folder, and the harvest reads
+        held rows. Dismissed within minutes, the row never lived that long,
+        and the folder stayed on disk unseen. On 8 Nov 2026 the untracked
+        sweep held 'Christina Aguilera_Greatest_Hits' 39 times in a row, and
+        69 done torrents sat "leaving audio in place" with 6 rows."""
+        if not discard_live:
+            return False
+        wr = getattr(self.cfg, "watch_root", None)
+        if not wr:
+            return False
+        try:
+            src = Path(str(it.get("source_path") or "")).resolve(strict=False)
+            root = Path(wr).resolve(strict=False)
+        except OSError:
+            return False
+        return src != root and root in src.parents
 
     @staticmethod
     def _sans_ts_nonempty(ex: Dict[str, Any]) -> bool:

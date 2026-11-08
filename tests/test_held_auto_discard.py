@@ -263,6 +263,29 @@ class AutoDiscard(_Held):
         self.assertEqual(calls, [20])
 
 
+    def test_a_download_the_library_holds_stays_for_the_discard(self):
+        # 8 Nov 2026: such rows were dismissed as "green" within minutes,
+        # before the harvest judged them, and the folders stayed on disk.
+        lib = {"_ts": time.time(), "in_library": True, "n_audio": 18}
+        d = self.row("Copy", existing=lib)
+        o, cfg = self.o, self.o.cfg
+        o._auto_discard_held_unwanted = lambda budget, library_budget=0: 0
+        o._drop_redundant_nested_held = lambda: 0
+        o._auto_resolve_held_gaps = lambda budget=6: 0
+        o._adopt_untracked_downloads = lambda budget=10: 0
+        o.expand_box_set = lambda it: None
+        o._lidarr_generation = lambda: 0
+        cfg.held_auto_resolve, cfg.held_auto_resolve_max_per_pass = True, 6
+        cfg.webui_held_refresh_seconds, cfg.held_recheck_seconds = 300, 1800
+        cfg.held_auto_discard_unwanted, cfg.held_auto_discard_max_per_pass = True, 20
+        o.curate_held_pass()
+        self.assertEqual(self.left(), ["Copy"])
+        cfg.held_auto_discard_unwanted = False     # nobody would delete it
+        o.curate_held_pass()
+        self.assertEqual(self.left(), [])
+        self.assertTrue(d.exists())
+
+
 FLAC, MP3 = 6, 2                           # Lidarr quality ids
 
 
