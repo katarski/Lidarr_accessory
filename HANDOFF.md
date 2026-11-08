@@ -900,6 +900,43 @@ test of a feature whose purpose is removing files.
 
 ## 6. Open items
 
+-1. **NEXT (8 Nov, owner): leftovers in the downloads folder.** Owner: "when
+   audio is processed or rejected ... the audio downloads (partial, complete)
+   and torrents from qbittorrent must be discarded as well"; "a lot of stuff
+   in my internet downloads folder that I don't know if its used". Read-only
+   inventory 8 Nov 13:10 (scratchpad scripts inv*.py, run in the container
+   with main.load_config + apply_env_overrides): 160 torrents, 0 errored
+   right now; 229 top-level entries, 214 GB. qBittorrent keeps incomplete
+   torrents in `/data/torrents` (download_path) and moves them to `/data`
+   when done; the 41 `.<hash>.parts` files all belong to live torrents.
+   (a) 6 stopped lidarr torrents have selected audio already imported (moved
+   out) but stay in the client: Fiona Apple Discography V0 (12/12 gone),
+   J Balvin (16/27), Nat King Cole Just One of Those Things (8/12), Kaleida
+   (6/7), Fiona Apple (4/16), Ray Charles Selected Singles (4/30). Cause:
+   `torrent_lifecycle_pass` counts EVERY audio file under the folder
+   (`_count_audio_on_disk`), and `_songs_on_disk_owned` demands a plan album
+   for every directory, so finished files of DESELECTED albums left on disk
+   block removal for ever ("CD2 is not an album the library holds
+   complete"). Fix to build: judge the selected audio and the files the
+   pipeline made from it as now. Judge deselected leftovers by the owner's
+   rule (5 Nov: same or worse than the library goes; better is an upgrade,
+   see the open auto-upgrade item). Never delete a held row's or an assembly
+   source's folder.
+   (b) ~60 top-level folders with no torrent: held rows (Alanis, Dusty, Gary
+   Numan x2, Inner Circle, Macy Gray Big, Mauro Picotto Meganite, Ray Parker,
+   _harvest_pending), owner's own files (Movies, TV Shows, Misc, Network
+   Documents, audio/Audio, old logs/csv/png/.ps1 from 100-200 days ago --
+   never touch), and untracked music nobody decides (Christina
+   Aguilera_Greatest_Hits 586 MB, Lana Del Rey, M.C. Sar Space Invaders 2 GB,
+   Melody Gardot 1.7 GB, ULTRAVOX-BRILLIANT 2.1 GB, Safri Duo, Sash!, ...),
+   plus ~20 empty shells. Needs a sweep: music with no torrent and no held
+   row -> same-or-worse than the library goes, else a held row.
+   (c) The two video torrents (Mauro Picotto Live At Mayday 2000.mpg, Nas &
+   Damian Marley VOB; RuTracker, added 5 Nov 00:55 / 16:29) have NO
+   category: not the pipeline's (every grab stamps `qbt_category`, default
+   lidarr, since August); handadded.py leaves them alone by the lidarr-only
+   rule.
+
 0. **31 Oct, started again after 11 days stopped** (Signal 15 on 20 Oct
    16:46; Lidarr stopped since 28 Oct 11:31, started 31 Oct). Fixed then:
    the template's `LLM_MODEL` named `huihui_ai/Qwen3.6-abliterated:27b`,
