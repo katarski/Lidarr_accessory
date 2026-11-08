@@ -55,6 +55,15 @@ from splitter import (SplitResult, incomplete_splits, probe_duration,
                       repair_leadin, split_cue)
 from tagger import TagPlan, album_folder_name, fit_name, tag_splits
 
+
+# How the cueless sweep judges a download. Bump it when a deploy changes that
+# judgment (a new way to find, add or file a record): every folder the sweep
+# ledger holds under an older number is judged again on the next pass instead
+# of on its 24-hour expiry. On 8 Nov 2026 the unreadable-search fix went live
+# at 14:20, and Voces8 - A Choral Christmas, failed at 13:32, would not have
+# been judged again until the next day. Facts that never decay (an ISO already
+# ripped, `ttl_seconds`) keep their entry.
+SWEEP_JUDGE_VERSION = 2
 logger = logging.getLogger(__name__)
 
 # Characters a filesystem will not take in a file name.
@@ -3969,6 +3978,13 @@ class Orchestrator:
             sig, ts = rec[0], float(rec[1])
         except Exception:  # noqa: BLE001
             return False
+        if not ttl_seconds:
+            try:
+                ver = int(rec[2]) if len(rec) > 2 else 1
+            except (TypeError, ValueError):
+                ver = 1
+            if ver < SWEEP_JUDGE_VERSION:
+                return False       # judged by older code: judge it again
         ttl = (int(ttl_seconds) if ttl_seconds
                else max(300, int(getattr(
                    self.cfg, "sweep_ledger_ttl_seconds", 86400))))
@@ -3992,13 +4008,15 @@ class Orchestrator:
         if not getattr(self.cfg, "sweep_ledger_enabled", True):
             return
         led = self._sweep_ledger()
-        led[str(folder)] = [self._folder_signature(audios), now_ts]
+        led[str(folder)] = [self._folder_signature(audios), now_ts,
+                            SWEEP_JUDGE_VERSION]
         discs: Dict[Path, List[Path]] = {}
         for a in audios:
             if a.parent != folder and folder in a.parent.parents:
                 discs.setdefault(a.parent, []).append(a)
         for d, auds in discs.items():
-            led[str(d)] = [self._folder_signature(auds), now_ts]
+            led[str(d)] = [self._folder_signature(auds), now_ts,
+                           SWEEP_JUDGE_VERSION]
         self._sweep_led_dirty = True
 
     # ---- persistent CUE ledger ------------------------------------------
