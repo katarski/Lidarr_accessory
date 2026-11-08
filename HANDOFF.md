@@ -973,7 +973,9 @@ test of a feature whose purpose is removing files.
    skipped the album as another artist's. An artist whose name opens with
    the artist's whole name is now taken when the folder carries the
    record's name. Re-fetch: Lidarr history hash 4B679F5A0976AB55DD494A61B9E6FB4695B65DEF
-   (1337x, 1.4 GB), only with the owner's yes.
+   (1337x, 1.4 GB): the owner said yes; re-added 19:15 (category lidarr,
+   1 seed). Check: its Record step line files it under VOCES8 Foundation
+   Choir.
    Still open: "artist X is not in Lidarr" (soundtrack and DJ artists)
    needs the new-artist path via Lidarr's artist lookup. "Fits X, but
    Lidarr filed none of it" (The Album, Hard Candy, Heart & Soul) is
