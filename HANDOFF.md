@@ -932,12 +932,36 @@ test of a feature whose purpose is removing files.
    Check: Voces8's Record step line. A failed folder is judged again only
    on its 24 h ledger expiry, so `SWEEP_JUDGE_VERSION` (2, fbf0701) re-opens
    all of them at once.
-   Still open: done lidarr torrents left "leaving audio in place" are
-   invisible (69 hold selected audio, 6 held). They need a held row so
-   the curator decides them. Examples: Lana Del Rey Born To Die x8;
-   soundtrack/DJ artists not in Lidarr (Hans Zimmer, Ramin Djawadi, Olivier
-   Deriviere, Mauro Picotto); "artist X is not in Lidarr" needs the same
-   new-artist path via Lidarr's artist lookup.
+   Evening, owner: "torrents that are completed long time ago ... The
+   pipeline is supposed to take care of these"; "if the assembly is empty
+   then whatever is incomplete and not missing - should be removed from
+   qbit as well as its contents"; "i dont need compilations, mixes,
+   remixes"; "I dont want live! And why does it need attention if its the
+   same!". Built (queued deploy `guard-20261108-keepdlrows`, b06725f):
+   (1) 2c4bf51: the curator's "green" auto-dismiss no longer drops a row
+   under the watch root while the auto-discard is live. It had hidden copies
+   within minutes, before the harvest judged them, so the folders stayed on
+   disk and the untracked sweep re-held them every pass (Christina
+   Aguilera 39x).
+   (2) b5ba13f: a done torrent whose songs are still on disk
+   `qbittorrent.lifecycle_hand_over_days` (default 3) after completing
+   leaves the client. Its files are kept and its part file deleted; the
+   held row (outcome done_unimported) goes to the curator. 87 done lidarr
+   torrents, up to 40 days, had been "keeping data for a later pass".
+   (3) e01fd18: `_not_an_album_reason` covers compilations, profile-excluded
+   MB types (live, remix, dj-mix ...), non-Album primary types, and
+   mix/remix/live-set/radio-show titles. Wanted albums of that kind are
+   unmonitored and never searched (dry run: 28 of 474). Torrents named so
+   are never grabbed. Held rows of that kind are discarded, gap or not,
+   after the harvest. "We're the Best of Friends" no longer reads as a
+   best-of.
+   (4) b06725f: a wholly deselected torrent with finished songs on disk
+   (10 at 0 %, "HAVE library 8/8") leaves the client, blocklisted, and
+   goes to the curator as leftovers.
+   Still open: "artist X is not in Lidarr" (soundtrack and DJ artists)
+   needs the new-artist path via Lidarr's artist lookup. "Fits X, but
+   Lidarr filed none of it" (The Album, Hard Candy, Heart & Soul) is
+   usually a copy Lidarr already holds; it is decided once it is held.
 
 -1. **Watch (8 Nov): downloads-folder leftovers, live `guard-20261108-leftovers`
    (b1e6cb7).** Owner: "when audio is processed or rejected ... the audio
