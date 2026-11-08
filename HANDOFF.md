@@ -44,8 +44,12 @@ base is missing and prints the `docker tag` that recreates it) with the repo's `
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20261108-unreadsearch`**
-(06b4b55, 8 Nov; section 6 item -2). Before it: `guard-20261108-leftovers`
+then is the container replaced. Live now: **`guard-20261108-judgever`**
+(fbf0701, 8 Nov; section 6 item -2). When a deploy changes how the cueless
+sweep judges a download, bump `SWEEP_JUDGE_VERSION` (orchestrator.py): ledger
+entries under an older number are judged again on the next pass instead of on
+their 24 h expiry (ISO facts keep theirs). Before it: `guard-20261108-unreadsearch`
+(06b4b55), `guard-20261108-leftovers`
 (b1e6cb7, item -1) and **`guard-20261108-longnames`**
 (9cc4b5e, 8 Nov; restarts=0, no ERROR). Owner: "I keep readding fiona
 apple's album and it never moves it". 'When the Pawn...' is 444
@@ -925,7 +929,9 @@ test of a feature whose purpose is removing files.
    nothing lands. Verified live with the new code: the search now gives 5
    records, 'A Choral Christmas' first. Same "(0 looked at)" verdicts
    before: Voces8, Mauro Picotto 'The Lizard Man', 'Meganite Ibiza 2007'.
-   Check: the startup sweep's Record step line for Voces8.
+   Check: Voces8's Record step line. A failed folder is judged again only
+   on its 24 h ledger expiry, so `SWEEP_JUDGE_VERSION` (2, fbf0701) re-opens
+   all of them at once.
    Still open: done lidarr torrents left "leaving audio in place" are
    invisible (69 hold selected audio, 6 held). They need a held row so
    the curator decides them. Examples: Lana Del Rey Born To Die x8;
