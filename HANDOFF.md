@@ -44,7 +44,13 @@ base is missing and prints the `docker tag` that recreates it) with the repo's `
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20261105-heldcleanup2`**
+then is the container replaced. Live now: **`guard-20261108-longnames`**
+(9cc4b5e, 8 Nov; restarts=0, no ERROR). Owner: "I keep readding fiona
+apple's album and it never moves it". 'When the Pawn...' is 444
+characters: every Lidarr import failed with PathTooLongException (a name
+over 255 bytes) yet read "completed" -- 252 failures in two hours. Fixed
+on both sides (see the "Names over 255 bytes" bullet in section 3); the
+album filed at 11:58 (12/12). Before that: **`guard-20261105-heldcleanup2`**
 (0cc0bc2, deployed 5 Nov 16:47:15 the same way, idle at 16:46:40; image
 0f622948373e. Owner: "I do not need anything to stay there that the library
 has better, or same. And if its new - there needs to be a decision if it
@@ -800,6 +806,20 @@ layer says `http://daniel:11434`.
   folder only when every song has an equal copy in the library. Discard never
   reaps on an unreadable file list, and deselects by the album's path inside
   the torrent, not a folder-name segment.
+- **Names over 255 bytes** (a Linux file or folder name; UTF-8, so a CJK
+  character or a curly quote is 3). Lidarr's naming truncates since 8 Nov
+  (owner-approved): folder `{Album Title:120} ({Release Year})`, file
+  `{Artist Name} - {Album Title:80} - {track:00} - {Track Title:100}`
+  (multi-disc the same with `{Medium Format} {medium:00}/`). 120 is above
+  the longest title already in the library (116, The Idler Wheel...), so
+  no existing album changes folder. The old format had no `:N`. Characters
+  are not bytes, so the pipeline also guards: `tagger.fit_name` cuts our
+  own folder names to 255 bytes (album cut, year kept, U+2026 mark), and
+  when Lidarr's log (`import_failed_on_long_name`: "Couldn't import track
+  <path>" + PathTooLongException after the import started) names the
+  cause, the held force-import and the Assembly Add call
+  `_file_under_short_name`: files go into the artist folder under the
+  album name cut to fit, are imported in place, and unfiled ones go back.
 
 ---
 
