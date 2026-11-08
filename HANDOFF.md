@@ -44,8 +44,9 @@ base is missing and prints the `docker tag` that recreates it) with the repo's `
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20261108-leftovers`**
-(b1e6cb7, 8 Nov; see section 6 item -1). Before it: **`guard-20261108-longnames`**
+then is the container replaced. Live now: **`guard-20261108-unreadsearch`**
+(06b4b55, 8 Nov; section 6 item -2). Before it: `guard-20261108-leftovers`
+(b1e6cb7, item -1) and **`guard-20261108-longnames`**
 (9cc4b5e, 8 Nov; restarts=0, no ERROR). Owner: "I keep readding fiona
 apple's album and it never moves it". 'When the Pawn...' is 444
 characters: every Lidarr import failed with PathTooLongException (a name
@@ -900,6 +901,37 @@ test of a feature whose purpose is removing files.
 ---
 
 ## 6. Open items
+
+-2. **Watch (8 Nov): Lidarr's 503 album search, live `guard-20261108-unreadsearch`
+   (06b4b55).** Owner: "Lidarr's album search fails with a 503 -- should not
+   be failing"; Voces8 - A Choral Christmas sat in downloads, not in Lidarr.
+   Cause (Lidarr 3.1.6 bug, lidarr.txt stack): one result whose track credits
+   an artist missing from its album's artist list throws KeyNotFoundException
+   in `SkyHookProxy.MapTrack`, and the WHOLE answer is a 503 "Invalid response
+   received from LidarrAPI". The metadata server itself answers 200. Null
+   ratings are NOT the cause (Fiona Apple/Madonna answers carry them, 200).
+   A newer Lidarr may fix it; updating Lidarr is the owner's call. Built:
+   `lookup_albums` reads the server's answer itself (Lidarr's
+   `/api/v1/config/metadataprovider` metadataSource, empty = built-in
+   `https://api.lidarr.audio/api/v0.4/`) and looks each album up as
+   `lidarr:<id>` (that path reads it). Not read stays `SearchUnread`, never
+   []; record_adder then says "not judged", `_give_lidarr_the_download`
+   returns None, and the two callers do NOT `_reject_wrong_grab` on it (a
+   not-judged download was one step from blocklist+delete). The record's own
+   artist may be one Lidarr lacks ('A Choral Christmas' is VOCES8 Foundation
+   Choir's): `add_album_unmonitored(new_artist_ok=True)` (downloads step
+   only) adds it with the matched artist's profiles/root, unmonitored,
+   monitor none, no search; filed under it; album and artist taken back when
+   nothing lands. Verified live with the new code: the search now gives 5
+   records, 'A Choral Christmas' first. Same "(0 looked at)" verdicts
+   before: Voces8, Mauro Picotto 'The Lizard Man', 'Meganite Ibiza 2007'.
+   Check: the startup sweep's Record step line for Voces8.
+   Still open: done lidarr torrents left "leaving audio in place" are
+   invisible (69 hold selected audio, 6 held). They need a held row so
+   the curator decides them. Examples: Lana Del Rey Born To Die x8;
+   soundtrack/DJ artists not in Lidarr (Hans Zimmer, Ramin Djawadi, Olivier
+   Deriviere, Mauro Picotto); "artist X is not in Lidarr" needs the same
+   new-artist path via Lidarr's artist lookup.
 
 -1. **Watch (8 Nov): downloads-folder leftovers, live `guard-20261108-leftovers`
    (b1e6cb7).** Owner: "when audio is processed or rejected ... the audio
