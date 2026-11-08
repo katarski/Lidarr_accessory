@@ -44,8 +44,9 @@ base is missing and prints the `docker tag` that recreates it) with the repo's `
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20261108-judgever`**
-(fbf0701, 8 Nov; section 6 item -2). When a deploy changes how the cueless
+then is the container replaced. Live now: **`guard-20261108-unproven`**
+(e9c9834, 8 Nov; section 6 item -2), after `guard-20261108-keepdlrows`
+(b06725f) and `guard-20261108-judgever` (fbf0701). When a deploy changes how the cueless
 sweep judges a download, bump `SWEEP_JUDGE_VERSION` (orchestrator.py): ledger
 entries under an older number are judged again on the next pass instead of on
 their 24 h expiry (ISO facts keep theirs). Before it: `guard-20261108-unreadsearch`
@@ -937,7 +938,9 @@ test of a feature whose purpose is removing files.
    then whatever is incomplete and not missing - should be removed from
    qbit as well as its contents"; "i dont need compilations, mixes,
    remixes"; "I dont want live! And why does it need attention if its the
-   same!". Built (queued deploy `guard-20261108-keepdlrows`, b06725f):
+   same!". Built (live since 17:58 as `guard-20261108-keepdlrows`, b06725f;
+   in the first hour about 45 torrents left the client and the curator
+   deleted about 75 rows):
    (1) 2c4bf51: the curator's "green" auto-dismiss no longer drops a row
    under the watch root while the auto-discard is live. It had hidden copies
    within minutes, before the harvest judged them, so the folders stayed on
@@ -958,6 +961,19 @@ test of a feature whose purpose is removing files.
    (4) b06725f: a wholly deselected torrent with finished songs on disk
    (10 at 0 %, "HAVE library 8/8") leaves the client, blocklisted, and
    goes to the curator as leftovers.
+   (5) e9c9834, live `guard-20261108-unproven`: DATA LOSS FIX. At 18:23
+   the curator deleted 'Voces8 - A Choral Christmas' (VOCES8 Foundation
+   Choir, 15 songs, none in the library) as a library copy of VOCES8's
+   'Christmas': "none of its 15 file(s) is better than the library's (0 are
+   songs the library holds)". The summary's "library has it" is a name
+   match. Now a copy whose songs are under half the library's stays ("not
+   proven the library's album; the record step decides it"). The dry run
+   over 3 days of logs gives 10 such deletions: 9 albums are whole in the
+   library (other encodings); Voces8 is the only loss. The record step
+   skipped the album as another artist's. An artist whose name opens with
+   the artist's whole name is now taken when the folder carries the
+   record's name. Re-fetch: Lidarr history hash 4B679F5A0976AB55DD494A61B9E6FB4695B65DEF
+   (1337x, 1.4 GB), only with the owner's yes.
    Still open: "artist X is not in Lidarr" (soundtrack and DJ artists)
    needs the new-artist path via Lidarr's artist lookup. "Fits X, but
    Lidarr filed none of it" (The Album, Hard Candy, Heart & Soul) is
