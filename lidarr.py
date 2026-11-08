@@ -92,6 +92,11 @@ class LidarrUnavailable(requests.ConnectionError):
     client's breaker is open (see LidarrClient._send)."""
 
 
+class SearchUnread(RuntimeError):
+    """An album search neither Lidarr nor we could read: "couldn't check",
+    never "no records" (LidarrClient.lookup_albums)."""
+
+
 class UnmappedPath(ValueError):
     """A path under no root we share with Lidarr (LidarrClient.windows_to_lidarr).
     Lidarr cannot see it, and its empty answer about it would read as "nothing
@@ -570,28 +575,125 @@ class LidarrClient:
                 self._HEAL_INTERVAL / 60)
         return ok
 
+    _DEFAULT_METADATA_SOURCE = "https://api.lidarr.audio/api/v0.4/"
+
     def lookup_albums(self, term: str) -> List[Dict[str, Any]]:
         """Lidarr's album search (its metadata server, not the library):
         "<artist> <title>", or "lidarr:<release-group mbid>". A result Lidarr
-        already holds carries its "id". A search whose answer Lidarr cannot
-        read (`_is_unreadable_search`) finds no records."""
+        already holds carries its "id".
+
+        A text search whose answer Lidarr cannot read (`_is_unreadable_search`)
+        is read by us, and each album it names is looked up by id, which
+        Lidarr reads. Lidarr 3.1.6 throws a whole answer away when ONE result
+        has a track crediting an artist its album does not list
+        (KeyNotFoundException in SkyHookProxy.MapTrack). 'VOCES8 A Choral
+        Christmas' failed on its own record, whose tracks 10, 12 and 13
+        credit an artist outside the album's nine. Read as "no records", that
+        download stayed "no record of VOCES8 carries its songs (0 looked at)"
+        on 8 Nov 2026. Raises SearchUnread when the answer could not be read
+        at all, or one of its records could not."""
         try:
             return self._get("/api/v1/album/lookup", term=term) or []
         except requests.HTTPError as exc:
             if exc.response is None or not self._is_unreadable_search(exc.response):
                 raise
-            logger.info("album search %r: Lidarr cannot read its metadata "
-                        "server's answer -- no records by that search", term)
-            return []
+        if term.lower().startswith("lidarr:"):
+            raise SearchUnread("Lidarr cannot read the record %s" % term)
+        ids = self._metadata_search_ids(term)
+        if ids is None:
+            raise SearchUnread("album search %r: neither Lidarr nor its "
+                               "metadata server could be read" % term)
+        out: List[Dict[str, Any]] = []
+        for i in ids:
+            try:
+                out.extend(self._get("/api/v1/album/lookup", term="lidarr:%s" % i) or [])
+            except requests.HTTPError as exc:
+                if exc.response is None or not self._is_unreadable_search(exc.response):
+                    raise
+                # One record of the answer unread: the answer is not whole,
+                # and the record left out may be the one.
+                raise SearchUnread("album search %r: Lidarr cannot read its "
+                                   "record %s" % (term, i)) from exc
+        logger.info("album search %r: Lidarr cannot read its metadata server's "
+                    "answer; read by us, %d record(s) looked up by id",
+                    term, len(out))
+        return out
+
+    def _metadata_search_ids(self, term: str, limit: int = 5) -> Optional[List[str]]:
+        """The album ids Lidarr's metadata server answers for a text search,
+        read by us, in its order (at most `limit`). The server is Lidarr's own
+        setting ("metadataSource"; empty means its built-in one). None: not
+        read."""
+        src = getattr(self, "_meta_source_url", None)
+        if not src:
+            try:
+                cfg = self._get("/api/v1/config/metadataprovider") or {}
+            except Exception as exc:  # noqa: BLE001
+                logger.info("Lidarr's metadata source setting not read: %s", exc)
+                return None
+            src = (str(cfg.get("metadataSource") or "").strip()
+                   or self._DEFAULT_METADATA_SOURCE)
+            self._meta_source_url = src
+        try:
+            r = requests.get(src.rstrip("/") + "/search",
+                             params={"type": "album", "query": term}, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+        except Exception as exc:  # noqa: BLE001
+            logger.info("album search %r on the metadata server failed: %s", term, exc)
+            return None
+        if not isinstance(data, list):
+            return None
+        ids: List[str] = []
+        for x in data:
+            i = str(x.get("id") or "") if isinstance(x, dict) else ""
+            if i and i not in ids:
+                ids.append(i)
+        return ids[:limit]
 
     def add_album_unmonitored(self, resource: Dict[str, Any],
-                              artist_id: int) -> Optional[Dict[str, Any]]:
+                              artist_id: int,
+                              new_artist_ok: bool = False) -> Optional[Dict[str, Any]]:
         """Add ONE record (a lookup result) to an artist Lidarr has, outside
         the metadata profile. addType "manual" is what keeps it through the
         next refresh; unmonitored and with no search, so nothing is wanted or
-        downloaded for it -- the files on disk make it owned."""
+        downloaded for it -- the files on disk make it owned.
+
+        `new_artist_ok`: a record whose own artist Lidarr does not have is
+        added with that artist, given the profiles and root folder of
+        `artist_id`'s artist, unmonitored, with no albums monitored and no
+        search. 'A Choral Christmas' is VOCES8 Foundation Choir's, not
+        VOCES8's. Lidarr refused the record with a lookup's artist block
+        (no profiles, no root folder). The answer's "artistId" is then the
+        new artist."""
         body = dict(resource)
         body.pop("id", None)
+        art = body.get("artist") if isinstance(body.get("artist"), dict) else None
+        if (new_artist_ok and art is not None and not art.get("id")
+                and art.get("foreignArtistId")):
+            try:
+                tpl = self._get(f"/api/v1/artist/{int(artist_id)}") or {}
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("adding album %r: artist %s not read: %s",
+                               resource.get("title"), artist_id, exc)
+                return None
+            root = str(tpl.get("rootFolderPath") or "")
+            if not root and tpl.get("path"):
+                root = str(tpl["path"]).rstrip("/").rsplit("/", 1)[0]
+            if not (root and tpl.get("qualityProfileId") and tpl.get("metadataProfileId")):
+                logger.warning("adding album %r: artist %s has no root folder "
+                               "or profiles to give its artist", resource.get("title"),
+                               artist_id)
+                return None
+            art = dict(art)
+            art.pop("path", None)
+            art.update({"qualityProfileId": tpl["qualityProfileId"],
+                        "metadataProfileId": tpl["metadataProfileId"],
+                        "rootFolderPath": root, "monitored": False,
+                        "monitorNewItems": "none",
+                        "addOptions": {"monitor": "none",
+                                       "searchForMissingAlbums": False}})
+            body["artist"] = art
         body.update({"artistId": int(artist_id), "monitored": False,
                      "anyReleaseOk": True,
                      "addOptions": {"addType": "manual",
@@ -601,6 +703,22 @@ class LidarrClient:
         except Exception as exc:  # noqa: BLE001
             logger.warning("adding album %r failed: %s", resource.get("title"), exc)
             return None
+
+    def remove_empty_artist(self, artist_id: int) -> bool:
+        """Take back an artist add_album_unmonitored added that holds no
+        file. Never deletes files, and refuses an artist that has any."""
+        try:
+            if self._get("/api/v1/trackfile", artistId=int(artist_id)):
+                return False
+            r = self.session.delete(self._url(f"/api/v1/artist/{int(artist_id)}"),
+                                    params={"deleteFiles": "false",
+                                            "addImportListExclusion": "false"},
+                                    timeout=30)
+            r.raise_for_status()
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("removing added artist %s failed: %s", artist_id, exc)
+            return False
 
     def remove_added_album(self, album_id: int) -> bool:
         """Take back an album add_album_unmonitored made that holds no file.

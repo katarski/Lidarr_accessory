@@ -116,6 +116,7 @@ def identify_record(
     tried: set = set()
     fitted: List[Tuple[int, int, Dict[str, Any], Dict[str, Any], int, str]] = []
     unchecked = [0]
+    unread = [0]
     own_names = {k for k in (norm(n) for n in names if n) if k}
 
     def whole_or_named(c: Dict[str, Any], hit: int, n_rel: int) -> bool:
@@ -154,10 +155,13 @@ def identify_record(
                     break
 
     def lookup(term: str) -> List[Dict[str, Any]]:
+        # A search not read is not "no record": VOCES8's 'A Choral Christmas'
+        # was "no record ... (0 looked at)" while every search for it failed.
         try:
             return list(lidarr.lookup_albums(term) or [])[:5]
         except Exception as exc:  # noqa: BLE001
-            logger.debug("album lookup %r failed: %s", term, exc)
+            logger.info("album lookup %r not read: %s", term, exc)
+            unread[0] += 1
             return []
 
     for name in dict.fromkeys(n for n in names if n and n.strip()):
@@ -196,6 +200,9 @@ def identify_record(
     if not fitted:
         if unchecked[0]:
             return None, "MusicBrainz could not be asked -- not judged"
+        if unread[0]:
+            return None, ("%d album search(es) could not be read -- not judged"
+                          % unread[0])
         if crowded:
             return None, ("its songs are on %d records of %s -- not sure which"
                           % (crowded, artist_name))

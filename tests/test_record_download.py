@@ -30,9 +30,13 @@ class FakeLidarr:
     def find_artist(self, name):
         return {"id": 7, "artistName": "Artist"} if name == "Artist" else None
 
-    def add_album_unmonitored(self, alb, aid):
+    def add_album_unmonitored(self, alb, aid, new_artist_ok=False):
         self.added.append((alb["title"], aid))
-        return {"id": 99}
+        return dict({"id": 99}, **getattr(self, "answer", {}))
+
+    def remove_empty_artist(self, artist_id):
+        self.removed.append(("artist", artist_id))
+        return True
 
     def get_album(self, album_id):
         return {"id": album_id, "releases": [
@@ -111,6 +115,139 @@ class RecordStepForDownloads(unittest.TestCase):
             self.assertFalse(o._give_lidarr_the_download(
                 AUDIOS[0].parent, AUDIOS[0].parent, AUDIOS, "Nobody", "Comp", "r"))
             ident.assert_not_called()
+
+
+class SearchesLidarrCannotRead(unittest.TestCase):
+    """Owner, 8 Nov 2026: "Lidarr's album search fails with a 503 -- should
+    not be failing". Lidarr 3.1.6 drops a whole answer when one result's track
+    credits an artist its album does not list; 'VOCES8 A Choral Christmas'
+    failed on its own record."""
+
+    def client(self, by_id, server_ids):
+        import requests
+        from lidarr import LidarrClient
+        c = LidarrClient.__new__(LidarrClient)
+        bad = requests.Response()
+        bad.status_code = 503
+        bad._content = (b'{"message":"Search for \'x\' failed. Invalid response '
+                        b'received from LidarrAPI."}')
+        asked = []
+
+        def get(path, **kw):
+            asked.append((path, kw))
+            if path == "/api/v1/config/metadataprovider":
+                return {"metadataSource": ""}
+            term = kw.get("term", "")
+            if term.startswith("lidarr:") and term[7:] in by_id:
+                return by_id[term[7:]]
+            raise requests.HTTPError(response=bad)
+        c._get = get
+
+        class Answer:
+            def __init__(self, ids):
+                self.ids = ids
+
+            def raise_for_status(self):
+                if self.ids is None:
+                    raise requests.HTTPError("502")
+
+            def json(self):
+                return [{"id": i} for i in self.ids]
+        patcher = mock.patch("lidarr.requests.get",
+                             side_effect=lambda url, **kw: (
+                                 asked.append((url, kw)) or Answer(server_ids)))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return c, asked
+
+    def test_the_answer_is_read_by_us_and_each_record_by_id(self):
+        c, asked = self.client({"a1": [{"title": "A Choral Christmas"}],
+                                "a2": [{"title": "A Choral Tapestry"}]}, ["a1", "a2", "a1"])
+        got = c.lookup_albums("VOCES8 A Choral Christmas")
+        self.assertEqual([g["title"] for g in got],
+                         ["A Choral Christmas", "A Choral Tapestry"])
+        url, kw = next(a for a in asked if a[0].startswith("http"))
+        self.assertEqual((url, kw["params"]),
+                         ("https://api.lidarr.audio/api/v0.4/search",
+                          {"type": "album", "query": "VOCES8 A Choral Christmas"}))
+
+    def test_an_unread_answer_or_record_is_not_no_records(self):
+        from lidarr import SearchUnread
+        c, _ = self.client({}, None)
+        with self.assertRaises(SearchUnread):
+            c.lookup_albums("VOCES8 A Choral Christmas")
+        c, _ = self.client({"a1": [{"title": "x"}]}, ["a1", "a9"])
+        with self.assertRaises(SearchUnread):
+            c.lookup_albums("VOCES8 A Choral Christmas")
+        with self.assertRaises(SearchUnread):
+            c.lookup_albums("lidarr:a9")
+
+    def test_the_record_step_calls_it_not_judged(self):
+        import record_adder as R
+        from song_harvest import norm_title
+
+        class Lid:
+            def lookup_albums(self, term):
+                raise RuntimeError("unread")
+
+        class MB:
+            def recording_releases_or_none(self, *a, **k):
+                return []
+        res, why = R.identify_record(
+            Lid(), {"artistName": "VOCES8", "foreignArtistId": "v8"},
+            ["A Choral Christmas"], [("Joy to the World", 200.0)], 1,
+            norm_title, mb=MB())
+        self.assertIsNone(res)
+        self.assertIn("not judged", why)
+
+    def test_not_judged_never_rejects_the_grab(self):
+        lid = FakeLidarr()
+        o = _orch(lid)
+        rec = (None, "2 album search(es) could not be read -- not judged")
+        self.assertIsNone(RecordStepForDownloads.call(self, o, rec=rec))
+        import inspect
+        src = inspect.getsource(Orchestrator)
+        self.assertEqual(src.count("if given is not None and self._reject_wrong_grab("), 2)
+        self.assertNotIn("if self._reject_wrong_grab(", src)
+
+
+class ARecordOfAnotherArtist(unittest.TestCase):
+
+    def test_added_with_its_own_artist_unmonitored(self):
+        from lidarr import LidarrClient
+        sent = []
+        c = LidarrClient.__new__(LidarrClient)
+        c._get = lambda path, **kw: {"id": 7, "qualityProfileId": 2,
+                                     "metadataProfileId": 3,
+                                     "path": "/music/VOCES8"}
+        c._post = lambda path, body: sent.append(body) or {"id": 1, "artistId": 40}
+        alb = {"title": "A Choral Christmas", "foreignAlbumId": "a1",
+               "artist": {"id": None, "foreignArtistId": "cb4d",
+                          "artistName": "VOCES8 Foundation Choir",
+                          "qualityProfileId": 0}}
+        c.add_album_unmonitored(alb, 7, new_artist_ok=True)
+        art = sent[0]["artist"]
+        self.assertEqual((art["foreignArtistId"], art["qualityProfileId"],
+                          art["metadataProfileId"], art["rootFolderPath"],
+                          art["monitored"], art["monitorNewItems"], art["addOptions"]),
+                         ("cb4d", 2, 3, "/music", False, "none",
+                          {"monitor": "none", "searchForMissingAlbums": False}))
+        sent.clear()
+        c.add_album_unmonitored(alb, 7)            # the library step: unchanged
+        self.assertEqual(sent[0]["artist"]["qualityProfileId"], 0)
+
+    def test_filed_under_the_new_artist_and_taken_back_when_nothing_lands(self):
+        lid = FakeLidarr()
+        lid.answer = {"artistId": 40, "artist": {"artistName": "VOCES8 Foundation Choir"}}
+        o = _orch(lid)
+        seen = []
+        o._import_library_folder_by_tracknumber = lambda alb, aid, a, **k: seen.append(aid) or 5
+        self.assertTrue(RecordStepForDownloads.call(self, o))
+        self.assertEqual(seen, [40])
+        lid2 = FakeLidarr(filled=0)
+        lid2.answer = {"artistId": 40}
+        self.assertFalse(RecordStepForDownloads.call(self, _orch(lid2)))
+        self.assertEqual(lid2.removed, [99, ("artist", 40)])
 
 
 if __name__ == "__main__":

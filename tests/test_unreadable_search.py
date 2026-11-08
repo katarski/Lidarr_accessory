@@ -77,9 +77,13 @@ class _MB:
 
 class UnreadableSearch(unittest.TestCase):
 
-    def test_it_finds_nothing_and_is_not_counted_against_lidarr(self):
+    def test_it_is_not_counted_against_lidarr_nor_read_as_no_records(self):
+        # 8 Nov 2026: an unreadable search is read from the metadata server
+        # by us (test_record_download.SearchesLidarrCannotRead); when that
+        # cannot be read either it is "not read", never "no records".
         c = client(UNREADABLE)
-        self.assertEqual(c.lookup_albums("James Blake 200 Press"), [])
+        with self.assertRaises(L.SearchUnread):
+            c.lookup_albums("James Blake 200 Press")
         self.assertEqual(c.failure_generation, 0)
         self.assertTrue(c.available())
 

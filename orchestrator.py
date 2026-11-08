@@ -6123,6 +6123,10 @@ class Orchestrator:
         holds it and its files without searching for it. Lidarr rewrites the
         imported files' tags from MusicBrainz (writeAudioTags=sync), names and
         ids both. An album added here that nothing lands in is removed again.
+
+        None (not False) when the songs were not judged -- a search or
+        MusicBrainz not read, Lidarr failing meanwhile: the caller must not
+        then reject the grab as wrong.
         """
         if not audios:
             return False
@@ -6158,10 +6162,10 @@ class Orchestrator:
             songs, len(audios), norm_title,
             mb=getattr(self.lidarr, "mb", None), web=getattr(self.lidarr, "web", None))
         if self._lidarr_generation() != gen:
-            return False
+            return None
         if res is None:
             logger.info("Record step (download): %s -- %s", folder.name[:50], why)
-            return False
+            return None if "not judged" in why else False
         alb, rel = res["album"], res["release"]
         title = str(alb.get("title") or "")
         added = False
@@ -6176,18 +6180,33 @@ class Orchestrator:
                             "added (no compilations or best-ofs)",
                             folder.name[:50], title, comp)
                 return False
+        new_artist = 0
+        artist_label = str(artist_rec.get("artistName") or artist_name)
         if alb.get("id"):
             album_id = int(alb["id"])
         else:
-            new = self.lidarr.add_album_unmonitored(alb, aid)
+            new = self.lidarr.add_album_unmonitored(alb, aid, new_artist_ok=True)
             if not new or not new.get("id"):
                 logger.info("Record step (download): %s -- Lidarr refused to "
                             "add %r", folder.name[:50], title)
                 return False
             album_id, added = int(new["id"]), True
+            try:
+                own = int(new.get("artistId") or 0)
+            except (TypeError, ValueError):
+                own = 0
+            if own and own != aid:
+                # The record is its own artist's (VOCES8 Foundation Choir's
+                # 'A Choral Christmas', not VOCES8's): Lidarr added that
+                # artist with it, unmonitored. Filed under that artist.
+                new_artist, aid = own, own
+                artist_label = str((new.get("artist") or {}).get("artistName")
+                                   or artist_label)
             logger.info("Record step (download): added %r to Lidarr, "
-                        "unmonitored -- %s, %d of %d song(s) on release %s",
-                        title, res["via"], res["hit"], len(songs),
+                        "unmonitored%s -- %s, %d of %d song(s) on release %s",
+                        title, (" with its artist %r" % artist_label
+                                if new_artist else ""),
+                        res["via"], res["hit"], len(songs),
                         rel.get("foreignReleaseId"))
         full = self.lidarr.get_album(album_id) or {}
         if not full.get("releases"):
@@ -6219,6 +6238,8 @@ class Orchestrator:
         if not filled:
             if added:
                 self.lidarr.remove_added_album(album_id)
+                if new_artist:
+                    self.lidarr.remove_empty_artist(new_artist)
             logger.info("Record step (download): %s fits %r (%s), but Lidarr "
                         "filed none of it%s", folder.name[:50], title, res["via"],
                         " -- the album was removed again" if added else "")
@@ -6226,11 +6247,10 @@ class Orchestrator:
         logger.info("Record step (download): %s -> %r, %d of %d track(s) filed "
                     "(%s)", folder.name[:50], title, filled, res["tracks"],
                     res["via"])
-        self._trigger_artist_refresh(str(artist_rec.get("artistName") or artist_name),
-                                     artist_id=aid)
+        self._trigger_artist_refresh(artist_label, artist_id=aid)
         self._record(
             key_path, outcome="imported_via_manual", pre_split=True,
-            artist=str(artist_rec.get("artistName") or artist_name), album=title,
+            artist=artist_label, album=title,
             track_count=filled,
             reason=("record step: %s after: %s" % (res["via"], reason))[:300],
         )
@@ -8008,11 +8028,12 @@ class Orchestrator:
                         key_path, folder, audios, artist_name, album_name,
                         reason):
                     return
-                if self._give_lidarr_the_download(
-                        key_path, folder, audios, artist_name, album_name,
-                        reason):
+                given = self._give_lidarr_the_download(
+                    key_path, folder, audios, artist_name, album_name, reason)
+                if given:
                     return
-                if self._reject_wrong_grab(key_path, folder, audios, reason):
+                if given is not None and self._reject_wrong_grab(
+                        key_path, folder, audios, reason):
                     return
                 logger.info(
                     "Pre-split: %s / %s has no monitored album in Lidarr "
@@ -8181,10 +8202,13 @@ class Orchestrator:
             if self._rescue_by_song_titles(key_path, folder, audios,
                                            artist_name, album_name, reason):
                 return
-            if self._give_lidarr_the_download(key_path, folder, audios,
-                                              artist_name, album_name, reason):
+            given = self._give_lidarr_the_download(key_path, folder, audios,
+                                                   artist_name, album_name, reason)
+            if given:
                 return
-            if self._reject_wrong_grab(key_path, folder, audios, reason):
+            # Not judged (None) is not "no record": no grab is rejected on it.
+            if given is not None and self._reject_wrong_grab(
+                    key_path, folder, audios, reason):
                 return
             logger.warning(
                 "Pre-split handoff: no acceptable candidates (floor=%.0f%%) "
