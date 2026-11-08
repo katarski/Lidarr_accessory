@@ -1235,6 +1235,8 @@ def _remove_deselected_torrent(
     qbt: QbtClient, lidarr: Optional[LidarrClient], t: Dict[str, Any],
     download_root: str, now: float, min_stable_seconds: int,
     emit: Callable[[str], None],
+    files: Optional[List[Dict[str, Any]]] = None,
+    on_leftovers: Optional[Callable[..., None]] = None,
 ) -> int:
     """A finished torrent whose every file is deselected (see _lifecycle_owns)
     leaves the client, its Lidarr queue row blocklisted as the dead-grab
@@ -1242,7 +1244,14 @@ def _remove_deselected_torrent(
     not grab it again). What is on disk decides how:
 
       * its folder holds a finished song or a disc image (downloaded before
-        the deselect) -> it stays, for the WebUI: deselected is not owned;
+        the deselect) -> with a held curator, it leaves the client and the
+        folder goes to the curator (_release_to_held), which deletes what the
+        library holds as good or better and overwrites with what is better.
+        Without one it stays. On 8 Nov 2026 ten such torrents sat seeding at
+        0 % for up to 4 days (Matt Berry, Chambao, Moby, Meredith Brooks ...:
+        every album "HAVE, library 8/8"), re-planned every pass and never
+        shown anywhere; the owner: "whatever is incomplete and not missing -
+        should be removed from qbit as well as its contents";
       * its folder holds nothing else -> removed with its data. That is
         qBittorrent's partial files (`.!qB`: songs cut off by the deselect,
         unusable) and extras;
@@ -1263,7 +1272,14 @@ def _remove_deselected_torrent(
         t.get("content_path"), t.get("save_path"), download_root)
     if os.path.exists(folder):
         if _disc_image_or_audio_on_disk(folder):
-            return 0
+            if on_leftovers is None:
+                return 0
+            leftovers = _deselected_audio_on_disk(files or [], folder)
+            n = _release_to_held(qbt, t, folder, download_root, leftovers,
+                                 on_leftovers, emit)
+            if n:
+                _blocklist_torrent(lidarr, h)
+            return n
         delete, what = True, ("REMOVED (every file deselected; its partial "
                               "files and extras deleted")
     elif os.path.isfile(os.path.join(download_root, "." + h.lower() + ".parts")):
@@ -1552,7 +1568,7 @@ def torrent_lifecycle_pass(
             if _every_file_deselected_music(files):
                 removed += _remove_deselected_torrent(
                     qbt, lidarr, t, download_root, now, min_stable_seconds,
-                    emit)
+                    emit, files=files, on_leftovers=on_leftovers)
             continue  # not a music torrent (or only its music deselected) -> ignore
 
         folder = _map_to_download_root(

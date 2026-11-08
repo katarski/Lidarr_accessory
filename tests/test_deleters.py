@@ -1604,5 +1604,40 @@ class DoneTorrentsNothingImportedLeave(unittest.TestCase):
         self.assertIn("hand_over_after_seconds=hand_over_after", src)
 
 
+
+class EveryFileDeselectedWithSongsOnDisk(unittest.TestCase):
+    """8 Nov 2026: ten torrents at 0 %, every album "HAVE (library 8/8)",
+    sat seeding with finished songs on disk; nothing ever decided them."""
+
+    def _pass(self, on_leftovers):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = tmp.name
+        tdir = Path(root) / "Matt Berry"
+        (tdir / "Night Terrors").mkdir(parents=True)
+        song = tdir / "Night Terrors" / "01.mp3"
+        song.write_bytes(b"x")
+        files = [{"name": "Matt Berry/Night Terrors/01.mp3", "priority": 0, "progress": 1},
+                 {"name": "Matt Berry/Night Terrors/02.mp3", "priority": 0, "progress": 0.2}]
+        q = _Qbt([{"hash": "abc", "name": "Matt Berry", "category": "lidarr",
+                   "state": "forcedUP", "progress": 0, "size": 0,
+                   "completion_on": time.time() - 86400,
+                   "content_path": "/data/Matt Berry", "save_path": "/data"}], files)
+        removed, _ = QD.torrent_lifecycle_pass(
+            q, root, category="lidarr", emit=lambda m: None, lidarr=None,
+            on_leftovers=on_leftovers)
+        return q, removed, tdir, song
+
+    def test_it_leaves_and_the_curator_decides_the_songs(self):
+        held = []
+        q, removed, tdir, song = self._pass(held.append)
+        self.assertEqual((removed, q.removed, held), (1, [("abc", False)], [str(tdir)]))
+        self.assertTrue(song.exists())
+
+    def test_without_a_curator_it_stays(self):
+        q, removed, tdir, song = self._pass(None)
+        self.assertEqual((removed, q.removed), (0, []))
+
+
 if __name__ == "__main__":
     unittest.main()
