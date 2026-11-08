@@ -53,7 +53,7 @@ from lidarr import LidarrClient, _demojibake, _translit_cyrillic
 from ollama_client import OllamaClient, is_unavailable
 from splitter import (SplitResult, incomplete_splits, probe_duration,
                       repair_leadin, split_cue)
-from tagger import TagPlan, album_folder_name, tag_splits
+from tagger import TagPlan, album_folder_name, fit_name, tag_splits
 
 logger = logging.getLogger(__name__)
 
@@ -2411,6 +2411,7 @@ class Orchestrator:
         # off, fall back to the old (100 - tol)% "near-complete" behaviour.
         pmin = (max(1, int(self.cfg.force_import_partial_min_percent))
                 if self.cfg.force_import_partial else (100 - tol))
+        t0 = time.time()
         try:
             # Before the release flip below: a folder Lidarr cannot see
             # (UnmappedPath) must not get as far as changing the album.
@@ -2591,11 +2592,15 @@ class Orchestrator:
             # legitimately leave files behind (extras / unmatched), so requiring
             # a cleared staging would reject every partial as "not trusted" --
             # which made compilation folders re-import in an endless loop.
+            # A name Lidarr cannot write fails the same way on every retry:
+            # file those songs under a name cut to fit instead.
             if not self._wait_for_manual_import(
                 cmd, folder, timeout=self.cfg.manual_import_timeout_seconds,
                 require_cleared=(mode == "exact"),
                 staging_exts=_ALL_AUDIO_EXTS,
-            ):
+            ) and not (self._lidarr_name_too_long(t0, audios)
+                       and self._file_under_short_name(
+                           album_id, aid, [a for a in audios if a.exists()])):
                 return self._force_abort(album_id, prev_rid, flipped)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Force-import failed for %s: %s", folder, exc)
@@ -2772,6 +2777,82 @@ class Orchestrator:
                 if t.get("hasFile")]
         return bool(held) and bool(want) and all(
             t.get("foreignRecordingId") in want for t in held)
+
+    def _lidarr_name_too_long(self, since: float, files: Sequence[Path]) -> bool:
+        """True only when Lidarr's log says it could not import one of
+        `files` (ours) because the name it builds for it is too long."""
+        try:
+            paths = [self.lidarr.windows_to_lidarr(Path(f)) for f in files]
+            return bool(self.lidarr.import_failed_on_long_name(since, paths))
+        except Exception:  # noqa: BLE001 -- unmapped, or unreadable: no answer
+            return False
+
+    def _file_under_short_name(self, album_id: int, artist_id: int,
+                               files: Sequence[Path]) -> int:
+        """File songs Lidarr cannot import because the folder or file name it
+        builds for this album is longer than the file system takes (Fiona
+        Apple's 444-character 'When the Pawn...': every retry failed the same
+        way, 252 times in two hours). They move into the artist's library
+        folder under the album's name cut to fit, and are imported there:
+        Lidarr files a file already inside the artist folder where it is, so
+        it never builds the long name. Returns how many tracks were filled; a
+        file Lidarr did not file goes back where it came from."""
+        album = self.lidarr.get_album(int(album_id)) or {}
+        artist = self.lidarr.get_artist(int(artist_id)) or {}
+        title = _sanitize_fs(str(album.get("title") or ""))
+        if not (title and artist.get("path") and files):
+            return 0
+        year = str(album.get("releaseDate") or "")[:4]
+        suffix = " (%s)" % year if year.isdigit() else ""
+        target = (Path(self.lidarr.lidarr_to_windows(str(artist["path"])))
+                  / fit_name(title + suffix, keep=suffix))
+        filled = lambda: {int(t["id"]) for t in (  # noqa: E731
+            self.lidarr.list_tracks_for_album(int(album_id)) or [])
+            if t.get("id") and t.get("trackFileId")}
+        before = filled()
+        moved: List[Tuple[Path, Path]] = []
+        # The library audit imports what it finds in a library folder: it must
+        # not see this one half-written.
+        claims.claim(target, wait=True)
+        try:
+            try:
+                target.mkdir(parents=True, exist_ok=True)
+                for f in files:
+                    f = Path(f)
+                    dst = target / f.name
+                    if f.is_file() and not dst.exists():
+                        shutil.move(str(f), str(dst))
+                        moved.append((f, dst))
+            except OSError as exc:
+                logger.warning("short-name filing: cannot place files in %s: %s",
+                               target, exc)
+            cmd = (self._import_library_folder_by_tracknumber(
+                       album, int(artist_id), [d for _, d in moved])
+                   if moved else None)
+            if cmd:
+                self.lidarr.wait_for_command(int(cmd), timeout_seconds=600)
+            on_file = {str(f.get("path") or "").replace("\\", "/")
+                       for f in (self.lidarr.list_trackfiles_for_album(
+                           int(album_id)) or [])}
+            for src, dst in moved:
+                if (self.lidarr.windows_to_lidarr(dst) not in on_file
+                        and dst.exists() and not src.exists()):
+                    try:
+                        shutil.move(str(dst), str(src))
+                    except OSError as exc:
+                        logger.warning("short-name filing: could not put %s "
+                                       "back: %s", dst, exc)
+            try:
+                target.rmdir()          # only when nothing was filed there
+            except OSError:
+                pass
+        finally:
+            claims.release(target)
+        n = len(filled() - before)
+        logger.info("short-name filing: Lidarr cannot write the name of %r; "
+                    "%d of %d file(s) filed in place under %s",
+                    album.get("title"), n, len(files), target)
+        return n
 
     def _force_abort(self, album_id: int, prev_rid, flipped: bool) -> bool:
         """Undo a release flip on an import that did not happen. Always False."""
@@ -14268,6 +14349,7 @@ class Orchestrator:
         except Exception:  # noqa: BLE001
             pass
         sources = {it["trackIds"][0]: it.pop("_source") for it in items}
+        t0 = time.time()
         cmd = self.lidarr.manual_import_apply_files(items, import_mode="move")
         if cmd is None:
             return False, "Lidarr refused the import (see log)"
@@ -14281,6 +14363,17 @@ class Orchestrator:
         filed = self._assembly_filed(album_id, before, staging)
         done = [t for t in sources if t in filed]
         state = str((rec or {}).get("status") or "").lower()
+        n_short = 0
+        if len(done) < len(items) and state in ("completed", "failed", "aborted"):
+            # A name Lidarr cannot write (too long for the file system) fails
+            # every Add the same way: file the copies under one cut to fit.
+            left = [p for p in staging.iterdir() if p.is_file()] \
+                if staging.is_dir() else []
+            if left and self._lidarr_name_too_long(t0, left):
+                n_short = self._file_under_short_name(album_id, artist_id, left)
+                if n_short:
+                    filed = self._assembly_filed(album_id, before, staging)
+                    done = [t for t in sources if t in filed]
         if len(done) == len(items):
             shutil.rmtree(staging, ignore_errors=True)
             store.remove(album_id)
@@ -14316,6 +14409,9 @@ class Orchestrator:
         if adopted:
             tail += ("; %d song(s) already in the album folder were filed in "
                      "place" % adopted)
+        if n_short:
+            tail += ("; the title is too long for a folder name, so %d song(s) "
+                     "were filed under a shortened one" % n_short)
         if len(done) < len(items):
             gone = state in ("completed", "failed", "aborted")
             return False, ("Lidarr filed %d of %d song(s) (import %s: %s); the "

@@ -1319,5 +1319,104 @@ class PreferLosslessPerDiscFolder(unittest.TestCase):
         self.assertEqual(rescanned, [str(self.album / "CD2")])
 
 
+class LongNamesStillFile(unittest.TestCase):
+    """A name longer than the file system takes (255 bytes) failed Lidarr's
+    import on every retry -- Fiona Apple / 'When the Pawn...', 444
+    characters, 252 failures in two hours. Our own folder names fit,
+    Lidarr's log is read for the reason, and the songs are filed in place
+    under a name cut to fit."""
+
+    PAWN = ("When the Pawn Hits the Conflicts He Thinks Like a King "
+            + "He’ll Win the Whole Thing ’Fore He Enters the Ring " * 8)
+
+    def test_names_are_cut_to_255_bytes(self):
+        from types import SimpleNamespace
+        from tagger import NAME_MAX_BYTES, album_folder_name, fit_name
+        self.assertEqual(fit_name("Short (1999)"), "Short (1999)")
+        cjk = fit_name("日" * 200 + " (1999)", keep=" (1999)")
+        self.assertLessEqual(len(cjk.encode("utf-8")), 255)
+        self.assertTrue(cjk.endswith("日… (1999)"))
+        plan = SimpleNamespace(album=self.PAWN, artist="Fiona Apple",
+                               albumartist="Fiona Apple", date="1999-11-09")
+        name = album_folder_name([plan])
+        self.assertLessEqual(len(name.encode("utf-8")), NAME_MAX_BYTES)
+        self.assertTrue(name.startswith("When the Pawn Hits"))
+        self.assertTrue(name.endswith("… (1999)"))
+        plan.album = "Tidal"
+        self.assertEqual(album_folder_name([plan]), "Tidal (1999)")
+
+    def test_lidarr_log_names_the_reason(self):
+        from datetime import datetime, timezone
+        from lidarr import LidarrClient
+        c = LidarrClient.__new__(LidarrClient)
+        too_long = "System.IO.PathTooLongException"
+        recs = [{"time": "2026-11-08T10:48:24Z", "exceptionType": too_long,
+                 "message": "Couldn't import track /downloads/A/01.mp3: The"},
+                {"time": "2026-11-08T10:47:00Z", "exceptionType": "Other",
+                 "message": "Couldn't import track /downloads/C/01.mp3: x"},
+                {"time": "2026-11-08T10:40:00Z", "exceptionType": too_long,
+                 "message": "Couldn't import track /downloads/B/01.mp3: The"}]
+        c._get = lambda path, **k: {"records": recs}
+        since = datetime(2026, 11, 8, 10, 45, tzinfo=timezone.utc).timestamp()
+        self.assertTrue(c.import_failed_on_long_name(since, ["/downloads/A/01.mp3"]))
+        # older than the import, or another reason: not this one
+        self.assertFalse(c.import_failed_on_long_name(since, ["/downloads/B/01.mp3"]))
+        self.assertFalse(c.import_failed_on_long_name(since, ["/downloads/C/01.mp3"]))
+
+        def down(path, **k):
+            raise OSError("down")
+        c._get = down
+        self.assertIsNone(c.import_failed_on_long_name(since, ["/downloads/A/01.mp3"]))
+
+    def test_songs_are_filed_in_place_under_a_short_name(self):
+        from types import SimpleNamespace
+        import claims
+        from orchestrator import Orchestrator
+        with tempfile.TemporaryDirectory() as root:
+            src = Path(root) / "dl" / "Pawn"
+            src.mkdir(parents=True)
+            a, b = src / "01. On The Bound.mp3", src / "02. To Your Love.mp3"
+            for f in (a, b):
+                f.write_bytes(b"x")
+            lib = Path(root) / "lib" / "Fiona Apple"
+            lib.mkdir(parents=True)
+            files = {}                 # track id -> path of the file it holds
+
+            def import_(album, artist_id, audios):
+                files[1] = str(audios[0])      # Lidarr files the first only
+                return 9
+            o = Orchestrator.__new__(Orchestrator)
+            o.lidarr = SimpleNamespace(
+                get_album=lambda i: {"title": self.PAWN,
+                                     "releaseDate": "1999-11-09T00:00:00Z"},
+                get_artist=lambda i: {"path": str(lib)},
+                lidarr_to_windows=lambda p: p,
+                windows_to_lidarr=lambda p: str(p),
+                list_tracks_for_album=lambda i: [
+                    {"id": n, "trackFileId": n if n in files else 0} for n in (1, 2)],
+                list_trackfiles_for_album=lambda i: [
+                    {"path": p} for p in files.values()],
+                wait_for_command=lambda c, timeout_seconds: {"status": "completed"})
+            o._import_library_folder_by_tracknumber = import_
+            self.assertEqual(o._file_under_short_name(7, 3, [a, b]), 1)
+            [folder] = list(lib.iterdir())
+            self.assertLessEqual(len(folder.name.encode("utf-8")), 255)
+            self.assertTrue(folder.name.endswith("… (1999)"))
+            self.assertEqual([p.name for p in folder.iterdir()], [a.name])
+            # the song Lidarr did not file went back where it came from
+            self.assertEqual((a.exists(), b.exists()), (False, True))
+            self.assertNotIn(claims._norm(folder), claims._held)
+
+    def test_both_import_paths_fall_back(self):
+        import inspect
+        from orchestrator import Orchestrator
+        for fn in (Orchestrator._try_positional_force_import,
+                   Orchestrator.assembly_add_to_library):
+            src = inspect.getsource(fn)
+            self.assertIn("t0 = time.time()", src)
+            self.assertIn("self._lidarr_name_too_long(t0, ", src)
+            self.assertIn("self._file_under_short_name(", src)
+
+
 if __name__ == "__main__":
     unittest.main()

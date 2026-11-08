@@ -176,6 +176,26 @@ def tag_splits(
 
 _FOLDER_SANITIZE_RE = None  # lazy import
 
+# A Linux file system takes at most 255 BYTES per file or folder name (UTF-8:
+# an accented letter is 2, a curly quote or a CJK character 3). Lidarr fails
+# a whole import on one longer name -- PathTooLongException, yet the command
+# reads "completed" (Fiona Apple's 444-character 'When the Pawn...').
+NAME_MAX_BYTES = 255
+
+
+def fit_name(name: str, limit: int = NAME_MAX_BYTES, keep: str = "") -> str:
+    """`name` cut to at most `limit` UTF-8 bytes on a character boundary,
+    marked with an ellipsis. `keep` is a tail kept whole (" (1999)"). The
+    mark is the single character U+2026, not "...": a name may not end in a
+    dot on the Windows side of the share."""
+    if len((name or "").encode("utf-8")) <= limit:
+        return name
+    tail = keep if keep and name.endswith(keep) else ""
+    head = name[:len(name) - len(tail)]
+    room = max(0, limit - len(tail.encode("utf-8")) - len("\u2026".encode("utf-8")))
+    cut = head.encode("utf-8")[:room].decode("utf-8", "ignore").rstrip(" .,-_")
+    return cut + "\u2026" + tail
+
 
 def album_folder_name(
     plans: List[TagPlan],
@@ -205,18 +225,36 @@ def album_folder_name(
         "albumartist": p.albumartist or p.artist or "",
         "year": (p.date or "").strip().split("-")[0].strip(),
     }
-    try:
-        name = template.format(**fields)
-    except (KeyError, IndexError, ValueError):
-        # Fall back to a sane default if the user typo'd the template.
-        name = f"{fields['album']} ({fields['year']})" if fields["year"] else fields["album"]
+    def render(album: str) -> str:
+        f = dict(fields, album=album)
+        try:
+            name = template.format(**f)
+        except (KeyError, IndexError, ValueError):
+            # Fall back to a sane default if the user typo'd the template.
+            name = f"{f['album']} ({f['year']})" if f["year"] else f["album"]
 
-    # Tidy up empty brackets/parens left when a placeholder was blank.
-    # "Forever Blue ()"   -> "Forever Blue"
-    # "Forever Blue [ - ]"-> "Forever Blue"
-    name = re.sub(r"\s*[\(\[]\s*[-\s,]*\s*[\)\]]", "", name)
-    name = re.sub(r"\s{2,}", " ", name).strip(" -_.,")
+        # Tidy up empty brackets/parens left when a placeholder was blank.
+        # "Forever Blue ()"   -> "Forever Blue"
+        # "Forever Blue [ - ]"-> "Forever Blue"
+        name = re.sub(r"\s*[\(\[]\s*[-\s,]*\s*[\)\]]", "", name)
+        name = re.sub(r"\s{2,}", " ", name).strip(" -_.,")
 
-    # Windows-invalid chars.
-    name = _FOLDER_SANITIZE_RE.sub("_", name).strip().rstrip(". ")
-    return name or (p.album or "Unknown Album")
+        # Windows-invalid chars.
+        return _FOLDER_SANITIZE_RE.sub("_", name).strip().rstrip(". ")
+
+    name = render(fields["album"])
+    # Too long for the file system: cut the ALBUM, so the year and the rest
+    # of the template stay readable.
+    over = len(name.encode("utf-8")) - NAME_MAX_BYTES
+    if over > 0 and fields["album"]:
+        album = fields["album"]
+        room = len(album.encode("utf-8")) - over
+        # The tidy-up above can shift the count (a trailing space collapses),
+        # so cut until the whole name fits.
+        while room > 4:
+            name = render(fit_name(album, room))
+            over = len(name.encode("utf-8")) - NAME_MAX_BYTES
+            if over <= 0:
+                break
+            room -= over
+    return fit_name(name) or fit_name(p.album or "Unknown Album")

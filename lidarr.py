@@ -1009,6 +1009,39 @@ class LidarrClient:
         failed, aborted, and a wait that timed out while still running."""
         return str((record or {}).get("status") or "").lower() == "completed"
 
+    def import_failed_on_long_name(self, since: float,
+                                   paths: List[str]) -> Optional[bool]:
+        """Did Lidarr fail to import one of `paths` (its own paths) after the
+        epoch `since` because a folder or file name it builds is longer than
+        the file system takes? Such a ManualImport still reads "completed";
+        only Lidarr's log says why: "Couldn't import track <path>" with a
+        PathTooLongException. None when the log cannot be read -- an outage
+        is not an answer."""
+        from datetime import datetime
+        want = [str(p).replace("\\", "/") for p in paths if p]
+        if not want:
+            return False
+        try:
+            recs = (self._get("/api/v1/log", page=1, pageSize=500,
+                              sortKey="time", sortDirection="descending",
+                              level="warn") or {}).get("records") or []
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Lidarr's log could not be read: %s", exc)
+            return None
+        for r in recs:
+            try:
+                t = datetime.fromisoformat(
+                    str(r.get("time") or "").replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                t = None
+            if t is not None and t < since - 5:
+                break                       # newest first: the rest is older
+            kind = "%s %s" % (r.get("exceptionType") or "", r.get("exception") or "")
+            msg = str(r.get("message") or "")
+            if "PathTooLongException" in kind and any(w in msg for w in want):
+                return True
+        return False
+
     def wait_for_command(
         self,
         command_id: int,

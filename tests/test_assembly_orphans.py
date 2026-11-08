@@ -197,6 +197,44 @@ class AddAdoptsTheAlbumFolder(unittest.TestCase):
         self.assertEqual(len(L_.sent), 1)
 
 
+
+class AddFilesALongTitleUnderAShortName(unittest.TestCase):
+    """Fiona Apple / 'When the Pawn...': Lidarr cannot write the album's
+    444-character name, files nothing and still calls the import
+    "completed"; the Add then files the copies under a name cut to fit."""
+
+    def make(self, too_long):
+        o, L_, src, root = AddAdoptsTheAlbumFolder.make(self, album_dir_files=False)
+        L_.manual_import_apply_files = (                 # files nothing
+            lambda items, import_mode="move": L_.sent.extend(items) or 2)
+        L_.windows_to_lidarr = lambda p: str(p)
+        L_.import_failed_on_long_name = lambda since, paths: too_long
+        short = []
+
+        def file_short(aid, artist_id, files):
+            short.append([f.name for f in files])
+            L_.filled = 88
+            return 1
+        o._file_under_short_name = file_short
+        return o, L_, src, short
+
+    def test_a_name_lidarr_cannot_write_is_filed_under_a_short_one(self):
+        o, L_, src, short = self.make(True)
+        ok, msg = o.assembly_add_to_library(6598)
+        self.assertTrue(ok, msg)
+        self.assertEqual(short, [["01 - Hard Candy.flac"]])
+        self.assertIn("shortened", msg)
+        self.assertIsNone(o.assembly.get(6598))
+
+    def test_another_failure_is_not_filed_under_a_short_name(self):
+        o, L_, src, short = self.make(False)
+        ok, msg = o.assembly_add_to_library(6598)
+        self.assertFalse(ok)
+        self.assertEqual(short, [])
+        self.assertIn("Lidarr filed 0 of 1", msg)
+        self.assertTrue(src.exists())
+
+
 class LegacyStagingIsCleared(unittest.TestCase):
     def test_only_folders_shaped_like_an_adds_staging_are_removed(self):
         from orchestrator import Orchestrator
