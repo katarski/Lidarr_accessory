@@ -44,7 +44,8 @@ base is missing and prints the `docker tag` that recreates it) with the repo's `
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20261108-longnames`**
+then is the container replaced. Live now: **`guard-20261108-leftovers`**
+(b1e6cb7, 8 Nov; see section 6 item -1). Before it: **`guard-20261108-longnames`**
 (9cc4b5e, 8 Nov; restarts=0, no ERROR). Owner: "I keep readding fiona
 apple's album and it never moves it". 'When the Pawn...' is 444
 characters: every Lidarr import failed with PathTooLongException (a name
@@ -900,42 +901,38 @@ test of a feature whose purpose is removing files.
 
 ## 6. Open items
 
--1. **NEXT (8 Nov, owner): leftovers in the downloads folder.** Owner: "when
-   audio is processed or rejected ... the audio downloads (partial, complete)
-   and torrents from qbittorrent must be discarded as well"; "a lot of stuff
-   in my internet downloads folder that I don't know if its used". Read-only
-   inventory 8 Nov 13:10 (scratchpad scripts inv*.py, run in the container
-   with main.load_config + apply_env_overrides): 160 torrents, 0 errored
-   right now; 229 top-level entries, 214 GB. qBittorrent keeps incomplete
-   torrents in `/data/torrents` (download_path) and moves them to `/data`
-   when done; the 41 `.<hash>.parts` files all belong to live torrents.
-   (a) 6 stopped lidarr torrents have selected audio already imported (moved
-   out) but stay in the client: Fiona Apple Discography V0 (12/12 gone),
-   J Balvin (16/27), Nat King Cole Just One of Those Things (8/12), Kaleida
-   (6/7), Fiona Apple (4/16), Ray Charles Selected Singles (4/30). Cause:
-   `torrent_lifecycle_pass` counts EVERY audio file under the folder
-   (`_count_audio_on_disk`), and `_songs_on_disk_owned` demands a plan album
-   for every directory, so finished files of DESELECTED albums left on disk
-   block removal for ever ("CD2 is not an album the library holds
-   complete"). Fix to build: judge the selected audio and the files the
-   pipeline made from it as now. Judge deselected leftovers by the owner's
-   rule (5 Nov: same or worse than the library goes; better is an upgrade,
-   see the open auto-upgrade item). Never delete a held row's or an assembly
-   source's folder.
-   (b) ~60 top-level folders with no torrent: held rows (Alanis, Dusty, Gary
-   Numan x2, Inner Circle, Macy Gray Big, Mauro Picotto Meganite, Ray Parker,
-   _harvest_pending), owner's own files (Movies, TV Shows, Misc, Network
-   Documents, audio/Audio, old logs/csv/png/.ps1 from 100-200 days ago --
-   never touch), and untracked music nobody decides (Christina
-   Aguilera_Greatest_Hits 586 MB, Lana Del Rey, M.C. Sar Space Invaders 2 GB,
-   Melody Gardot 1.7 GB, ULTRAVOX-BRILLIANT 2.1 GB, Safri Duo, Sash!, ...),
-   plus ~20 empty shells. Needs a sweep: music with no torrent and no held
-   row -> same-or-worse than the library goes, else a held row.
+-1. **Watch (8 Nov): downloads-folder leftovers, live `guard-20261108-leftovers`
+   (b1e6cb7).** Owner: "when audio is processed or rejected ... the audio
+   downloads (partial, complete) and torrents from qbittorrent must be
+   discarded as well"; "a lot of stuff in my internet downloads folder".
+   Inventory scripts: scratchpad inv*.py / dry.py (run in the image with
+   main.load_config + apply_env_overrides; dry.py stubs the hold and the
+   rmtree). qBittorrent keeps incomplete torrents in `/data/torrents`
+   (download_path), done ones in `/data`; `.<hash>.parts` are live part
+   files. Built:
+   (a) `torrent_lifecycle_pass`: finished songs of DESELECTED albums no
+   longer count as "still needed" (`_deselected_audio_on_disk`) and are
+   left out of `_songs_on_disk_owned` (`skip`). When nothing else remains,
+   `_release_to_held` removes the torrent entry, deletes its part file, and
+   hands the folder to the held curator (`on_leftovers` ->
+   `Orchestrator._hold_leftovers`). The curator deletes it unless it is better
+   than the library. 6 done torrents had been stuck (Fiona Apple Discography
+   V0 12/12 imported, J Balvin, Nat King Cole, Kaleida, Fiona Apple, Ray
+   Charles).
+   (b) `_adopt_untracked_downloads` (each curator pass, max 10): a
+   top-level folder with no torrent of ANY category, no held row, no
+   assembly source, not '.'/'_', unchanged 24 h, holding music or download
+   leftovers (cue/log/checksums/.!qB) -> held row (outcome "untracked"); an
+   empty tree the ledger names -> removed; anything else (owner's Movies, TV
+   Shows, Misc, Network Documents) never touched. Dry run 8 Nov: 21 to hold
+   (17 with music, 4 of only .!qB partials of torrents removed mid-download:
+   311 Archive FLAC 1.3 GB, Diana Krall 1.1 GB, Cream, Chic) and 13 empty
+   shells. Check: the curator then deletes / imports / keeps them by its
+   rules (`_auto_discard_held_unwanted`, needs the harvest's verdict).
    (c) The two video torrents (Mauro Picotto Live At Mayday 2000.mpg, Nas &
-   Damian Marley VOB; RuTracker, added 5 Nov 00:55 / 16:29) have NO
-   category: not the pipeline's (every grab stamps `qbt_category`, default
-   lidarr, since August); handadded.py leaves them alone by the lidarr-only
-   rule.
+   Damian Marley VOB; RuTracker, 5 Nov 00:55 / 16:29) have NO category, so
+   they are not the pipeline's: every grab stamps `qbt_category` (lidarr)
+   since August. Added by hand or by another app; handadded.py leaves them.
 
 0. **31 Oct, started again after 11 days stopped** (Signal 15 on 20 Oct
    16:46; Lidarr stopped since 28 Oct 11:31, started 31 Oct). Fixed then:
