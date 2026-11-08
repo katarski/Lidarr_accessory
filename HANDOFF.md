@@ -939,8 +939,8 @@ test of a feature whose purpose is removing files.
    qbit as well as its contents"; "i dont need compilations, mixes,
    remixes"; "I dont want live! And why does it need attention if its the
    same!". Built (live since 17:58 as `guard-20261108-keepdlrows`, b06725f;
-   in the first hour about 45 torrents left the client and the curator
-   deleted about 75 rows):
+   by 19:05, 53 torrents had left the client, the curator had
+   deleted 91 rows and 28 wanted albums were unmonitored):
    (1) 2c4bf51: the curator's "green" auto-dismiss no longer drops a row
    under the watch root while the auto-discard is live. It had hidden copies
    within minutes, before the harvest judged them, so the folders stayed on
