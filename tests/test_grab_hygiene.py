@@ -31,6 +31,12 @@ class CompilationTitles(unittest.TestCase):
         for t in ("Best I Ever Had", "Best Friend", "Second Best", "Togetherland"):
             self.assertIsNone(r(t), t)
 
+    def test_the_deselect_drops_it_too(self):
+        u = qbt_deselect._album_looks_unofficial
+        self.assertTrue(u("Best 1991-2004"))
+        self.assertFalse(u("Best I Ever Had"))
+        self.assertFalse(u("Seal II"))
+
 
 class _Qbt:
     def __init__(self, files):

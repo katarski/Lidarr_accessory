@@ -109,6 +109,8 @@ _NOISE_DIR = re.compile(
 _UNOFFICIAL_ALBUM = re.compile(
     r"(?i)(?:^|[\s\-_.\(\[])("
     r"greatest\s+hits|best\s+of|the\s+very\s+best|very\s+best\s+of|"
+    # 'Seal / Best 1991-2004' (9 Nov 2026) was kept as "not in library".
+    r"best\s+(?:19|20)\d\d|"
     r"antholog(?:y|ies)|compilations?|collections?|box\s*sets?|sampler|"
     r"essential|definitive|singles\s+collection|hits\s+collection|"
     r"remix(?:es|ed)?|megamix|dj[\s\-_.]*mix|mixtape|karaoke|tribute|"
