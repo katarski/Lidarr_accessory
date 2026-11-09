@@ -144,10 +144,13 @@ class DiscImageTorrent(Base):
         (self.folder / "DISC.ISO").unlink()
         self.assertEqual(self.run_pass(q), (1, 0))
 
-    def test_a_deselected_image_is_not_a_disc_torrent(self):
+    def test_a_deselected_image_with_only_extras_selected_goes(self):
+        # 9 Nov 2026: a selected .cue/.log/.txt is not music; with the image
+        # deselected nothing of the torrent is wanted (nothing on disk here:
+        # the entry only).
         q = _Qbt([torrent()], {"h1": sacd_files(iso_priority=0)})
-        self.assertEqual(self.run_pass(q), (0, 0))   # as before: ignored
-        self.assertEqual(q.removed, [])
+        self.assertEqual(self.run_pass(q), (1, 0))
+        self.assertEqual(q.removed, [("h1", False)])
 
     def test_a_single_file_torrent_is_the_image_itself(self):
         iso = self.root / "disc.iso"

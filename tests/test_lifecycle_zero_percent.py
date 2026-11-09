@@ -188,11 +188,20 @@ class NothingSelected(Base):
         self.assertEqual(self.run_pass(q), (0, 0))
         self.assertEqual(q.removed, [])
 
-    def test_an_extra_still_selected_is_not_nothing_selected(self):
+    def test_an_extra_still_selected_is_still_nothing_wanted(self):
+        # 9 Nov 2026 ('The Trammps - Discography [DJ]', only a Demonoid .txt
+        # selected, seeding at 100 %): an extra is not music.
         files = album_files()
         files[-1]["priority"] = 1                               # the .cue
         q = _Qbt([torrent(progress=1, size=10)], {"h1": files})
-        self.assertEqual(self.run_pass(q), (0, 0))              # as before
+        self.assertEqual(self.run_pass(q), (1, 0))
+        self.assertEqual(q.removed, [("h1", False)])
+
+    def test_a_song_still_selected_keeps_it(self):
+        files = album_files()
+        files[0]["priority"] = 1
+        q = _Qbt([torrent(progress=0.5, size=10)], {"h1": files})
+        self.assertEqual(self.run_pass(q), (0, 0))
         self.assertEqual(q.removed, [])
 
     def test_a_removal_the_client_refuses_is_not_counted(self):

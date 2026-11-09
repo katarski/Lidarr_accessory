@@ -1053,6 +1053,50 @@ def adopt_uncategorised(
     return adopted
 
 
+# Running states the mirror forces: downloading or seeding, not stopped or
+# paused (a stop is someone's decision) and not already forced.
+_MIRROR_STATES = frozenset({
+    "downloading", "stalleddl", "queueddl", "metadl", "checkingdl",
+    "uploading", "stalledup", "queuedup", "checkingup", "allocating",
+})
+
+
+def mirror_initial_state(
+    qbt: QbtClient, category: str, initial: Optional[str],
+    emit: Callable[[str], None] = logger.info, max_per_pass: int = 200,
+) -> int:
+    """Give every running torrent of `category` the start Lidarr gives its
+    own grabs. Lidarr's Initial State (Force Start here) applies only to what
+    Lidarr itself sends; a torrent the pipeline added (Prowlarr, the
+    harvest), adopted or restarted starts plain, queued behind qBittorrent's
+    active limits. The owner, 9 Nov 2026: "The pipeline should mirror what
+    lidarr has for the initial state". Only 'force' acts: a stopped or paused
+    torrent is left alone, and so is one the pipeline added itself still
+    fetching its metadata (the hunt stops it there on purpose). Returns how
+    many were forced."""
+    if initial != "force" or not category:
+        return 0
+    forced = 0
+    for t in qbt.torrents(category=category):
+        if forced >= max_per_pass:
+            break
+        h = t.get("hash")
+        state = str(t.get("state") or "").lower()
+        if not h or t.get("force_start") or state.startswith("forced"):
+            continue
+        if state not in _MIRROR_STATES:
+            continue
+        tags = {x.strip() for x in str(t.get("tags") or "").split(",")}
+        if QbtClient.SELF_ADDED_TAG in tags and state == "metadl":
+            continue
+        if qbt.force_start(h, True):
+            forced += 1
+    if forced:
+        emit(f"qbt: force-started {forced} torrent(s) -- Lidarr's initial "
+             f"state is Force Start")
+    return forced
+
+
 def stalled_grab_reaper_pass(
     qbt: QbtClient, lidarr: Optional[LidarrClient], category: str = "",
     grace_seconds: int = 259200, blocklist: bool = True,
@@ -1221,14 +1265,18 @@ def _lifecycle_owns(t: Dict[str, Any]) -> bool:
 
 
 def _every_file_deselected_music(files: List[Dict[str, Any]]) -> bool:
-    """Every file of the torrent at priority 0, and music among them (audio
-    or a disc image): the deselect pass found nothing in it to download."""
-    if not files or any(f.get("priority", 1) != 0 for f in files):
+    """No music of the torrent selected (audio or a disc image at priority
+    0), and music among its files: the deselect pass found nothing in it to
+    download. A selected text, playlist or info file does not count: 'The
+    Trammps - Discography (1975-2012) [DJ]' (9 Nov 2026) had all 283 songs
+    deselected and only 'Torrent_downloaded_from_Demonoid.is_.txt' left, and
+    sat seeding at 100 % because one file was still selected."""
+    def music(f) -> bool:
+        ext = os.path.splitext(str(f.get("name") or ""))[1].lower()
+        return ext in AUDIO_EXTS or ext == ".iso"
+    if not files or any(f.get("priority", 1) != 0 and music(f) for f in files):
         return False
-    return any(os.path.splitext(str(f.get("name") or ""))[1].lower()
-               in AUDIO_EXTS or
-               os.path.splitext(str(f.get("name") or ""))[1].lower() == ".iso"
-               for f in files)
+    return any(music(f) for f in files)
 
 
 def _remove_deselected_torrent(

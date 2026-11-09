@@ -14967,6 +14967,8 @@ class Orchestrator:
         """Blocklist + remove THIS grab: the queue rows whose downloadId is its
         hash (never one found by artist/album name), then the torrent with its
         data -- all through _remove_torrent (category, claims, outage)."""
+        if blocklist:
+            self._await_queue_row(thash)
         if not self._remove_torrent(thash, delete_files=True, blocklist=blocklist,
                                     qbt=qbt, why=" (rejected grab for %s / %s)"
                                     % (artist[:24], album[:30])):
@@ -15642,9 +15644,37 @@ class Orchestrator:
             time.sleep(3)
         return None, None
 
-    def _verify_discography(self, qbt, thash: str, tname: str):
+    @staticmethod
+    def _folder_holds_wanted(keys, missing) -> bool:
+        """Does any album folder of the torrent carry the title of an album
+        still missing? `keys` are the folders (_file_album_key), `missing`
+        [(album_title, expected, album_id)]. Compared on titlematch keys, the
+        folder's last segment against the album title, either way round (a
+        folder '1977 - Disco Inferno [Remastered]' holds 'Disco Inferno')."""
+        wants = []
+        for m in missing or ():
+            k = titlematch.key(str((m or ("",))[0] or ""))
+            if len(k) >= 3:
+                wants.append(k)
+        if not wants:
+            return True                 # nothing to compare: not a reason
+        for key in keys or ():
+            seg = [p for p in re.split(r"[\\/]", str(key or "")) if p]
+            fk = titlematch.key(seg[-1] if seg else "")
+            if not fk:
+                continue
+            if any(w in fk or (len(fk) >= 3 and fk in w) for w in wants):
+                return True
+        return False
+
+    def _verify_discography(self, qbt, thash: str, tname: str, missing=None):
         """Pause + inspect: a real discography must contain >= 2 distinct album
-        folders. Returns ('accept', n_albums) or ('reject:<reason>', n)."""
+        folders, and -- when `missing` is given -- one of them must be an
+        album still missing. 9 Nov 2026: 'Arielle Dombasle - (7 CD)
+        2000-2013' was grabbed for the missing 'Iconics' and 'The Trammps -
+        Discography (1975-2012) [DJ]' for two Christmas albums; neither held
+        any of them, so every folder was deselected and the torrents sat at
+        0 B. Returns ('accept', n_albums) or ('reject:<reason>', n)."""
         if qbt is None:
             return "accept", 0
         files = self._await_torrent_files(qbt, thash, tname)
@@ -15664,11 +15694,39 @@ class Orchestrator:
                 parts = [p for p in re.split(r"[\\/]", str(f.get("name") or "")) if p]
                 keys.add(parts[1] if len(parts) >= 3 else (parts[0] if parts else ""))
         n = len(keys)
-        return ("accept", n) if n >= 2 else ("reject:single-album", n)
+        if n < 2:
+            return "reject:single-album", n
+        if missing and not self._folder_holds_wanted(keys, missing):
+            return "reject:no-wanted-album", n
+        return "accept", n
+
+    def _await_queue_row(self, thash: str, timeout: float = 30.0) -> bool:
+        """Wait until Lidarr's queue lists a row for this hash. A grab bound
+        through Lidarr's history is verified within a second, before Lidarr
+        has made the queue row the blocklist goes through: on 9 Nov 2026
+        'Seal - Best 1991-2004' and the Trammps 8CD box were rejected and
+        removed without a blocklist ("removed torrent ... (interactive search
+        reject)", no "(blocklisted)"), so the release stayed grabbable."""
+        h = str(thash or "").lower()
+        if not h:
+            return False
+        deadline = time.time() + max(0.0, float(timeout))
+        while True:
+            try:
+                if any(str(r.get("downloadId") or "").lower() == h
+                       for r in (self.lidarr.queue_list() or [])):
+                    return True
+            except Exception:  # noqa: BLE001
+                pass
+            if time.time() >= deadline:
+                return False
+            time.sleep(3)
 
     def _reject_by_hash(self, thash: str, qbt, blocklist: bool = True) -> None:
         """Drop this torrent's Lidarr queue rows (blocklisting) and remove it
         with its data -- through _remove_torrent (category, claims, outage)."""
+        if blocklist:
+            self._await_queue_row(thash)
         if not self._remove_torrent(thash, delete_files=True,
                                     blocklist=blocklist, qbt=qbt,
                                     why=" (interactive search reject)"):
@@ -15775,7 +15833,7 @@ class Orchestrator:
                 return True
             if cand.get("_is_disco"):
                 verdict, detail = self._verify_discography(
-                    qbt, thash, cand.get("title") or "")
+                    qbt, thash, cand.get("title") or "", missing=missing)
                 detail = f"{detail} album folder(s)"
             else:
                 m = cand.get("_match") or ("", 0, 0)
@@ -17061,6 +17119,9 @@ class Orchestrator:
         # studio album: a best-of in a sentence is not a best-of.
         r"(?i)\b(?:(?<!re\sthe\s)(?<!is\sthe\s)best\s+of|the\s+very\s+best|"
         r"(?<!re\s)(?<!is\s)the\s+best|greatest|"
+        # 'Seal - Best 1991-2004' (9 Nov 2026: grabbed as a "discography"
+        # for the wanted Togetherland): Best and a year span, no "of".
+        r"best\s+(?=(?:19|20)\d\d)|^\s*best\s*$|"
         r"(?:smash|golden|super|number\s+one|no\.?\s*1)\s+hits|hits|gold|platinum|"
         r"collection|collected|anthology|essentials?|definitive|retrospective|"
         r"tribute|the\s+singles|die\s+gro(?:ss|ß)en\s+erfolge|"

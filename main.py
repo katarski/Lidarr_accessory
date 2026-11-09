@@ -929,7 +929,7 @@ def qbt_auto_deselect_loop(
     import qbittorrent_client
     from qbt_deselect import (
         auto_deselect_pass, torrent_lifecycle_pass, dead_grab_reaper_pass,
-        stalled_grab_reaper_pass, adopt_uncategorised,
+        stalled_grab_reaper_pass, adopt_uncategorised, mirror_initial_state,
     )
 
     cadence = max(10, interval)
@@ -1061,6 +1061,16 @@ def qbt_auto_deselect_loop(
                                         proof=proof)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("adopt uncategorised: %s", exc)
+            # Lidarr's Initial State for every running torrent of ours, not
+            # only for what Lidarr itself sent (mirror_initial_state).
+            if category:
+                try:
+                    mirror_initial_state(
+                        qbt, category, (lidarr.qbit_initial_state(category)
+                         if lidarr is not None else None),
+                        emit=logger.info)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("mirror initial state: %s", exc)
             # The torrents still without a category and without proof are the
             # owner's: their folders are kept out of every pass that splits,
             # moves or deletes (handadded.protected). Every pass, adoption on

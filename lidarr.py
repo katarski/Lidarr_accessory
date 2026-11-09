@@ -1748,6 +1748,41 @@ class LidarrClient:
 
     # ---- Download-client queue management ----------------------------
 
+    # Lidarr's QBittorrentState: what its qBittorrent client does to a grab.
+    _QBIT_INITIAL_STATES = {0: "start", 1: "force", 2: "stop"}
+
+    def qbit_initial_state(self, category: str = "") -> Optional[str]:
+        """The Initial State of Lidarr's qBittorrent download client --
+        'start', 'force' or 'stop' -- for the enabled client whose music
+        category is `category` (else the first enabled one). None when Lidarr
+        does not answer or has no such client. Read at most every 10 min."""
+        now = time.time()
+        cache = getattr(self, "_qbit_state_cache", None)
+        if cache and cache[0] == category and now - cache[1] < 600:
+            return cache[2]
+        try:
+            clients = self._get("/api/v1/downloadclient") or []
+        except Exception:  # noqa: BLE001
+            return cache[2] if cache and cache[0] == category else None
+        pick = None
+        for c in clients:
+            if not c.get("enable") or str(c.get("implementation") or "") != "QBittorrent":
+                continue
+            fields = {f.get("name"): f.get("value") for f in c.get("fields") or []}
+            if category and str(fields.get("musicCategory") or "") == category:
+                pick = fields
+                break
+            if pick is None:
+                pick = fields
+        state = None
+        if pick is not None:
+            try:
+                state = self._QBIT_INITIAL_STATES.get(int(pick.get("initialState")))
+            except (TypeError, ValueError):
+                state = None
+        self._qbit_state_cache = (category, now, state)
+        return state
+
     def queue_list(self) -> List[Dict[str, Any]]:
         """Return all items currently in Lidarr's download-client queue."""
         try:
