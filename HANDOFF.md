@@ -44,7 +44,29 @@ base is missing and prints the `docker tag` that recreates it) with the repo's `
 still a dataclass, generates the run command from the flash template
 (`tools/tpl2run.py`), and `tools/mkrun.py` refuses unless it has exactly 6
 mounts, 52 env vars, HA_URL/HA_TOKEN/LLM_* present and the image last. Only
-then is the container replaced. Live now: **`guard-20261108-unproven`**
+then is the container replaced. Live now: **`guard-20261109-grabhygiene`**
+(062858c + d5f1f30, deployed 9 Nov 11:41:16; image 97608718a1c3. `cue_pipeline:base`
+had been pruned: re-tagged from `latest` before the deploy). The owner, 9 Nov: 0 B
+torrents seeding, Seal's best-of downloading, Lidarr-forced torrents not forced.
+Found: (1) **qBittorrent config** -- "Copy .torrent files to" and "...for finished
+downloads" both pointed at `/data/torrents`, which is also the WATCHED folder (and
+the temp path). Every add was re-added ~10 s later as a duplicate, and a torrent the
+pipeline rejected within those seconds came back UNCATEGORISED, was adopted and
+downloaded (Seal 'Best 1991-2004', Trammps 8CD, Stacey Kent, Sweet Inspirations,
+Alanis since at least 8 Nov). Changed 9 Nov 11:3x via setPreferences: backup dir
+-> `/config/qBittorrent/torrent-backup`, finished-backup off; watched folder kept.
+(2) 'Best 1991-2004' passed both compilation patterns (Best + years) -- fixed in
+`_COMPILATION_TITLE_RE` and qbt_deselect `_UNOFFICIAL_ALBUM`. (3) Discographies
+were accepted on folder count alone: `_verify_discography(missing=)` now rejects
+one with no folder named for a missing album (`reject:no-wanted-album`; Arielle
+Dombasle 7 CD for 'Iconics', Trammps DJ for two Christmas albums). (4) A reject
+removed the torrent before Lidarr's queue row existed, so no blocklist:
+`_await_queue_row` (30 s) first. (5) Lifecycle: no audio/image selected = nothing
+wanted, even with a .txt/.cue still selected (Trammps DJ seeded on a Demonoid
+.txt; removed 11:41:20). (6) `mirror_initial_state` + `LidarrClient.qbit_initial_state`:
+Lidarr's qBittorrent Initial State (1 = Force Start here) is applied every qbt pass
+to running torrents of the category (stopped/paused and the hunt's metaDL left
+alone); 11:41:13 forced 2. 749 tests. Before that: **`guard-20261108-unproven`**
 (e9c9834, 8 Nov; section 6 item -2), after `guard-20261108-keepdlrows`
 (b06725f) and `guard-20261108-judgever` (fbf0701). When a deploy changes how the cueless
 sweep judges a download, bump `SWEEP_JUDGE_VERSION` (orchestrator.py): ledger
